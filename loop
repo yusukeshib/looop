@@ -1,0 +1,666 @@
+#!/usr/bin/env bash
+# =============================================================================
+# loop — a tiny, portable, Kubernetes-shaped control loop for your work.
+#
+# This single file IS the whole program: principles, rules, and defaults are all
+# inside it. No README, no helper dir required — copy this one file and run it.
+#
+# -----------------------------------------------------------------------------
+# THE IDEA
+# -----------------------------------------------------------------------------
+# Arrive in the morning, look at the state of the world, make the single most
+# important move, repeat. Now a machine does that. It is a reconciliation loop,
+# exactly like Kubernetes — with one deliberate twist (see RULE 1):
+#
+#   Kubernetes            loop
+#   ----------            ----
+#   desired state (YAML)  goals/*.md         "how things should be" (inert files)
+#   etcd                  git (the data dir) PLAYBOOK + goals + journal = memory
+#   informers / watch     sensors/*.sh       scripts that print the world as JSON
+#   reconcile loop        the pulse (`loop`) observe → diff → one move, every tick
+#   scheduler policy      PLAYBOOK.md        priorities + guardrails, in prose
+#   Job / Pod             worker session     a real agent doing hands-on work
+#   Pod sandbox           box workspace      a git worktree per session
+#
+# THE THREE NOUNS
+#   PLAYBOOK.md   judgment in prose: priorities, guardrails, rules. Humans AND
+#                 the AI grow it. It is *data* (lives with goals + journal).
+#   goals/*.md    the desired state. One file per goal: a `goal:` frontmatter
+#                 line + free-form dated notes. The AI creates/updates/archives
+#                 them; they are evaluated every tick but NEVER executed.
+#   session       an agent actually working — born only for hands-on work, runs
+#                 in a box workspace under babysit, gone when finished.
+#
+# ONE BEAT (a tick) — see tick() below
+#   1. run sensors/*.sh → snapshot the world as JSON (fresh every tick)
+#   2. if nothing changed since last tick → do nothing (cheap, no AI call)
+#   3. else hand PLAYBOOK + goals + sensor readings + sessions to the AI, which
+#      makes EXACTLY ONE move and appends ONE line to journal.md
+#   4. the AI process is disposable — all memory is the files in the data dir
+#
+# -----------------------------------------------------------------------------
+# RULES (the invariants that keep this safe and legible)
+# -----------------------------------------------------------------------------
+#   1. ONE TICK = ONE MOVE. The highest-priority move only; "do nothing" counts.
+#      A runaway can do at most one thing per tick, and leaves one journal line.
+#   2. THE PULSE IS UNBREAKABLE SHELL, JUDGMENT IS THE AI, MEMORY IS GIT.
+#      This file never "thinks"; it only gathers context and runs the AI once.
+#   3. NEVER DO IRREVERSIBLE THINGS AUTOMATICALLY (merge, public comments,
+#      closing issues, deleting data). Prepare fully, then a worker session
+#      raises a babysit flag and waits for a human. Encode this in the PLAYBOOK.
+#   4. BE INQUISITIVE. When a worker lacks context it asks (flag + wait) rather
+#      than guessing. Asking is cheaper than a wrong irreversible move.
+#   5. ADD STRUCTURE LATER. Only harden a drift into a PLAYBOOK rule or a check
+#      once it actually hurts. Never build machinery in advance.
+#   6. LEVEL-TRIGGERED. Each tick re-observes from scratch; the loop keeps no
+#      "what I was waiting for" state. Re-running after days off is just a tick.
+#
+# -----------------------------------------------------------------------------
+# CODE / CONFIG / DATA are cleanly separated (all overridable by env)
+# -----------------------------------------------------------------------------
+#   EXEC    this one script                              the program (portable)
+#   CONFIG  ${XDG_CONFIG_HOME:-~/.config}/loop.json       one file: runner wiring
+#           └ override with $LOOP_CONFIG                  (seeded inline if absent)
+#   DATA    ${XDG_STATE_HOME:-~/.local/state}/loop/        the git-tracked memory
+#           └ override with $LOOP_DATA_DIR
+#             PLAYBOOK.md  goals/  journal.md  sensors/*.sh   ← commit these
+#             sensor-*.json  prompts/  .lock  .last-tick-hash  paused  ← scratch (gitignored)
+#
+# SUBCOMMANDS
+#   loop                run the pulse (default; foreground, Ctrl-C to stop)
+#   loop tick           run a single beat and exit (debug / cron; refuses while
+#                       the pulse is already running)
+#   loop start-session <id> <repo|-> "<prompt>" [runner]
+#                       start a worker session (called by the tick AI; repo `-`
+#                       = meta work in the data dir itself, e.g. grooming goals)
+#   loop help           show help
+#
+# WATCH / INTERVENE (workers + workspaces are external tools, not reinvented):
+#   babysit ls | attach -s loop-<id> | log | screenshot     ⚑ = a worker wants you
+#   box ls | repo add <path>                                sandbox workspaces
+#
+# BOOTSTRAP: a fresh data dir is seeded once (see seed_data) with a starter
+# PLAYBOOK + goals/setup.md + goals/playbook-daily.md + sensors/today.sh, all
+# embedded in this file. The starter PLAYBOOK's top priority is to run an
+# interactive setup session (goals/setup.md) that interviews you and rewrites
+# the seed into your real config. Setup is just a goal; the shell only seeds.
+#
+# DEPENDENCIES: babysit, box, jq, and the configured agent CLI (claude or pi).
+# (gh and other tools are used only by sensor scripts / worker agents, not loop.)
+# =============================================================================
+set -euo pipefail
+shopt -s nullglob
+
+# ---- paths -------------------------------------------------------------------
+self="${BASH_SOURCE[0]}"
+LOOP_BIN="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
+LOOP_DATA_DIR="${LOOP_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/loop}"
+CONFIG="${LOOP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/loop.json}"   # the only config: runner wiring
+export LOOP_BIN LOOP_DATA_DIR CONFIG
+
+SENSORS_DIR="$LOOP_DATA_DIR/sensors"           # sensor scripts (data: AI writes them as needed)
+PLAYBOOK="$LOOP_DATA_DIR/PLAYBOOK.md"          # judgment brain (data: grown over time)
+GOALS_DIR="$LOOP_DATA_DIR/goals"               # desired state
+JOURNAL="$LOOP_DATA_DIR/journal.md"            # action log
+LOCK="$LOOP_DATA_DIR/.lock"
+
+# ---- colors (respect a tty + $NO_COLOR; $LOOP_COLOR is inherited by `loop _fmt`)
+if [ -n "${LOOP_COLOR:-}" ]; then :; elif [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then LOOP_COLOR=1; else LOOP_COLOR=0; fi
+export LOOP_COLOR
+if [ "$LOOP_COLOR" = 1 ]; then
+  c_rst=$'\033[0m'; c_dim=$'\033[2m'; c_b=$'\033[1m'
+  c_blue=$'\033[34m'; c_cyan=$'\033[36m'; c_grn=$'\033[32m'; c_red=$'\033[31m'; c_yel=$'\033[33m'
+else
+  c_rst=; c_dim=; c_b=; c_blue=; c_cyan=; c_grn=; c_red=; c_yel=
+fi
+
+log() { printf '%s[%s]%s %s\n' "$c_dim" "$(date '+%H:%M:%S')" "$c_rst" "$*"; }
+
+# ---- dependency preflight ----------------------------------------------------
+# loop is only glue: it orchestrates external tools. If any required command is
+# missing, fail fast with install instructions and exit 1 (RULE: the pulse must
+# not limp along half-wired).
+dep_hint() {
+  case "$1" in
+    babysit) echo "cargo install babysit   (or: nix profile install github:yusukeshib/babysit)" ;;
+    box)     echo "cargo install box-cli   (or: curl -fsSL https://raw.githubusercontent.com/yusukeshib/box/main/install.sh | bash)" ;;
+    jq)      echo "brew install jq         (or your package manager: apt-get install jq, ...)" ;;
+    *)       echo "see the tool's docs" ;;
+  esac
+}
+require_deps() {
+  local missing=0 c
+  for c in babysit box jq; do
+    if ! command -v "$c" >/dev/null 2>&1; then
+      [ "$missing" -eq 0 ] && echo "loop: missing required dependencies — cannot run:" >&2
+      printf '  %-8s install:  %s\n' "$c" "$(dep_hint "$c")" >&2
+      missing=1
+    fi
+  done
+  [ "$missing" -eq 0 ] || { printf '\nInstall the above, then re-run loop.\n' >&2; exit 1; }
+}
+
+# ---- the inline default config (the only thing that needs "installing") ------
+# Written to $CONFIG on first run if it is absent. `tick` = how to run one
+# disposable AI move (stdin = the tick prompt). `interactive` = how to launch a
+# worker agent; {{prompt_file}} is substituted with the worker's prompt file.
+default_config() {
+  cat <<'JSON'
+{
+  "default": "pi",
+  "runners": {
+    "claude": {
+      "tick": "claude -p --dangerously-skip-permissions",
+      "interactive": "claude \"$(cat {{prompt_file}})\"",
+      "resume": "claude --resume"
+    },
+    "pi": {
+      "tick": "pi -p --mode json -ne --model claude-sonnet-4-5 --thinking low 'Execute the loop tick instructions provided on stdin.' | \"$LOOP_BIN\" _fmt",
+      "interactive": "pi --model claude-opus-4-8 --thinking medium @{{prompt_file}}",
+      "resume": "pi --session"
+    }
+  }
+}
+JSON
+}
+
+# ---- first-run seeding -------------------------------------------------------
+# Config is seeded inline; data (memory) is created empty — the PLAYBOOK is
+# written by the bootstrap setup session, not seeded.
+ensure_dirs() {
+  mkdir -p "$(dirname "$CONFIG")" "$SENSORS_DIR" \
+           "$GOALS_DIR/archive" "$LOOP_DATA_DIR/prompts"
+  [ -f "$CONFIG" ] || default_config > "$CONFIG"
+  # Fresh data dir (no PLAYBOOK yet) → lay down the embedded starter seed once.
+  [ -f "$PLAYBOOK" ] || seed_data
+  # Keep the data dir a clean git "memory": commit PLAYBOOK/goals/journal/sensors, ignore scratch.
+  if [ ! -f "$LOOP_DATA_DIR/.gitignore" ]; then
+    cat > "$LOOP_DATA_DIR/.gitignore" <<'GI'
+sensor-*.json
+sensor-*.err
+prompts/
+.lock/
+.last-tick-hash
+.tmux-surfaced
+attention.md
+tick.log
+paused
+GI
+  fi
+}
+
+cfg() { jq -r "$1" "$CONFIG"; }
+
+# ---- progressive output formatter (internal: `loop _fmt`) --------------------
+# Reads a `pi --mode json` NDJSON event stream on stdin and prints friendly,
+# line-buffered progress as it happens: one line per tool call (so you see what
+# is executing live), error markers, and the assistant's narrative as each turn
+# ends. Non-JSON lines (errors, stray output) pass through unchanged.
+cmd_fmt() {
+  # We color only what we generate (tool-call lines); the assistant's freeform
+  # prose is printed plain. pi emits raw JSON (no ANSI), so nothing competes.
+  jq -Rr --unbuffered \
+    --arg ar "$c_cyan" --arg er "$c_red" --arg rs "$c_rst" --arg dm "$c_dim" '
+    (try fromjson catch null) as $e
+    | if $e == null then (if . == "" then empty else . end)
+      elif $e.type == "tool_execution_start" then
+        "  " + $ar + "→ " + ($e.toolName // "tool") + $rs
+        + ( ($e.args.command // $e.args.path // $e.args.file_path // ($e.args|tojson))
+            | tostring | gsub("\\s+";" ") | .[0:100]
+            | if . == "" then "" else $dm + ": " + . + $rs end )
+      elif ($e.type == "tool_execution_end" and ($e.isError // false)) then
+        "  " + $er + "✗ " + ($e.toolName // "tool") + " failed" + $rs
+      elif ($e.type == "message_end" and $e.message.role == "assistant") then
+        ( [ $e.message.content[]? | select(.type=="text") | .text ] | join("") )
+        | if (. | length) > 0 then "\n" + . else empty end
+      else empty end
+  '
+}
+
+# ---- the embedded seed (laid down once, on a fresh data dir) -----------------
+# A brand-new user starts with an EMPTY data dir. Rather than special-casing
+# "no PLAYBOOK" in the pulse, we embed a starter memory here and write it once.
+# Setup is then just a goal: the starter PLAYBOOK's top priority is to run an
+# interactive setup session (goals/setup.md) that interviews the human and
+# rewrites this seed into their real config. The shell makes no decisions.
+# All heredocs are quoted ('SEED') so nothing expands — $(date ...) etc. are
+# written literally into the files.
+seed_data() {
+  cat > "$PLAYBOOK" <<'SEED'
+# PLAYBOOK (starter — not yet customized)
+
+You are my personal operations agent. Each tick, make exactly ONE move — the
+single most important one — then stop and append one line to journal.md.
+
+## Priorities (highest first)
+1. SETUP — this PLAYBOOK is still the generic starter. Until it reflects my real
+   work, your top priority is the `setup` goal (goals/setup.md): start ONE
+   interactive setup session to interview me, then rewrite this PLAYBOOK and
+   create real goals + sensor scripts. Start it with:
+     loop start-session setup - "$(cat goals/setup.md)"
+   If a session loop-setup already exists, do nothing and wait for me.
+2. A goal whose situation changed and needs a move.
+3. Recurring goals that are due today (check each goal's notes vs sensor-today.json).
+4. Otherwise, do nothing.
+
+## Moves
+- Small reversible actions directly (edit a goal, write an sensor script).
+- Hands-on / interactive work: loop start-session <id> <repo|-> "<prompt>"
+  (repo `-` = work in this data dir; <id> matches the goal file name. For a
+  RECURRING goal use a date-stamped id like name-YYYYMMDD so a finished run
+  never blocks the next one.)
+
+## Guardrails
+- NEVER do irreversible things (merge, public comments, closing issues, deleting
+  data, deploys) without explicit human approval: prepare fully, then
+  `babysit flag -s loop-<id> "<why>"` and wait. I attach and answer.
+- When you lack information or context, ASK me (flag + wait) rather than guess.
+- One move per tick. When unsure, do nothing and say why in journal.md.
+SEED
+
+  cat > "$GOALS_DIR/setup.md" <<'SEED'
+---
+goal: PLAYBOOK and goals reflect my real work (not the starter template)
+---
+This is a fresh loop. Interview me and turn the generic starter into my real
+setup. You run as an interactive worker session, in the loop data dir.
+
+BE VERY INQUISITIVE: ask ONE focused question at a time, wait, dig in, never
+assume. First raise a flag so I know you are waiting:
+  babysit flag -s loop-setup "setup: attach and answer my questions"
+
+Cover at least:
+- What work should this loop watch over and push forward day to day?
+- Which sources define "the world"? (GitHub / Linear / Grafana / …) For each,
+  what to observe, and is the CLI/token available? You WRITE the sensor scripts
+  yourself into ./sensors/ — each just prints ONE JSON object to stdout.
+- Priorities when several things compete (ordered).
+- What is irreversible and must never happen without my approval?
+- Which code repos will workers touch? (register each: box repo add PATH)
+- Recurring chores / cadences? How many goals at once (capacity)?
+
+Then, with my agreement (show drafts BEFORE writing):
+- rewrite ./PLAYBOOK.md to reflect the above — keep the Guardrails and the
+  "ask, don't guess" rule, and DROP the starter "SETUP" priority once customized;
+- create ./goals/*.md for what I am actually working on now;
+- write ./sensors/*.sh we agreed on.
+Finally archive this goal (move to goals/archive/), unflag yourself
+(babysit unflag -s loop-setup), and tell me the next tick will pick it up.
+SEED
+
+  cat > "$GOALS_DIR/playbook-daily.md" <<'SEED'
+---
+goal: Every day, the PLAYBOOK is refined from the previous day's journal
+---
+Recurring goal (never archived). Once per day — when today's date (sensor-today.json)
+is newer than the last-improved date below — make ONE small improvement:
+
+- Read the last ~24h of journal.md. Find ONE recurring mistake, hesitation, or
+  human intervention and turn it into a clearer PLAYBOOK rule (or sharpen a vague
+  one). Keep it to a single small change.
+- Do it as an interactive session in the data dir, with a DATE-STAMPED id so a
+  finished run never blocks tomorrow's (RULE: recurring goals use dated ids):
+     loop start-session playbook-YYYYMMDD - "<the task above>"
+- PLAYBOOK changes affect every future tick, so PROPOSE the diff and
+  `babysit flag` for my confirmation before committing.
+- When done, set last-improved below to today's date. Occasionally `babysit prune`
+  to clear finished playbook-* sessions.
+
+last-improved: never
+SEED
+
+  cat > "$SENSORS_DIR/today.sh" <<'SEED'
+#!/usr/bin/env bash
+# Heartbeat: emit today's date (day granularity) so the loop wakes once a day
+# even when nothing else changes — lets daily/recurring goals fire on schedule.
+echo "{\"date\":\"$(date +%F)\"}"
+SEED
+  chmod +x "$SENSORS_DIR/today.sh"
+}
+
+# Surface everything that needs the human ON the loop pane. No OS notifications:
+# we live in tmux, so a worker that needs us pops a dedicated tmux window (see
+# tmux_surface). attention.md is reserved for genuine blockers (mentions/questions
+# where someone is stuck on us) — standing review-request queues are count-only
+# (see goals/review-inbox.md) and must NOT land here.
+surface_attention() {
+  local flags att
+  flags="$(babysit ls --json 2>/dev/null \
+    | jq -r '.[] | select(.id|startswith("loop-")) | select(.note != null and .note != "")
+        | "  ⚑ \(.id)\n     \(.note)\n     → babysit attach -s \(.id)"' 2>/dev/null || true)"
+  att=""
+  [ -s "$LOOP_DATA_DIR/attention.md" ] && att="$(sed 's/^/  /' "$LOOP_DATA_DIR/attention.md")"
+  [ -z "$flags" ] && [ -z "$att" ] && return 0
+  log "${c_yel}${c_b}👁  NEEDS YOU${c_rst}"
+  [ -n "$att" ] && printf '%s\n' "$att"
+  [ -n "$flags" ] && printf '%s\n' "$flags"
+  tmux_surface
+}
+
+# When a worker raises a flag (babysit note), pop a tmux window attached to it,
+# so a human living in tmux can't miss it — much louder than a buried log line
+# or a transient OS notification. Idempotent: at most one window per flagged
+# session, tracked in .tmux-surfaced; unflag→reflag pops a fresh one. The pulse
+# runs detached (no $TMUX), so we target the running server's current session.
+# Disable with LOOP_TMUX_SURFACE=0. Add -d to new-window to stop it stealing focus.
+tmux_surface() {
+  [ "${LOOP_TMUX_SURFACE:-1}" = "0" ] && return 0
+  command -v tmux >/dev/null 2>&1 || return 0
+  tmux info >/dev/null 2>&1 || return 0          # no server running → nothing to pop into
+  local seen="$LOOP_DATA_DIR/.tmux-surfaced" ids existing id wname
+  ids="$(babysit ls --json 2>/dev/null \
+    | jq -r '.[] | select(.id|startswith("loop-")) | select(.note != null and .note != "") | .id' 2>/dev/null || true)"
+  # Prune the seen-list to only still-flagged ids, so a re-flag pops again later.
+  touch "$seen"
+  printf '%s\n' "$ids" | grep -Fxf "$seen" > "$seen.tmp" 2>/dev/null || : > "$seen.tmp"
+  mv "$seen.tmp" "$seen"
+  [ -z "$ids" ] && return 0
+  existing="$(tmux list-windows -a -F '#{window_name}' 2>/dev/null || true)"
+  while IFS= read -r id; do
+    [ -z "$id" ] && continue
+    grep -qxF "$id" "$seen" 2>/dev/null && continue              # already surfaced this flag
+    wname="⚑${id#loop-}"
+    printf '%s\n' "$existing" | grep -qxF "$wname" && continue   # window already open
+    if tmux new-window -n "$wname" "babysit attach -s '$id'" 2>/dev/null; then
+      printf '%s\n' "$id" >> "$seen"
+    fi
+  done <<EOF
+$ids
+EOF
+}
+
+# ---- world hash: skip the AI when nothing changed ---------------------------
+world_hash() {
+  {
+    # /dev/null guards against empty globs: cat with zero args would block on stdin
+    cat "$PLAYBOOK" "$GOALS_DIR"/*.md "$LOOP_DATA_DIR"/sensor-*.json /dev/null 2>/dev/null
+    # worker sessions (id prefixed 'loop-'). Hash only the STABLE signal —
+    # id/state/exit_code/flag-note — NOT the ever-incrementing age column, so a
+    # tick fires on a real transition (worker started / exited / raised a flag)
+    # and stays idle otherwise (incl. while exited-but-unpruned sessions linger).
+    babysit ls --json 2>/dev/null \
+      | jq -r '.[] | select(.id|startswith("loop-")) | "\(.id) \(.state) \(.exit_code) \(.note)"' \
+      || true
+  } | shasum | cut -d' ' -f1
+}
+
+# ---- assemble the tick prompt ------------------------------------------------
+build_prompt() {
+  cat <<EOF
+You are "loop", a personal operations agent. This is one tick of a loop; your
+process is disposable. Your working directory is the loop's DATA dir
+($LOOP_DATA_DIR): goals/, journal.md and sensors/ are here; edit with relative paths.
+
+Read the PLAYBOOK, goals, sensor readings and sessions below, then make exactly
+ONE move — the single most important one — and stop.
+
+Moves:
+- do a small reversible action directly (gh commands, drafts, queries)
+- create / update / archive a goal (files in goals/; archive = move to goals/archive/)
+- write or adjust an sensor script in sensors/ (each just prints one JSON object
+  to stdout) when you need a new view of the world; it runs from next tick
+- start a worker session for hands-on work (creates a sandboxed box workspace
+  and runs an agent in it under babysit):
+    $LOOP_BIN start-session <id> <repo|-> "<detailed prompt for the worker>"
+  <repo> is a box-registered repo name (worker gets a sandboxed box workspace);
+  use - for meta work on the loop's data dir itself. <id> matches the goal file name.
+- do nothing (a valid move when nothing needs doing)
+
+After your move, append exactly ONE line to journal.md:
+  - $(date -u '+%Y-%m-%d %H:%M') <what you did and why>
+
+=== PLAYBOOK ===
+$(cat "$PLAYBOOK")
+
+=== GOALS ===
+EOF
+  local g had=0
+  for g in "$GOALS_DIR"/*.md; do
+    had=1
+    printf -- '--- %s\n' "$(basename "$g")"
+    cat "$g"
+    printf '\n'
+  done
+  [ "$had" -eq 0 ] && echo "(no goals yet)"
+
+  echo
+  echo "=== SENSOR READINGS ==="
+  local o
+  for o in "$LOOP_DATA_DIR"/sensor-*.json; do
+    printf -- '--- %s\n' "$(basename "$o")"
+    cat "$o"
+    printf '\n'
+  done
+
+  echo
+  echo "=== WORKER SESSIONS (babysit; ⚑note = the worker is waiting for you) ==="
+  babysit ls --json 2>/dev/null \
+    | jq -r '.[] | select(.id|startswith("loop-"))
+        | "- \(.id) [\(.state)" + (if .exit_code != null then " exit \(.exit_code)" else "" end) + "]"
+          + (if .note then "  ⚑ \(.note)" else "" end)' \
+    | grep . || echo "(none)"
+
+  echo
+  echo "=== RECENT JOURNAL ==="
+  tail -20 "$JOURNAL" 2>/dev/null || echo "(empty)"
+}
+
+# ---- one beat ----------------------------------------------------------------
+TICK_ACTED=0
+tick() {
+  TICK_ACTED=0
+  ensure_dirs
+
+  if [ -f "$LOOP_DATA_DIR/paused" ]; then
+    log "paused ($LOOP_DATA_DIR/paused exists) — skipping"
+    return 0
+  fi
+
+  # 0. housekeeping: reap finished worker corpses (deterministic, no AI). Workers
+  #    self-kill when fully done (see the WORKER CONTRACT in start-session), which
+  #    turns them into dead sessions; prune clears them so babysit ls stays clean.
+  babysit prune >/dev/null 2>&1 || true
+
+  # 1. sense the world (run sensors) — each prints one JSON snapshot; log each
+  #    one with its duration so a slow sensor (gh/linear/…) is visible.
+  local s name t0 n
+  n=$(ls "$SENSORS_DIR"/*.sh 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$n" -gt 0 ]; then log "${c_b}sensing the world${c_rst} ${c_dim}($n sensors)${c_rst}…"; fi
+  for s in "$SENSORS_DIR"/*.sh; do
+    name="$(basename "${s%.sh}")"
+    t0=$SECONDS
+    if "$s" > "$LOOP_DATA_DIR/sensor-$name.json" 2>"$LOOP_DATA_DIR/sensor-$name.err"; then
+      log "  ${c_grn}✓${c_rst} $name ${c_dim}($((SECONDS - t0))s)${c_rst}"
+    else
+      log "  ${c_red}✗ $name FAILED${c_rst} ${c_dim}($((SECONDS - t0))s) — see sensor-$name.err${c_rst}"
+    fi
+  done
+
+  # 2. skip if the world is unchanged (cheap: no AI call)
+  local hash
+  hash="$(world_hash)"
+  if [ "$hash" = "$(cat "$LOOP_DATA_DIR/.last-tick-hash" 2>/dev/null || true)" ]; then
+    log "${c_dim}world unchanged — nothing to decide; skipping (no AI call)${c_rst}"
+    return 0
+  fi
+
+  # 3. hand everything to the AI for one move
+  local runner tick_cmd prompt
+  runner="$(cfg '.default')"
+  tick_cmd="$(jq -r --arg r "$runner" '.runners[$r].tick' "$CONFIG")"
+  prompt="$(mktemp)"
+  build_prompt > "$prompt"
+
+  t0=$SECONDS
+  log "${c_cyan}${c_b}deciding the one move${c_rst} — $runner is thinking ${c_dim}(model latency; its output follows)${c_rst}…"
+  log "${c_dim}┌─ $runner ─────────────────────────────────────────${c_rst}"
+  if ( cd "$LOOP_DATA_DIR" && eval "$tick_cmd" < "$prompt" ) 2>&1 | tee "$LOOP_DATA_DIR/tick.log"; then
+    log "${c_dim}└────────────────────────────────────────────${c_rst}"
+    printf '%s\n' "$hash" > "$LOOP_DATA_DIR/.last-tick-hash"
+    TICK_ACTED=1
+    log "${c_grn}✓ tick done${c_rst} in $((SECONDS - t0))s ${c_dim}— journal: $(tail -1 "$JOURNAL" 2>/dev/null || echo '(no line)')${c_rst}"
+  else
+    log "${c_dim}└────────────────────────────────────────────${c_rst}"
+    log "${c_red}✗ tick FAILED${c_rst} after $((SECONDS - t0))s ${c_dim}(see tick.log)${c_rst}"
+  fi
+  rm -f "$prompt"
+  surface_attention
+}
+
+# ---- a single beat (debug / cron) -------------------------------------------
+# Runs exactly one tick and exits. Refuses if the pulse (or another one-shot)
+# holds a live lock, so it never double-acts against a running `loop run`.
+cmd_tick() {
+  if [ -d "$LOCK" ]; then
+    local oldpid; oldpid="$(cat "$LOCK/pid" 2>/dev/null || true)"
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+      echo "loop: pulse already running (pid $oldpid) — it ticks on its own" >&2
+      exit 1
+    fi
+  fi
+  tick
+}
+
+# ---- the pulse (default subcommand) -----------------------------------------
+cmd_run() {
+  ensure_dirs
+  # Idle backoff when a tick did nothing; prompt re-tick after it acted.
+  local INTERVAL="${LOOP_INTERVAL:-600}"
+  local BUSY_INTERVAL="${LOOP_BUSY_INTERVAL:-2}"
+
+  # single-instance lock (mkdir-based; macOS has no flock)
+  if ! mkdir "$LOCK" 2>/dev/null; then
+    local oldpid; oldpid="$(cat "$LOCK/pid" 2>/dev/null || true)"
+    if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then
+      echo "loop: already running (pid $oldpid)" >&2; exit 1
+    fi
+    rm -rf "$LOCK" && mkdir "$LOCK"
+  fi
+  printf '%s\n' "$$" > "$LOCK/pid"
+  trap 'rm -rf "$LOCK"' EXIT
+
+  log "${c_b}loop started${c_rst} ${c_dim}(idle ${INTERVAL}s / busy ${BUSY_INTERVAL}s, runner $(cfg '.default' 2>/dev/null || echo '?'))${c_rst}"
+  while true; do
+    tick
+    if [ "$TICK_ACTED" -eq 1 ]; then
+      sleep "$BUSY_INTERVAL"   # acted: re-evaluate promptly
+    else
+      sleep "$INTERVAL"        # idle: back off, spare external APIs
+    fi
+  done
+}
+
+# ---- start a worker session --------------------------------------------------
+# loop start-session <id> <repo|-> "<prompt>" [runner]
+#   <repo>  a box-registered repo name → worker gets a sandboxed box workspace.
+#           Pass - for meta work on the loop's data dir (bootstrap, goal grooming).
+cmd_start_session() {
+  ensure_dirs
+  local id="${1:?usage: loop start-session <id> <repo|-> <prompt> [runner]}"
+  local repo="${2:?missing repo (a box repo name, or - for the loop data dir)}"
+  local prompt="${3:?missing prompt}"
+  local runner="${4:-$(cfg '.default')}"
+
+  local tmpl; tmpl="$(jq -r --arg r "$runner" '.runners[$r].interactive // empty' "$CONFIG")"
+  [ -n "$tmpl" ] || { echo "start-session: unknown runner '$runner'" >&2; exit 1; }
+
+  local session="loop-$id"
+  if babysit status -s "$session" >/dev/null 2>&1; then
+    # A session with this id exists. Only block if it's still ALIVE; a dead
+    # (exited/killed) corpse just holds the id — prune it and reuse the id, so
+    # "kill a worker → next tick re-spawns with the same id" just works.
+    if babysit ls --json 2>/dev/null | jq -e --arg s "$session" '.[] | select(.id==$s and .alive==true)' >/dev/null 2>&1; then
+      echo "start-session: session $session is already running" >&2; exit 1
+    fi
+    babysit prune >/dev/null 2>&1 || true
+  fi
+
+  # Prompt passed via file (avoids quoting hell; also a record of the ask).
+  # Every worker gets the same contract prepended so the pulse can't forget it:
+  # workers NEVER notify; when they need a human they raise a babysit flag and
+  # wait. The pulse turns that flag into a tmux window the human can't miss.
+  local prompt_file="$LOOP_DATA_DIR/prompts/$session.md"
+  cat > "$prompt_file" <<EOF
+# ⚑ WORKER CONTRACT (auto-injected — must obey)
+- Never send notifications (no terminal-notifier or any OS notification). You are
+  an agent; only the pulse notifies.
+- When you need a human decision / info / approval, do NOT guess — use ONLY this
+  and then wait right there:
+    babysit flag -s $session "<what you are waiting for / what you need to ask>"
+  Once flagged, the human attaches over tmux to answer (the pulse turns the flag
+  into a tmux window they can't miss).
+- When the wait is resolved (you got your answer), unflag before continuing:
+    babysit unflag -s $session
+- When the task is 100% complete and nothing is flagged, end your own session:
+    babysit kill -s $session
+  (this lets the pulse prune the corpse). NEVER do this mid-task or while waiting
+  on a human.
+
+---
+
+EOF
+  printf '%s\n' "$prompt" >> "$prompt_file"
+
+  # Resolve the working directory:
+  #   repo == '-' → meta work on the loop data dir (PLAYBOOK/goals), no sandbox
+  #   otherwise   → a sandboxed box workspace (`box new` prints its path)
+  local workspace
+  if [ "$repo" = "-" ]; then
+    workspace="$LOOP_DATA_DIR"
+  else
+    if ! workspace="$(box new "$session" --repo "$repo" 2>/dev/null)"; then
+      workspace="$(box switch "$session" 2>/dev/null || true)"
+    fi
+    workspace="$(printf '%s\n' "$workspace" | tail -1)"
+    if [ -z "$workspace" ] || [ ! -d "$workspace" ]; then
+      echo "start-session: could not resolve box workspace for $session (repo: $repo)" >&2
+      exit 1
+    fi
+  fi
+
+  # Run the agent in the workspace under babysit, detached. bash -lc gives the
+  # template shell semantics (e.g. the "$(cat prompt_file)" in loop.json).
+  # FULLY detach the worker's std fds (</dev/null >/dev/null 2>&1): otherwise the
+  # daemonized worker inherits and holds the caller's stdout/stderr pipe, so a
+  # tick that spawns a worker can't finish until the worker exits — which would
+  # defeat the whole point of detached workers (non-blocking, parallel).
+  local cmd="${tmpl//\{\{prompt_file\}\}/$prompt_file}"
+  ( cd "$workspace" && babysit run -d --id "$session" -- bash -lc "$cmd" ) </dev/null >/dev/null 2>&1
+  echo "started $session (runner: $runner, repo: ${repo}, ws: $workspace)"
+  echo "  watch: babysit attach -s $session"
+}
+
+usage() {
+  cat <<EOF
+loop — personal operations loop
+
+Usage:
+  loop                          run the pulse (foreground; Ctrl-C to stop)
+  loop tick                     run a single beat and exit (debug / cron)
+  loop start-session <id> <repo|-> "<prompt>" [runner]
+                                start a worker session (used by the tick AI)
+  loop help                     show this help
+
+Paths (override via env LOOP_CONFIG / LOOP_DATA_DIR):
+  config  $CONFIG
+  data    $LOOP_DATA_DIR
+
+Worker sessions and workspaces are managed by external tools:
+  babysit ls                    list worker sessions (⚑ = waiting for you)
+  babysit attach -s loop-<id>   enter a waiting session and talk to it
+  box ls                        list sandbox workspaces
+
+Fix judgment by editing PLAYBOOK.md (in the data dir) and committing — it takes
+effect next tick. Drop a file at \$data/paused to pause the loop.
+EOF
+}
+
+cmd="${1:-run}"
+case "$cmd" in
+  run|loop)        require_deps; cmd_run ;;
+  tick)            require_deps; cmd_tick ;;
+  _fmt)            cmd_fmt ;;
+  start-session)   require_deps; shift; cmd_start_session "$@" ;;
+  help|-h|--help)  usage ;;
+  *) echo "loop: unknown command '$cmd' (try: run, tick, start-session, help)" >&2; exit 1 ;;
+esac
