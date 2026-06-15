@@ -407,7 +407,7 @@ Moves:
 - do nothing (a valid move when nothing needs doing)
 
 After your move, append exactly ONE line to journal.md:
-  - $(date -u '+%Y-%m-%d %H:%M') <what you did and why>
+  - $(date '+%Y-%m-%d %H:%M') <what you did and why>
 
 === PLAYBOOK ===
 $(cat "$PLAYBOOK")
