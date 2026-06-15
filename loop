@@ -397,6 +397,19 @@ world_hash() {
 
 # ---- assemble the tick prompt ------------------------------------------------
 build_prompt() {
+  local focus="${1:-}"
+  if [ -n "$focus" ]; then
+    cat <<EOF
+=== MANUAL RUN (human override) ===
+The human explicitly asked you to act on the goal "$focus" RIGHT NOW. IGNORE the
+normal priority order AND the "do nothing" option: make the single most important
+move FOR THAT GOAL this run (often: start its worker session, or a small direct
+action / file edit). The PLAYBOOK, the OTHER goals, sensor readings and sessions
+below are CONTEXT to inform that move — act on "$focus", not on them. Still obey
+every rule & guardrail, and still append exactly ONE line to journal.md.
+
+EOF
+  fi
   cat <<EOF
 You are "loop", a personal operations agent. This is one tick of a loop; your
 process is disposable. Your working directory is the loop's DATA dir
@@ -542,6 +555,13 @@ cmd_run() {
   # Idle backoff when a tick did nothing; prompt re-tick after it acted.
   local INTERVAL="${LOOP_INTERVAL:-600}"
   local BUSY_INTERVAL="${LOOP_BUSY_INTERVAL:-2}"
+  # While any worker is in flight we re-observe on a SHORT cadence even when a
+  # tick did nothing: workers exit / resolve threads / free a cap slot at any
+  # moment, and the long idle backoff would leave us blind to that for minutes
+  # (a freed slot or a newly-failing PR sits unhandled). The world_hash skip
+  # still suppresses the AI call when nothing actually changed, so this only
+  # costs cheap sensor re-runs — never idle AI spend.
+  local ACTIVE_INTERVAL="${LOOP_ACTIVE_INTERVAL:-60}"
 
   # single-instance lock (mkdir-based; macOS has no flock)
   if ! mkdir "$LOCK" 2>/dev/null; then
@@ -558,11 +578,64 @@ cmd_run() {
   while true; do
     tick
     if [ "$TICK_ACTED" -eq 1 ]; then
-      sleep "$BUSY_INTERVAL"   # acted: re-evaluate promptly
+      sleep "$BUSY_INTERVAL"        # acted: re-evaluate promptly
+    elif babysit ls --json 2>/dev/null \
+         | jq -e '[.[] | select((.id|startswith("loop-")) and .alive==true)] | length > 0' >/dev/null 2>&1; then
+      sleep "$ACTIVE_INTERVAL"      # workers in flight: poll to fill freed slots
     else
-      sleep "$INTERVAL"        # idle: back off, spare external APIs
+      sleep "$INTERVAL"            # truly quiescent: back off, spare external APIs
     fi
   done
+}
+
+# ---- manual one-shot: run a single goal NOW ---------------------------------
+# loop run <goal-id> — force ONE goal-focused move immediately. Unlike a normal
+# tick this bypasses the priority order AND the world-unchanged skip, and it does
+# NOT refuse while the pulse is running (explicit human override; start-session
+# still guards against double-spawning a live worker). <goal-id> must exist in
+# goals/ (or goals/archive/) — it is the goal file's basename without .md.
+cmd_run_goal() {
+  ensure_dirs
+  local id="$1"
+  local gf="$GOALS_DIR/$id.md"
+  [ -f "$gf" ] || gf="$GOALS_DIR/archive/$id.md"
+  if [ ! -f "$gf" ]; then
+    echo "loop run: no such goal '$id' (looked in goals/ and goals/archive/)" >&2
+    echo "available goals:" >&2
+    ( cd "$GOALS_DIR" 2>/dev/null && ls ./*.md 2>/dev/null | sed 's#\.md$##;s#^\./#  #' ) >&2
+    exit 1
+  fi
+
+  if [ -d "$LOCK" ]; then
+    local p; p="$(cat "$LOCK/pid" 2>/dev/null || true)"
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+      log "${c_yel}note:${c_rst} pulse is running (pid $p) — running goal '$id' anyway ${c_dim}(manual override)${c_rst}"
+    fi
+  fi
+
+  babysit prune >/dev/null 2>&1 || true
+
+  # fresh sensors so the move reflects the current world (same as a tick)
+  local s name
+  for s in "$SENSORS_DIR"/*.sh; do
+    [ -e "$s" ] || continue
+    name="$(basename "${s%.sh}")"
+    "$s" > "$LOOP_DATA_DIR/sensor-$name.json" 2>"$LOOP_DATA_DIR/sensor-$name.err" || true
+  done
+
+  local runner tick_cmd prompt t0
+  runner="$(cfg '.default')"
+  tick_cmd="$(jq -r --arg r "$runner" '.runners[$r].tick' "$CONFIG")"
+  prompt="$(mktemp)"
+  build_prompt "$id" > "$prompt"
+  t0=$SECONDS
+  log "${c_cyan}${c_b}manual run — goal '$id'${c_rst} ${c_dim}($runner is thinking; its output follows)${c_rst}…"
+  log "${c_dim}┌─ $runner ──────────────────────────────────────${c_rst}"
+  ( cd "$LOOP_DATA_DIR" && eval "$tick_cmd" < "$prompt" ) 2>&1 | tee "$LOOP_DATA_DIR/tick.log"
+  log "${c_dim}└────────────────────────────────────────${c_rst}"
+  log "${c_grn}✓ run done${c_rst} in $((SECONDS - t0))s ${c_dim}— journal: $(tail -1 "$JOURNAL" 2>/dev/null || echo '(no line)')${c_rst}"
+  rm -f "$prompt"
+  surface_attention
 }
 
 # ---- start a worker session --------------------------------------------------
@@ -646,6 +719,11 @@ loop — personal operations loop
 
 Usage:
   loop                          run the pulse (foreground; Ctrl-C to stop)
+  loop run <goal-id>            run ONE goal NOW (manual override): a forced,
+                                goal-focused move, ignoring priority order and
+                                the world-unchanged skip; works while the pulse
+                                runs. <goal-id> = goals/<id>.md basename.
+                                e.g. loop run setup ; loop run morning-standup
   loop tick                     run a single beat and exit (debug / cron)
   loop start-session <id> "<prompt>" [runner]
                                 start a worker session (used by the tick AI)
@@ -670,10 +748,11 @@ EOF
 
 cmd="${1:-run}"
 case "$cmd" in
-  run|loop)        require_deps; cmd_run ;;
+  run|loop)        require_deps; shift 2>/dev/null || true
+                   if [ -n "${1:-}" ]; then cmd_run_goal "$1"; else cmd_run; fi ;;
   tick)            require_deps; cmd_tick ;;
   _fmt)            cmd_fmt ;;
   start-session)   require_deps; shift; cmd_start_session "$@" ;;
   help|-h|--help)  usage ;;
-  *) echo "loop: unknown command '$cmd' (try: run, tick, start-session, help)" >&2; exit 1 ;;
+  *) echo "loop: unknown command '$cmd' (try: run, run <goal>, tick, start-session, help)" >&2; exit 1 ;;
 esac
