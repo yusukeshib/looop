@@ -406,8 +406,11 @@ Moves:
   use - for meta work on the loop's data dir itself. <id> matches the goal file name.
 - do nothing (a valid move when nothing needs doing)
 
-After your move, append exactly ONE line to journal.md:
+After your move, append exactly ONE line to journal.md. Copy the timestamp
+prefix below VERBATIM — it is already in local time (America/New_York). Do NOT
+recompute it, do NOT convert to UTC, do NOT use your own clock:
   - $(date '+%Y-%m-%d %H:%M') <what you did and why>
+(For reference, the current local time right now is $(date '+%Y-%m-%d %H:%M %Z').)
 
 === PLAYBOOK ===
 $(cat "$PLAYBOOK")
