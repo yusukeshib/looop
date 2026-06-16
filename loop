@@ -64,7 +64,7 @@
 #   DATA    ${XDG_STATE_HOME:-~/.local/state}/loop/        the git-tracked memory
 #           └ override with $LOOP_DATA_DIR
 #             PLAYBOOK.md  goals/  journal.md  sensors/*.sh   ← commit these
-#             sensor-*.json  prompts/  .lock  .last-tick-hash  paused  ← scratch (gitignored)
+#             snapshots/  prompts/  .lock  .last-tick-hash  paused  ← scratch (gitignored)
 #
 # SUBCOMMANDS
 #   loop                run the pulse (default; foreground, Ctrl-C to stop)
@@ -109,6 +109,7 @@ PLAYBOOK="$LOOP_DATA_DIR/PLAYBOOK.md"          # judgment brain (data: grown ove
 GOALS_DIR="$LOOP_DATA_DIR/goals"               # desired state
 JOURNAL="$LOOP_DATA_DIR/journal.md"            # action log
 LOCK="$LOOP_DATA_DIR/.lock"
+SNAPSHOTS_DIR="$LOOP_DATA_DIR/snapshots"        # per-tick sensor output (scratch: wiped each tick)
 
 # ---- colors (respect a tty + $NO_COLOR; $LOOP_COLOR is inherited by `loop _fmt`)
 if [ -n "${LOOP_COLOR:-}" ]; then :; elif [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then LOOP_COLOR=1; else LOOP_COLOR=0; fi
@@ -176,7 +177,7 @@ JSON
 # Config is seeded inline; data (memory) is created empty — the PLAYBOOK is
 # written by the bootstrap setup session, not seeded.
 ensure_dirs() {
-  mkdir -p "$(dirname "$CONFIG")" "$SENSORS_DIR" \
+  mkdir -p "$(dirname "$CONFIG")" "$SENSORS_DIR" "$SNAPSHOTS_DIR" \
            "$GOALS_DIR/archive" "$LOOP_DATA_DIR/prompts"
   [ -f "$CONFIG" ] || default_config > "$CONFIG"
   # Fresh data dir (no PLAYBOOK yet) → lay down the embedded starter seed once.
@@ -184,8 +185,7 @@ ensure_dirs() {
   # Keep the data dir a clean git "memory": commit PLAYBOOK/goals/journal/sensors, ignore scratch.
   if [ ! -f "$LOOP_DATA_DIR/.gitignore" ]; then
     cat > "$LOOP_DATA_DIR/.gitignore" <<'GI'
-sensor-*.json
-sensor-*.err
+snapshots/
 prompts/
 .lock/
 .last-tick-hash
@@ -193,6 +193,11 @@ prompts/
 attention.md
 tick.log
 paused
+# worker scratch that can land in the data dir
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+__pycache__/
 GI
   fi
 }
@@ -385,8 +390,13 @@ EOF
 # ---- world hash: skip the AI when nothing changed ---------------------------
 world_hash() {
   {
-    # /dev/null guards against empty globs: cat with zero args would block on stdin
-    cat "$PLAYBOOK" "$GOALS_DIR"/*.md "$LOOP_DATA_DIR"/sensor-*.json /dev/null 2>/dev/null
+    # hash each input behind a path marker so file boundaries are unambiguous
+    # (and an empty glob just contributes nothing instead of blocking on stdin)
+    local f
+    for f in "$PLAYBOOK" "$GOALS_DIR"/*.md "$SNAPSHOTS_DIR"/*.json; do
+      [ -f "$f" ] || continue
+      printf '@@ %s\n' "${f#"$LOOP_DATA_DIR"/}"; cat "$f"
+    done
     # worker sessions (id prefixed 'loop-'). Hash only the STABLE signal —
     # id/state/exit_code/flag-note — NOT the ever-incrementing age column, so a
     # tick fires on a real transition (worker started / exited / raised a flag)
@@ -456,7 +466,8 @@ EOF
   echo
   echo "=== SENSOR READINGS ==="
   local o
-  for o in "$LOOP_DATA_DIR"/sensor-*.json; do
+  for o in "$SNAPSHOTS_DIR"/sensor-*.json; do
+    [ -e "$o" ] || continue
     printf -- '--- %s\n' "$(basename "$o")"
     cat "$o"
     printf '\n'
@@ -494,17 +505,24 @@ tick() {
   # 1. sense the world (run sensors) — each prints one JSON snapshot; log each
   #    one with its duration so a slow sensor (gh/linear/…) is visible.
   local s name t0 n
+  # level-triggered (RULE 6): wipe last tick's snapshots so a deleted/renamed
+  # sensor can't leave a stale reading behind — the snapshot set always equals
+  # the current sensor set.
+  rm -rf "$SNAPSHOTS_DIR"; mkdir -p "$SNAPSHOTS_DIR"
   # shellcheck disable=SC2012  # glob already expands paths safely; we only count lines
   n=$(ls "$SENSORS_DIR"/*.sh 2>/dev/null | wc -l | tr -d ' ')
   if [ "$n" -gt 0 ]; then log "${c_b}sensing the world${c_rst} ${c_dim}($n sensors)${c_rst}…"; fi
   for s in "$SENSORS_DIR"/*.sh; do
+    [ -e "$s" ] || continue
     name="$(basename "${s%.sh}")"
     t0=$SECONDS
-    if "$s" > "$LOOP_DATA_DIR/sensor-$name.json" 2>"$LOOP_DATA_DIR/sensor-$name.err"; then
+    if "$s" > "$SNAPSHOTS_DIR/sensor-$name.json" 2>"$SNAPSHOTS_DIR/sensor-$name.err"; then
       log "  ${c_grn}✓${c_rst} $name ${c_dim}($((SECONDS - t0))s)${c_rst}"
     else
-      log "  ${c_red}✗ $name FAILED${c_rst} ${c_dim}($((SECONDS - t0))s) — see sensor-$name.err${c_rst}"
+      log "  ${c_red}✗ $name FAILED${c_rst} ${c_dim}($((SECONDS - t0))s) — see snapshots/sensor-$name.err${c_rst}"
     fi
+    # drop the empty .err a successful sensor leaves behind (keep only real errors)
+    [ -s "$SNAPSHOTS_DIR/sensor-$name.err" ] || rm -f "$SNAPSHOTS_DIR/sensor-$name.err"
   done
 
   # 2. skip if the world is unchanged (cheap: no AI call)
@@ -621,10 +639,12 @@ cmd_run_goal() {
 
   # fresh sensors so the move reflects the current world (same as a tick)
   local s name
+  rm -rf "$SNAPSHOTS_DIR"; mkdir -p "$SNAPSHOTS_DIR"   # same level-triggered wipe as a tick
   for s in "$SENSORS_DIR"/*.sh; do
     [ -e "$s" ] || continue
     name="$(basename "${s%.sh}")"
-    "$s" > "$LOOP_DATA_DIR/sensor-$name.json" 2>"$LOOP_DATA_DIR/sensor-$name.err" || true
+    "$s" > "$SNAPSHOTS_DIR/sensor-$name.json" 2>"$SNAPSHOTS_DIR/sensor-$name.err" || true
+    [ -s "$SNAPSHOTS_DIR/sensor-$name.err" ] || rm -f "$SNAPSHOTS_DIR/sensor-$name.err"
   done
 
   local runner tick_cmd prompt t0
