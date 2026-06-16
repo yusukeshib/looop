@@ -13,7 +13,7 @@
 
         looop = pkgs.stdenvNoCC.mkDerivation {
           pname = "looop";
-          version = "0.3.0";
+          version = "0.4.0";
           src = ./.;
 
           nativeBuildInputs = [ pkgs.makeWrapper ];

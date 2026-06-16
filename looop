@@ -95,7 +95,7 @@
 set -euo pipefail
 shopt -s nullglob
 
-LOOOP_VERSION="0.3.0"
+LOOOP_VERSION="0.4.0"
 
 # ---- paths -------------------------------------------------------------------
 self="${BASH_SOURCE[0]}"
@@ -115,6 +115,10 @@ CLAIMS_DIR="$LOOOP_DATA_DIR/claims"              # worker leases (scratch): clai
                                                  # live ones, but never interprets the rest (ownership
                                                  # semantics live in the PLAYBOOK — the shell has no repo concept)
 export CLAIMS_DIR
+REPORTS_DIR="$LOOOP_DATA_DIR/reports"            # worker deliverables a human reads (reports, artifacts).
+                                                 # PERSISTENT: the pulse never wipes this (unlike snapshots/),
+                                                 # so a report survives across ticks until the human acts on it.
+export REPORTS_DIR
 
 # ---- colors (respect a tty + $NO_COLOR; $LOOOP_COLOR is inherited by `looop _fmt`)
 if [ -n "${LOOOP_COLOR:-}" ]; then :; elif [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then LOOOP_COLOR=1; else LOOOP_COLOR=0; fi
@@ -182,7 +186,7 @@ JSON
 # Config is seeded inline; data (memory) is created empty — the PLAYBOOK is
 # written by the bootstrap setup session, not seeded.
 ensure_dirs() {
-  mkdir -p "$(dirname "$CONFIG")" "$SENSORS_DIR" "$SNAPSHOTS_DIR" "$CLAIMS_DIR" \
+  mkdir -p "$(dirname "$CONFIG")" "$SENSORS_DIR" "$SNAPSHOTS_DIR" "$CLAIMS_DIR" "$REPORTS_DIR" \
            "$GOALS_DIR/archive" "$LOOOP_DATA_DIR/prompts"
   [ -f "$CONFIG" ] || default_config > "$CONFIG"
   # Fresh data dir (no PLAYBOOK yet) → lay down the embedded starter seed once.
@@ -193,6 +197,7 @@ ensure_dirs() {
 snapshots/
 prompts/
 claims/
+reports/
 .lock/
 .last-tick-hash
 .tmux-surfaced
@@ -761,6 +766,11 @@ cmd_start_session() {
     • if \`box\` is available:  box new $session --repo <repo> && cd "\$(box switch $session)"
     • otherwise (git):         git -C <local-clone> worktree add /tmp/$session -b looop/$session && cd /tmp/$session
   (the PLAYBOOK names the repos and which to prefer.)
+- DELIVERABLES: write any report / artifact a human will read into the data dir's
+  reports/ folder (e.g. reports/<id>.md). That dir PERSISTS across ticks. NEVER
+  write deliverables to snapshots/ — the pulse wipes snapshots/ on EVERY beat, so
+  anything you leave there vanishes before the human sees it. Reference the
+  reports/ path in your babysit flag so I know where to look.
 
 ---
 
