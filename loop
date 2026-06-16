@@ -95,7 +95,7 @@
 set -euo pipefail
 shopt -s nullglob
 
-LOOP_VERSION="0.1.0"
+LOOP_VERSION="0.2.0"
 
 # ---- paths -------------------------------------------------------------------
 self="${BASH_SOURCE[0]}"
