@@ -230,6 +230,8 @@ GI
 }
 
 cfg() { jq -r "$1" "$CONFIG"; }
+# cfg with a fallback: null / missing / empty in the config yields the default.
+cfg_or() { local v; v="$(jq -r "$1 // empty" "$CONFIG" 2>/dev/null)"; [ -n "$v" ] && printf '%s' "$v" || printf '%s' "$2"; }
 
 # ---- LLM cost accounting -----------------------------------------------------
 # Every AI call goes through one of two seams: the tick/goal runner (metered in
@@ -679,18 +681,18 @@ cmd_tick() {
 # ---- the pulse (default subcommand) -----------------------------------------
 cmd_run() {
   ensure_dirs
-  # Idle backoff when a tick did nothing; prompt re-tick after it acted.
-  local INTERVAL="${LOOOP_INTERVAL:-60}"
-  local BUSY_INTERVAL="${LOOOP_BUSY_INTERVAL:-60}"
-  # While any worker is in flight we re-observe on a SHORT cadence even when a
-  # tick did nothing: workers exit / resolve threads / free a cap slot at any
-  # moment, and the long idle backoff would leave us blind to that for minutes
-  # (a freed slot or a newly-failing PR sits unhandled). The world_hash skip
-  # still suppresses the AI call when nothing actually changed, so this only
-  # costs cheap sensor re-runs — never idle AI spend.
-  local ACTIVE_INTERVAL="${LOOOP_ACTIVE_INTERVAL:-60}"
-  # Default cadence is a flat 60s in every state (acted / workers-in-flight /
-  # quiescent). Override any of the three env vars to restore a tiered rhythm.
+  # Tick cadence. Resolution order per knob: env var > config > default.
+  #   config: ~/.config/looop.json -> .interval / .busy_interval / .active_interval
+  # A single "interval" in config governs all three states (flat cadence);
+  # busy_interval / active_interval default to it but can be set to restore a
+  # tiered rhythm. Default is a flat 60s everywhere.
+  local INTERVAL="${LOOOP_INTERVAL:-$(cfg_or '.interval' 60)}"
+  local BUSY_INTERVAL="${LOOOP_BUSY_INTERVAL:-$(cfg_or '.busy_interval' "$INTERVAL")}"
+  # While any worker is in flight we re-observe even when a tick did nothing:
+  # workers exit / resolve threads / free a cap slot at any moment. The
+  # world_hash skip still suppresses the AI call when nothing actually changed,
+  # so a short active cadence only costs cheap sensor re-runs — never idle AI spend.
+  local ACTIVE_INTERVAL="${LOOOP_ACTIVE_INTERVAL:-$(cfg_or '.active_interval' "$INTERVAL")}"
 
   # single-instance lock (mkdir-based; macOS has no flock)
   if ! mkdir "$LOCK" 2>/dev/null; then
