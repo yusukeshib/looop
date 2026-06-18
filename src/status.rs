@@ -86,10 +86,8 @@ fn build(paths: &Paths) -> serde_json::Value {
 
     serde_json::json!({
         "pulse": { "running": running, "pid": pid, "interval_s": idle },
-        "paused": paths.data_dir.join("paused").is_file(),
         "last_tick": { "at": last_at, "hash": last_hash },
         "workers": workers,
-        "playbook_proposal_pending": paths.playbook_proposed().is_file(),
         "attention": attention,
         "cost_today_usd": cost_today(paths),
         "data_dir": paths.data_dir.to_string_lossy(),
@@ -114,12 +112,6 @@ pub fn cmd_status(paths: &Paths, args: &[String]) -> Result<ExitCode> {
             "stopped".into()
         }
     );
-    if s["paused"].as_bool().unwrap_or(false) {
-        println!(
-            "          ⏸ paused (remove {}/paused)",
-            paths.data_dir.display()
-        );
-    }
     println!(
         "last tick: {}  (hash {})",
         s["last_tick"]["at"].as_str().unwrap_or("never"),
@@ -142,9 +134,6 @@ pub fn cmd_status(paths: &Paths, args: &[String]) -> Result<ExitCode> {
             w["state"].as_str().unwrap_or("?"),
             flag
         );
-    }
-    if s["playbook_proposal_pending"].as_bool().unwrap_or(false) {
-        println!("playbook: 📝 change pending approval (looop playbook diff)");
     }
     let att = s["attention"].as_array().cloned().unwrap_or_default();
     if !att.is_empty() {

@@ -23,7 +23,6 @@ prompts/
 runs/
 claims/
 reports/
-.PLAYBOOK.approved
 .lock/
 .last-tick-hash
 .next-interval
@@ -32,7 +31,6 @@ attention.md
 tick.log
 events.jsonl
 cost.jsonl
-paused
 # worker scratch that can land in the data dir
 .ruff_cache/
 .pytest_cache/

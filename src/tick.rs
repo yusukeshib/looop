@@ -14,17 +14,7 @@ use std::time::Instant;
 /// Run one beat. Returns whether the AI actually acted (drives cadence).
 pub fn tick(paths: &Paths) -> bool {
     let _ = seed::ensure_dirs(paths);
-    gate::playbook_gate_pre(paths); // adopt any idle/human PLAYBOOK edit
     events::emit(paths, "tick_start", serde_json::json!({}));
-
-    if paths.data_dir.join("paused").is_file() {
-        util::log(&format!(
-            "paused ({}/paused exists) — skipping",
-            paths.data_dir.display()
-        ));
-        events::emit(paths, "paused", serde_json::json!({}));
-        return false;
-    }
 
     // 0. housekeeping (deterministic, no AI).
     babysit::prune();
@@ -141,7 +131,6 @@ pub fn tick(paths: &Paths) -> bool {
         );
     }
 
-    gate::playbook_gate_post(paths);
     prune_runs(paths);
     surface::surface_attention(paths);
     acted

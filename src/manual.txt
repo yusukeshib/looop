@@ -61,7 +61,7 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
   DATA    ${XDG_STATE_HOME:-~/.local/state}/looop/  the git-tracked memory
           └ override with $LOOOP_DATA_DIR
             PLAYBOOK.md  goals/  journal.md  sensors/*.sh   <- commit these
-            snapshots/ prompts/ runs/ .lock .last-tick-hash paused <- scratch
+            snapshots/ prompts/ runs/ .lock .last-tick-hash <- scratch
             (runs/<id>/{prompt.md,output.log} = a replayable archive per beat)
 
 BOOTSTRAP

@@ -43,13 +43,9 @@ Moves:
   <id> matches the goal file name. The worker starts in the data dir; if its
   task edits CODE it must provision its OWN sandbox first (box if available, else
   git worktree) and cd in — say so in the prompt. Never edit code in the data dir.
-- propose a PLAYBOOK change: write the FULL new PLAYBOOK to PLAYBOOK.proposed.md
-  (NOT PLAYBOOK.md). The PLAYBOOK is the guardrail, so a change does NOT take
-  effect until the HUMAN approves it (looop playbook approve); the loop keeps
-  running on the current PLAYBOOK until then. NOTE: any edit you make to
-  PLAYBOOK.md directly is automatically rolled back and parked as a proposal
-  anyway — so just write PLAYBOOK.proposed.md. If a proposal is already pending
-  (flagged below), do NOT add another.
+- change the PLAYBOOK: edit PLAYBOOK.md directly. The PLAYBOOK is the guardrail;
+  your edit takes effect next tick. Be deliberate — only harden a drift into a
+  rule once it actually hurts (RULE 5).
 - do nothing (a valid move when nothing needs doing)
 
 Optional — set WHEN the next beat runs: you may write a single integer (seconds)
@@ -65,8 +61,6 @@ Do NOT recompute it, do NOT convert to UTC, do NOT use your own clock:
 (For reference, the current local time right now is __NOW__.)
 
 "#;
-
-const PROPOSAL_PENDING: &str = "\n=== ⚠ A PLAYBOOK CHANGE IS ALREADY PENDING HUMAN APPROVAL ===\nA previous tick proposed an edit; it is awaiting the human and is NOT yet active\n(the PLAYBOOK above is still the one in force). Do NOT propose another PLAYBOOK\nchange this tick — pick a different move or do nothing.\n";
 
 fn sorted_glob(dir: &Path, ext: &str) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = fs::read_dir(dir)
@@ -101,12 +95,9 @@ pub fn build_prompt(paths: &Paths, focus: Option<&str>, snap_dir: &Path) -> Stri
         .replace("__NOW__", &util::date_fmt("%Y-%m-%d %H:%M %Z"));
     out.push_str(&instr);
 
-    // PLAYBOOK (+ pending-proposal warning).
+    // PLAYBOOK.
     out.push_str("=== PLAYBOOK ===\n");
     out.push_str(&fs::read_to_string(paths.playbook()).unwrap_or_default());
-    if paths.playbook_proposed().is_file() {
-        out.push_str(PROPOSAL_PENDING);
-    }
     out.push('\n');
 
     // GOALS.
@@ -226,15 +217,5 @@ mod tests {
         let focused = build_prompt(&p, Some("triage"), &p.snapshots_dir());
         assert!(focused.contains("MANUAL RUN"));
         assert!(focused.contains("triage"), "focus goal interpolated");
-    }
-
-    #[test]
-    fn pending_proposal_warning_appears_only_when_parked() {
-        let p = fixture();
-        let before = build_prompt(&p, None, &p.snapshots_dir());
-        assert!(!before.contains("PLAYBOOK CHANGE IS ALREADY PENDING"));
-        fs::write(p.playbook_proposed(), b"a proposal\n").unwrap();
-        let after = build_prompt(&p, None, &p.snapshots_dir());
-        assert!(after.contains("PLAYBOOK CHANGE IS ALREADY PENDING"));
     }
 }

@@ -22,8 +22,8 @@ Usage:
                                 e.g. looop run setup ; looop run morning-standup
   looop tick                     run a single beat and exit (debug / cron)
   looop status [--json]          structured snapshot of the loop's live state
-                                (pulse, last tick, workers, proposals, cost) —
-                                for an external observer / AI watching the loop
+                                (pulse, last tick, workers, cost) — for an
+                                external observer / AI watching the loop
   looop ls [--json] [--watch] [--interval <dur>]
                                 list this profile's worker sessions (⚑ = waiting),
                                 in-process; --watch refreshes live (Ctrl-C to stop)
@@ -40,13 +40,6 @@ Usage:
                                 (ticks + manual goal runs are metered
                                 automatically; workers self-report via
                                 'looop _cost')
-  looop playbook [diff|approve|reject]
-                                review a PLAYBOOK change the AI proposed. PLAYBOOK
-                                edits never take effect until you approve them —
-                                the loop keeps running on the current PLAYBOOK.
-                                diff (default) shows it; approve applies it;
-                                reject discards it. (To change judgment yourself,
-                                just edit PLAYBOOK.md — that takes effect next tick.)
   looop version                  print the looop version
   looop help                     show this help
 
@@ -67,7 +60,7 @@ it provisions its OWN sandbox (box if available, else git worktree), as told by
 the PLAYBOOK. looop itself has no notion of repos.
 
 Fix judgment by editing PLAYBOOK.md (in the data dir) and committing — it takes
-effect next tick. Drop a file at $data/paused to pause the loop."#,
+effect next tick."#,
         config = paths.config.display(),
         data = paths.data_dir.display(),
     );

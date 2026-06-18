@@ -165,7 +165,6 @@ pub fn cmd_run_goal(paths: &Paths, id: &str) -> Result<ExitCode> {
 
     babysit::prune();
     gate::reap_stale_claims(paths);
-    gate::playbook_gate_pre(paths);
 
     // Private snapshots dir so a concurrent pulse tick can't tear our readings.
     let snap = std::env::temp_dir().join(format!(
@@ -235,7 +234,6 @@ pub fn cmd_run_goal(paths: &Paths, id: &str) -> Result<ExitCode> {
         util::rst()
     ));
 
-    gate::playbook_gate_post(paths);
     tick::prune_runs(paths);
     surface::surface_attention(paths);
     Ok(ExitCode::SUCCESS)

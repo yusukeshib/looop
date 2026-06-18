@@ -14,7 +14,6 @@ mod events;
 mod gate;
 mod help;
 mod paths;
-mod playbook;
 mod prompt;
 mod run;
 mod runner;
@@ -72,12 +71,11 @@ fn main() -> ExitCode {
         "unflag" => deps::require_deps(&paths).and_then(|_| session::cmd_unflag(&paths, rest)),
         "prune" => deps::require_deps(&paths).and_then(|_| session::cmd_prune(&paths, rest)),
         "cost" => cost::cmd_cost(&paths, rest),
-        "playbook" => playbook::cmd_playbook(&paths, rest),
         "_fmt" => cost::cmd_fmt(&paths),
         "_cost" => cost::cmd_cost_record(&paths, rest),
         other => {
             eprintln!(
-                "looop: unknown command '{other}' (try: run, run <goal>, tick, ls, status, start-session, attach, kill, flag, unflag, prune, playbook, help)"
+                "looop: unknown command '{other}' (try: run, run <goal>, tick, ls, status, start-session, attach, kill, flag, unflag, prune, help)"
             );
             Ok(ExitCode::from(1))
         }

@@ -79,12 +79,6 @@ impl Paths {
     pub fn playbook(&self) -> PathBuf {
         self.data_dir.join("PLAYBOOK.md")
     }
-    pub fn playbook_approved(&self) -> PathBuf {
-        self.data_dir.join(".PLAYBOOK.approved")
-    }
-    pub fn playbook_proposed(&self) -> PathBuf {
-        self.data_dir.join("PLAYBOOK.proposed.md")
-    }
     pub fn goals_dir(&self) -> PathBuf {
         self.data_dir.join("goals")
     }

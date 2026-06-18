@@ -1,7 +1,7 @@
 //! Surface everything that needs the human, ON the loop pane. No OS
 //! notifications: we live in tmux, so a flagged worker pops a dedicated tmux
-//! window. attention.md is reserved for genuine blockers; a pending PLAYBOOK
-//! proposal and worker flags are shown inline.
+//! window. attention.md is reserved for genuine blockers; worker flags are
+//! shown inline.
 
 use crate::babysit;
 use crate::events;
@@ -36,16 +36,7 @@ pub fn surface_attention(paths: &Paths) {
                 .join("\n")
         });
 
-    let pb = if paths.playbook_proposed().is_file() {
-        Some(
-            "  📝 PLAYBOOK change pending approval\n     review:  looop playbook diff\n     accept:  looop playbook approve   ·   discard:  looop playbook reject"
-                .to_string(),
-        )
-    } else {
-        None
-    };
-
-    if flags.is_empty() && att.is_none() && pb.is_none() {
+    if flags.is_empty() && att.is_none() {
         return;
     }
 
@@ -55,9 +46,6 @@ pub fn surface_attention(paths: &Paths) {
         util::b(),
         util::rst()
     ));
-    if let Some(pb) = &pb {
-        println!("{pb}");
-    }
     if let Some(att) = &att {
         println!("{att}");
     }
@@ -71,7 +59,6 @@ pub fn surface_attention(paths: &Paths) {
         serde_json::json!({
             "flags": flags.len(),
             "attention": att.is_some(),
-            "proposal_pending": pb.is_some(),
         }),
     );
 

@@ -84,15 +84,11 @@ looop status [--json]          structured snapshot of the loop's live state
 looop ls [--watch]             list this profile's worker sessions (⚑ = waiting)
 looop attach <id>              attach to a waiting worker (Ctrl-\ Ctrl-\ to detach)
 looop kill|flag|unflag <id>    manage a worker; looop prune clears finished ones
-looop playbook [diff|approve|reject]
-                               review an AI-proposed PLAYBOOK change (gated on you)
 looop cost [today|all|--json]  report LLM spend from the cost ledger
 looop version | help           (looop help = the full design manual)
 ```
 
-To pause the loop: drop a file at `$data/paused`. To change judgment: edit
-`PLAYBOOK.md` — it takes effect next tick (AI-proposed edits are parked until you
-`looop playbook approve` them).
+To change judgment: edit `PLAYBOOK.md` — it takes effect next tick.
 
 ## Install
 
