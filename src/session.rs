@@ -34,7 +34,7 @@ const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
 - LEASE (ONLY if the PLAYBOOK/goal tells you to claim this task) — announce
   ownership BEFORE any work so a tick or sibling can't duplicate/race you, and
   release it when done:
-    mkdir -p claims && printf '{"session":"%s","name":"%s"}\n' "$BABYSIT_SESSION_ID" "<name>" > "claims/<name>.json"
+    mkdir -p claims && printf '{"session":"%s","name":"%s"}\n' "$LOOOP_SESSION_ID" "<name>" > "claims/<name>.json"
   (<name> and any extra fields are defined by the goal — e.g. one file per repo.)
   Delete claims/<name>.json the instant the task is fully done, right before the
   kill above. If you crash the pulse auto-reaps your claim; on a clean finish YOU
@@ -119,8 +119,12 @@ pub fn cmd_start_session(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     // The worker runs in the DATA dir. The in-process spawner inherits the
     // current process cwd (babysit's Pane uses `std::env::current_dir`), so we
     // `cd` there inside the shell command instead of mutating looop's own cwd.
+    // Export LOOOP_SESSION_ID so the worker knows its OWN session id (for its
+    // lease claim, etc.) through a looop-branded var — looop never relies on
+    // babysit's internal BABYSIT_SESSION_ID.
     let launch = format!(
-        "cd {} && {cmd}",
+        "export LOOOP_SESSION_ID={}; cd {} && {cmd}",
+        shell_quote(&session),
         shell_quote(&paths.data_dir.to_string_lossy())
     );
 
