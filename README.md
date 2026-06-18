@@ -90,16 +90,22 @@ To pause the loop: drop a file at `$data/paused`. To change judgment: edit
 
 ## Install
 
-### curl (recommended)
+### Cargo (recommended)
 
-Builds the Rust binary from source (needs a [Rust toolchain](https://rustup.rs)):
+```sh
+cargo install looop
+```
+
+### curl
+
+Installs the published crate via `cargo` (needs a [Rust toolchain](https://rustup.rs)):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/yusukeshib/looop/main/install.sh | bash
 ```
 
 Installs `looop` to `~/.local/bin/looop`. Override with `LOOOP_INSTALL_DIR`, or
-pin a ref with `LOOOP_REF`:
+build a specific git ref with `LOOOP_REF`:
 
 ```sh
 LOOOP_INSTALL_DIR=/usr/local/bin LOOOP_REF=v0.1.0 \
@@ -120,7 +126,7 @@ nix profile install github:yusukeshib/looop     # install into your profile
 nix develop github:yusukeshib/looop             # dev shell (cargo, clippy, rustfmt)
 ```
 
-### Cargo
+### From git (latest `main`)
 
 ```sh
 cargo install --git https://github.com/yusukeshib/looop.git --locked looop

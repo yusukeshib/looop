@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
-# looop installer — build the Rust binary from source and drop it on your PATH.
+# looop installer — install the Rust binary and drop it on your PATH.
 #
 #   curl -fsSL https://raw.githubusercontent.com/yusukeshib/looop/main/install.sh | bash
 #
 # Requires a Rust toolchain (cargo). Get one at https://rustup.rs.
+# By default installs the published crate from crates.io.
 #
 # Env vars:
 #   LOOOP_INSTALL_DIR   where to install (default: $HOME/.local/bin)
-#   LOOOP_REF           git ref/branch/tag to build (default: main)
+#   LOOOP_REF           build this git ref/branch/tag instead of crates.io
 set -euo pipefail
 
 REPO="yusukeshib/looop"
-REF="${LOOOP_REF:-main}"
 INSTALL_DIR="${LOOOP_INSTALL_DIR:-$HOME/.local/bin}"
 DEST="$INSTALL_DIR/looop"
 
@@ -24,23 +24,19 @@ command -v cargo >/dev/null 2>&1 || {
 
 mkdir -p "$INSTALL_DIR"
 
-err "building looop ($REF) from source → $DEST"
-# cargo install handles the clone, build (release), and copy. --root puts the
-# binary at <root>/bin/looop, so point it one level above INSTALL_DIR's bin.
-cargo install \
-	--git "https://github.com/${REPO}.git" \
-	--rev "$REF" \
-	--locked \
-	--root "${INSTALL_DIR%/bin}" \
-	--force \
-	looop 2>/dev/null ||
-	cargo install \
-		--git "https://github.com/${REPO}.git" \
-		--branch "$REF" \
-		--locked \
-		--root "${INSTALL_DIR%/bin}" \
-		--force \
-		looop
+# --root puts the binary at <root>/bin/looop, so point it one level above
+# INSTALL_DIR's bin. By default install the published crate from crates.io; set
+# LOOOP_REF to build a specific git branch/tag/commit instead.
+if [ -n "${LOOOP_REF:-}" ]; then
+	err "building looop ($LOOOP_REF) from git → $DEST"
+	cargo install --git "https://github.com/${REPO}.git" --rev "$LOOOP_REF" \
+		--locked --root "${INSTALL_DIR%/bin}" --force looop 2>/dev/null ||
+		cargo install --git "https://github.com/${REPO}.git" --branch "$LOOOP_REF" \
+			--locked --root "${INSTALL_DIR%/bin}" --force looop
+else
+	err "installing looop from crates.io → $DEST"
+	cargo install looop --locked --root "${INSTALL_DIR%/bin}" --force
+fi
 
 err "installed: $("$DEST" version 2>/dev/null || echo looop)"
 
