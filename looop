@@ -101,7 +101,7 @@
 set -euo pipefail
 shopt -s nullglob
 
-LOOOP_VERSION="0.11.0"
+LOOOP_VERSION="0.11.1"
 
 # ---- paths -------------------------------------------------------------------
 self="${BASH_SOURCE[0]}"
@@ -1132,14 +1132,18 @@ cmd_cost() {
   local today=""
   case "$mode" in
     all) : ;;
-    today) today="$(date -u +%F)" ;;
+    today) today="$(date +%F)" ;;   # local day (ledger ts are UTC; converted per-row below)
     *) echo "usage: looop cost [today|all|--json]" >&2; return 1 ;;
   esac
   jq -rs --arg today "$today" '
     def usd: "$" + (((.*10000|round)/10000)|tostring);
-    [ .[] | select(type=="object") | select($today=="" or ((.ts // "")|startswith($today))) ] as $r
+    # ledger ts are UTC ISO-8601; fold each into the HOST local day so "today"
+    # matches the wall-clock day rather than the UTC day — a late-evening call
+    # would otherwise be counted under tomorrow.
+    def localday: (.ts // "") | (try (fromdateiso8601|localtime|strftime("%Y-%m-%d")) catch "");
+    [ .[] | select(type=="object") | select($today=="" or (localday == $today)) ] as $r
     | ($r|map(.cost_usd // 0)|add // 0) as $t
-    | "looop cost \u2014 \(if $today=="" then "all time" else "today ("+$today+" UTC)" end)",
+    | "looop cost \u2014 \(if $today=="" then "all time" else "today ("+$today+" local)" end)",
       "  total: \($t|usd)  (\($r|length) calls)"
     + (if ($r|length)>0 then
         "\n  by kind:"
