@@ -1,0 +1,79 @@
+looop — a tiny, portable, Kubernetes-shaped control loop for your work.
+
+This single binary IS the whole program: principles, rules, and defaults all
+live inside it. Install one binary and run it — no README, no helper dir.
+
+THE IDEA
+  Arrive in the morning, look at the state of the world, make the single most
+  important move, repeat. Now a machine does that. It is a reconciliation loop,
+  exactly like Kubernetes — with one deliberate twist (see RULE 1):
+
+    Kubernetes            looop
+    ----------            -----
+    desired state (YAML)  goals/*.md         how things should be (inert files)
+    etcd                  git (the data dir) PLAYBOOK + goals + journal = memory
+    informers / watch     sensors/*.sh       scripts that print the world as JSON
+    reconcile loop        the pulse (looop)  observe -> diff -> one move per tick
+    scheduler policy      PLAYBOOK.md        priorities + guardrails, in prose
+    Job / Pod             worker session     a real agent doing hands-on work
+    Pod sandbox           box workspace      a git worktree per session
+
+THE THREE NOUNS
+  PLAYBOOK.md   judgment in prose: priorities, guardrails, rules. Humans AND the
+                AI grow it. It is data (lives with goals + journal).
+  goals/*.md    the desired state. One file per goal: a 'goal:' frontmatter line
+                + free-form dated notes. The AI creates/updates/archives them;
+                they are evaluated every tick but NEVER executed.
+  session       an agent actually working — born only for hands-on work, runs in
+                a box workspace under babysit, gone when finished.
+
+ONE BEAT (a tick)
+  1. run sensors/*.sh -> snapshot the world as JSON (fresh every tick)
+  2. if nothing changed since last tick -> do nothing (cheap, no AI call)
+  3. else hand PLAYBOOK + goals + sensor readings + sessions to the AI, which
+     makes EXACTLY ONE move and appends ONE line to journal.md
+  4. the AI process is disposable — all memory is the files in the data dir
+
+RULES (the invariants that keep this safe and legible)
+  1. ONE TICK = ONE MOVE. The highest-priority move only; "do nothing" counts.
+     A runaway can do at most one thing per tick, and leaves one journal line.
+  2. THE PULSE IS UNBREAKABLE SHELL, JUDGMENT IS THE AI, MEMORY IS GIT. This
+     program never "thinks"; it only gathers context and runs the AI once.
+  3. NEVER DO IRREVERSIBLE THINGS AUTOMATICALLY (merge, public comments, closing
+     issues, deleting data). Prepare fully, then a worker session raises a
+     babysit flag and waits for a human. Encode this in the PLAYBOOK.
+  4. BE INQUISITIVE. When a worker lacks context it asks (flag + wait) rather
+     than guessing. Asking is cheaper than a wrong irreversible move.
+  5. ADD STRUCTURE LATER. Only harden a drift into a PLAYBOOK rule or a check
+     once it actually hurts. Never build machinery in advance.
+  6. LEVEL-TRIGGERED. Each tick re-observes from scratch; the loop keeps no
+     "what I was waiting for" state. Re-running after days off is just a tick.
+  7. SINGLE-WRITER POLICY FILES. The pulse (the tick AI) is the sole writer of
+     PLAYBOOK.md, goals/ and sensors/. Workers write only to claims/, reports/
+     and their own code sandbox — never racing the pulse on policy files. The
+     lone exception is a human-gated meta session (setup / playbook grooming),
+     which shows a diff and waits for approval (RULE 3) before touching policy.
+
+CODE / CONFIG / DATA are cleanly separated (all overridable by env)
+  EXEC    this one binary                          the program (portable)
+  CONFIG  ${XDG_CONFIG_HOME:-~/.config}/looop.json  one file: runner wiring
+          └ override with $LOOOP_CONFIG            (seeded inline if absent)
+  DATA    ${XDG_STATE_HOME:-~/.local/state}/looop/  the git-tracked memory
+          └ override with $LOOOP_DATA_DIR
+            PLAYBOOK.md  goals/  journal.md  sensors/*.sh   <- commit these
+            snapshots/ prompts/ runs/ .lock .last-tick-hash paused <- scratch
+            (runs/<id>/{prompt.md,output.log} = a replayable archive per beat)
+
+BOOTSTRAP
+  A fresh data dir is seeded once with a starter PLAYBOOK + goals/setup.md +
+  goals/playbook-daily.md + sensors/today.sh, all embedded in this binary. The
+  starter PLAYBOOK's top priority is an interactive setup session (goals/setup.md)
+  that interviews you and rewrites the seed into your real config. Setup is just
+  a goal; the program only seeds.
+
+DEPENDENCIES
+  babysit and the configured agent CLI (claude or pi). The pulse provisions NO
+  workspaces; a worker that touches code makes its own sandbox (box if available,
+  else git worktree), so box/git are worker concerns, not pulse prerequisites.
+  (gh and other tools are used only by sensor scripts / worker agents — looop
+  never requires them.)
