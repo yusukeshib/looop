@@ -95,7 +95,7 @@
 set -euo pipefail
 shopt -s nullglob
 
-LOOOP_VERSION="0.7.0"
+LOOOP_VERSION="0.7.1"
 
 # ---- paths -------------------------------------------------------------------
 self="${BASH_SOURCE[0]}"
@@ -152,6 +152,16 @@ else
 fi
 
 log() { printf '%s[%s]%s %s\n' "$c_dim" "$(date '+%H:%M:%S')" "$c_rst" "$*"; }
+
+# Portable content hash for world_hash(): shasum ships with macOS but is absent
+# on minimal Linux (it comes with perl); prefer coreutils sha1sum there, and
+# fall back to the POSIX-guaranteed cksum as a last resort. Reads stdin once.
+_hash() {
+  if command -v shasum >/dev/null 2>&1; then shasum
+  elif command -v sha1sum >/dev/null 2>&1; then sha1sum
+  else cksum
+  fi
+}
 
 # Prefix each line of a streamed sub-process (the runner's output) with the same
 # dim [HH:MM:SS] stamp log() uses, so the AI's narrative lines up under the
@@ -496,7 +506,7 @@ world_hash() {
     babysit ls --json 2>/dev/null \
       | jq -r '.[] | select(.id|startswith("looop-")) | "\(.id) \(.state) \(.exit_code) \(.note)"' \
       || true
-  } | shasum | cut -d' ' -f1
+  } | _hash | cut -d' ' -f1
 }
 
 # ---- assemble the tick prompt ------------------------------------------------
