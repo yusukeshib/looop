@@ -41,7 +41,7 @@ RULES (the invariants that keep this safe and legible)
      program never "thinks"; it only gathers context and runs the AI once.
   3. NEVER DO IRREVERSIBLE THINGS AUTOMATICALLY (merge, public comments, closing
      issues, deleting data). Prepare fully, then a worker session raises a
-     babysit flag and waits for a human. Encode this in the PLAYBOOK.
+     flag (looop flag) and waits for a human. Encode this in the PLAYBOOK.
   4. BE INQUISITIVE. When a worker lacks context it asks (flag + wait) rather
      than guessing. Asking is cheaper than a wrong irreversible move.
   5. ADD STRUCTURE LATER. Only harden a drift into a PLAYBOOK rule or a check
@@ -72,8 +72,9 @@ BOOTSTRAP
   a goal; the program only seeds.
 
 DEPENDENCIES
-  babysit and the configured agent CLI (claude or pi). The pulse provisions NO
-  workspaces; a worker that touches code makes its own sandbox (box if available,
-  else git worktree), so box/git are worker concerns, not pulse prerequisites.
-  (gh and other tools are used only by sensor scripts / worker agents — looop
-  never requires them.)
+  Just the configured agent CLI (claude or pi). The worker fleet (babysit) is
+  LINKED IN as a library and runs in-process — no babysit binary is required.
+  The pulse provisions NO workspaces; a worker that touches code makes its own
+  sandbox (box if available, else git worktree), so box/git are worker concerns,
+  not pulse prerequisites. (gh and other tools are used only by sensor scripts /
+  worker agents — looop never requires them.)
