@@ -1,0 +1,32 @@
+[package]
+name = "looop"
+version = "0.1.0"
+edition = "2024"
+description = "A tiny, portable, Kubernetes-shaped control loop for your work"
+license = "MIT"
+repository = "https://github.com/yusukeshib/looop"
+readme = "README.md"
+
+[[bin]]
+name = "looop"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+# babysit as a library: drive the worker fleet in-process instead of shelling
+# out to the `babysit` binary + re-parsing JSON (step 3 of the port).
+# default-features = false drops the `upgrade` feature (self_update), keeping
+# the network stack out of looop.
+babysit = { version = "0.10", default-features = false }
+# looop drives babysit's async API in-process, including the detached worker
+# supervisor (serve_worker), which babysit runs under a multi-thread runtime
+# (`#[tokio::main]`). Match that so the in-process worker behaves identically.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "signal"] }
+
+[profile.release]
+strip = true
+lto = true

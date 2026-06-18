@@ -4,7 +4,7 @@ A tiny, portable, Kubernetes-shaped control loop for your work.
 
 `looop` watches the things you care about (GitHub, Linear, Grafana, …), and once
 per beat asks an LLM to make **exactly one move** toward your goals — then stops.
-It's a single self-contained bash script with no daemon, no database, no server.
+It's a single self-contained binary with no daemon, no database, no server.
 
 ![looop running a tick](demo.png)
 
@@ -84,7 +84,7 @@ looop cost [today|--json]   report LLM spend from the cost ledger
 looop version | help
 ```
 
-To talk to a waiting worker: `babysit attach -s looop-<id>`.
+To talk to a waiting worker: `looop attach <id>`.
 To pause the loop: drop a file at `$data/paused`. To change judgment: edit
 `PLAYBOOK.md` — it takes effect next tick.
 
@@ -92,22 +92,24 @@ To pause the loop: drop a file at `$data/paused`. To change judgment: edit
 
 ### curl (recommended)
 
+Downloads a prebuilt binary from GitHub Releases — **no Rust toolchain needed**:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/yusukeshib/looop/main/install.sh | bash
 ```
 
-Downloads `looop` to `~/.local/bin/looop`. Override with `LOOOP_INSTALL_DIR`, or
-pin a ref with `LOOOP_REF`:
-
-```sh
-LOOOP_INSTALL_DIR=/usr/local/bin LOOOP_REF=v0.2.0 \
-  curl -fsSL https://raw.githubusercontent.com/yusukeshib/looop/main/install.sh | bash
-```
-
-Make sure the install dir is on your `PATH` (the installer warns you if not):
+Installs `looop` to `~/.local/bin/looop` (override with `LOOOP_INSTALL_DIR`). The
+script falls back to `cargo install` / `nix profile install` if no prebuilt
+binary matches your platform. Make sure the install dir is on your `PATH`:
 
 ```sh
 export PATH="$HOME/.local/bin:$PATH"
+```
+
+### Cargo
+
+```sh
+cargo install looop
 ```
 
 ### Nix (flakes)
@@ -115,24 +117,25 @@ export PATH="$HOME/.local/bin:$PATH"
 ```sh
 nix run github:yusukeshib/looop                 # run without installing
 nix profile install github:yusukeshib/looop     # install into your profile
-nix develop github:yusukeshib/looop             # dev shell with runtime deps
+nix develop github:yusukeshib/looop             # dev shell (cargo, clippy, rustfmt)
 ```
 
-### Manual
+### From git (latest `main`)
 
 ```sh
-git clone https://github.com/yusukeshib/looop.git
-ln -s "$PWD/looop/looop" ~/.local/bin/looop
+cargo install --git https://github.com/yusukeshib/looop.git --locked looop
 ```
 
 ### Verify
 
 ```sh
-looop version   # -> looop 0.11.1
+looop version   # -> looop 0.1.0
 looop help
 ```
 
-Runtime deps: `bash`, `jq`, `babysit`, and an LLM runner (`pi` or `claude`).
+Runtime deps: just an LLM runner (`pi` or `claude`). The worker fleet (babysit)
+is linked as a **library** and driven entirely in-process — spawn, list, attach,
+kill, flag, prune all run inside `looop`, so **no `babysit` binary is required**.
 (Workers that touch code also need `git` or `box` to sandbox themselves, but
 that's a worker concern, not a prerequisite for the pulse.)
 
