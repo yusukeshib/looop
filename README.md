@@ -102,7 +102,7 @@ Installs `looop` to `~/.local/bin/looop`. Override with `LOOOP_INSTALL_DIR`, or
 pin a ref with `LOOOP_REF`:
 
 ```sh
-LOOOP_INSTALL_DIR=/usr/local/bin LOOOP_REF=v0.12.0 \
+LOOOP_INSTALL_DIR=/usr/local/bin LOOOP_REF=v0.1.0 \
   curl -fsSL https://raw.githubusercontent.com/yusukeshib/looop/main/install.sh | bash
 ```
 
@@ -129,7 +129,7 @@ cargo install --git https://github.com/yusukeshib/looop.git --locked looop
 ### Verify
 
 ```sh
-looop version   # -> looop 0.12.0
+looop version   # -> looop 0.1.0
 looop help
 ```
 
