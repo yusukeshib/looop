@@ -19,7 +19,9 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # babysit as a library: drive the worker fleet in-process instead of shelling
 # out to the `babysit` binary + re-parsing JSON (step 3 of the port).
-babysit = { path = "../babysit", default-features = false }
+# default-features = false drops the `upgrade` feature (self_update), keeping
+# the network stack out of looop.
+babysit = { version = "0.10", default-features = false }
 tokio = { version = "1", features = ["rt"] }
 
 [profile.release]
