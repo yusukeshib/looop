@@ -250,6 +250,7 @@ claims/
 reports/
 .lock/
 .last-tick-hash
+.next-interval
 .tmux-surfaced
 attention.md
 tick.log
@@ -553,6 +554,12 @@ Moves:
   git worktree) and cd in — say so in the prompt. Never edit code in the data dir.
 - do nothing (a valid move when nothing needs doing)
 
+Optional — set WHEN the next beat runs: you may write a single integer (seconds)
+to .next-interval (one-shot, clamped 5..3600). Use your judgment per the PLAYBOOK:
+tighten to keep working when a backlog is piling up, or widen when it's been
+quiet a long while (spare cost / external APIs). Write nothing to keep the
+default rhythm. This does NOT count as your one move.
+
 After your move, append exactly ONE line to journal.md. Copy the timestamp
 prefix below VERBATIM — it is already in local time (America/New_York). Do NOT
 recompute it, do NOT convert to UTC, do NOT use your own clock:
@@ -741,14 +748,32 @@ cmd_run() {
   [ -n "${BABYSIT_DIR:-}" ] && log "${c_dim}profile fleet: BABYSIT_DIR=$BABYSIT_DIR (attach with: BABYSIT_DIR=$BABYSIT_DIR babysit ls)${c_rst}"
   while true; do
     tick
+    # default cadence (tiered): acted → busy; workers in flight → active; else idle
+    local want
     if [ "$TICK_ACTED" -eq 1 ]; then
-      sleep "$BUSY_INTERVAL"        # acted: re-evaluate promptly
+      want="$BUSY_INTERVAL"          # acted: re-evaluate promptly
     elif babysit ls --json 2>/dev/null \
          | jq -e '[.[] | select((.id|startswith("looop-")) and .alive==true)] | length > 0' >/dev/null 2>&1; then
-      sleep "$ACTIVE_INTERVAL"      # workers in flight: poll to fill freed slots
+      want="$ACTIVE_INTERVAL"        # workers in flight: poll to fill freed slots
     else
-      sleep "$INTERVAL"            # truly quiescent: back off, spare external APIs
+      want="$INTERVAL"              # truly quiescent: back off, spare external APIs
     fi
+    # The tick may drop a one-shot integer (seconds) into .next-interval to set
+    # WHEN the next beat runs; the AI decides (per the PLAYBOOK) — e.g. widen when
+    # it's been quiet a long while, tighten when a backlog is piling up. The shell
+    # only consumes it and clamps to a sane range so a bad value can't wedge
+    # (0s busy-spin) or strand (hours asleep) the loop.
+    local reqf="$LOOOP_DATA_DIR/.next-interval" req
+    if [ -s "$reqf" ]; then
+      req="$(tr -dc '0-9' < "$reqf")"; rm -f "$reqf"
+      if [ -n "$req" ]; then
+        [ "$req" -lt 5 ] && req=5
+        [ "$req" -gt 3600 ] && req=3600
+        log "${c_dim}next beat in ${req}s (AI cadence; default ${want}s)${c_rst}"
+        want="$req"
+      fi
+    fi
+    sleep "$want"
   done
 }
 
