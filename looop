@@ -95,7 +95,7 @@
 set -euo pipefail
 shopt -s nullglob
 
-LOOOP_VERSION="0.6.0"
+LOOOP_VERSION="0.7.0"
 
 # ---- paths -------------------------------------------------------------------
 self="${BASH_SOURCE[0]}"
@@ -103,6 +103,23 @@ LOOOP_BIN="$(cd "$(dirname "$self")" && pwd)/$(basename "$self")"
 LOOOP_DATA_DIR="${LOOOP_DATA_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/looop}"
 CONFIG="${LOOOP_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/looop.json}"   # the only config: runner wiring
 export LOOOP_BIN LOOOP_DATA_DIR CONFIG
+
+# ---- worker-fleet isolation: one knob = one profile -------------------------
+# A profile is just a distinct LOOOP_DATA_DIR. To keep two pulses' WORKERS as
+# separate as their on-disk memory, each non-default profile also gets its own
+# babysit state root, so `babysit ls/prune/kill` are naturally scoped to THIS
+# profile (babysit's global `prune` cannot be filtered by id/prefix, so a shared
+# root would let one profile reap another's finished workers — RULE 6 demands a
+# clean, self-contained view). The root is DERIVED PURELY from LOOOP_DATA_DIR —
+# not a separate, independently-settable knob — so you can never point two data
+# dirs at the same fleet by mistake. The default profile keeps ~/.babysit
+# untouched (zero migration; existing looop-* sessions keep working).
+_looop_default_data="${XDG_STATE_HOME:-$HOME/.local/state}/looop"
+if [ "$LOOOP_DATA_DIR" != "$_looop_default_data" ]; then
+  BABYSIT_DIR="$LOOOP_DATA_DIR/babysit"   # pure function of LOOOP_DATA_DIR (intentionally ignores any inherited BABYSIT_DIR)
+  export BABYSIT_DIR
+fi
+unset _looop_default_data
 
 SENSORS_DIR="$LOOOP_DATA_DIR/sensors"           # sensor scripts (data: AI writes them as needed)
 PLAYBOOK="$LOOOP_DATA_DIR/PLAYBOOK.md"          # judgment brain (data: grown over time)
@@ -703,6 +720,7 @@ cmd_run() {
   trap 'rm -rf "$LOCK"' EXIT
 
   log "${c_b}looop started${c_rst} ${c_dim}(idle ${INTERVAL}s / busy ${BUSY_INTERVAL}s, runner $(cfg '.default' 2>/dev/null || echo '?'))${c_rst}"
+  [ -n "${BABYSIT_DIR:-}" ] && log "${c_dim}profile fleet: BABYSIT_DIR=$BABYSIT_DIR (attach with: BABYSIT_DIR=$BABYSIT_DIR babysit ls)${c_rst}"
   while true; do
     tick
     if [ "$TICK_ACTED" -eq 1 ]; then
