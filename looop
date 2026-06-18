@@ -95,7 +95,7 @@
 set -euo pipefail
 shopt -s nullglob
 
-LOOOP_VERSION="0.7.1"
+LOOOP_VERSION="0.7.2"
 
 # ---- paths -------------------------------------------------------------------
 self="${BASH_SOURCE[0]}"
@@ -168,9 +168,11 @@ _hash() {
 # pulse's own logs. Blank lines stay blank (no lonely timestamp).
 ts_prefix() {
   local line gutter="${1:-}"
+  # Always emit the timestamp + gutter so the gutter rail (│) stays vertically
+  # aligned — even on blank lines, which otherwise printed the gutter at column 0
+  # and broke the box. Blank input still yields just the rail, no stray text.
   while IFS= read -r line; do
-    if [ -z "$line" ]; then printf '%s\n' "$gutter"
-    else printf '%s[%s]%s %s%s\n' "$c_dim" "$(date '+%H:%M:%S')" "$c_rst" "$gutter" "$line"; fi
+    printf '%s[%s]%s %s%s\n' "$c_dim" "$(date '+%H:%M:%S')" "$c_rst" "$gutter" "$line"
   done
 }
 
