@@ -13,9 +13,12 @@ use std::process::{Command, Stdio};
 #[derive(Debug, Deserialize, Default)]
 pub struct Session {
     pub id: String,
+    // `cmd` is an array of argv strings in `babysit ls --json`; keep it as a raw
+    // Value so a type mismatch can never fail the WHOLE list parse (it is not
+    // consumed here anyway). Tolerance over precision for an external schema.
     #[serde(default)]
-    #[allow(dead_code)] // part of the babysit ls schema; not consumed yet
-    pub cmd: Option<String>,
+    #[allow(dead_code)]
+    pub cmd: Option<serde_json::Value>,
     #[serde(default)]
     pub state: String,
     #[serde(default)]
@@ -49,7 +52,13 @@ pub fn list() -> Vec<Session> {
     if !out.status.success() {
         return Vec::new();
     }
-    serde_json::from_slice::<Vec<Session>>(&out.stdout).unwrap_or_default()
+    // Parse element-by-element so one malformed/extended row can't drop the whole
+    // fleet (resilience to babysit schema drift).
+    serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<Session>(v).ok())
+        .collect()
 }
 
 /// looop-owned sessions only.
