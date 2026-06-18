@@ -4,6 +4,7 @@
 
 use crate::config::Config;
 use crate::paths::Paths;
+use crate::util::Level;
 use crate::{babysit, events, gate, prompt, runner, seed, sensor, surface, util};
 use anyhow::Result;
 use std::fs;
@@ -34,11 +35,12 @@ pub fn tick(paths: &Paths) -> bool {
         .trim()
         .to_string();
     if hash == last {
-        util::log(&format!(
-            "{}world unchanged — nothing to decide; skipping (no AI call){}",
-            util::dim(),
-            util::rst()
-        ));
+        util::event(
+            Level::Info,
+            "tick.skip",
+            "world unchanged — no AI call",
+            &[],
+        );
         events::emit(paths, "world_unchanged", serde_json::json!({}));
         return false;
     }
@@ -47,17 +49,18 @@ pub fn tick(paths: &Paths) -> bool {
     let cfg = match Config::load(paths) {
         Ok(c) => c,
         Err(e) => {
-            util::log(&format!("{}config error: {e}{}", util::red(), util::rst()));
+            util::event(Level::Error, "tick.error", &format!("config: {e}"), &[]);
             return false;
         }
     };
     let runner_name = cfg.default_runner().unwrap_or_default();
     let Some(tick_cmd) = cfg.runner_cmd(&runner_name, "tick") else {
-        util::log(&format!(
-            "{}no tick command for runner '{runner_name}'{}",
-            util::red(),
-            util::rst()
-        ));
+        util::event(
+            Level::Error,
+            "tick.error",
+            &format!("no tick command for runner '{runner_name}'"),
+            &[("runner", serde_json::json!(runner_name))],
+        );
         return false;
     };
 
@@ -68,24 +71,25 @@ pub fn tick(paths: &Paths) -> bool {
     let _ = fs::write(&prompt_file, prompt::build_prompt(paths, None, &snap));
 
     let t0 = Instant::now();
-    util::log(&format!(
-        "{}╭─ {}deciding the one move{}{} ─{} {}{} is thinking (its output follows)…{}",
-        util::cyan(),
-        util::b(),
-        util::rst(),
-        util::cyan(),
-        util::rst(),
-        util::dim(),
-        runner_name,
-        util::rst()
-    ));
+    util::event(
+        Level::Step,
+        "tick.start",
+        &format!("{runner_name} is deciding the one move"),
+        &[
+            ("runner", serde_json::json!(runner_name)),
+            ("run_id", serde_json::json!(cost_id)),
+        ],
+    );
     events::emit(
         paths,
         "decide_start",
         serde_json::json!({ "runner": runner_name, "run_id": cost_id }),
     );
 
-    let gutter = format!("{}│{} ", util::cyan(), util::rst());
+    // In human mode the runner's live output is indented under the step; in JSON
+    // mode `run_streamed` suppresses stdout (tees to files only) so the machine
+    // stream stays one-object-per-line.
+    let gutter = format!("{}│{} ", util::dim(), util::rst());
     let tee: Vec<PathBuf> = vec![run_dir.join("output.log"), paths.data_dir.join("tick.log")];
     let cost_env = [
         ("LOOOP_COST_KIND", "tick"),
@@ -98,32 +102,34 @@ pub fn tick(paths: &Paths) -> bool {
         let _ = fs::write(paths.data_dir.join(".last-tick-hash"), format!("{hash}\n"));
         acted = true;
         let last_line = journal_tail(paths);
-        util::log(&format!(
-            "{}╰─ {}✓ decided{} {}in {}s · journal: {}{}",
-            util::cyan(),
-            util::grn(),
-            util::rst(),
-            util::dim(),
-            t0.elapsed().as_secs(),
-            last_line,
-            util::rst()
-        ));
+        let secs = t0.elapsed().as_secs();
+        util::event(
+            Level::Ok,
+            "tick.decided",
+            &format!("decided in {secs}s · {last_line}"),
+            &[
+                ("secs", serde_json::json!(secs)),
+                ("run_id", serde_json::json!(cost_id)),
+                ("journal", serde_json::json!(last_line)),
+            ],
+        );
         events::emit(
             paths,
             "decided",
             serde_json::json!({ "run_id": cost_id, "journal": last_line }),
         );
     } else {
-        util::log(&format!(
-            "{}╰─ {}✗ tick FAILED{} {}after {}s (replay: {}){}",
-            util::cyan(),
-            util::red(),
-            util::rst(),
-            util::dim(),
-            t0.elapsed().as_secs(),
-            run_dir.display(),
-            util::rst()
-        ));
+        let secs = t0.elapsed().as_secs();
+        util::event(
+            Level::Error,
+            "tick.failed",
+            &format!("tick failed after {secs}s · replay: {}", run_dir.display()),
+            &[
+                ("secs", serde_json::json!(secs)),
+                ("run_id", serde_json::json!(cost_id)),
+                ("replay", serde_json::json!(run_dir.display().to_string())),
+            ],
+        );
         events::emit(
             paths,
             "tick_failed",

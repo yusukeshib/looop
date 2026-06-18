@@ -13,7 +13,7 @@ THE IDEA
     desired state (YAML)  goals/*.md         how things should be (inert files)
     etcd                  git (the data dir) PLAYBOOK + goals + journal = memory
     informers / watch     sensors/*.sh       scripts that print the world as JSON
-    reconcile loop        the pulse (looop)  observe -> diff -> one move per tick
+    reconcile loop        the pulse (looop up) observe -> diff -> one move per tick
     scheduler policy      PLAYBOOK.md        priorities + guardrails, in prose
     Job / Pod             worker session     a real agent doing hands-on work
     Pod sandbox           box workspace      a git worktree per session

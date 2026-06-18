@@ -10,14 +10,35 @@ use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 static COLOR: OnceLock<bool> = OnceLock::new();
+static JSON: OnceLock<bool> = OnceLock::new();
+
+/// Decide once whether the loop's own log lines are emitted as NDJSON (one
+/// structured object per line) instead of the human-pretty `[HH:MM:SS] …` form.
+/// Driven by `$LOOOP_LOG_FORMAT=json`. Exported so the detached pulse worker and
+/// any child inherit the decision (so `looop watch pulse` sees a clean stream).
+pub fn init_format() {
+    let json = matches!(std::env::var("LOOOP_LOG_FORMAT").as_deref(), Ok("json"));
+    let _ = JSON.set(json);
+    unsafe { std::env::set_var("LOOOP_LOG_FORMAT", if json { "json" } else { "human" }) };
+}
+
+/// True when log lines should be NDJSON rather than human-pretty text.
+pub fn is_json() -> bool {
+    *JSON.get().unwrap_or(&false)
+}
 
 /// Decide once whether to emit ANSI, mirroring the bash gate:
 /// `$LOOOP_COLOR` wins; else a tty on stdout with no `$NO_COLOR`.
+/// JSON mode forces color OFF so the machine stream stays free of escapes.
 pub fn init_color() {
-    let enabled = match std::env::var("LOOOP_COLOR") {
-        Ok(v) if v == "1" => true,
-        Ok(v) if v == "0" => false,
-        _ => is_stdout_tty() && std::env::var_os("NO_COLOR").is_none(),
+    let enabled = if is_json() {
+        false
+    } else {
+        match std::env::var("LOOOP_COLOR") {
+            Ok(v) if v == "1" => true,
+            Ok(v) if v == "0" => false,
+            _ => is_stdout_tty() && std::env::var_os("NO_COLOR").is_none(),
+        }
     };
     let _ = COLOR.set(enabled);
     // Export so children (`looop _fmt`, sensors, workers) inherit the decision.
@@ -60,9 +81,103 @@ code!(grn, "\x1b[32m");
 code!(red, "\x1b[31m");
 code!(yel, "\x1b[33m");
 
+/// Severity of a structured log line — picks the human color and rides along as
+/// the `level` field in JSON mode.
+#[derive(Clone, Copy)]
+pub enum Level {
+    /// Neutral progress / context.
+    Info,
+    /// A step of the beat is starting (cyan).
+    Step,
+    /// Success (green).
+    Ok,
+    /// Non-fatal caution (yellow).
+    Warn,
+    /// Failure (red).
+    Error,
+}
+
+impl Level {
+    fn tag(self) -> &'static str {
+        match self {
+            Level::Info => "info",
+            Level::Step => "step",
+            Level::Ok => "ok",
+            Level::Warn => "warn",
+            Level::Error => "error",
+        }
+    }
+    fn color(self) -> &'static str {
+        match self {
+            Level::Info => "",
+            Level::Step => cyan(),
+            Level::Ok => grn(),
+            Level::Warn => yel(),
+            Level::Error => red(),
+        }
+    }
+}
+
+/// The one structured log primitive the pulse uses. Human mode prints a single
+/// concise, consistently-colored line:  `[HH:MM:SS] <event> — <msg>`. JSON mode
+/// prints one NDJSON object `{ts,level,event,msg,...fields}` — the same shape an
+/// agent watching `looop watch pulse` can parse line-by-line. `fields` carry the
+/// machine-useful extras (runner, secs, run_id, journal, …).
+pub fn event(level: Level, event: &str, msg: &str, fields: &[(&str, serde_json::Value)]) {
+    if is_json() {
+        let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        println!("{}", json_event_line(&ts, level, event, msg, fields));
+    } else {
+        let c = level.color();
+        let reset = if c.is_empty() { "" } else { rst() };
+        println!(
+            "{}[{}]{} {}{}{}{} {}{}",
+            dim(),
+            hms(),
+            rst(),
+            c,
+            event,
+            reset,
+            dim(),
+            msg,
+            rst()
+        );
+    }
+}
+
+/// Build one NDJSON object line for a structured event. Always carries the
+/// reserved keys `ts`, `level`, `event`, `msg` plus any caller `fields` (keys
+/// are serialized in sorted order — serde_json's default Map). Pure + testable.
+fn json_event_line(
+    ts: &str,
+    level: Level,
+    event: &str,
+    msg: &str,
+    fields: &[(&str, serde_json::Value)],
+) -> String {
+    let mut obj = serde_json::Map::new();
+    obj.insert("ts".into(), serde_json::Value::String(ts.into()));
+    obj.insert(
+        "level".into(),
+        serde_json::Value::String(level.tag().into()),
+    );
+    obj.insert("event".into(), serde_json::Value::String(event.into()));
+    obj.insert("msg".into(), serde_json::Value::String(msg.into()));
+    for (k, v) in fields {
+        obj.insert((*k).to_string(), v.clone());
+    }
+    serde_json::Value::Object(obj).to_string()
+}
+
 /// `[HH:MM:SS] <msg>` on stdout, the dim timestamp matching the bash `log()`.
+/// In JSON mode it becomes a generic `{event:"log"}` object so legacy callers
+/// still produce parseable output.
 pub fn log(msg: &str) {
-    println!("{}[{}]{} {}", dim(), hms(), rst(), msg);
+    if is_json() {
+        event(Level::Info, "log", msg, &[]);
+    } else {
+        println!("{}[{}]{} {}", dim(), hms(), rst(), msg);
+    }
 }
 
 /// Local wall-clock `HH:MM:SS` for log lines (chrono — fast, no subprocess).
@@ -151,4 +266,40 @@ pub fn pid_alive(pid: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_event_line_is_valid_and_ordered() {
+        let line = json_event_line(
+            "2026-01-02T03:04:05Z",
+            Level::Ok,
+            "tick.decided",
+            "decided in 3s",
+            &[
+                ("secs", serde_json::json!(3)),
+                ("runner", serde_json::json!("claude")),
+            ],
+        );
+        // Parses back to the expected object.
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["ts"], "2026-01-02T03:04:05Z");
+        assert_eq!(v["level"], "ok");
+        assert_eq!(v["event"], "tick.decided");
+        assert_eq!(v["msg"], "decided in 3s");
+        assert_eq!(v["secs"], 3);
+        assert_eq!(v["runner"], "claude");
+    }
+
+    #[test]
+    fn level_tags_are_stable() {
+        assert_eq!(Level::Info.tag(), "info");
+        assert_eq!(Level::Step.tag(), "step");
+        assert_eq!(Level::Ok.tag(), "ok");
+        assert_eq!(Level::Warn.tag(), "warn");
+        assert_eq!(Level::Error.tag(), "error");
+    }
 }

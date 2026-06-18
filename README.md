@@ -66,10 +66,14 @@ actions (merges, deploys, deletes) always require your explicit approval.
 ## Quick start
 
 ```sh
-looop run      # run the pulse in the foreground (Ctrl-C to stop)
-# or, as a detached background service:
-looop up       # start the pulse in the background (looop down to stop)
+looop up            # start the pulse as a background service (looop down to stop)
+looop up --watch    # start it and follow its output (Ctrl-C stops watching, not the pulse)
+looop watch pulse   # follow a running pulse's output any time
 ```
+
+The pulse always runs detached now (babysit-supervised) — there is no foreground
+`looop run`. Watch it live with `looop up --watch` / `looop watch pulse`, or add
+`--json` for a machine-readable NDJSON stream.
 
 On the first run the loop seeds a starter PLAYBOOK and a `setup` goal whose only
 job is to **interview you** and rewrite the PLAYBOOK, goals, and sensors to match
@@ -78,14 +82,26 @@ your real work. After that it just runs.
 ## Commands
 
 ```sh
-looop run                      run the pulse in the foreground (ticks on a cadence)
-looop up | down                run / stop the pulse as a detached background service
-looop tick                     run a single beat and exit (debug / cron)
+looop up [--watch] [--json]    run the pulse as a detached background service
+                               (--watch follows it; --json = NDJSON output)
+looop down                     stop the detached pulse service
+looop watch <id>               follow a session's output read-only (tail -f);
+                               `looop watch pulse` watches the loop itself
 looop run <goal-id>            force ONE move for a goal NOW (manual override)
+looop tick                     run a single beat and exit (debug / cron)
 looop status [--json]          structured snapshot of the loop's live state
                                (for an external observer / AI watching it)
 looop ls [--watch]             list this profile's worker sessions (⚑ = waiting)
-looop attach <id>              attach to a waiting worker (Ctrl-\ Ctrl-\ to detach)
+looop log <id> [--tail N] [--grep RE] [--follow] [--json]
+                               show / tail / grep / follow a session's output
+looop shot <id> [--ansi|--json]   render a session's current visible screen
+looop send <id> <text...>      type text into a session's stdin
+looop key <id> <KEY...>        send named keys (Enter, Up, C-c, …)
+looop expect <id> <REGEX>      block until a regex appears (exit 124 on timeout)
+looop wait <id> | wait-idle <id>  block until exit / until output is quiet
+looop resize <id> <COLSxROWS>  resize a session's terminal
+looop attach <id> | detach <id>   attach/force-detach a terminal (Ctrl-\ Ctrl-\)
+looop restart <id>             restart a worker's wrapped command
 looop kill|flag|unflag <id>    manage a worker; looop prune clears finished ones
 looop cost [today|all|--json]  report LLM spend from the cost ledger
 looop config zsh|bash          print shell integration (tab completions)

@@ -118,6 +118,13 @@ pub fn prune() {
             Err(_) => return,
         };
         for id in ids {
+            // Scope to OUR fleet only. On the default profile looop shares
+            // ~/.babysit with the user's other babysit sessions, so pruning by
+            // liveness alone would reap THEIR dead corpses too. Only ever touch
+            // `looop-` ids (the pulse + workers we own).
+            if !id.starts_with("looop-") {
+                continue;
+            }
             let Ok(meta) = session::read_meta(&id).await else {
                 continue; // unparseable meta — leave it alone, never nuke blind
             };
@@ -165,6 +172,128 @@ pub fn unflag(session: &str) -> anyhow::Result<()> {
 /// `looop attach <id>` — attach the terminal to a session; returns its exit code.
 pub fn attach(session: &str) -> anyhow::Result<i32> {
     rt().block_on(::babysit::attach::attach(Some(session.to_string())))
+}
+
+/// `looop detach <id>` — force-detach any other terminal attached to a session.
+pub fn detach(session: &str, json: bool) -> anyhow::Result<()> {
+    rt().block_on(::babysit::attach::detach(Some(session.to_string()), json))
+}
+
+/// `looop watch <id>` — follow a session's output read-only (tail -f), printing
+/// the full log so far and then live output until the session exits (Ctrl-C to
+/// stop). This is the non-interactive twin of `attach`: no input, just output.
+pub fn watch(session: &str) -> anyhow::Result<()> {
+    rt().block_on(::babysit::sub::log(
+        Some(session.to_string()),
+        None,  // tail: whole log, then follow
+        None,  // grep
+        false, // raw
+        None,  // since: from the start
+        true,  // follow
+        false, // json
+    ))
+}
+
+/// `looop log <id>` — show / tail / grep / follow a session's recorded output.
+#[allow(clippy::too_many_arguments)]
+pub fn log(
+    session: &str,
+    tail: Option<usize>,
+    grep: Option<String>,
+    raw: bool,
+    since: Option<u64>,
+    follow: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    rt().block_on(::babysit::sub::log(
+        Some(session.to_string()),
+        tail,
+        grep,
+        raw,
+        since,
+        follow,
+        json,
+    ))
+}
+
+/// `looop shot <id>` — render the session's current visible screen.
+pub fn screenshot(
+    session: &str,
+    format: ::babysit::cli::ShotFormat,
+    trim: bool,
+) -> anyhow::Result<()> {
+    rt().block_on(::babysit::sub::screenshot(
+        Some(session.to_string()),
+        format,
+        trim,
+    ))
+}
+
+/// `looop send <id> <text>` — type text into a session's stdin.
+pub fn send(session: &str, text: String, newline: bool, json: bool) -> anyhow::Result<()> {
+    rt().block_on(::babysit::sub::send(
+        Some(session.to_string()),
+        text,
+        newline,
+        json,
+    ))
+}
+
+/// `looop key <id> <KEY...>` — send named keys (Enter, Up, C-c, …) to a session.
+pub fn key(session: &str, keys: Vec<String>, json: bool) -> anyhow::Result<()> {
+    rt().block_on(::babysit::sub::key(Some(session.to_string()), keys, json))
+}
+
+/// `looop expect <id> <REGEX>` — block until a regex appears; exit 124 on timeout.
+#[allow(clippy::too_many_arguments)]
+pub fn expect(
+    session: &str,
+    pattern: String,
+    timeout: String,
+    since: Option<u64>,
+    from_now: bool,
+    raw: bool,
+    screen: bool,
+    json: bool,
+) -> anyhow::Result<i32> {
+    rt().block_on(::babysit::sub::expect(
+        Some(session.to_string()),
+        pattern,
+        timeout,
+        since,
+        from_now,
+        raw,
+        screen,
+        json,
+    ))
+}
+
+/// `looop wait <id>` — block until the session exits; returns its exit code.
+pub fn wait(session: &str, timeout: Option<String>) -> anyhow::Result<i32> {
+    rt().block_on(::babysit::sub::wait(Some(session.to_string()), timeout))
+}
+
+/// `looop wait-idle <id>` — block until output is quiet for `settle`.
+pub fn wait_idle(session: &str, settle: String, timeout: String) -> anyhow::Result<i32> {
+    rt().block_on(::babysit::sub::wait_idle(
+        Some(session.to_string()),
+        settle,
+        timeout,
+    ))
+}
+
+/// `looop resize <id> <COLSxROWS>` — resize a session's terminal.
+pub fn resize(session: &str, size: String, json: bool) -> anyhow::Result<()> {
+    rt().block_on(::babysit::sub::resize(
+        Some(session.to_string()),
+        size,
+        json,
+    ))
+}
+
+/// `looop restart <id>` — restart the wrapped command in a session.
+pub fn restart(session: &str, json: bool) -> anyhow::Result<()> {
+    rt().block_on(::babysit::sub::restart(Some(session.to_string()), json))
 }
 
 /// `looop ls [--json] [--watch] [--interval <dur>]` — render the fleet table

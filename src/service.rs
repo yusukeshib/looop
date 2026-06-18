@@ -19,16 +19,32 @@ use crate::{run, util};
 use anyhow::Result;
 use std::process::ExitCode;
 
-/// `looop up` — ensure the pulse is running as a detached service. Idempotent:
-/// if a live pulse session already exists we leave it alone; a dead corpse is
-/// pruned so its id can be reused.
-pub fn cmd_up(paths: &Paths) -> Result<ExitCode> {
+/// `looop up [--watch] [--json]` — ensure the pulse is running as a detached
+/// service. Idempotent: a live pulse is left alone; a dead corpse is pruned so
+/// its id can be reused. `--json` makes the detached pulse emit NDJSON to its
+/// output.log (machine-readable for an agent). `--watch` follows that output
+/// after starting (Ctrl-C to stop the window; the pulse keeps running).
+pub fn cmd_up(paths: &Paths, args: &[String]) -> Result<ExitCode> {
+    let watch = args.iter().any(|a| a == "--watch" || a == "-w");
+    let json = args.iter().any(|a| a == "--json");
+
     if babysit::is_alive(PULSE_SESSION) {
         println!("looop: pulse already running ({PULSE_SESSION}) — see it: looop ls");
+        if watch {
+            println!("looop: watching {PULSE_SESSION} (Ctrl-C to stop watching)");
+            babysit::watch(PULSE_SESSION)?;
+        }
         return Ok(ExitCode::SUCCESS);
     }
     if babysit::status_exists(PULSE_SESSION) {
         babysit::prune(); // reuse the id held by a dead corpse
+    }
+
+    // Propagate the output format to the detached pulse: spawn_detached re-execs
+    // this binary as `_pulse`, which inherits our env, and `util::init_format`
+    // there reads LOOOP_LOG_FORMAT to pick NDJSON vs human.
+    if json {
+        unsafe { std::env::set_var("LOOOP_LOG_FORMAT", "json") };
     }
 
     // babysit wraps `<looop-bin> _pulse`; its detacher re-execs looop as the
@@ -37,10 +53,17 @@ pub fn cmd_up(paths: &Paths) -> Result<ExitCode> {
     let bin = paths.bin.to_string_lossy().to_string();
     babysit::spawn_detached(vec![bin, "_pulse".to_string()], PULSE_SESSION)?;
 
-    println!("looop: pulse started ({PULSE_SESSION})");
+    println!(
+        "looop: pulse started ({PULSE_SESSION}){}",
+        if json { " [json]" } else { "" }
+    );
     println!("  see:   {}looop ls", paths.looop_hint_env());
-    println!("  watch: {}looop attach pulse", paths.looop_hint_env());
+    println!("  watch: {}looop watch pulse", paths.looop_hint_env());
     println!("  stop:  {}looop down", paths.looop_hint_env());
+    if watch {
+        println!("looop: watching {PULSE_SESSION} (Ctrl-C to stop watching)");
+        babysit::watch(PULSE_SESSION)?;
+    }
     Ok(ExitCode::SUCCESS)
 }
 

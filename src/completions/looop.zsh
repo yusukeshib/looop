@@ -46,6 +46,19 @@ __looop_workers() {
     (( ${#workers} )) && _describe 'worker' workers
 }
 
+# Like __looop_workers but also includes the pulse (for read/observe verbs).
+__looop_sessions() {
+    local -a sessions
+    local root s name
+    root=$(__looop_babysit_root)
+    for s in "$root"/sessions/looop-*(N/); do
+        name=${s:t}
+        [[ -n "$name" ]] && sessions+=("$name")
+    done
+    sessions+=('pulse')
+    (( ${#sessions} )) && _describe 'session' sessions
+}
+
 _looop() {
     local curcontext="$curcontext" state line
     typeset -A opt_args
@@ -58,14 +71,25 @@ _looop() {
         cmd)
             local -a cmds
             cmds=(
-                'run:Run the pulse in the foreground (or force ONE goal)'
                 'up:Run the pulse as a detached background service'
                 'down:Stop the detached pulse service'
+                'watch:Follow a session output read-only (tail -f)'
+                'run:Force ONE goal now (manual override)'
                 'tick:Run a single beat and exit (debug / cron)'
                 'ls:List this profile worker sessions'
                 'status:Structured snapshot of the loop state'
+                'log:Show / tail / grep / follow a session output'
+                'shot:Render a session current visible screen'
+                'send:Type text into a session stdin'
+                'key:Send named keys to a session'
+                'expect:Block until a regex appears in output'
+                'wait:Block until a session exits'
+                'wait-idle:Block until output is quiet'
+                'resize:Resize a session terminal'
+                'restart:Restart the wrapped command'
                 'start-session:Start a worker session'
                 'attach:Attach to a waiting worker'
+                'detach:Force-detach any other terminal'
                 'kill:Terminate a worker session'
                 'flag:Raise a worker attention flag'
                 'unflag:Clear a worker attention flag'
@@ -82,8 +106,73 @@ _looop() {
                 run)
                     (( CURRENT == 2 )) && __looop_goals
                     ;;
-                attach|kill|flag|unflag)
+                up)
+                    _arguments \
+                        '(-w --watch)'{-w,--watch}'[Follow the pulse output after starting]' \
+                        '--json[Pulse emits NDJSON to its log]'
+                    ;;
+                attach|kill|flag|unflag|restart)
                     (( CURRENT == 2 )) && __looop_workers
+                    ;;
+                watch|detach)
+                    (( CURRENT == 2 )) && __looop_sessions
+                    ;;
+                log)
+                    if (( CURRENT == 2 )); then
+                        __looop_sessions
+                    else
+                        _arguments \
+                            '--tail[Last N lines]:n:' \
+                            '--grep[Only lines matching regex]:regex:' \
+                            '--since[Only bytes after this offset]:bytes:' \
+                            '(-f --follow)'{-f,--follow}'[Stream new output live]' \
+                            '--raw[Include raw ANSI escapes]' \
+                            '--json[Emit JSON]'
+                    fi
+                    ;;
+                shot)
+                    if (( CURRENT == 2 )); then
+                        __looop_sessions
+                    else
+                        _arguments \
+                            '--ansi[Keep ANSI color escapes]' \
+                            '--json[Structured JSON output]' \
+                            '--trim[Drop trailing blank lines]'
+                    fi
+                    ;;
+                send|key)
+                    (( CURRENT == 2 )) && __looop_sessions
+                    ;;
+                expect)
+                    if (( CURRENT == 2 )); then
+                        __looop_sessions
+                    else
+                        _arguments \
+                            '--timeout[Give up after DUR]:duration:' \
+                            '--from-now[Only match new output]' \
+                            '--raw[Match raw output]' \
+                            '--screen[Match the rendered screen]' \
+                            '--json[Emit JSON]'
+                    fi
+                    ;;
+                wait)
+                    if (( CURRENT == 2 )); then
+                        __looop_sessions
+                    else
+                        _arguments '--timeout[Give up after DUR]:duration:'
+                    fi
+                    ;;
+                wait-idle)
+                    if (( CURRENT == 2 )); then
+                        __looop_sessions
+                    else
+                        _arguments \
+                            '--settle[Quiet window, e.g. 500ms]:duration:' \
+                            '--timeout[Give up after DUR]:duration:'
+                    fi
+                    ;;
+                resize)
+                    (( CURRENT == 2 )) && __looop_sessions
                     ;;
                 ls)
                     _arguments \

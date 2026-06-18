@@ -51,6 +51,9 @@ pub fn run_streamed(
 
     let mut sinks: Vec<File> = tee.iter().filter_map(|p| File::create(p).ok()).collect();
     let mut stdout = std::io::stdout();
+    // In JSON mode stdout is a machine NDJSON stream; the runner's free-form
+    // output would corrupt it, so we only tee it to the archive files there.
+    let echo = !util::is_json();
 
     for line in BufReader::new(out).lines() {
         let Ok(line) = line else { break };
@@ -62,8 +65,10 @@ pub fn run_streamed(
             gutter,
             line
         );
-        let _ = writeln!(stdout, "{stamped}");
-        let _ = stdout.flush();
+        if echo {
+            let _ = writeln!(stdout, "{stamped}");
+            let _ = stdout.flush();
+        }
         for f in &mut sinks {
             let _ = writeln!(f, "{stamped}");
         }

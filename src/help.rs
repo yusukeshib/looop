@@ -14,16 +14,23 @@ pub fn print(paths: &Paths) {
     println!(
         r#"
 Usage:
-  looop run                      run the pulse in the FOREGROUND (Ctrl-C to stop)
-  looop up                       run the pulse as a DETACHED service (the 親玉
-                                becomes a babysit session; see it with looop ls,
-                                watch it with looop attach pulse)
+  looop up [--watch] [--json]    run the pulse as a DETACHED service (the 親玉
+                                becomes a babysit session). --json makes the
+                                pulse emit NDJSON to its log (agent-readable);
+                                --watch follows that output after starting.
+                                Idempotent: a live pulse is left running.
   looop down                     stop the detached pulse service
+  looop watch <id>               follow a session's output read-only, like
+                                tail -f (Ctrl-C to stop). `looop watch pulse`
+                                watches the loop itself. No input — use attach
+                                for that.
   looop run <goal-id>            run ONE goal NOW (manual override): a forced,
                                 goal-focused move, ignoring priority order and
                                 the world-unchanged skip; works while the pulse
                                 runs. <goal-id> = goals/<id>.md basename.
                                 e.g. looop run setup ; looop run morning-standup
+                                (a bare `looop run` is gone — the pulse only runs
+                                detached now; start it with `looop up`.)
   looop tick                     run a single beat and exit (debug / cron)
   looop status [--json]          structured snapshot of the loop's live state
                                 (pulse, last tick, workers, cost) — for an
@@ -35,11 +42,28 @@ Usage:
                                 start a worker session (used by the tick AI)
   looop attach <id>              attach your terminal to a worker (in-process;
                                 detach with Ctrl-\ Ctrl-\)
+  looop detach <id>              force-detach any other terminal from a session
+  looop log <id> [--tail N] [--grep RE] [--since N] [--follow] [--raw] [--json]
+                                show / tail / grep / follow a session's output
+  looop shot <id> [--ansi|--json] [--trim]
+                                render the session's current visible screen
+  looop send <id> <text...> [-n] [--json]
+                                type text into a session's stdin (-n: no newline)
+  looop key <id> <KEY...> [--json]
+                                send named keys (Enter, Up, Esc, C-c, F1, …)
+  looop expect <id> <REGEX> [--timeout DUR] [--from-now] [--screen] [--json]
+                                block until a regex appears (exit 124 on timeout)
+  looop wait <id> [--timeout DUR]
+                                block until the session exits; return its code
+  looop wait-idle <id> [--settle DUR] [--timeout DUR]
+                                block until output is quiet for --settle
+  looop resize <id> <COLSxROWS>  resize a session's terminal (e.g. 120x40)
+  looop restart <id>             restart the wrapped command in a session
   looop kill <id>                terminate a worker session
   looop flag <id> [message]      raise a worker's attention flag
   looop unflag <id>              clear a worker's attention flag
-  looop prune                    clear finished worker corpses (the pulse also
-                                does this every tick)
+  looop prune                    clear finished worker corpses (looop-scoped;
+                                the pulse also does this every tick)
   looop cost [today|all|--json]   report LLM spend recorded in the cost ledger
                                 (ticks + manual goal runs are metered
                                 automatically; workers self-report via

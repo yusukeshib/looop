@@ -6,6 +6,7 @@
 
 use crate::config::Config;
 use crate::paths::Paths;
+use crate::util::Level;
 use crate::{babysit, gate, prompt, runner, seed, sensor, surface, tick, util};
 use anyhow::Result;
 use std::fs;
@@ -64,23 +65,30 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
     let _guard = LockGuard { path: lock.clone() };
 
     let runner_name = cfg.default_runner().unwrap_or_else(|| "?".into());
-    util::log(&format!(
-        "{}looop started{} {}(idle {}s / busy {}s, runner {}){}",
-        util::b(),
-        util::rst(),
-        util::dim(),
-        idle,
-        busy,
-        runner_name,
-        util::rst()
-    ));
+    util::event(
+        Level::Ok,
+        "pulse.start",
+        &format!("pulse started · idle {idle}s / busy {busy}s · runner {runner_name}"),
+        &[
+            ("idle", serde_json::json!(idle)),
+            ("busy", serde_json::json!(busy)),
+            ("active", serde_json::json!(active)),
+            ("runner", serde_json::json!(runner_name)),
+        ],
+    );
     if paths.babysit_dir.is_some() {
-        util::log(&format!(
-            "{}profile fleet under {d} (list with: LOOOP_DATA_DIR={d} looop ls){}",
-            util::dim(),
-            util::rst(),
-            d = paths.data_dir.display()
-        ));
+        util::event(
+            Level::Info,
+            "pulse.profile",
+            &format!(
+                "profile fleet under {d} (LOOOP_DATA_DIR={d} looop ls)",
+                d = paths.data_dir.display()
+            ),
+            &[(
+                "data_dir",
+                serde_json::json!(paths.data_dir.display().to_string()),
+            )],
+        );
     }
 
     loop {
@@ -100,14 +108,34 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
             let _ = fs::remove_file(&reqf);
             if let Ok(mut req) = digits.parse::<u64>() {
                 req = req.clamp(5, 3600);
-                util::log(&format!(
-                    "{}next beat in {req}s (AI cadence; default {want}s){}",
-                    util::dim(),
-                    util::rst()
-                ));
+                util::event(
+                    Level::Info,
+                    "cadence",
+                    &format!("AI cadence override: next beat in {req}s (default {want}s)"),
+                    &[
+                        ("secs", serde_json::json!(req)),
+                        ("default", serde_json::json!(want)),
+                    ],
+                );
                 want = req;
             }
         }
+        let reason = if acted {
+            "busy"
+        } else if babysit::any_worker_alive() {
+            "active"
+        } else {
+            "idle"
+        };
+        util::event(
+            Level::Info,
+            "sleep",
+            &format!("next beat in {want}s ({reason})"),
+            &[
+                ("secs", serde_json::json!(want)),
+                ("reason", serde_json::json!(reason)),
+            ],
+        );
         std::thread::sleep(Duration::from_secs(want));
     }
 }
@@ -153,13 +181,14 @@ pub fn cmd_run_goal(paths: &Paths, id: &str) -> Result<ExitCode> {
         let pid = fs::read_to_string(lock.join("pid")).unwrap_or_default();
         let pid = pid.trim();
         if util::pid_alive(pid) {
-            util::log(&format!(
-                "{}note:{} pulse is running (pid {pid}) — running goal '{id}' anyway {}(manual override){}",
-                util::yel(),
-                util::rst(),
-                util::dim(),
-                util::rst()
-            ));
+            util::event(
+                Level::Warn,
+                "run.note",
+                &format!(
+                    "pulse is running (pid {pid}) — running goal '{id}' anyway (manual override)"
+                ),
+                &[("pid", serde_json::json!(pid))],
+            );
         }
     }
 
@@ -190,21 +219,15 @@ pub fn cmd_run_goal(paths: &Paths, id: &str) -> Result<ExitCode> {
     let _ = fs::write(&prompt_file, prompt::build_prompt(paths, Some(id), &snap));
 
     let t0 = Instant::now();
-    util::log(&format!(
-        "{}{}manual run — goal '{id}'{} {}({} is thinking; its output follows){}…",
-        util::cyan(),
-        util::b(),
-        util::rst(),
-        util::dim(),
-        runner_name,
-        util::rst()
-    ));
-    util::log(&format!(
-        "{}┌─ {} ──────────────────────────────────────{}",
-        util::dim(),
-        runner_name,
-        util::rst()
-    ));
+    util::event(
+        Level::Step,
+        "run.start",
+        &format!("manual run — goal '{id}' · {runner_name} is thinking"),
+        &[
+            ("goal", serde_json::json!(id)),
+            ("runner", serde_json::json!(runner_name)),
+        ],
+    );
 
     let tee: Vec<PathBuf> = vec![run_dir.join("output.log"), paths.data_dir.join("tick.log")];
     let cost_env = [
@@ -214,25 +237,22 @@ pub fn cmd_run_goal(paths: &Paths, id: &str) -> Result<ExitCode> {
     ];
     runner::run_streamed(paths, &tick_cmd, &prompt_file, &cost_env, &tee, "");
 
-    util::log(&format!(
-        "{}└────────────────────────────────────────{}",
-        util::dim(),
-        util::rst()
-    ));
     let last_line = fs::read_to_string(paths.journal())
         .ok()
         .and_then(|j| j.lines().last().map(str::to_owned))
         .unwrap_or_else(|| "(no line)".into());
-    util::log(&format!(
-        "{}✓ run done{} in {}s {}— journal: {} · replay: {}{}",
-        util::grn(),
-        util::rst(),
-        t0.elapsed().as_secs(),
-        util::dim(),
-        last_line,
-        run_dir.display(),
-        util::rst()
-    ));
+    let secs = t0.elapsed().as_secs();
+    util::event(
+        Level::Ok,
+        "run.done",
+        &format!("run done in {secs}s · {last_line}"),
+        &[
+            ("secs", serde_json::json!(secs)),
+            ("goal", serde_json::json!(id)),
+            ("journal", serde_json::json!(last_line)),
+            ("replay", serde_json::json!(run_dir.display().to_string())),
+        ],
+    );
 
     tick::prune_runs(paths);
     surface::surface_attention(paths);

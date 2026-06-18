@@ -22,7 +22,19 @@ _looop() {
     local cur prev words cword
     _init_completion || return
 
-    local subcommands="run up down tick ls status start-session attach kill flag unflag prune cost config version help"
+    local subcommands="up down watch run tick ls status log shot send key expect wait wait-idle resize restart start-session attach detach kill flag unflag prune cost config version help"
+
+    # session ids including the pulse (for read/observe verbs)
+    __looop_session_list() {
+        local root s name out=""
+        root=$(__looop_babysit_root)
+        for s in "$root"/sessions/looop-*/; do
+            [[ -d "$s" ]] || continue
+            name=$(basename "$s")
+            [[ -n "$name" ]] && out+=" $name"
+        done
+        printf '%s pulse' "$out"
+    }
 
     if [[ $cword -eq 1 ]]; then
         COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
@@ -45,7 +57,7 @@ _looop() {
                 COMPREPLY=($(compgen -W "$goals" -- "$cur"))
             fi
             ;;
-        attach|kill|flag|unflag)
+        attach|kill|flag|unflag|restart)
             if [[ $cword -eq 2 ]]; then
                 local root workers="" s name
                 root=$(__looop_babysit_root)
@@ -57,6 +69,49 @@ _looop() {
                 done
                 COMPREPLY=($(compgen -W "$workers" -- "$cur"))
             fi
+            ;;
+        watch|detach|send|key|resize)
+            if [[ $cword -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "$(__looop_session_list)" -- "$cur"))
+            fi
+            ;;
+        log)
+            if [[ $cword -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "$(__looop_session_list)" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--tail --grep --since --follow -f --raw --json" -- "$cur"))
+            fi
+            ;;
+        shot)
+            if [[ $cword -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "$(__looop_session_list)" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--ansi --json --trim" -- "$cur"))
+            fi
+            ;;
+        expect)
+            if [[ $cword -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "$(__looop_session_list)" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--timeout --from-now --raw --screen --json" -- "$cur"))
+            fi
+            ;;
+        wait)
+            if [[ $cword -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "$(__looop_session_list)" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--timeout" -- "$cur"))
+            fi
+            ;;
+        wait-idle)
+            if [[ $cword -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "$(__looop_session_list)" -- "$cur"))
+            else
+                COMPREPLY=($(compgen -W "--settle --timeout" -- "$cur"))
+            fi
+            ;;
+        up)
+            COMPREPLY=($(compgen -W "--watch -w --json" -- "$cur"))
             ;;
         ls)
             COMPREPLY=($(compgen -W "--json --watch -w --interval -n" -- "$cur"))

@@ -35,6 +35,7 @@ fn main() -> ExitCode {
     restore_sigpipe();
     let paths = Paths::resolve();
     export_env(&paths);
+    util::init_format();
     util::init_color();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -43,7 +44,7 @@ fn main() -> ExitCode {
     // surprising than helpful. Require a verb (foreground pulse = `looop run`).
     let Some(cmd) = args.first().map(String::as_str) else {
         eprintln!(
-            "looop: no command — try: up, down, run [<goal>], tick, ls, status, start-session, attach, kill, flag, unflag, prune, help"
+            "looop: no command — try: up [--watch], down, watch <id>, run <goal>, tick, ls, status, log, send, key, attach, kill, flag, unflag, prune, help"
         );
         return ExitCode::from(1);
     };
@@ -64,14 +65,38 @@ fn main() -> ExitCode {
         "run" | "loop" if rest.first().map(String::as_str) == Some("--detached-id") => {
             babysit::run_detached_worker(rest).map(|c| ExitCode::from(c.clamp(0, 255) as u8))
         }
+        // `looop run <goal>` is the manual one-shot (forced single move). A bare
+        // `looop run` (foreground pulse) is gone: the pulse only ever runs as a
+        // detached service now — `looop up` (watch it with `--watch`).
         "run" | "loop" => deps::require_deps(&paths).and_then(|_| match rest.first() {
             Some(goal) => run::cmd_run_goal(&paths, goal),
-            None => run::cmd_run(&paths),
+            None => {
+                eprintln!(
+                    "looop run: needs a goal id (manual one-shot). Start the pulse with: looop up"
+                );
+                eprintln!("  e.g. looop run setup");
+                Ok(ExitCode::from(1))
+            }
         }),
         "tick" => deps::require_deps(&paths).and_then(|_| tick::cmd_tick(&paths)),
         // The pulse-as-a-service trio + its read-only window.
-        "up" => deps::require_deps(&paths).and_then(|_| service::cmd_up(&paths)),
+        "up" => deps::require_deps(&paths).and_then(|_| service::cmd_up(&paths, rest)),
         "down" => service::cmd_down(&paths),
+        "watch" => deps::require_deps(&paths).and_then(|_| session::cmd_watch(&paths, rest)),
+        "log" | "logs" => deps::require_deps(&paths).and_then(|_| session::cmd_log(&paths, rest)),
+        "shot" | "screenshot" => {
+            deps::require_deps(&paths).and_then(|_| session::cmd_screenshot(&paths, rest))
+        }
+        "send" => deps::require_deps(&paths).and_then(|_| session::cmd_send(&paths, rest)),
+        "key" => deps::require_deps(&paths).and_then(|_| session::cmd_key(&paths, rest)),
+        "expect" => deps::require_deps(&paths).and_then(|_| session::cmd_expect(&paths, rest)),
+        "wait" => deps::require_deps(&paths).and_then(|_| session::cmd_wait(&paths, rest)),
+        "wait-idle" => {
+            deps::require_deps(&paths).and_then(|_| session::cmd_wait_idle(&paths, rest))
+        }
+        "resize" => deps::require_deps(&paths).and_then(|_| session::cmd_resize(&paths, rest)),
+        "restart" => deps::require_deps(&paths).and_then(|_| session::cmd_restart(&paths, rest)),
+        "detach" => deps::require_deps(&paths).and_then(|_| session::cmd_detach(&paths, rest)),
         // Hidden: the headless pulse body babysit wraps under a PTY (`looop up`).
         "_pulse" => deps::require_deps(&paths).and_then(|_| service::cmd_pulse(&paths)),
         "ls" => deps::require_deps(&paths).and_then(|_| ls_inproc(rest)),
@@ -105,7 +130,7 @@ fn main() -> ExitCode {
         "_cost" => cost::cmd_cost_record(&paths, rest),
         other => {
             eprintln!(
-                "looop: unknown command '{other}' (try: run, run <goal>, up, down, tick, ls, status, start-session, attach, kill, flag, unflag, prune, help)"
+                "looop: unknown command '{other}' (try: up [--watch], down, watch <id>, run <goal>, tick, ls, status, log, shot, send, key, expect, wait, wait-idle, resize, restart, attach, detach, kill, flag, unflag, prune, help)"
             );
             Ok(ExitCode::from(1))
         }
