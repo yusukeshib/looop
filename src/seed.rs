@@ -44,7 +44,11 @@ __pycache__/
 /// Idempotent (mirrors the bash `ensure_dirs`).
 pub fn ensure_dirs(paths: &Paths) -> Result<()> {
     for d in [
-        paths.config.parent().unwrap_or(Path::new(".")).to_path_buf(),
+        paths
+            .config
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf(),
         paths.sensors_dir(),
         paths.snapshots_dir(),
         paths.claims_dir(),

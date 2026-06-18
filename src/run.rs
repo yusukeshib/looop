@@ -6,7 +6,7 @@
 
 use crate::config::Config;
 use crate::paths::Paths;
-use crate::{babysit, gate, prompt, runner, sensor, seed, surface, tick, util};
+use crate::{babysit, gate, prompt, runner, seed, sensor, surface, tick, util};
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
@@ -15,10 +15,10 @@ use std::time::{Duration, Instant};
 
 /// Resolve a cadence knob: env var > config key > fallback.
 fn interval(env: &str, cfg: &Config, key: &str, fallback: u64) -> u64 {
-    if let Ok(v) = std::env::var(env) {
-        if let Ok(n) = v.trim().parse::<u64>() {
-            return n;
-        }
+    if let Ok(v) = std::env::var(env)
+        && let Ok(n) = v.trim().parse::<u64>()
+    {
+        return n;
     }
     cfg.root
         .get(key)
@@ -184,10 +184,7 @@ pub fn cmd_run_goal(paths: &Paths, id: &str) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     };
 
-    let run_id = format!(
-        "run-{id}-{}",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
-    );
+    let run_id = format!("run-{id}-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
     let run_dir = paths.runs_dir().join(&run_id);
     let _ = fs::create_dir_all(&run_dir);
     let prompt_file = run_dir.join("prompt.md");

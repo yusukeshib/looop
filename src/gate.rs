@@ -35,7 +35,11 @@ pub fn reap_stale_claims(paths: &Paths) {
             .unwrap_or_default();
         if sess.is_empty() || !alive.iter().any(|a| a == &sess) {
             let _ = fs::remove_file(&cf);
-            let name = cf.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let name = cf
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             util::log(&format!(
                 "  {}reaped stale claim {} (session '{}' not alive){}",
                 util::dim(),

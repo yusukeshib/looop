@@ -4,7 +4,7 @@
 
 use crate::config::Config;
 use crate::paths::Paths;
-use crate::{babysit, events, gate, prompt, runner, sensor, seed, surface, util};
+use crate::{babysit, events, gate, prompt, runner, seed, sensor, surface, util};
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
@@ -71,10 +71,7 @@ pub fn tick(paths: &Paths) -> bool {
         return false;
     };
 
-    let cost_id = format!(
-        "tick-{}",
-        chrono::Local::now().format("%Y%m%d-%H%M%S")
-    );
+    let cost_id = format!("tick-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
     let run_dir = paths.runs_dir().join(&cost_id);
     let _ = fs::create_dir_all(&run_dir);
     let prompt_file = run_dir.join("prompt.md");
@@ -178,7 +175,7 @@ pub fn prune_runs(paths: &Paths) {
             Some((m, e.path()))
         })
         .collect();
-    runs.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    runs.sort_by_key(|r| std::cmp::Reverse(r.0)); // newest first
     for (_, p) in runs.into_iter().skip(keep) {
         let _ = fs::remove_dir_all(p);
     }

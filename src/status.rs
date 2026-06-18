@@ -115,7 +115,10 @@ pub fn cmd_status(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         }
     );
     if s["paused"].as_bool().unwrap_or(false) {
-        println!("          ⏸ paused (remove {}/paused)", paths.data_dir.display());
+        println!(
+            "          ⏸ paused (remove {}/paused)",
+            paths.data_dir.display()
+        );
     }
     println!(
         "last tick: {}  (hash {})",

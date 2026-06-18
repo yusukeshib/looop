@@ -54,14 +54,13 @@ pub fn require_deps(paths: &Paths) -> Result<()> {
     // The tick itself shells out to the configured runner (pi/claude), so a
     // missing runner binary is a hard prereq too. Resolve from $LOOOP_CONFIG
     // when present, else the inline default, and check its first token.
-    if let Ok(cfg) = Config::load(paths) {
-        if let Some(tick_cmd) = cfg.active_runner_cmd("tick") {
-            if let Some(bin) = tick_cmd.split_whitespace().next() {
-                if !bin.is_empty() && !on_path(bin) {
-                    missing.push((bin.to_string(), dep_hint(bin)));
-                }
-            }
-        }
+    if let Ok(cfg) = Config::load(paths)
+        && let Some(tick_cmd) = cfg.active_runner_cmd("tick")
+        && let Some(bin) = tick_cmd.split_whitespace().next()
+        && !bin.is_empty()
+        && !on_path(bin)
+    {
+        missing.push((bin.to_string(), dep_hint(bin)));
     }
 
     if missing.is_empty() {

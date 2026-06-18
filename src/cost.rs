@@ -16,23 +16,25 @@ pub fn record_cost(paths: &Paths, kind: &str, id: &str, runner: &str, cost: &str
     let Ok(amount) = cost.trim().parse::<f64>() else {
         return;
     };
-    if !(amount > 0.0) {
-        return;
-    }
-    let line = serde_json::json!({
-        "ts": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
-        "kind": kind,
-        "id": id,
-        "runner": runner,
-        "cost_usd": amount,
-    })
-    .to_string();
-    if let Ok(mut f) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.cost_ledger())
-    {
-        let _ = writeln!(f, "{line}");
+    // Record only positive amounts; NaN and <= 0 are dropped (world-unchanged
+    // ticks, runners that emit no usage data). Phrased as a positive branch so
+    // NaN is excluded without a negated float comparison.
+    if amount > 0.0 {
+        let line = serde_json::json!({
+            "ts": chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "kind": kind,
+            "id": id,
+            "runner": runner,
+            "cost_usd": amount,
+        })
+        .to_string();
+        if let Ok(mut f) = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(paths.cost_ledger())
+        {
+            let _ = writeln!(f, "{line}");
+        }
     }
 }
 
@@ -60,15 +62,14 @@ pub fn cmd_fmt(paths: &Paths) -> Result<ExitCode> {
             let _ = writeln!(stdout, "{rendered}");
             let _ = stdout.flush();
         }
-        if metering {
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-                if v.get("type").and_then(|t| t.as_str()) == Some("message_end") {
-                    total += v
-                        .pointer("/usage/cost/total")
-                        .and_then(|c| c.as_f64())
-                        .unwrap_or(0.0);
-                }
-            }
+        if metering
+            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
+            && v.get("type").and_then(|t| t.as_str()) == Some("message_end")
+        {
+            total += v
+                .pointer("/usage/cost/total")
+                .and_then(|c| c.as_f64())
+                .unwrap_or(0.0);
         }
     }
 
@@ -225,7 +226,8 @@ pub fn cmd_cost(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 
     if !filtered.is_empty() {
         let group = |key: &str| -> Vec<(String, f64)> {
-            let mut map: std::collections::BTreeMap<String, f64> = std::collections::BTreeMap::new();
+            let mut map: std::collections::BTreeMap<String, f64> =
+                std::collections::BTreeMap::new();
             for r in &filtered {
                 let k = r
                     .get(key)

@@ -100,9 +100,7 @@ pub fn status_exists(session: &str) -> bool {
 
 /// Is a session currently alive?
 pub fn is_alive(session: &str) -> bool {
-    list()
-        .iter()
-        .any(|s| s.id == session && s.alive)
+    list().iter().any(|s| s.id == session && s.alive)
 }
 
 /// Any looop worker currently in flight?

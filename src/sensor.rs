@@ -57,17 +57,18 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
     // tiny error object so the pulse stops paying for the blob and the AI sees
     // the misbehavior.
     let cap = env_num("LOOOP_SENSOR_MAX_BYTES", 8192);
-    if rc == 0 && cap != 0 {
-        if let Ok(meta) = fs::metadata(out) {
-            let sz = meta.len();
-            if sz > cap {
-                let blob = serde_json::json!({
-                    "error": "sensor output too large — emit a small normalized {signal,detail} snapshot, not a raw dump",
-                    "bytes": sz,
-                    "cap": cap,
-                });
-                let _ = fs::write(out, format!("{blob}\n"));
-            }
+    if rc == 0
+        && cap != 0
+        && let Ok(meta) = fs::metadata(out)
+    {
+        let sz = meta.len();
+        if sz > cap {
+            let blob = serde_json::json!({
+                "error": "sensor output too large — emit a small normalized {signal,detail} snapshot, not a raw dump",
+                "bytes": sz,
+                "cap": cap,
+            });
+            let _ = fs::write(out, format!("{blob}\n"));
         }
     }
     rc
@@ -102,7 +103,11 @@ pub fn run_all(paths: &Paths, snap_dir: &Path, verbose: bool) {
         ));
     }
     for s in scripts {
-        let name = s.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let name = s
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         let out = snap_dir.join(format!("sensor-{name}.json"));
         let err = snap_dir.join(format!("sensor-{name}.err"));
         let t0 = Instant::now();
@@ -122,16 +127,10 @@ pub fn run_all(paths: &Paths, snap_dir: &Path, verbose: bool) {
             } else {
                 if rc == 124 {
                     let to = env_num("LOOOP_SENSOR_TIMEOUT", 60);
-                    let _ = fs::OpenOptions::new()
-                        .append(true)
-                        .open(&err)
-                        .map(|mut f| {
-                            use std::io::Write;
-                            let _ = writeln!(
-                                f,
-                                "sensor timed out after {to}s (LOOOP_SENSOR_TIMEOUT)"
-                            );
-                        });
+                    let _ = fs::OpenOptions::new().append(true).open(&err).map(|mut f| {
+                        use std::io::Write;
+                        let _ = writeln!(f, "sensor timed out after {to}s (LOOOP_SENSOR_TIMEOUT)");
+                    });
                 }
                 util::log(&format!(
                     "  {}✗ {} FAILED{} {}({}s) — see snapshots/sensor-{}.err{}",

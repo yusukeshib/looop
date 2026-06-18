@@ -54,7 +54,14 @@ pub fn run_streamed(
 
     for line in BufReader::new(out).lines() {
         let Ok(line) = line else { break };
-        let stamped = format!("{}[{}]{} {}{}", util::dim(), util::hms(), util::rst(), gutter, line);
+        let stamped = format!(
+            "{}[{}]{} {}{}",
+            util::dim(),
+            util::hms(),
+            util::rst(),
+            gutter,
+            line
+        );
         let _ = writeln!(stdout, "{stamped}");
         let _ = stdout.flush();
         for f in &mut sinks {

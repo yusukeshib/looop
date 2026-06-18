@@ -124,6 +124,9 @@ pub fn cmd_start_session(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         "started {session} (runner: {runner}, cwd: {})",
         paths.data_dir.display()
     );
-    println!("  watch: {}babysit attach -s {session}", paths.bs_hint_env());
+    println!(
+        "  watch: {}babysit attach -s {session}",
+        paths.bs_hint_env()
+    );
     Ok(ExitCode::SUCCESS)
 }

@@ -48,7 +48,12 @@ pub fn surface_attention(paths: &Paths) {
         return;
     }
 
-    util::log(&format!("{}{}👁  NEEDS YOU{}", util::yel(), util::b(), util::rst()));
+    util::log(&format!(
+        "{}{}👁  NEEDS YOU{}",
+        util::yel(),
+        util::b(),
+        util::rst()
+    ));
     if let Some(pb) = &pb {
         println!("{pb}");
     }

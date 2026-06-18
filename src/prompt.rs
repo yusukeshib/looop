@@ -1,5 +1,5 @@
-//! DECIDE — assemble the one-tick prompt: the PLAYBOOK + goals + sensor readings
-//! + worker sessions + claims + recent journal. A faithful port of the bash
+//! DECIDE — assemble the one-tick prompt: the PLAYBOOK, goals, sensor readings,
+//! worker sessions, claims and recent journal. A faithful port of the bash
 //! `build_prompt`. The instruction text is verbatim; only the marked dynamic
 //! fields (data dir, binary path, local-time strings) are substituted.
 
@@ -117,7 +117,7 @@ pub fn build_prompt(paths: &Paths, focus: Option<&str>, snap_dir: &Path) -> Stri
     } else {
         for g in goals {
             let name = g.file_name().unwrap_or_default().to_string_lossy();
-            let _ = write!(out, "--- {name}\n");
+            let _ = writeln!(out, "--- {name}");
             out.push_str(&fs::read_to_string(&g).unwrap_or_default());
             out.push('\n');
         }
@@ -126,11 +126,15 @@ pub fn build_prompt(paths: &Paths, focus: Option<&str>, snap_dir: &Path) -> Stri
     // SENSOR READINGS.
     out.push_str("\n=== SENSOR READINGS ===\n");
     for o in sorted_glob(snap_dir, "json") {
-        let fname = o.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let fname = o
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         if !fname.starts_with("sensor-") {
             continue;
         }
-        let _ = write!(out, "--- {fname}\n");
+        let _ = writeln!(out, "--- {fname}");
         out.push_str(&fs::read_to_string(&o).unwrap_or_default());
         out.push('\n');
     }
@@ -150,7 +154,7 @@ pub fn build_prompt(paths: &Paths, focus: Option<&str>, snap_dir: &Path) -> Stri
                 Some(n) => format!("  ⚑ {n}"),
                 None => String::new(),
             };
-            let _ = write!(out, "- {} [{}{}]{}\n", s.id, s.state, exit, note);
+            let _ = writeln!(out, "- {} [{}{}]{}", s.id, s.state, exit, note);
         }
     }
 
@@ -161,9 +165,13 @@ pub fn build_prompt(paths: &Paths, focus: Option<&str>, snap_dir: &Path) -> Stri
         out.push_str("(none)\n");
     } else {
         for c in claims {
-            let name = c.file_stem().unwrap_or_default().to_string_lossy().to_string();
+            let name = c
+                .file_stem()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             let body = fs::read_to_string(&c).unwrap_or_default().replace('\n', "");
-            let _ = write!(out, "- {name}: {body}\n");
+            let _ = writeln!(out, "- {name}: {body}");
         }
     }
 

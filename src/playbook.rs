@@ -27,7 +27,13 @@ pub fn cmd_playbook(paths: &Paths, args: &[String]) -> Result<ExitCode> {
                 paths.playbook()
             };
             let _ = Command::new("diff")
-                .args(["-u", "-L", "PLAYBOOK.md (approved)", "-L", "PLAYBOOK.proposed.md"])
+                .args([
+                    "-u",
+                    "-L",
+                    "PLAYBOOK.md (approved)",
+                    "-L",
+                    "PLAYBOOK.proposed.md",
+                ])
                 .arg(&left)
                 .arg(&proposed)
                 .status();
