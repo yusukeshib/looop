@@ -23,8 +23,8 @@ Like a Kubernetes controller, every **tick** reconciles *desired state* against
                           one tick
 
 1. SENSE    run every sensors/*.sh → each prints one JSON snapshot of the world
-2. DIFF     hash (goals + snapshots + workers). Unchanged since last tick?
-            → skip, no LLM call (cheap, level-triggered)
+2. DIFF     hash (PLAYBOOK + goals + snapshots + workers). Unchanged since
+            last tick? → skip, no LLM call (cheap, level-triggered)
 3. DECIDE   hand the PLAYBOOK + goals + snapshots + live workers to the LLM;
             it picks THE single most important move
 4. ACT      a small reversible action, edit a goal/sensor, or start a worker
@@ -76,17 +76,23 @@ your real work. After that it just runs.
 ## Commands
 
 ```sh
-looop                       run the pulse (default; ticks on a cadence)
-looop tick                  run a single beat and exit (debug / cron)
-looop run <goal-id>         force ONE move for a goal NOW (manual override)
-looop ls [--watch]          list this profile's worker sessions (⚑ = waiting)
-looop cost [today|--json]   report LLM spend from the cost ledger
-looop version | help
+looop                          run the pulse (default; ticks on a cadence)
+looop tick                     run a single beat and exit (debug / cron)
+looop run <goal-id>            force ONE move for a goal NOW (manual override)
+looop status [--json]          structured snapshot of the loop's live state
+                               (for an external observer / AI watching it)
+looop ls [--watch]             list this profile's worker sessions (⚑ = waiting)
+looop attach <id>              attach to a waiting worker (Ctrl-\ Ctrl-\ to detach)
+looop kill|flag|unflag <id>    manage a worker; looop prune clears finished ones
+looop playbook [diff|approve|reject]
+                               review an AI-proposed PLAYBOOK change (gated on you)
+looop cost [today|all|--json]  report LLM spend from the cost ledger
+looop version | help           (looop help = the full design manual)
 ```
 
-To talk to a waiting worker: `looop attach <id>`.
 To pause the loop: drop a file at `$data/paused`. To change judgment: edit
-`PLAYBOOK.md` — it takes effect next tick.
+`PLAYBOOK.md` — it takes effect next tick (AI-proposed edits are parked until you
+`looop playbook approve` them).
 
 ## Install
 
