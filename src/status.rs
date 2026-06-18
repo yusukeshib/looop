@@ -63,7 +63,7 @@ fn build(paths: &Paths) -> serde_json::Value {
                 .unwrap_or_default()
         });
 
-    let workers: Vec<serde_json::Value> = babysit::list_looop()
+    let workers: Vec<serde_json::Value> = babysit::list_workers()
         .into_iter()
         .map(|s| {
             serde_json::json!({

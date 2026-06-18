@@ -14,7 +14,11 @@ pub fn print(paths: &Paths) {
     println!(
         r#"
 Usage:
-  looop                          run the pulse (foreground; Ctrl-C to stop)
+  looop run                      run the pulse in the FOREGROUND (Ctrl-C to stop)
+  looop up                       run the pulse as a DETACHED service (the 親玉
+                                becomes a babysit session; see it with looop ls,
+                                watch it with looop attach pulse)
+  looop down                     stop the detached pulse service
   looop run <goal-id>            run ONE goal NOW (manual override): a forced,
                                 goal-focused move, ignoring priority order and
                                 the world-unchanged skip; works while the pulse

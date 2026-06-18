@@ -87,7 +87,7 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
         let acted = tick::tick(paths);
         let mut want = if acted {
             busy
-        } else if babysit::any_looop_alive() {
+        } else if babysit::any_worker_alive() {
             active
         } else {
             idle

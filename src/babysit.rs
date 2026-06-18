@@ -15,6 +15,13 @@
 use serde::Deserialize;
 use std::sync::OnceLock;
 
+/// The babysit session id the pulse (親玉) runs under when started as a service
+/// (`looop up`). It shares the `looop-` prefix so `looop ls` lists it alongside
+/// the workers, but it is NOT a worker: cadence selection, the world hash, the
+/// tick prompt's worker list, status, and flag-surfacing all treat it
+/// separately (see `list_workers`).
+pub const PULSE_SESSION: &str = "looop-pulse";
+
 /// A process-wide current-thread tokio runtime to drive babysit's async API.
 /// looop is otherwise synchronous; async is confined to this boundary.
 fn rt() -> &'static tokio::runtime::Runtime {
@@ -56,6 +63,10 @@ impl Session {
     pub fn is_looop(&self) -> bool {
         self.id.starts_with("looop-")
     }
+    /// The pulse session is `looop-`-prefixed but is the 親玉, not a worker.
+    pub fn is_pulse(&self) -> bool {
+        self.id == PULSE_SESSION
+    }
     /// True when the worker has raised a flag (a non-empty note).
     pub fn flagged(&self) -> bool {
         self.note.as_deref().map(|n| !n.is_empty()).unwrap_or(false)
@@ -83,9 +94,15 @@ pub fn list() -> Vec<Session> {
     }
 }
 
-/// looop-owned sessions only.
-pub fn list_looop() -> Vec<Session> {
-    list().into_iter().filter(Session::is_looop).collect()
+/// looop-owned WORKER sessions only — the pulse (親玉) is excluded. This is the
+/// list everything that reasons about "the fleet the pulse manages" must use
+/// (cadence, world hash, tick prompt, status, flag-surfacing), so the pulse
+/// never counts itself as one of its own workers.
+pub fn list_workers() -> Vec<Session> {
+    list()
+        .into_iter()
+        .filter(|s| s.is_looop() && !s.is_pulse())
+        .collect()
 }
 
 /// Clear exited/dead-owner corpses, IN-PROCESS and SILENTLY. babysit's own
@@ -263,8 +280,8 @@ pub fn is_alive(session: &str) -> bool {
 }
 
 /// Any looop worker currently in flight?
-pub fn any_looop_alive() -> bool {
-    list_looop().iter().any(|s| s.alive)
+pub fn any_worker_alive() -> bool {
+    list_workers().iter().any(|s| s.alive)
 }
 
 #[cfg(test)]
@@ -284,6 +301,16 @@ mod tests {
         assert!(sess("looop-triage", None).is_looop());
         assert!(!sess("other-job", None).is_looop());
         assert!(!sess("looop", None).is_looop()); // needs the trailing dash
+    }
+
+    #[test]
+    fn pulse_is_looop_but_not_a_worker() {
+        let p = sess(PULSE_SESSION, None);
+        assert!(p.is_looop(), "pulse shares the looop- prefix");
+        assert!(p.is_pulse(), "pulse is the 親玉");
+        // A worker is looop-prefixed but is NOT the pulse.
+        let w = sess("looop-triage", None);
+        assert!(w.is_looop() && !w.is_pulse());
     }
 
     #[test]

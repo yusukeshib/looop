@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 pub fn surface_attention(paths: &Paths) {
     let lhd = paths.looop_hint_env();
 
-    let flags: Vec<String> = babysit::list_looop()
+    let flags: Vec<String> = babysit::list_workers()
         .into_iter()
         .filter(|s| s.flagged())
         .map(|s| {
@@ -79,7 +79,7 @@ fn tmux_surface(paths: &Paths) {
         return; // no server running
     }
 
-    let flagged_ids: Vec<String> = babysit::list_looop()
+    let flagged_ids: Vec<String> = babysit::list_workers()
         .into_iter()
         .filter(|s| s.flagged())
         .map(|s| s.id)

@@ -19,6 +19,7 @@ mod run;
 mod runner;
 mod seed;
 mod sensor;
+mod service;
 mod session;
 mod status;
 mod surface;
@@ -37,8 +38,16 @@ fn main() -> ExitCode {
     util::init_color();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let cmd = args.first().map(String::as_str).unwrap_or("run");
-    let rest = if args.is_empty() { &[][..] } else { &args[1..] };
+    // A bare `looop` is invalid: with `up` / `watch` / `run` all explicit, a
+    // no-arg invocation silently launching a foreground infinite loop is more
+    // surprising than helpful. Require a verb (foreground pulse = `looop run`).
+    let Some(cmd) = args.first().map(String::as_str) else {
+        eprintln!(
+            "looop: no command — try: up, down, run [<goal>], tick, ls, status, start-session, attach, kill, flag, unflag, prune, help"
+        );
+        return ExitCode::from(1);
+    };
+    let rest = &args[1..];
 
     let result: Result<ExitCode> = match cmd {
         "help" | "-h" | "--help" => {
@@ -60,6 +69,11 @@ fn main() -> ExitCode {
             None => run::cmd_run(&paths),
         }),
         "tick" => deps::require_deps(&paths).and_then(|_| tick::cmd_tick(&paths)),
+        // The pulse-as-a-service trio + its read-only window.
+        "up" => deps::require_deps(&paths).and_then(|_| service::cmd_up(&paths)),
+        "down" => service::cmd_down(&paths),
+        // Hidden: the headless pulse body babysit wraps under a PTY (`looop up`).
+        "_pulse" => deps::require_deps(&paths).and_then(|_| service::cmd_pulse(&paths)),
         "ls" => deps::require_deps(&paths).and_then(|_| ls_inproc(rest)),
         "status" => status::cmd_status(&paths, rest),
         "start-session" => {
@@ -75,7 +89,7 @@ fn main() -> ExitCode {
         "_cost" => cost::cmd_cost_record(&paths, rest),
         other => {
             eprintln!(
-                "looop: unknown command '{other}' (try: run, run <goal>, tick, ls, status, start-session, attach, kill, flag, unflag, prune, help)"
+                "looop: unknown command '{other}' (try: run, run <goal>, up, down, tick, ls, status, start-session, attach, kill, flag, unflag, prune, help)"
             );
             Ok(ExitCode::from(1))
         }

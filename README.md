@@ -66,7 +66,9 @@ actions (merges, deploys, deletes) always require your explicit approval.
 ## Quick start
 
 ```sh
-looop          # run the pulse (foreground; Ctrl-C to stop)
+looop run      # run the pulse in the foreground (Ctrl-C to stop)
+# or, as a detached background service:
+looop up       # start the pulse in the background (looop down to stop)
 ```
 
 On the first run the loop seeds a starter PLAYBOOK and a `setup` goal whose only
@@ -76,7 +78,8 @@ your real work. After that it just runs.
 ## Commands
 
 ```sh
-looop                          run the pulse (default; ticks on a cadence)
+looop run                      run the pulse in the foreground (ticks on a cadence)
+looop up | down                run / stop the pulse as a detached background service
 looop tick                     run a single beat and exit (debug / cron)
 looop run <goal-id>            force ONE move for a goal NOW (manual override)
 looop status [--json]          structured snapshot of the loop's live state

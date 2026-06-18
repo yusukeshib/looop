@@ -132,7 +132,7 @@ pub fn build_prompt(paths: &Paths, focus: Option<&str>, snap_dir: &Path) -> Stri
 
     // WORKER SESSIONS.
     out.push_str("\n=== WORKER SESSIONS (babysit; ⚑note = the worker is waiting for you) ===\n");
-    let sessions = babysit::list_looop();
+    let sessions = babysit::list_workers();
     if sessions.is_empty() {
         out.push_str("(none)\n");
     } else {
