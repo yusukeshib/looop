@@ -22,6 +22,9 @@ Usage:
                                 runs. <goal-id> = goals/<id>.md basename.
                                 e.g. looop run setup ; looop run morning-standup
   looop tick                     run a single beat and exit (debug / cron)
+  looop status [--json]          structured snapshot of the loop's live state
+                                (pulse, last tick, workers, proposals, cost) —
+                                for an external observer / AI watching the loop
   looop ls [babysit ls opts]     list this profile's worker sessions (⚑ = waiting);
                                 opts pass through to babysit ls, e.g.
                                 looop ls --watch [--interval 2s]  (live, Ctrl-C to stop)
