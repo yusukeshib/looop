@@ -12,6 +12,7 @@ mod config;
 mod cost;
 mod deps;
 mod events;
+mod executor;
 mod gate;
 mod help;
 mod paths;
