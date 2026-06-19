@@ -84,13 +84,11 @@ pub fn cmd_up(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     let bin = paths.bin.to_string_lossy().to_string();
     session::spawn_detached(paths, vec![bin, "_pulse".to_string()], PULSE_SESSION)?;
 
+    let hint = paths.looop_hint_env();
     println!(
-        "looop: pulse started ({PULSE_SESSION}){}",
+        "looop: pulse started ({PULSE_SESSION}){} — watch: {hint}looop watch pulse · stop: {hint}looop down",
         if json { " [json]" } else { "" }
     );
-    println!("  see:   {}looop ls", paths.looop_hint_env());
-    println!("  watch: {}looop watch pulse", paths.looop_hint_env());
-    println!("  stop:  {}looop down", paths.looop_hint_env());
     if watch {
         println!("looop: watching {PULSE_SESSION} (Ctrl-C to stop watching)");
         session::watch(paths, PULSE_SESSION)?;
