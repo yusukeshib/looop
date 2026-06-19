@@ -12,23 +12,14 @@
         pkgs = nixpkgs.legacyPackages.${system};
 
         # The Rust binary. babysit is linked as a library and the whole worker
-        # fleet runs in-process — no `babysit` binary needed at runtime. `git`
-        # (for the memory dir) is wrapped onto PATH; the configured LLM runner
-        # (pi/claude) is the user's to provide.
+        # fleet runs in-process — no `babysit` binary needed at runtime. The
+        # configured LLM runner (pi/claude) is the user's to provide.
         looop = pkgs.rustPlatform.buildRustPackage {
           pname = "looop";
           version = "0.12.1";
           src = ./.;
 
           cargoLock.lockFile = ./Cargo.lock;
-
-          nativeBuildInputs = [ pkgs.makeWrapper ];
-
-          # `git` is shelled out for the memory dir.
-          postInstall = ''
-            wrapProgram "$out/bin/looop" \
-              --prefix PATH : ${pkgs.lib.makeBinPath (with pkgs; [ git ])}
-          '';
 
           meta = with pkgs.lib; {
             description = "A tiny, portable, Kubernetes-shaped control loop for your work";
