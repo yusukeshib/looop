@@ -3,6 +3,25 @@
 //! Written to $LOOOP_CONFIG on first run if absent. `tick` = how to run one
 //! disposable AI move (stdin = the tick prompt). `interactive` = how to launch
 //! a worker agent; {{prompt_file}} is substituted with the worker's prompt file.
+//!
+//! TICK COST ACCOUNTING (H3): both runners pipe their tick through `_fmt`, which
+//! meters spend into the cost ledger. pi emits per-message usage (`_fmt` sums it);
+//! claude emits a single cumulative `total_cost_usd` in its stream-json `result`
+//! event (`_fmt` takes it as-is). Previously the claude tick ran as plain
+//! `claude -p` with no `_fmt` seam, so `looop cost` always showed $0 for claude
+//! ticks — accounting was asymmetric between runners. The default now routes
+//! claude through `--output-format stream-json | _fmt` so both runners meter
+//! symmetrically. (Worker sessions still self-report via `looop _cost`,
+//! independent of the tick seam.)
+//!
+//! MODEL ALLOCATION (M4): the tick is the highest-leverage call — it picks the
+//! single move that steers everything — so it must NOT run on a weaker model than
+//! the workers it directs. The default tick therefore uses the same strong model
+//! as the worker (claude-opus-4-8). Cost stays bounded because the world-hash gate
+//! skips the AI entirely when nothing changed, and the tick emits only one tiny
+//! decision; the heavier `medium` thinking budget is reserved for the worker,
+//! which does the actual multi-step execution. Operators who want to trade
+//! decision quality for cost can drop the tick model back to sonnet in this file.
 
 use crate::paths::Paths;
 use anyhow::{Context, Result};
@@ -13,12 +32,12 @@ pub const DEFAULT_CONFIG: &str = r#"{
   "default": "pi",
   "runners": {
     "claude": {
-      "tick": "claude -p --dangerously-skip-permissions",
+      "tick": "claude -p --output-format stream-json --verbose --dangerously-skip-permissions | \"$LOOOP_BIN\" _fmt",
       "interactive": "claude \"$(cat {{prompt_file}})\"",
       "resume": "claude --resume"
     },
     "pi": {
-      "tick": "pi -p --mode json -ne --model claude-sonnet-4-5 --thinking low 'Execute the looop tick instructions provided on stdin.' | \"$LOOOP_BIN\" _fmt",
+      "tick": "pi -p --mode json -ne --model claude-opus-4-8 --thinking low 'Execute the looop tick instructions provided on stdin.' | \"$LOOOP_BIN\" _fmt",
       "interactive": "pi --model claude-opus-4-8 --thinking medium @{{prompt_file}}",
       "resume": "pi --session"
     }

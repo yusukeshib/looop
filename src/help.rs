@@ -25,7 +25,6 @@ Usage:
                                 tail -f (Ctrl-C to stop). `looop watch pulse`
                                 watches the loop itself. No input — use attach
                                 for that.
-  looop tick                     run a single beat and exit (debug / cron)
   looop status [--json]          structured snapshot of the loop's live state
                                 (pulse, last tick, workers, cost) — for an
                                 external observer / AI watching the loop
@@ -59,6 +58,8 @@ Usage:
   looop prune                    clear ALL finished worker corpses now (the pulse
                                 auto-reaps only ones older than the retention
                                 window each tick — LOOOP_SESSION_TTL, default 3d)
+  looop journal [--tail N]       read the decision log (one timestamped line per
+                                move); --tail N shows only the last N
   looop cost [today|all|--json]   report LLM spend recorded in the cost ledger
                                 (ticks are metered automatically; workers
                                 self-report via 'looop _cost')

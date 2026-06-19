@@ -30,6 +30,9 @@ THE THREE NOUNS
 ONE BEAT (a tick)
   1. run sensors/*.sh -> snapshot the world as JSON (fresh every tick)
   2. if nothing changed since last tick -> do nothing (cheap, no AI call)
+     ("changed" = PLAYBOOK + goals + each sensor's .signal + session transitions.
+      NOTE: editing a sensor SCRIPT does not itself wake the loop — only the
+      reading it emits does. PLAYBOOK/goals edits wake the loop immediately.)
   3. else hand PLAYBOOK + goals + sensor readings + sessions to the AI, which
      EMITS exactly ONE typed action (to .decision.json); looop executes it and
      appends ONE line to journal.md
@@ -75,6 +78,9 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
   EXEC    this one binary                          the program (portable)
   CONFIG  ${XDG_CONFIG_HOME:-~/.config}/looop.json  one file: runner wiring
           └ override with $LOOOP_CONFIG            (seeded inline if absent)
+            optional knobs: interval/busy_interval/active_interval (cadence),
+            session_ttl (corpse retention), max_daily_usd (skip ticks once the
+            day's metered spend hits the cap — a billing circuit breaker).
   DATA    ${XDG_STATE_HOME:-~/.local/state}/looop/  the file-based memory
           └ override with $LOOOP_DATA_DIR
             PLAYBOOK.md  goals/  journal.md  sensors/*.sh   <- the durable memory

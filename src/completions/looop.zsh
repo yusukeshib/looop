@@ -47,9 +47,9 @@ _looop() {
             local -a cmds
             cmds=(
                 'watch:Follow a session output read-only (tail -f)'
-                'tick:Run a single beat and exit (debug / cron)'
                 'ls:List this profile worker sessions'
                 'status:Structured snapshot of the loop state'
+                'journal:Read the decision log (one line per move)'
                 'log:Show / tail / grep / follow a session output'
                 'shot:Render a session current visible screen'
                 'send:Type text into a session stdin'
@@ -146,6 +146,9 @@ _looop() {
                     ;;
                 status)
                     _arguments '--json[Emit JSON instead of text]'
+                    ;;
+                journal)
+                    _arguments '(--tail -n)'{--tail,-n}'[Show only the last N lines]:n:'
                     ;;
                 cost)
                     _arguments \

@@ -9,7 +9,9 @@ single most important one — then stop and append one line to journal.md.
    interactive setup session to interview me, then rewrite this PLAYBOOK and
    create real goals + sensor scripts. Start it with:
      looop start-session setup "$(cat goals/setup.md)"
-   If a session `setup` already exists, do nothing and wait for me.
+   Only ONE live setup at a time: if a setup session is still RUNNING (check
+   `looop ls` — state running/alive), do nothing and wait for me. A dead setup
+   corpse (Exited/Killed) does NOT count — the pulse reaps it; start a fresh one.
 2. A goal whose situation changed and needs a move.
 3. Recurring goals that are due today (check each goal's notes vs sensor-today.json).
 4. Otherwise, do nothing.

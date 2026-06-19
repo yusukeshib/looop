@@ -60,6 +60,29 @@ impl Drop for LockGuard {
     }
 }
 
+/// Acquire the single-instance lock (atomic mkdir + PID file). Returns the guard
+/// (released on drop) on success, or `None` if a LIVE pulse already holds it. A
+/// stale lock left by a dead process is reclaimed (mkdir is the atomic arbiter of
+/// the reclaim race), so a crashed pulse never wedges the next start. The pulse
+/// is the sole beat runner, so holding this for its lifetime guarantees no two
+/// beats ever wipe/regenerate the shared snapshots/ dir under each other (H4).
+fn acquire_lock(paths: &Paths) -> Option<LockGuard> {
+    let lock = paths.lock();
+    if fs::create_dir(&lock).is_err() {
+        let oldpid = fs::read_to_string(lock.join("pid")).unwrap_or_default();
+        if util::pid_alive(oldpid.trim()) {
+            return None;
+        }
+        // Stale lock: reclaim it (mkdir is the atomic arbiter on the race).
+        let _ = fs::remove_dir_all(&lock);
+        if fs::create_dir(&lock).is_err() {
+            return None;
+        }
+    }
+    let _ = fs::write(lock.join("pid"), format!("{}\n", std::process::id()));
+    Some(LockGuard { path: lock })
+}
+
 pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
     seed::ensure_dirs(paths)?;
     let cfg = Config::load(paths)?;
@@ -68,23 +91,11 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
     let active = interval("LOOOP_ACTIVE_INTERVAL", &cfg, "active_interval", idle);
 
     // Single-instance lock (mkdir-based; macOS has no flock).
-    let lock = paths.lock();
-    if fs::create_dir(&lock).is_err() {
-        let oldpid = fs::read_to_string(lock.join("pid")).unwrap_or_default();
-        let oldpid = oldpid.trim();
-        if util::pid_alive(oldpid) {
-            eprintln!("looop: already running (pid {oldpid})");
-            return Ok(ExitCode::from(1));
-        }
-        // Stale lock: reclaim it (mkdir is the atomic arbiter on the race).
-        let _ = fs::remove_dir_all(&lock);
-        if fs::create_dir(&lock).is_err() {
-            eprintln!("looop: lost the lock race — another pulse started; exiting");
-            return Ok(ExitCode::from(1));
-        }
-    }
-    let _ = fs::write(lock.join("pid"), format!("{}\n", std::process::id()));
-    let _guard = LockGuard { path: lock.clone() };
+    let Some(_guard) = acquire_lock(paths) else {
+        let oldpid = fs::read_to_string(paths.lock().join("pid")).unwrap_or_default();
+        eprintln!("looop: already running (pid {})", oldpid.trim());
+        return Ok(ExitCode::from(1));
+    };
 
     let runner_name = cfg.default_runner().unwrap_or_else(|| "?".into());
     util::event(

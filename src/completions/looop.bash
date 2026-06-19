@@ -9,7 +9,7 @@ _looop() {
     local cur prev words cword
     _init_completion || return
 
-    local subcommands="watch tick ls status log shot send key expect wait wait-idle resize restart start-session attach detach kill flag unflag prune cost config version help"
+    local subcommands="watch ls status journal log shot send key expect wait wait-idle resize restart start-session attach detach kill flag unflag prune cost config version help"
 
     # session ids including the pulse (for read/observe verbs)
     __looop_session_list() {
@@ -91,6 +91,9 @@ _looop() {
             ;;
         status)
             COMPREPLY=($(compgen -W "--json" -- "$cur"))
+            ;;
+        journal)
+            COMPREPLY=($(compgen -W "--tail -n" -- "$cur"))
             ;;
         cost)
             COMPREPLY=($(compgen -W "today all --json" -- "$cur"))

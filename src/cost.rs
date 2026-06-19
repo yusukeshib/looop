@@ -5,11 +5,42 @@
 //! self-report via `looop _cost`). Both append one JSON line to the cost ledger.
 //! `looop cost` reports over it.
 
+use crate::config::Config;
 use crate::paths::Paths;
 use anyhow::Result;
 use std::fs::OpenOptions;
 use std::io::{BufRead, Write};
 use std::process::ExitCode;
+
+/// Total USD recorded in the ledger for the current LOCAL day. The ledger is the
+/// single source of truth for spend (both tick `_fmt` and worker `_cost` append
+/// to it), so summing it survives pulse restarts (H2 — the daily cap must be
+/// process-independent state on disk, not in-memory loop state).
+pub fn spent_today(paths: &Paths) -> f64 {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let Ok(text) = std::fs::read_to_string(paths.cost_ledger()) else {
+        return 0.0;
+    };
+    text.lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .filter(|r| {
+            r.get("ts")
+                .and_then(|t| t.as_str())
+                .map(|ts| local_day(ts) == today)
+                .unwrap_or(false)
+        })
+        .filter_map(|r| r.get("cost_usd").and_then(|c| c.as_f64()))
+        .sum()
+}
+
+/// The configured daily spend ceiling (`max_daily_usd`), if set to a positive
+/// number. `None` disables the circuit breaker (the default).
+pub fn daily_budget(cfg: &Config) -> Option<f64> {
+    cfg.root
+        .get("max_daily_usd")
+        .and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|n| n as f64)))
+        .filter(|x| *x > 0.0)
+}
 
 /// Append one ledger line if `cost` parses to a positive amount.
 pub fn record_cost(paths: &Paths, kind: &str, id: &str, runner: &str, cost: &str) {
@@ -52,7 +83,12 @@ pub fn cmd_cost_record(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 /// progress live, and (when LOOOP_COST_* is set) meter spend into the ledger.
 pub fn cmd_fmt(paths: &Paths) -> Result<ExitCode> {
     let metering = std::env::var("LOOOP_COST_KIND").is_ok();
-    let mut total = 0.0f64;
+    // pi emits per-message usage we SUM; claude (stream-json) emits one final
+    // `result` event with a CUMULATIVE total_cost_usd we take as-is. Tracking
+    // them separately lets one `_fmt` meter either runner (H3) — the claude
+    // total, when present, wins so we never double-count.
+    let mut pi_total = 0.0f64;
+    let mut claude_total: Option<f64> = None;
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
 
@@ -62,18 +98,28 @@ pub fn cmd_fmt(paths: &Paths) -> Result<ExitCode> {
             let _ = writeln!(stdout, "{rendered}");
             let _ = stdout.flush();
         }
-        if metering
-            && let Ok(v) = serde_json::from_str::<serde_json::Value>(&line)
-            && v.get("type").and_then(|t| t.as_str()) == Some("message_end")
-        {
-            total += v
-                .pointer("/usage/cost/total")
-                .and_then(|c| c.as_f64())
-                .unwrap_or(0.0);
+        if metering && let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
+            match v.get("type").and_then(|t| t.as_str()) {
+                // pi --mode json: sum per-message cost.
+                Some("message_end") => {
+                    pi_total += v
+                        .pointer("/usage/cost/total")
+                        .and_then(|c| c.as_f64())
+                        .unwrap_or(0.0);
+                }
+                // claude --output-format stream-json: single cumulative total.
+                Some("result") => {
+                    if let Some(c) = v.get("total_cost_usd").and_then(|c| c.as_f64()) {
+                        claude_total = Some(c);
+                    }
+                }
+                _ => {}
+            }
         }
     }
 
     if metering {
+        let total = claude_total.unwrap_or(pi_total);
         let kind = std::env::var("LOOOP_COST_KIND").unwrap_or_default();
         let id = std::env::var("LOOOP_COST_ID").unwrap_or_default();
         let runner = std::env::var("LOOOP_COST_RUNNER").unwrap_or_default();
@@ -307,6 +353,32 @@ mod tests {
         // Unknown event types emit nothing.
         let other = json!({ "type": "session_start" }).to_string();
         assert_eq!(format_line(&other), None);
+    }
+
+    #[test]
+    fn daily_budget_reads_positive_only() {
+        let cfg = |v: serde_json::Value| Config { root: v };
+        assert_eq!(daily_budget(&cfg(json!({"max_daily_usd": 5.0}))), Some(5.0));
+        assert_eq!(daily_budget(&cfg(json!({"max_daily_usd": 10}))), Some(10.0));
+        assert_eq!(daily_budget(&cfg(json!({"max_daily_usd": 0}))), None);
+        assert_eq!(daily_budget(&cfg(json!({}))), None);
+    }
+
+    #[test]
+    fn spent_today_sums_only_todays_rows() {
+        let p = Paths::temp();
+        let today = chrono::Local::now().to_rfc3339();
+        let line = |ts: &str, c: f64| {
+            format!(r#"{{"ts":"{ts}","kind":"tick","id":"x","runner":"pi","cost_usd":{c}}}"#)
+        };
+        let body = format!(
+            "{}\n{}\n{}\n",
+            line(&today, 0.5),
+            line(&today, 1.25),
+            line("2000-01-01T00:00:00Z", 9.0), // ancient row excluded
+        );
+        std::fs::write(p.cost_ledger(), body).unwrap();
+        assert!((spent_today(&p) - 1.75).abs() < 1e-9);
     }
 
     #[test]

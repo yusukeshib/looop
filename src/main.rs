@@ -15,6 +15,7 @@ mod events;
 mod executor;
 mod gate;
 mod help;
+mod journal;
 mod paths;
 mod prompt;
 mod run;
@@ -71,7 +72,6 @@ fn main() -> ExitCode {
         }
         // A leading flag with no verb is still the foreground serve (`looop --json`).
         "--json" => deps::require_deps(&paths).and_then(|_| service::cmd_serve(&paths, &args)),
-        "tick" => deps::require_deps(&paths).and_then(|_| tick::cmd_tick(&paths)),
         // The pulse foreground + its read-only window.
         "watch" => deps::require_deps(&paths).and_then(|_| session::cmd_watch(&paths, rest)),
         "log" | "logs" => deps::require_deps(&paths).and_then(|_| session::cmd_log(&paths, rest)),
@@ -116,12 +116,13 @@ fn main() -> ExitCode {
                 Ok(ExitCode::from(1))
             }
         },
+        "journal" => journal::cmd_journal(&paths, rest),
         "cost" => cost::cmd_cost(&paths, rest),
         "_fmt" => cost::cmd_fmt(&paths),
         "_cost" => cost::cmd_cost_record(&paths, rest),
         other => {
             eprintln!(
-                "looop: unknown command '{other}' (run `looop` to start the loop; or: watch <id>, tick, ls, status, log, shot, send, key, expect, wait, wait-idle, resize, restart, attach, detach, kill, flag, unflag, prune, help)"
+                "looop: unknown command '{other}' (run `looop` to start the loop; or: watch <id>, ls, status, journal, log, shot, send, key, expect, wait, wait-idle, resize, restart, attach, detach, kill, flag, unflag, prune, help)"
             );
             Ok(ExitCode::from(1))
         }
@@ -159,10 +160,16 @@ fn export_env(paths: &Paths) {
     let set = |k: &str, v: &std::ffi::OsStr| unsafe { std::env::set_var(k, v) };
     set("LOOOP_BIN", paths.bin.as_os_str());
     set("LOOOP_DATA_DIR", paths.data_dir.as_os_str());
-    set("CONFIG", paths.config.as_os_str());
-    set("CLAIMS_DIR", paths.claims_dir().as_os_str());
-    set("REPORTS_DIR", paths.reports_dir().as_os_str());
-    set("COST_LEDGER", paths.cost_ledger().as_os_str());
+    // All looop-owned env lives under the LOOOP_ namespace (M1): bare CONFIG /
+    // CLAIMS_DIR / REPORTS_DIR / COST_LEDGER collided with whatever the child
+    // (sensors, workers, the runner pipeline) already had in scope. Exporting
+    // LOOOP_CONFIG also keeps children pinned to the same resolved wiring as the
+    // parent (Paths::resolve reads it as the override), so a worker that re-invokes
+    // looop stays on this profile's config.
+    set("LOOOP_CONFIG", paths.config.as_os_str());
+    set("LOOOP_CLAIMS_DIR", paths.claims_dir().as_os_str());
+    set("LOOOP_REPORTS_DIR", paths.reports_dir().as_os_str());
+    set("LOOOP_COST_LEDGER", paths.cost_ledger().as_os_str());
     // NB: no $BABYSIT_DIR. looop never configures the babysit library through the
     // environment — it passes an explicit context (`paths.sessions()`) to every
     // call, and the detached worker receives its root via `--root`.

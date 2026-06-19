@@ -7,6 +7,17 @@
 //!     no-op.
 //!   * worker sessions: only the STABLE signal (id/state/exit_code/note), never
 //!     the ever-incrementing age, so a tick fires on a real transition.
+//!
+//! ASYMMETRY (M3, deliberate): PLAYBOOK.md and goals/*.md are hashed whole, so
+//! editing them wakes the loop next beat. The sensor SCRIPTS (sensors/*.sh) are
+//! NOT hashed — only the snapshots they produce are. Editing a sensor script
+//! therefore does NOT wake the loop on its own; the change only takes effect once
+//! the next snapshot it emits differs in its `.signal`. Rationale: a sensor's job
+//! is to observe the world, not to BE part of the world we react to — rehashing
+//! the script would wake the loop on every cosmetic edit (comments, formatting)
+//! that produces identical readings. If you need an edited sensor to take effect
+//! immediately, run it once so its snapshot refreshes (the pulse regenerates
+//! snapshots every beat anyway).
 
 use crate::paths::Paths;
 use crate::session;

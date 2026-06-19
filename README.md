@@ -90,7 +90,6 @@ looop down [--keep-workers]    stop the pulse and its live workers
                                (--keep-workers stops only the pulse)
 looop watch <id>               follow a session's output read-only (tail -f);
                                `looop watch pulse` watches the loop itself
-looop tick                     run a single beat and exit (debug / cron)
 looop status [--json]          structured snapshot of the loop's live state
                                (for an external observer / AI watching it)
 looop ls [--watch]             list this profile's worker sessions (⚑ = waiting)
@@ -105,6 +104,7 @@ looop resize <id> <COLSxROWS>  resize a session's terminal
 looop attach <id> | detach <id>   attach/force-detach a terminal (Ctrl-\ Ctrl-\)
 looop restart <id>             restart a worker's wrapped command
 looop kill|flag|unflag <id>    manage a worker; looop prune clears finished ones
+looop journal [--tail N]       read the decision log (one line per move; --tail N)
 looop cost [today|all|--json]  report LLM spend from the cost ledger
 looop config zsh|bash          print shell integration (tab completions)
 looop version | help           (looop help = the full design manual)
