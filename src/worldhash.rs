@@ -1,12 +1,15 @@
 //! DIFF — a single content hash of everything that should trigger a move. If it
 //! is unchanged since last tick, the beat skips the AI entirely (cheap,
 //! level-triggered). What feeds the hash is deliberate:
-//!   * PLAYBOOK + goals: hashed whole.
+//!   * PLAYBOOK + goals: hashed whole (the desired state).
 //!   * sensor snapshots: only the `.signal` (if present) — volatile detail under
 //!     `.detail` never wakes the loop; keys are canonicalized so reordering is a
-//!     no-op.
-//!   * worker sessions: only the STABLE signal (id/state/exit_code/note), never
-//!     the ever-incrementing age, so a tick fires on a real transition.
+//!     no-op. This is the WHOLE observed-state half: the live worker fleet and
+//!     the worker leases are themselves system sensors (`sys-sessions` /
+//!     `sys-claims`), so they flow through this same snapshot loop — there is no
+//!     bespoke per-kind hashing. A worker's stable identity (id/state/exit_code,
+//!     plus a ⚑note while alive) lives in that snapshot's `.signal`; its volatile
+//!     age rides in `.detail` and never wakes the loop.
 //!
 //! ASYMMETRY (M3, deliberate): PLAYBOOK.md and goals/*.md are hashed whole, so
 //! editing them wakes the loop next beat. The sensor SCRIPTS (sensors/*.sh) are
@@ -20,7 +23,6 @@
 //! snapshots every beat anyway).
 
 use crate::paths::Paths;
-use crate::session;
 use crate::util;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -74,7 +76,9 @@ pub fn world_hash(paths: &Paths) -> String {
         }
     }
 
-    // Sensor snapshots: hash only the wake SIGNAL.
+    // Sensor snapshots: hash only the wake SIGNAL. User sensors AND the virtual
+    // system sensors (sys-sessions / sys-claims) all land here, so the fleet and
+    // leases are diffed through this one loop — no bespoke per-kind hashing.
     for f in sorted_glob(&paths.snapshots_dir(), "json") {
         buf.extend_from_slice(format!("@@ {}\n", rel(paths, &f)).as_bytes());
         let raw = fs::read(&f).unwrap_or_default();
@@ -85,17 +89,6 @@ pub fn world_hash(paths: &Paths) -> String {
             }
             Err(_) => buf.extend_from_slice(&raw), // non-JSON / error reading: raw bytes
         }
-    }
-
-    // Worker sessions: stable signal only (id state exit_code note), null-faithful.
-    // Workers only — the pulse's own session must not feed its own wake signal.
-    for s in session::list_workers(paths) {
-        let exit = s
-            .exit_code
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "null".into());
-        let note = s.note.clone().unwrap_or_else(|| "null".into());
-        buf.extend_from_slice(format!("{} {} {} {}\n", s.id, s.state, exit, note).as_bytes());
     }
 
     util::content_hash(&buf)

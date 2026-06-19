@@ -4,7 +4,6 @@
 //! fields (data dir, binary path, local-time strings) are substituted.
 
 use crate::paths::Paths;
-use crate::session;
 use crate::util;
 use std::fmt::Write as _;
 use std::fs;
@@ -84,8 +83,15 @@ Every action ALSO takes:
   "next_interval_s": <int>  — OPTIONAL one-shot cadence nudge (clamped 5..3600):
      tighten when a backlog is piling up, widen when it's been quiet a long while.
 
-The live worker sessions are listed below; prefer steering an existing worker
-over spawning a SECOND one for the same goal. Current local time: __NOW__.
+Two of the SENSOR READINGS are looop's OWN state (system sensors, not
+sensors/*.sh):
+  • sys-sessions — the live worker fleet. An entry with a `note` means that worker
+    raised a ⚑flag and is WAITING for the human: relay it via send_notification;
+    do NOT answer a human-flag yourself. Prefer steering an existing worker over
+    spawning a SECOND one for the same goal.
+  • sys-claims — live worker leases. A name listed here is OWNED by the worker
+    reconciling it; do NOT act on it yourself.
+Current local time: __NOW__.
 
 Write your single JSON object to `.decision.json` now, then stop.
 
@@ -144,51 +150,15 @@ pub fn build_prompt(paths: &Paths, snap_dir: &Path) -> String {
             .unwrap_or_default()
             .to_string_lossy()
             .to_string();
-        if !fname.starts_with("sensor-") {
+        // User sensors (`sensor-*`) and the virtual system sensors (`sys-*`) are
+        // one uniform stream here — the fleet and leases arrive as `sys-sessions`
+        // / `sys-claims`, no bespoke per-kind sections.
+        if !(fname.starts_with("sensor-") || fname.starts_with("sys-")) {
             continue;
         }
         let _ = writeln!(out, "--- {fname}");
         out.push_str(&fs::read_to_string(&o).unwrap_or_default());
         out.push('\n');
-    }
-
-    // WORKER SESSIONS.
-    out.push_str("\n=== WORKER SESSIONS (babysit; ⚑note = the worker is waiting for you) ===\n");
-    let sessions = session::list_workers(paths);
-    if sessions.is_empty() {
-        out.push_str("(none)\n");
-    } else {
-        for s in &sessions {
-            let exit = s
-                .exit_code
-                .map(|c| format!(" exit {c}"))
-                .unwrap_or_default();
-            // Show the ⚑ only for a LIVE worker: a flag on an exited corpse is
-            // stale, and surfacing it would make the pulse think a finished
-            // worker is still waiting for a human.
-            let note = match &s.note {
-                Some(n) if s.alive => format!("  ⚑ {n}"),
-                _ => String::new(),
-            };
-            let _ = writeln!(out, "- {} [{}{}]{}", s.id, s.state, exit, note);
-        }
-    }
-
-    // WORKER CLAIMS (live leases — reaped before this point, so all are live).
-    out.push_str("\n=== WORKER CLAIMS (live leases — a name with a claim here is OWNED by a worker; do NOT act on it yourself, the owner is reconciling it) ===\n");
-    let claims = sorted_glob(&paths.claims_dir(), "json");
-    if claims.is_empty() {
-        out.push_str("(none)\n");
-    } else {
-        for c in claims {
-            let name = c
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            let body = fs::read_to_string(&c).unwrap_or_default().replace('\n', "");
-            let _ = writeln!(out, "- {name}: {body}");
-        }
     }
 
     // RECENT JOURNAL.
@@ -224,8 +194,7 @@ mod tests {
         for marker in [
             "=== PLAYBOOK ===",
             "=== GOALS ===",
-            "=== WORKER SESSIONS",
-            "=== WORKER CLAIMS",
+            "=== SENSOR READINGS ===",
             "=== RECENT JOURNAL ===",
         ] {
             assert!(out.contains(marker), "missing section: {marker}");
