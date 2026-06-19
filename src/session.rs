@@ -127,8 +127,7 @@ pub fn cmd_start_session(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     // current process cwd (babysit's Pane uses `std::env::current_dir`), so we
     // `cd` there inside the shell command instead of mutating looop's own cwd.
     // Export LOOOP_SESSION_ID so the worker knows its OWN session id (for its
-    // lease claim, etc.) through a looop-branded var — looop never relies on
-    // babysit's internal BABYSIT_SESSION_ID.
+    // lease claim, etc.) through a looop-branded var.
     let launch = format!(
         "export LOOOP_SESSION_ID={}; cd {} && {cmd}",
         shell_quote(&session),
