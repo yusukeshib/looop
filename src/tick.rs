@@ -5,7 +5,7 @@
 use crate::config::Config;
 use crate::paths::Paths;
 use crate::util::Level;
-use crate::{events, executor, gate, prompt, runner, seed, sensor, session, surface, util};
+use crate::{events, executor, gate, prompt, runner, seed, sensor, session, util};
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
@@ -188,7 +188,6 @@ pub fn tick(paths: &Paths) -> bool {
     }
 
     prune_runs(paths);
-    surface::surface_attention(paths);
     acted
 }
 

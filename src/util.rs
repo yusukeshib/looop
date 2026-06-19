@@ -208,17 +208,6 @@ fn json_event_line(
     serde_json::Value::Object(obj).to_string()
 }
 
-/// `[HH:MM:SS] <msg>` on stdout, the dim timestamp matching the bash `log()`.
-/// In JSON mode it becomes a generic `{event:"log"}` object so legacy callers
-/// still produce parseable output.
-pub fn log(msg: &str) {
-    if is_json() {
-        event(Level::Info, "log", msg, &[]);
-    } else {
-        println!("{}[{}]{} {}", dim(), hms(), rst(), msg);
-    }
-}
-
 /// Local wall-clock `HH:MM:SS` for log lines (chrono — fast, no subprocess).
 pub fn hms() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()

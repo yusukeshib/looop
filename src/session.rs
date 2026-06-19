@@ -23,8 +23,8 @@ const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
 - When you need a human decision / info / approval, do NOT guess — use ONLY this
   and then wait right there:
     "$LOOOP_BIN" flag __ID__ "<what you are waiting for / what you need to ask>"
-  Once flagged, the human attaches over tmux to answer (the pulse turns the flag
-  into a tmux window they can't miss).
+  Once flagged, the pulse relays your note to the human, who attaches over tmux
+  to answer (their reply flows into your stdin).
 - When the wait is resolved (you got your answer), unflag before continuing:
     "$LOOOP_BIN" unflag __ID__
 - When the task is 100% complete and nothing is flagged, end your own session:

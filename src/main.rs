@@ -24,7 +24,6 @@ mod sensor;
 mod service;
 mod session;
 mod status;
-mod surface;
 mod tick;
 mod util;
 mod worldhash;

@@ -26,7 +26,6 @@ reports/
 .lock/
 .last-tick-hash
 .next-interval
-.tmux-surfaced
 tick.log
 events.jsonl
 cost.jsonl

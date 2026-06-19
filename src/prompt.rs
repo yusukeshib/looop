@@ -57,17 +57,23 @@ Pick exactly ONE `action` and fill its fields:
   {"action":"steer_session","id":"<worker>","input":"<text>"}
      Type into a LIVE worker's stdin to nudge it / answer what it asked of YOU.
      NEVER use this to answer something a worker ⚑flagged for the HUMAN — leave
-     the flag up and `noop`.
+     the flag up and `send_notification` so the human knows to attach (below).
   {"action":"send_key","id":"<worker>","keys":["Enter"]}   named keys (Enter, C-c)
   {"action":"restart_session","id":"<worker>"}            restart a wedged worker
 
   {"action":"send_notification","message":"<what the human must know / decide>"}
      Surface a blocker or notice to the human — journaled and shown on this
-     tick's line. Use when YOU, the pulse, are blocked on a human and the fix is
-     the human editing the world (a goal, the PLAYBOOK, creds, a priority call),
-     which the next tick observes. There is NO reply channel and NO state kept:
-     for a question whose answer must flow back INTO running work, start a
-     worker that prepares it and ⚑flags instead.
+     tick's line. This is the ONLY way the human hears anything; looop emits no
+     other banner. Two cases:
+       1. YOU, the pulse, are blocked on a human editing the world (a goal, the
+          PLAYBOOK, creds, a priority call) — which the next tick observes.
+       2. A worker is ⚑flagged and waiting for the human: relay its note and tell
+          them how to answer, e.g. "fix-pr-2143 waiting: <note> → looop attach
+          fix-pr-2143". The flag stays up in WORKER SESSIONS until they answer,
+          so notify ONCE — don't re-notify the same flag every tick.
+     There is NO reply channel and NO state kept on the notice itself: for a
+     question whose answer must flow back INTO running work, the worker's own
+     ⚑flag (above) is the session-backed channel — the human attaches to reply.
 
   {"action":"write_playbook","body":"<full PLAYBOOK.md contents>"}
      Change your own judgment / guardrails. Deliberate — only harden a drift into
