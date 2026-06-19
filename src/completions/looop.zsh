@@ -47,6 +47,7 @@ __looop_sessions() {
     dir=$(__looop_sessions_dir)
     for s in "$dir"/*(N/); do
         name=${s:t}
+        [[ "$name" == "pulse" ]] && continue
         [[ -n "$name" ]] && sessions+=("$name")
     done
     sessions+=('pulse')

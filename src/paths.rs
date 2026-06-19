@@ -54,7 +54,7 @@ impl Paths {
         };
 
         // Worker-fleet isolation: the session store ALWAYS lives inside this
-        // profile's data dir (`<data_dir>/babysit`), derived purely from
+        // profile's data dir (`<data_dir>/sessions`), derived purely from
         // LOOOP_DATA_DIR (ignoring any inherited BABYSIT_DIR). Every profile —
         // including the default one — is therefore self-contained, so session
         // ids never need a `looop-` prefix to be disambiguated from anything

@@ -1,10 +1,11 @@
 //! looop — a tiny, portable, Kubernetes-shaped control loop for your work.
 //!
 //! Rust port. The pulse is unbreakable code, judgment is the AI, memory is git
-//! (RULE 2). babysit is linked as a LIBRARY: list/prune/status/kill/flag/unflag/
-//! attach all run in-process. The one verb that still shells out is detached
-//! worker spawn (`start-session` -> `babysit run -d`), because babysit's detacher
-//! re-execs its own binary as the supervisor.
+//! (RULE 2). babysit is linked as a LIBRARY and driven entirely in-process —
+//! list/prune/status/kill/flag/unflag/attach AND detached worker spawn all run
+//! through the library, no `babysit` binary. The one process re-exec is the
+//! detached supervisor: babysit's detacher re-execs looop itself (current_exe)
+//! as the headless worker supervisor (`looop run --detached-id <id> -- <cmd>`).
 
 mod config;
 mod cost;

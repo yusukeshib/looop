@@ -25,6 +25,7 @@ _looop() {
         for s in "$dir"/*/; do
             [[ -d "$s" ]] || continue
             name=$(basename "$s")
+            [[ "$name" == "pulse" ]] && continue
             [[ -n "$name" ]] && out+=" $name"
         done
         printf '%s pulse' "$out"
