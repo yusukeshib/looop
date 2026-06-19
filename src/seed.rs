@@ -65,7 +65,8 @@ pub fn ensure_dirs(paths: &Paths) -> Result<()> {
         seed_data(paths)?;
     }
 
-    // Keep the data dir a clean git "memory": commit policy/journal, ignore scratch.
+    // Seed a .gitignore so the data dir versions cleanly IF the user chooses to
+    // `git init` it (looop itself does not): track policy/journal, ignore scratch.
     let gi = paths.data_dir.join(".gitignore");
     if !gi.is_file() {
         fs::write(&gi, GITIGNORE).with_context(|| format!("writing {}", gi.display()))?;

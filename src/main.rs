@@ -12,6 +12,7 @@ mod config;
 mod cost;
 mod deps;
 mod events;
+mod executor;
 mod gate;
 mod help;
 mod paths;
@@ -69,7 +70,7 @@ fn main() -> ExitCode {
         "tick" => deps::require_deps(&paths).and_then(|_| tick::cmd_tick(&paths)),
         // The pulse-as-a-service trio + its read-only window.
         "up" => deps::require_deps(&paths).and_then(|_| service::cmd_up(&paths, rest)),
-        "down" => service::cmd_down(&paths),
+        "down" => service::cmd_down(&paths, rest),
         "watch" => deps::require_deps(&paths).and_then(|_| session::cmd_watch(&paths, rest)),
         "log" | "logs" => deps::require_deps(&paths).and_then(|_| session::cmd_log(&paths, rest)),
         "shot" | "screenshot" => {

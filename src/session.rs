@@ -127,8 +127,7 @@ pub fn cmd_start_session(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     // current process cwd (babysit's Pane uses `std::env::current_dir`), so we
     // `cd` there inside the shell command instead of mutating looop's own cwd.
     // Export LOOOP_SESSION_ID so the worker knows its OWN session id (for its
-    // lease claim, etc.) through a looop-branded var — looop never relies on
-    // babysit's internal BABYSIT_SESSION_ID.
+    // lease claim, etc.) through a looop-branded var.
     let launch = format!(
         "export LOOOP_SESSION_ID={}; cd {} && {cmd}",
         shell_quote(&session),
@@ -911,7 +910,7 @@ pub fn run_detached_worker(args: &[String]) -> anyhow::Result<i32> {
 /// restore it. Used to swallow babysit's parent-path banner while keeping
 /// looop's own output. Unix-only; a no-op redirect failure just runs `f`.
 #[cfg(unix)]
-fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
+pub(crate) fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
     unsafe extern "C" {
@@ -938,7 +937,7 @@ fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
 }
 
 #[cfg(not(unix))]
-fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
+pub(crate) fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 

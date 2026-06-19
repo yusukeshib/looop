@@ -90,9 +90,9 @@ checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
 name = "babysit"
-version = "0.11.0"
+version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cebf06ea0abe6dc116ff973d0efe3942907ca6ea480cd96c79655dc70f6c1c08"
+checksum = "81a7a17b563cb5d3d755a6fda7f97e820b9e121ef74775e022cf838bc48590a6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -486,7 +486,7 @@ checksum = "953f07c43838f8e6f9758cab68bf5bed85465e7587ebe0b823f1bcd81978ad3a"
 
 [[package]]
 name = "looop"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "babysit",

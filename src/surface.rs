@@ -13,9 +13,11 @@ use std::process::{Command, Stdio};
 pub fn surface_attention(paths: &Paths) {
     let lhd = paths.looop_hint_env();
 
+    // Only LIVE flagged workers need you: a flag on an exited corpse is stale
+    // (you can't attach to a finished session), so it must not nag.
     let flagged: Vec<(String, String)> = session::list_workers(paths)
         .into_iter()
-        .filter(|s| s.flagged())
+        .filter(|s| s.flagged() && s.alive)
         .map(|s| (s.id.clone(), s.note.clone().unwrap_or_default()))
         .collect();
 
@@ -96,7 +98,7 @@ fn tmux_surface(paths: &Paths) {
 
     let flagged_ids: Vec<String> = session::list_workers(paths)
         .into_iter()
-        .filter(|s| s.flagged())
+        .filter(|s| s.flagged() && s.alive)
         .map(|s| s.id)
         .collect();
 

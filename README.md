@@ -3,8 +3,9 @@
 A tiny, portable, Kubernetes-shaped control loop for your work.
 
 `looop` watches the things you care about (GitHub, Linear, Grafana, …), and once
-per beat asks an LLM to make **exactly one move** toward your goals — then stops.
-It's a single self-contained binary with no daemon, no database, no server.
+per beat asks an LLM for **exactly one move** toward your goals — which looop
+then executes, and stops. It's a single self-contained binary with no daemon, no
+database, no server.
 
 ![looop running a tick](demo.png)
 
@@ -26,9 +27,10 @@ Like a Kubernetes controller, every **tick** reconciles *desired state* against
 2. DIFF     hash (PLAYBOOK + goals + snapshots + workers). Unchanged since
             last tick? → skip, no LLM call (cheap, level-triggered)
 3. DECIDE   hand the PLAYBOOK + goals + snapshots + live workers to the LLM;
-            it picks THE single most important move
-4. ACT      a small reversible action, edit a goal/sensor, or start a worker
-5. LOG      append one line to journal.md, surface anything that needs you
+            it emits THE single most important move as ONE typed action (JSON)
+4. ACT      looop — not the LLM — executes that one action: edit a goal/sensor/
+            PLAYBOOK, run one gated shell command, or start/steer a worker
+5. LOG      looop appends one line to journal.md, surfaces anything that needs you
 ```
 
 Each tick is **stateless and disposable**: the process carries nothing in
@@ -84,7 +86,8 @@ your real work. After that it just runs.
 ```sh
 looop up [--watch] [--json]    run the pulse as a detached background service
                                (--watch follows it; --json = NDJSON output)
-looop down                     stop the detached pulse service
+looop down [--keep-workers]    stop the pulse and its live workers
+                               (--keep-workers stops only the pulse)
 looop watch <id>               follow a session's output read-only (tail -f);
                                `looop watch pulse` watches the loop itself
 looop tick                     run a single beat and exit (debug / cron)

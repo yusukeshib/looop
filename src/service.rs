@@ -98,7 +98,31 @@ pub fn cmd_up(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 /// `looop down` — stop the pulse service. The single-instance lock left behind
 /// is stale-reclaimed on the next `looop up` (cmd_run checks pid liveness), so
 /// no extra cleanup is needed here.
-pub fn cmd_down(paths: &Paths) -> Result<ExitCode> {
+pub fn cmd_down(paths: &Paths, args: &[String]) -> Result<ExitCode> {
+    // "down" = stop looop AND everything it is running. A worker is a detached
+    // child of the loop; with the pulse gone, nothing would supervise, surface,
+    // or reap it, so leaving live workers behind is a surprising orphan. Kill
+    // them first. --keep-workers opts out (e.g. to bounce just the pulse).
+    let keep_workers = args.iter().any(|a| a == "--keep-workers");
+    if !keep_workers {
+        let live: Vec<String> = session::list_workers(paths)
+            .into_iter()
+            .filter(|s| s.alive)
+            .map(|s| s.id)
+            .collect();
+        for id in &live {
+            let _ = session::kill_quiet(paths, id);
+        }
+        if !live.is_empty() {
+            println!(
+                "looop: stopped {} worker{} ({})",
+                live.len(),
+                if live.len() == 1 { "" } else { "s" },
+                live.join(", ")
+            );
+        }
+    }
+
     // Only a LIVE pulse is something to stop. A leftover corpse (killed/exited)
     // isn't: prune it and report nothing-to-do, so a second `down` doesn't try
     // to re-kill a finished session and error.

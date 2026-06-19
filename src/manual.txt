@@ -31,12 +31,14 @@ ONE BEAT (a tick)
   1. run sensors/*.sh -> snapshot the world as JSON (fresh every tick)
   2. if nothing changed since last tick -> do nothing (cheap, no AI call)
   3. else hand PLAYBOOK + goals + sensor readings + sessions to the AI, which
-     makes EXACTLY ONE move and appends ONE line to journal.md
+     EMITS exactly ONE typed action (to .decision.json); looop executes it and
+     appends ONE line to journal.md
   4. the AI process is disposable — all memory is the files in the data dir
 
 RULES (the invariants that keep this safe and legible)
-  1. ONE TICK = ONE MOVE. The highest-priority move only; "do nothing" counts.
-     A runaway can do at most one thing per tick, and leaves one journal line.
+  1. ONE TICK = ONE MOVE — enforced. The AI only EMITS one typed action; looop is
+     the SOLE executor, so a tick does at most one move and leaves one journal
+     line no matter how the model misbehaves ("do nothing" = the noop action).
   2. THE PULSE IS UNBREAKABLE SHELL, JUDGMENT IS THE AI, MEMORY IS FILES. This
      program never "thinks"; it only gathers context and runs the AI once.
   3. NEVER DO IRREVERSIBLE THINGS AUTOMATICALLY (merge, public comments, closing

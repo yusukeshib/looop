@@ -11,13 +11,13 @@
 - [x] **C3. single-writer 不変条件を `looop run` が破る** — pulse 稼働中でも拒否せず
       並走し journal/goals/PLAYBOOK をレース。
       → *対応済み: `looop run <goal>` を全廃（#feat/remove-looop-run）。*
-- [ ] **C2. RULE 1「1 tick = 1 move」が harness で強制されていない** — tick runner は
-      `--dangerously-skip-permissions` でデータディレクトリ内・フルシェル権限。1 move も
-      irreversible 承認もプロンプトの honor system のみ。
-      `src/config.rs` (DEFAULT_CONFIG), `src/runner.rs` (run_streamed)
-      - [ ] tick をデフォルトで box / 制限環境で走らせる選択肢
-      - [ ] あるいは deny-list ラッパ（`rm -rf` / `git push` / `gh pr merge` / `kubectl delete` 等）
-      - [ ] ドキュメントを「強制」ではなく「規律」と正直に表記
+- [~] **C2. RULE 1「1 tick = 1 move」の強制** — typed-action 化で解決。decider は
+      `.decision.json` に1アクションを emit し、**looop が唯一の executor**。モデルが
+      暴走しても tick あたり1 move にコードで限定される（#feat/typed-action-executor）。
+      残タスク（完全サンドボックス化）：
+      - [ ] `run_shell` をコードでゲート（deny-list：rm -rf / git push / gh pr merge / kubectl delete 等）
+      - [ ] decider のツール権限を落とす（stage B：調査は sensor、出力は .decision.json のみ）
+      - [ ] `--dangerously-skip-permissions` を外す（上記が済めば不要に）
 
 ## 🟠 High — コスト暴走 / 堅牢性
 
