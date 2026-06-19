@@ -48,9 +48,9 @@
       `src/gate.rs`
 - [ ] **M4. 判断は弱モデル・実行は強モデル** — tick=sonnet/low、worker=opus/medium。
       全体を左右する「どの一手か」を一番弱いモデルが下す配分の再考。`src/config.rs`
-- [ ] **M5. config がプロファイル非スコープ** — `LOOOP_DATA_DIR` で分離してもconfigは共有。
-      プロファイル別 runner/model には `LOOOP_CONFIG` 上書きが必要。最低限ドキュメント注記。
-      `src/paths.rs`
+- [x] **M5. config がプロファイル非スコープ** — `LOOOP_DATA_DIR` で分離してもconfigは共有。
+      → *対応済み: config を `<data_dir>/looop.json` に移動。プロファイルを分ければ
+      config も自動で分かれる。明示の `$LOOOP_CONFIG` は引き続き最優先(配線共有用)。`src/paths.rs`*
 
 ## 🟢 Feature / UX
 

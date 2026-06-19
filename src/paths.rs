@@ -1,8 +1,8 @@
 //! Path + profile layer — a faithful port of the bash header's path block.
 //!
 //! CODE / CONFIG / DATA are cleanly separated and all overridable by env:
-//!   CONFIG  = $LOOOP_CONFIG          or ${XDG_CONFIG_HOME:-~/.config}/looop.json
 //!   DATA    = $LOOOP_DATA_DIR        or ${XDG_STATE_HOME:-~/.local/state}/looop
+//!   CONFIG  = $LOOOP_CONFIG          or <DATA>/looop.json (per-profile, M5)
 //!
 //! We intentionally do NOT use the `directories` crate: it maps XDG dirs to
 //! ~/Library/Application Support on macOS, which would diverge from the bash
@@ -48,9 +48,14 @@ impl Paths {
             _ => default_data.clone(),
         };
 
+        // Config lives INSIDE the data dir so a profile is fully self-contained
+        // (copy the dir = copy its runner wiring) and splitting LOOOP_DATA_DIR
+        // also splits the config — fixes M5 (config was profile-global). An
+        // explicit $LOOOP_CONFIG still wins for sharing one wiring across
+        // profiles.
         let config = match env::var_os("LOOOP_CONFIG") {
             Some(v) if !v.is_empty() => PathBuf::from(v),
-            _ => xdg("XDG_CONFIG_HOME", ".config").join("looop.json"),
+            _ => data_dir.join("looop.json"),
         };
 
         // Worker-fleet isolation: the session store ALWAYS lives inside this
