@@ -86,7 +86,8 @@ your real work. After that it just runs.
 ```sh
 looop up [--watch] [--json]    run the pulse as a detached background service
                                (--watch follows it; --json = NDJSON output)
-looop down                     stop the detached pulse service
+looop down [--keep-workers]    stop the pulse and its live workers
+                               (--keep-workers stops only the pulse)
 looop watch <id>               follow a session's output read-only (tail -f);
                                `looop watch pulse` watches the loop itself
 looop tick                     run a single beat and exit (debug / cron)

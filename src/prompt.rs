@@ -149,9 +149,12 @@ pub fn build_prompt(paths: &Paths, snap_dir: &Path) -> String {
                 .exit_code
                 .map(|c| format!(" exit {c}"))
                 .unwrap_or_default();
+            // Show the ⚑ only for a LIVE worker: a flag on an exited corpse is
+            // stale, and surfacing it would make the pulse think a finished
+            // worker is still waiting for a human.
             let note = match &s.note {
-                Some(n) => format!("  ⚑ {n}"),
-                None => String::new(),
+                Some(n) if s.alive => format!("  ⚑ {n}"),
+                _ => String::new(),
             };
             let _ = writeln!(out, "- {} [{}{}]{}", s.id, s.state, exit, note);
         }

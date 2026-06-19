@@ -19,7 +19,8 @@ Usage:
                                 pulse emit NDJSON to its log (agent-readable);
                                 --watch follows that output after starting.
                                 Idempotent: a live pulse is left running.
-  looop down                     stop the detached pulse service
+  looop down [--keep-workers]    stop the pulse AND its live workers
+                                (--keep-workers stops only the pulse)
   looop watch <id>               follow a session's output read-only, like
                                 tail -f (Ctrl-C to stop). `looop watch pulse`
                                 watches the loop itself. No input — use attach
