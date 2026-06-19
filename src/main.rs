@@ -3,10 +3,12 @@
 //! Rust port. The pulse is unbreakable code, judgment is the AI, memory is the
 //! files in the data dir (RULE 2). babysit is linked as a LIBRARY and driven
 //! entirely in-process —
-//! list/prune/status/kill/flag/unflag/attach AND detached worker spawn all run
-//! through the library, no `babysit` binary. The one process re-exec is the
-//! detached supervisor: babysit's detacher re-execs looop itself (current_exe)
-//! as the headless worker supervisor (`looop run --detached-id <id> -- <cmd>`).
+//! list/prune/status/kill/flag/unflag/attach AND detached spawn all run through
+//! the library, no `babysit` binary. The one process re-exec is babysit's
+//! detacher re-execing looop itself (current_exe) as the headless session
+//! supervisor (`looop run --detached-id <id> -- <cmd>`). That ONE path
+//! supervises both kinds of detached session: a worker (cmd is the agent) and
+//! the pulse (cmd is `looop _pulse`, the reconcile-loop body).
 
 mod config;
 mod cost;
@@ -64,10 +66,11 @@ fn main() -> ExitCode {
             println!("looop {}", env!("CARGO_PKG_VERSION"));
             Ok(ExitCode::SUCCESS)
         }
-        // Hidden: babysit's detacher re-execs us as the headless worker
-        // supervisor (`looop run --detached-id <id> -- <cmd>`). Route straight
-        // to serve_worker; no deps check, no pulse.
-        "run" | "loop" if rest.first().map(String::as_str) == Some("--detached-id") => {
+        // Hidden: babysit's detacher re-execs us as the headless session
+        // supervisor (`looop run --detached-id <id> -- <cmd>`), for BOTH workers
+        // and the pulse. babysit hard-codes the `run` verb. Route straight to
+        // the supervisor; no deps check, no pulse.
+        "run" if rest.first().map(String::as_str) == Some("--detached-id") => {
             session::run_detached_worker(rest).map(|c| ExitCode::from(c.clamp(0, 255) as u8))
         }
         // A leading flag with no verb is still the foreground serve (`looop --json`).

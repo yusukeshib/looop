@@ -68,14 +68,17 @@ actions (merges, deploys, deletes) always require your explicit approval.
 ## Quick start
 
 ```sh
-looop up            # start the pulse as a background service (looop down to stop)
-looop up --watch    # start it and follow its output (Ctrl-C stops watching, not the pulse)
-looop watch pulse   # follow a running pulse's output any time
+looop               # run the loop in the FOREGROUND: start the pulse, stream it,
+                    # and tear it (and its workers) down on Ctrl-C
+looop --json        # same, but emit machine-readable NDJSON to the pulse's log
+looop watch pulse   # follow a running pulse's output read-only, any time
 ```
 
-The pulse always runs detached now (supervised in the background) — there is no foreground
-`looop run`. Watch it live with `looop up --watch` / `looop watch pulse`, or add
-`--json` for a machine-readable NDJSON stream.
+The loop runs in the foreground: a bare `looop` brings the pulse up as a
+supervised session, streams its output, and on exit (Ctrl-C, or the pulse dying)
+tears the pulse AND its workers down. There is no detached up/down pair — to run
+it unattended, background the command (`looop &` / `nohup looop &`). Add `--json`
+for a machine-readable NDJSON stream.
 
 On the first run the loop seeds a starter PLAYBOOK and a `setup` goal whose only
 job is to **interview you** and rewrite the PLAYBOOK, goals, and sensors to match
@@ -84,10 +87,10 @@ your real work. After that it just runs.
 ## Commands
 
 ```sh
-looop up [--watch] [--json]    run the pulse as a detached background service
-                               (--watch follows it; --json = NDJSON output)
-looop down [--keep-workers]    stop the pulse and its live workers
-                               (--keep-workers stops only the pulse)
+looop [--json]                 run the loop in the FOREGROUND: bring the pulse up,
+                               stream it, and tear pulse + workers down on exit
+                               (Ctrl-C, or the pulse dying). --json = NDJSON
+                               output. Background it (looop &) to run unattended.
 looop watch <id>               follow a session's output read-only (tail -f);
                                `looop watch pulse` watches the loop itself
 looop status [--json]          structured snapshot of the loop's live state

@@ -1,9 +1,14 @@
 //! LLM cost accounting + the progressive output formatter (`looop _fmt`).
 //!
-//! Every AI call is metered through one of two seams: the tick/goal runner
-//! (piped through `_fmt`, which sums per-message USD) and worker sessions (which
-//! self-report via `looop _cost`). Both append one JSON line to the cost ledger.
-//! `looop cost` reports over it.
+//! Spend reaches the ledger through two seams — INTENTIONALLY two, because the
+//! two AI process models are different, not because the logic is duplicated:
+//!   • tick / goal runs are one-shot, non-interactive, and looop owns their
+//!     stdout, so we pipe them through `_fmt`, which renders progress live AND
+//!     meters spend off the same NDJSON stream (see `CostMeter`).
+//!   • worker sessions are long-lived, interactive, and self-supervising — looop
+//!     never pipes their stdout, so the agent self-reports its own total via
+//!     `looop _cost` at end-of-session.
+//! Both append one JSON line to the cost ledger; `looop cost` reports over it.
 
 use crate::config::Config;
 use crate::paths::Paths;
@@ -79,16 +84,56 @@ pub fn cmd_cost_record(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `looop _fmt` — read a `pi --mode json` NDJSON stream on stdin, print friendly
-/// progress live, and (when LOOOP_COST_* is set) meter spend into the ledger.
+/// Accumulates LLM spend from a runner's NDJSON stream. The two supported tick
+/// runners report cost in different shapes, so the meter keeps both readings and
+/// resolves them at the end (H3):
+///   • pi (`--mode json`) emits per-message `usage.cost.total` — we SUM them.
+///   • claude (`--output-format stream-json`) emits ONE `result.total_cost_usd`
+///     that is already the CUMULATIVE run total — we take it verbatim.
+/// claude's authoritative total wins when present, so the two readings are never
+/// added together (no double counting); pi's running sum is the fallback.
+#[derive(Default)]
+struct CostMeter {
+    pi_sum: f64,
+    claude_total: Option<f64>,
+}
+
+impl CostMeter {
+    /// Fold one NDJSON line into the running cost. Non-JSON lines and events
+    /// without usage data are ignored.
+    fn ingest(&mut self, line: &str) {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            return;
+        };
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("message_end") => {
+                self.pi_sum += v
+                    .pointer("/usage/cost/total")
+                    .and_then(|c| c.as_f64())
+                    .unwrap_or(0.0);
+            }
+            Some("result") => {
+                if let Some(c) = v.get("total_cost_usd").and_then(|c| c.as_f64()) {
+                    self.claude_total = Some(c);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The resolved spend for the run: claude's authoritative cumulative total
+    /// when present, else pi's per-message sum.
+    fn total(&self) -> f64 {
+        self.claude_total.unwrap_or(self.pi_sum)
+    }
+}
+
+/// `looop _fmt` — read a runner's NDJSON stream on stdin, print friendly progress
+/// live, and (when LOOOP_COST_* is set) meter spend into the ledger. The two
+/// responsibilities are kept separate: `format_line` renders, `CostMeter` meters.
 pub fn cmd_fmt(paths: &Paths) -> Result<ExitCode> {
     let metering = std::env::var("LOOOP_COST_KIND").is_ok();
-    // pi emits per-message usage we SUM; claude (stream-json) emits one final
-    // `result` event with a CUMULATIVE total_cost_usd we take as-is. Tracking
-    // them separately lets one `_fmt` meter either runner (H3) — the claude
-    // total, when present, wins so we never double-count.
-    let mut pi_total = 0.0f64;
-    let mut claude_total: Option<f64> = None;
+    let mut meter = CostMeter::default();
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
 
@@ -98,32 +143,16 @@ pub fn cmd_fmt(paths: &Paths) -> Result<ExitCode> {
             let _ = writeln!(stdout, "{rendered}");
             let _ = stdout.flush();
         }
-        if metering && let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) {
-            match v.get("type").and_then(|t| t.as_str()) {
-                // pi --mode json: sum per-message cost.
-                Some("message_end") => {
-                    pi_total += v
-                        .pointer("/usage/cost/total")
-                        .and_then(|c| c.as_f64())
-                        .unwrap_or(0.0);
-                }
-                // claude --output-format stream-json: single cumulative total.
-                Some("result") => {
-                    if let Some(c) = v.get("total_cost_usd").and_then(|c| c.as_f64()) {
-                        claude_total = Some(c);
-                    }
-                }
-                _ => {}
-            }
+        if metering {
+            meter.ingest(&line);
         }
     }
 
     if metering {
-        let total = claude_total.unwrap_or(pi_total);
         let kind = std::env::var("LOOOP_COST_KIND").unwrap_or_default();
         let id = std::env::var("LOOOP_COST_ID").unwrap_or_default();
         let runner = std::env::var("LOOOP_COST_RUNNER").unwrap_or_default();
-        record_cost(paths, &kind, &id, &runner, &format!("{total:.6}"));
+        record_cost(paths, &kind, &id, &runner, &format!("{:.6}", meter.total()));
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -353,6 +382,38 @@ mod tests {
         // Unknown event types emit nothing.
         let other = json!({ "type": "session_start" }).to_string();
         assert_eq!(format_line(&other), None);
+    }
+
+    #[test]
+    fn cost_meter_sums_pi_per_message_usage() {
+        let mut m = CostMeter::default();
+        m.ingest(r#"{"type":"message_end","usage":{"cost":{"total":0.10}}}"#);
+        m.ingest(r#"{"type":"message_end","usage":{"cost":{"total":0.25}}}"#);
+        m.ingest(r#"{"type":"tool_execution_start"}"#); // no usage — ignored
+        m.ingest("not json"); // ignored
+        assert!((m.total() - 0.35).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_meter_takes_claude_cumulative_total_verbatim() {
+        let mut m = CostMeter::default();
+        m.ingest(r#"{"type":"result","total_cost_usd":1.23}"#);
+        assert!((m.total() - 1.23).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_meter_claude_total_wins_and_never_adds_to_pi_sum() {
+        // A stream carrying both shapes must NOT double-count: claude's
+        // authoritative cumulative total wins, pi's per-message sum is dropped.
+        let mut m = CostMeter::default();
+        m.ingest(r#"{"type":"message_end","usage":{"cost":{"total":0.50}}}"#);
+        m.ingest(r#"{"type":"result","total_cost_usd":2.00}"#);
+        assert!((m.total() - 2.00).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_meter_empty_stream_is_zero() {
+        assert_eq!(CostMeter::default().total(), 0.0);
     }
 
     #[test]

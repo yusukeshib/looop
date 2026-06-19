@@ -228,12 +228,16 @@ pub fn tick(paths: &Paths) -> bool {
         None
     };
 
-    let mut acted = false;
-    match (runner_ok, outcome) {
+    // A beat SUCCEEDS only when a usable decision was produced: commit the world
+    // hash, clear backoff, journal the move. Every other outcome (bad decision /
+    // no decision / runner crash) is a failure that arms exponential backoff
+    // (H1) and leaves the hash uncommitted so a transient issue retries — the
+    // three failure shapes share that handling and differ only in how the log
+    // line reads.
+    let acted = match (runner_ok, outcome) {
         (true, Some(Ok(d))) => {
             let _ = fs::write(paths.data_dir.join(".last-tick-hash"), format!("{hash}\n"));
             clear_backoff(paths);
-            acted = true;
             let cost = tick_cost(paths, &cost_id);
             let cost_str = cost.map(|c| format!(" · ${c:.4}")).unwrap_or_default();
             util::event(
@@ -254,68 +258,52 @@ pub fn tick(paths: &Paths) -> bool {
                 "decided",
                 serde_json::json!({ "run_id": cost_id, "action": d.kind, "journal": d.journal }),
             );
+            true
         }
-        (true, Some(Err(e))) => {
+        failure => {
             let fails = record_backoff(paths, &hash);
-            util::event(
-                Level::Error,
-                "tick.failed",
-                &format!(
-                    "decision failed after {secs}s (fail #{fails}): {e} · replay: {}",
-                    run_dir.display()
+            let replay = run_dir.display().to_string();
+            let mut fields = vec![
+                ("secs", serde_json::json!(secs)),
+                ("run_id", serde_json::json!(cost_id)),
+                ("fails", serde_json::json!(fails)),
+            ];
+            let (level, code, msg) = match failure {
+                (true, Some(Err(e))) => {
+                    fields.push(("error", serde_json::json!(e.to_string())));
+                    (
+                        Level::Error,
+                        "tick.failed",
+                        format!(
+                            "decision failed after {secs}s (fail #{fails}): {e} · replay: {replay}"
+                        ),
+                    )
+                }
+                (true, None) => (
+                    Level::Warn,
+                    "tick.no_decision",
+                    format!(
+                        "ran {secs}s but emitted no .decision.json (no move, fail #{fails}) · replay: {replay}"
+                    ),
                 ),
-                &[
-                    ("secs", serde_json::json!(secs)),
-                    ("run_id", serde_json::json!(cost_id)),
-                    ("error", serde_json::json!(e.to_string())),
-                    ("fails", serde_json::json!(fails)),
-                ],
-            );
+                _ => {
+                    fields.push(("replay", serde_json::json!(replay.clone())));
+                    (
+                        Level::Error,
+                        "tick.failed",
+                        format!("tick failed after {secs}s (fail #{fails}) · replay: {replay}"),
+                    )
+                }
+            };
+            util::event(level, code, &msg, &fields);
             events::emit(
                 paths,
                 "tick_failed",
                 serde_json::json!({ "run_id": cost_id }),
             );
+            false
         }
-        (true, None) => {
-            let fails = record_backoff(paths, &hash);
-            util::event(
-                Level::Warn,
-                "tick.no_decision",
-                &format!(
-                    "ran {secs}s but emitted no .decision.json (no move, fail #{fails}) · replay: {}",
-                    run_dir.display()
-                ),
-                &[
-                    ("secs", serde_json::json!(secs)),
-                    ("run_id", serde_json::json!(cost_id)),
-                    ("fails", serde_json::json!(fails)),
-                ],
-            );
-        }
-        (false, _) => {
-            let fails = record_backoff(paths, &hash);
-            util::event(
-                Level::Error,
-                "tick.failed",
-                &format!(
-                    "tick failed after {secs}s (fail #{fails}) · replay: {}",
-                    run_dir.display()
-                ),
-                &[
-                    ("secs", serde_json::json!(secs)),
-                    ("run_id", serde_json::json!(cost_id)),
-                    ("replay", serde_json::json!(run_dir.display().to_string())),
-                    ("fails", serde_json::json!(fails)),
-                ],
-            );
-            events::emit(
-                paths,
-                "tick_failed",
-                serde_json::json!({ "run_id": cost_id }),
-            );
-        }
-    }
+    };
 
     prune_runs(paths);
     acted

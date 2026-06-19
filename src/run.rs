@@ -126,12 +126,17 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
 
     loop {
         let acted = tick::tick(paths);
-        let mut want = if acted {
-            busy
+
+        // Pick the base cadence ONCE: a beat that moved is "busy"; otherwise a
+        // live worker keeps us "active"; an idle world waits the longest. Both
+        // the interval and its label come from this single classification, so
+        // any_worker_alive() is probed at most once per beat (not twice).
+        let (mut want, mut reason) = if acted {
+            (busy, "busy")
         } else if session::any_worker_alive(paths) {
-            active
+            (active, "active")
         } else {
-            idle
+            (idle, "idle")
         };
 
         // One-shot AI cadence override via .next-interval (clamped 5..3600).
@@ -151,15 +156,9 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
                     ],
                 );
                 want = req;
+                reason = "override";
             }
         }
-        let reason = if acted {
-            "busy"
-        } else if session::any_worker_alive(paths) {
-            "active"
-        } else {
-            "idle"
-        };
         util::event(
             Level::Info,
             "sleep",
