@@ -160,13 +160,35 @@ fn full_session(id: &str) -> String {
     id.strip_prefix("looop-").unwrap_or(id).to_string()
 }
 
+/// The pulse is the control loop, NOT a worker: refuse worker-management verbs
+/// aimed at it so a stray `looop kill pulse` / `attach pulse` can't decapitate
+/// or hijack the loop. Observe it with `looop watch`/`log`; control it with
+/// `looop up`/`down`. Returns true (and prints guidance) when `session` is the
+/// reserved pulse id — the caller should then bail with a non-zero code.
+fn reject_pulse(session: &str, verb: &str) -> bool {
+    if session == PULSE_SESSION {
+        eprintln!(
+            "looop {verb}: '{PULSE_SESSION}' is the control loop, not a worker — observe it with \
+             `looop watch {PULSE_SESSION}` / `looop log {PULSE_SESSION}`, control it with \
+             `looop up` / `looop down`"
+        );
+        true
+    } else {
+        false
+    }
+}
+
 /// `looop attach <id>` — attach the terminal to a worker session (in-process).
 pub fn cmd_attach(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     let Some(id) = args.first() else {
         eprintln!("usage: looop attach <id>");
         return Ok(ExitCode::from(1));
     };
-    let code = attach(paths, &full_session(id))?;
+    let session = full_session(id);
+    if reject_pulse(&session, "attach") {
+        return Ok(ExitCode::from(1));
+    }
+    let code = attach(paths, &session)?;
     Ok(ExitCode::from(code.clamp(0, 255) as u8))
 }
 
@@ -176,7 +198,11 @@ pub fn cmd_kill(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         eprintln!("usage: looop kill <id>");
         return Ok(ExitCode::from(1));
     };
-    kill(paths, &full_session(id))?;
+    let session = full_session(id);
+    if reject_pulse(&session, "kill") {
+        return Ok(ExitCode::from(1));
+    }
+    kill(paths, &session)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -191,7 +217,11 @@ pub fn cmd_flag(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     } else {
         None
     };
-    flag(paths, &full_session(id), message)?;
+    let session = full_session(id);
+    if reject_pulse(&session, "flag") {
+        return Ok(ExitCode::from(1));
+    }
+    flag(paths, &session, message)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -201,7 +231,11 @@ pub fn cmd_unflag(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         eprintln!("usage: looop unflag <id>");
         return Ok(ExitCode::from(1));
     };
-    unflag(paths, &full_session(id))?;
+    let session = full_session(id);
+    if reject_pulse(&session, "unflag") {
+        return Ok(ExitCode::from(1));
+    }
+    unflag(paths, &session)?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -335,9 +369,13 @@ pub fn cmd_send(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     let newline = !(has(args, "-n") || has(args, "--no-newline"));
+    let session = full_session(id);
+    if reject_pulse(&session, "send") {
+        return Ok(ExitCode::from(1));
+    }
     send(
         paths,
-        &full_session(id),
+        &session,
         text.join(" "),
         newline,
         has(args, "--json"),
@@ -356,7 +394,11 @@ pub fn cmd_key(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         eprintln!("usage: looop key <id> <KEY...>   (e.g. looop key foo Enter C-c)");
         return Ok(ExitCode::from(1));
     }
-    key(paths, &full_session(id), keys.to_vec(), has(args, "--json"))?;
+    let session = full_session(id);
+    if reject_pulse(&session, "key") {
+        return Ok(ExitCode::from(1));
+    }
+    key(paths, &session, keys.to_vec(), has(args, "--json"))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -417,7 +459,11 @@ pub fn cmd_resize(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         eprintln!("usage: looop resize <id> <COLSxROWS>   (e.g. looop resize foo 120x40)");
         return Ok(ExitCode::from(1));
     };
-    resize(paths, &full_session(id), size.clone(), has(args, "--json"))?;
+    let session = full_session(id);
+    if reject_pulse(&session, "resize") {
+        return Ok(ExitCode::from(1));
+    }
+    resize(paths, &session, size.clone(), has(args, "--json"))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -427,7 +473,11 @@ pub fn cmd_restart(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         eprintln!("usage: looop restart <id>");
         return Ok(ExitCode::from(1));
     };
-    restart(paths, &full_session(&id), has(args, "--json"))?;
+    let session = full_session(&id);
+    if reject_pulse(&session, "restart") {
+        return Ok(ExitCode::from(1));
+    }
+    restart(paths, &session, has(args, "--json"))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -437,7 +487,11 @@ pub fn cmd_detach(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         eprintln!("usage: looop detach <id>");
         return Ok(ExitCode::from(1));
     };
-    detach(paths, &full_session(&id), has(args, "--json"))?;
+    let session = full_session(&id);
+    if reject_pulse(&session, "detach") {
+        return Ok(ExitCode::from(1));
+    }
+    detach(paths, &session, has(args, "--json"))?;
     Ok(ExitCode::SUCCESS)
 }
 
