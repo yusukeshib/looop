@@ -146,7 +146,17 @@ fn with_trailing_newline(body: &str) -> String {
 /// Execute the decided action deterministically. Returns a short human summary
 /// of what was done (used for the journal fallback + stdout rendering). The
 /// caller owns appending the journal line and applying `next_interval_s`.
+///
+/// The executor is SILENT on stdout — looop renders the returned summary. Some
+/// underlying calls (the worker spawn's `started …` banner, babysit's
+/// send/key/restart chatter) print CLI-friendly lines; we suppress fd 1 around
+/// them so raw text never leaks into the pulse's structured — and under
+/// `--json`, NDJSON — stream.
 pub fn execute(paths: &Paths, action: &Action) -> Result<String> {
+    session::suppress_stdout(|| execute_inner(paths, action))
+}
+
+fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
     match action {
         Action::Noop { reason } => Ok(if reason.is_empty() {
             "noop".into()

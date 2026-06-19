@@ -911,7 +911,7 @@ pub fn run_detached_worker(args: &[String]) -> anyhow::Result<i32> {
 /// restore it. Used to swallow babysit's parent-path banner while keeping
 /// looop's own output. Unix-only; a no-op redirect failure just runs `f`.
 #[cfg(unix)]
-fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
+pub(crate) fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
     unsafe extern "C" {
@@ -938,7 +938,7 @@ fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
 }
 
 #[cfg(not(unix))]
-fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
+pub(crate) fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
