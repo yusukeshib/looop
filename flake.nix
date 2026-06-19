@@ -17,7 +17,7 @@
         # (pi/claude) is the user's to provide.
         looop = pkgs.rustPlatform.buildRustPackage {
           pname = "looop";
-          version = "0.5.2";
+          version = "0.6.0";
           src = ./.;
 
           cargoLock.lockFile = ./Cargo.lock;

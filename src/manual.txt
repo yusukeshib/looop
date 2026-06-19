@@ -11,7 +11,7 @@ THE IDEA
     Kubernetes            looop
     ----------            -----
     desired state (YAML)  goals/*.md         how things should be (inert files)
-    etcd                  git (the data dir) PLAYBOOK + goals + journal = memory
+    etcd                  the data dir       PLAYBOOK + goals + journal = memory
     informers / watch     sensors/*.sh       scripts that print the world as JSON
     reconcile loop        the pulse (looop up) observe -> diff -> one move per tick
     scheduler policy      PLAYBOOK.md        priorities + guardrails, in prose
@@ -37,7 +37,7 @@ ONE BEAT (a tick)
 RULES (the invariants that keep this safe and legible)
   1. ONE TICK = ONE MOVE. The highest-priority move only; "do nothing" counts.
      A runaway can do at most one thing per tick, and leaves one journal line.
-  2. THE PULSE IS UNBREAKABLE SHELL, JUDGMENT IS THE AI, MEMORY IS GIT. This
+  2. THE PULSE IS UNBREAKABLE SHELL, JUDGMENT IS THE AI, MEMORY IS FILES. This
      program never "thinks"; it only gathers context and runs the AI once.
   3. NEVER DO IRREVERSIBLE THINGS AUTOMATICALLY (merge, public comments, closing
      issues, deleting data). Prepare fully, then a worker session raises a
@@ -73,9 +73,9 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
   EXEC    this one binary                          the program (portable)
   CONFIG  ${XDG_CONFIG_HOME:-~/.config}/looop.json  one file: runner wiring
           └ override with $LOOOP_CONFIG            (seeded inline if absent)
-  DATA    ${XDG_STATE_HOME:-~/.local/state}/looop/  the git-tracked memory
+  DATA    ${XDG_STATE_HOME:-~/.local/state}/looop/  the file-based memory
           └ override with $LOOOP_DATA_DIR
-            PLAYBOOK.md  goals/  journal.md  sensors/*.sh   <- commit these
+            PLAYBOOK.md  goals/  journal.md  sensors/*.sh   <- the durable memory
             snapshots/ prompts/ runs/ .lock .last-tick-hash <- scratch
             sessions/<id>/  <- worker + pulse sessions (babysit state, per
                                profile; no $BABYSIT_DIR, no shared ~/.babysit).

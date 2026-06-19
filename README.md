@@ -41,7 +41,7 @@ exactly where the world is, not where a remembered cursor left off.
 
 ## Concepts
 
-Everything lives as plain files in the data dir (a git repo = the loop's memory):
+Everything lives as plain files in the data dir (the loop's memory):
 
 | File / dir      | Role (Kubernetes analogy)                                          |
 | --------------- | ------------------------------------------------------------------ |
@@ -87,7 +87,6 @@ looop up [--watch] [--json]    run the pulse as a detached background service
 looop down                     stop the detached pulse service
 looop watch <id>               follow a session's output read-only (tail -f);
                                `looop watch pulse` watches the loop itself
-looop run <goal-id>            force ONE move for a goal NOW (manual override)
 looop tick                     run a single beat and exit (debug / cron)
 looop status [--json]          structured snapshot of the loop's live state
                                (for an external observer / AI watching it)
@@ -119,10 +118,9 @@ eval "$(looop config bash)"
 ```
 
 This adds tab completion for every subcommand plus dynamic completion for
-`looop run <goal-id>` (your `goals/*.md`) and `looop attach|kill|flag|unflag
-<id>` (this profile's live worker sessions). Completions resolve `LOOOP_DATA_DIR`
-the same way the binary does, so an isolated profile completes its own goals and
-sessions.
+`looop attach|kill|flag|unflag <id>` (this profile's live worker sessions).
+Completions resolve `LOOOP_DATA_DIR` the same way the binary does, so an isolated
+profile completes its own sessions.
 
 To change judgment: edit `PLAYBOOK.md` — it takes effect next tick.
 
@@ -190,5 +188,5 @@ pulse.)
   self-contained. Pointing `LOOOP_DATA_DIR` elsewhere gives you an isolated
   **profile** with its own sessions.
 
-LLM spend is metered automatically (ticks, manual runs, and self-reporting
-workers) into an append-only ledger; see `looop cost`.
+LLM spend is metered automatically (ticks and self-reporting workers) into an
+append-only ledger; see `looop cost`.

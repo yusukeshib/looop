@@ -73,7 +73,7 @@ pub fn tick(paths: &Paths) -> bool {
     let run_dir = paths.runs_dir().join(&cost_id);
     let _ = fs::create_dir_all(&run_dir);
     let prompt_file = run_dir.join("prompt.md");
-    let _ = fs::write(&prompt_file, prompt::build_prompt(paths, None, &snap));
+    let _ = fs::write(&prompt_file, prompt::build_prompt(paths, &snap));
 
     let t0 = Instant::now();
     util::event(
@@ -104,7 +104,7 @@ pub fn tick(paths: &Paths) -> bool {
     ];
 
     let mut acted = false;
-    if runner::run_streamed(paths, &tick_cmd, &prompt_file, &cost_env, &tee, false) {
+    if runner::run_streamed(paths, &tick_cmd, &prompt_file, &cost_env, &tee) {
         let _ = fs::write(paths.data_dir.join(".last-tick-hash"), format!("{hash}\n"));
         acted = true;
         let last_line = journal_tail(paths);

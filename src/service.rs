@@ -127,8 +127,9 @@ pub fn cmd_down(paths: &Paths) -> Result<ExitCode> {
     }
 }
 
-/// `looop _pulse` (internal) — the headless pulse body babysit wraps. Identical
-/// to the foreground `looop run`; the only difference is who owns the terminal.
+/// `looop _pulse` (internal) — the headless pulse body babysit wraps. It is just
+/// the reconcile loop (`run::cmd_run`) running under a PTY; `looop up` is how a
+/// user starts it.
 pub fn cmd_pulse(paths: &Paths) -> Result<ExitCode> {
     run::cmd_run(paths)
 }

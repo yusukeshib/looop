@@ -1,30 +1,10 @@
 #compdef looop
 
-# Resolve looop's data dir the same way paths.rs does:
-#   $LOOOP_DATA_DIR  or  ${XDG_STATE_HOME:-$HOME/.local/state}/looop
-__looop_data_dir() {
-    local default="${XDG_STATE_HOME:-$HOME/.local/state}/looop"
-    print -r -- "${LOOOP_DATA_DIR:-$default}"
-}
-
 # Resolve the session-fleet dir the same way paths.rs does: sessions live at
 # <LOOOP_DATA_DIR>/sessions/<id> (the fleet root is the data dir itself).
 __looop_sessions_dir() {
     local default="${XDG_STATE_HOME:-$HOME/.local/state}/looop"
     print -r -- "${LOOOP_DATA_DIR:-$default}/sessions"
-}
-
-# Goal ids = goals/<id>.md basenames (also goals/archive/<id>.md).
-__looop_goals() {
-    local -a goals
-    local data g name
-    data=$(__looop_data_dir)
-    for g in "$data"/goals/*.md(N) "$data"/goals/archive/*.md(N); do
-        name=${g:t}
-        name=${name%.md}
-        [[ -n "$name" ]] && goals+=("$name")
-    done
-    (( ${#goals} )) && _describe 'goal' goals
 }
 
 # Worker session ids = session dirs, minus the pulse.
@@ -69,7 +49,6 @@ _looop() {
                 'up:Run the pulse as a detached background service'
                 'down:Stop the detached pulse service'
                 'watch:Follow a session output read-only (tail -f)'
-                'run:Force ONE goal now (manual override)'
                 'tick:Run a single beat and exit (debug / cron)'
                 'ls:List this profile worker sessions'
                 'status:Structured snapshot of the loop state'
@@ -98,9 +77,6 @@ _looop() {
             ;;
         args)
             case $words[1] in
-                run)
-                    (( CURRENT == 2 )) && __looop_goals
-                    ;;
                 up)
                     _arguments \
                         '(-w --watch)'{-w,--watch}'[Follow the pulse output after starting]' \

@@ -15,7 +15,7 @@ use std::path::PathBuf;
 pub struct Paths {
     /// The looop binary's own absolute path (exported to workers as $LOOOP_BIN).
     pub bin: PathBuf,
-    /// The git-tracked memory dir ($LOOOP_DATA_DIR).
+    /// The file-based memory dir ($LOOOP_DATA_DIR).
     pub data_dir: PathBuf,
     /// The single runner-wiring config file ($LOOOP_CONFIG).
     pub config: PathBuf,

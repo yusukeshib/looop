@@ -1,7 +1,8 @@
 //! looop — a tiny, portable, Kubernetes-shaped control loop for your work.
 //!
-//! Rust port. The pulse is unbreakable code, judgment is the AI, memory is git
-//! (RULE 2). babysit is linked as a LIBRARY and driven entirely in-process —
+//! Rust port. The pulse is unbreakable code, judgment is the AI, memory is the
+//! files in the data dir (RULE 2). babysit is linked as a LIBRARY and driven
+//! entirely in-process —
 //! list/prune/status/kill/flag/unflag/attach AND detached worker spawn all run
 //! through the library, no `babysit` binary. The one process re-exec is the
 //! detached supervisor: babysit's detacher re-execs looop itself (current_exe)
@@ -39,12 +40,12 @@ fn main() -> ExitCode {
     util::init_color();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // A bare `looop` is invalid: with `up` / `watch` / `run` all explicit, a
-    // no-arg invocation silently launching a foreground infinite loop is more
-    // surprising than helpful. Require a verb (foreground pulse = `looop run`).
+    // A bare `looop` is invalid: with `up` / `watch` / `tick` all explicit, a
+    // no-arg invocation silently doing something is more surprising than
+    // helpful. Require a verb (start the pulse with `looop up`).
     let Some(cmd) = args.first().map(String::as_str) else {
         eprintln!(
-            "looop: no command — try: up [--watch], down, watch <id>, run <goal>, tick, ls, status, log, send, key, attach, kill, flag, unflag, prune, help"
+            "looop: no command — try: up [--watch], down, watch <id>, tick, ls, status, log, send, key, attach, kill, flag, unflag, prune, help"
         );
         return ExitCode::from(1);
     };
@@ -65,19 +66,6 @@ fn main() -> ExitCode {
         "run" | "loop" if rest.first().map(String::as_str) == Some("--detached-id") => {
             session::run_detached_worker(rest).map(|c| ExitCode::from(c.clamp(0, 255) as u8))
         }
-        // `looop run <goal>` is the manual one-shot (forced single move). A bare
-        // `looop run` (foreground pulse) is gone: the pulse only ever runs as a
-        // detached service now — `looop up` (watch it with `--watch`).
-        "run" | "loop" => deps::require_deps(&paths).and_then(|_| match rest.first() {
-            Some(goal) => run::cmd_run_goal(&paths, goal),
-            None => {
-                eprintln!(
-                    "looop run: needs a goal id (manual one-shot). Start the pulse with: looop up"
-                );
-                eprintln!("  e.g. looop run setup");
-                Ok(ExitCode::from(1))
-            }
-        }),
         "tick" => deps::require_deps(&paths).and_then(|_| tick::cmd_tick(&paths)),
         // The pulse-as-a-service trio + its read-only window.
         "up" => deps::require_deps(&paths).and_then(|_| service::cmd_up(&paths, rest)),
@@ -130,7 +118,7 @@ fn main() -> ExitCode {
         "_cost" => cost::cmd_cost_record(&paths, rest),
         other => {
             eprintln!(
-                "looop: unknown command '{other}' (try: up [--watch], down, watch <id>, run <goal>, tick, ls, status, log, shot, send, key, expect, wait, wait-idle, resize, restart, attach, detach, kill, flag, unflag, prune, help)"
+                "looop: unknown command '{other}' (try: up [--watch], down, watch <id>, tick, ls, status, log, shot, send, key, expect, wait, wait-idle, resize, restart, attach, detach, kill, flag, unflag, prune, help)"
             );
             Ok(ExitCode::from(1))
         }

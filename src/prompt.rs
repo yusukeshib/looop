@@ -10,16 +10,6 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-const MANUAL_RUN: &str = r#"=== MANUAL RUN (human override) ===
-The human explicitly asked you to act on the goal "__FOCUS__" RIGHT NOW. IGNORE the
-normal priority order AND the "do nothing" option: make the single most important
-move FOR THAT GOAL this run (often: start its worker session, or a small direct
-action / file edit). The PLAYBOOK, the OTHER goals, sensor readings and sessions
-below are CONTEXT to inform that move — act on "__FOCUS__", not on them. Still obey
-every rule & guardrail, and still append exactly ONE line to journal.md.
-
-"#;
-
 const INSTRUCTIONS: &str = r#"You are "looop", a personal operations agent. This is one tick of a loop; your
 process is disposable. Your working directory is the loop's DATA dir
 (__DATA__): goals/, journal.md and sensors/ are here; edit with relative paths.
@@ -94,12 +84,8 @@ fn tail_lines(text: &str, n: usize) -> String {
     lines[start..].join("\n")
 }
 
-pub fn build_prompt(paths: &Paths, focus: Option<&str>, snap_dir: &Path) -> String {
+pub fn build_prompt(paths: &Paths, snap_dir: &Path) -> String {
     let mut out = String::new();
-
-    if let Some(f) = focus {
-        out.push_str(&MANUAL_RUN.replace("__FOCUS__", f));
-    }
 
     let instr = INSTRUCTIONS
         .replace("__DATA__", &paths.data_dir.to_string_lossy())
@@ -209,7 +195,7 @@ mod tests {
     #[test]
     fn build_prompt_has_all_sections() {
         let p = fixture();
-        let out = build_prompt(&p, None, &p.snapshots_dir());
+        let out = build_prompt(&p, &p.snapshots_dir());
         for marker in [
             "=== PLAYBOOK ===",
             "=== GOALS ===",
@@ -221,15 +207,5 @@ mod tests {
         }
         assert!(out.contains("PB RULES"), "playbook body inlined");
         assert!(out.contains("triage the inbox"), "goal body inlined");
-    }
-
-    #[test]
-    fn manual_run_focus_only_when_requested() {
-        let p = fixture();
-        let plain = build_prompt(&p, None, &p.snapshots_dir());
-        assert!(!plain.contains("MANUAL RUN"));
-        let focused = build_prompt(&p, Some("triage"), &p.snapshots_dir());
-        assert!(focused.contains("MANUAL RUN"));
-        assert!(focused.contains("triage"), "focus goal interpolated");
     }
 }

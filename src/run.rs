@@ -1,18 +1,19 @@
-//! The pulse (`looop`) and the manual one-shot (`looop run <goal>`).
+//! The pulse (`looop`) — the control loop itself.
 //!
 //! The pulse is a single-instance, level-triggered reconcile loop: tick, choose
-//! the next cadence, sleep, repeat. The manual run forces ONE goal-focused move
-//! immediately, bypassing the priority order and the world-unchanged skip.
+//! the next cadence, sleep, repeat. It is the SOLE writer of the policy files
+//! (PLAYBOOK/goals/sensors) and the journal — there is no imperative override
+//! that races it; humans steer it by editing the desired state it reconciles.
 
 use crate::config::Config;
 use crate::paths::Paths;
 use crate::util::Level;
-use crate::{gate, prompt, runner, seed, sensor, session, surface, tick, util};
+use crate::{seed, session, tick, util};
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// Retention for `sessions/<id>/` corpses (system scratch): env
 /// `LOOOP_SESSION_TTL` (seconds) > config `session_ttl` > 3 days. looop owns
@@ -159,126 +160,4 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
         );
         std::thread::sleep(Duration::from_secs(want));
     }
-}
-
-/// Cleans up a private snapshots temp dir on drop.
-struct TempDir {
-    path: PathBuf,
-}
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
-pub fn cmd_run_goal(paths: &Paths, id: &str) -> Result<ExitCode> {
-    seed::ensure_dirs(paths)?;
-
-    let mut gf = paths.goals_dir().join(format!("{id}.md"));
-    if !gf.is_file() {
-        gf = paths.goals_dir().join("archive").join(format!("{id}.md"));
-    }
-    if !gf.is_file() {
-        eprintln!("looop run: no such goal '{id}' (looked in goals/ and goals/archive/)");
-        eprintln!("available goals:");
-        let mut names: Vec<String> = fs::read_dir(paths.goals_dir())
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().map(|e| e == "md").unwrap_or(false))
-            .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
-            .collect();
-        names.sort();
-        for n in names {
-            eprintln!("  {n}");
-        }
-        return Ok(ExitCode::from(1));
-    }
-
-    // Manual override: note (don't refuse) if the pulse is running.
-    let lock = paths.lock();
-    if lock.is_dir() {
-        let pid = fs::read_to_string(lock.join("pid")).unwrap_or_default();
-        let pid = pid.trim();
-        if util::pid_alive(pid) {
-            util::event(
-                Level::Warn,
-                "run.note",
-                &format!(
-                    "pulse is running (pid {pid}) — running goal '{id}' anyway (manual override)"
-                ),
-                &[("pid", serde_json::json!(pid))],
-            );
-        }
-    }
-
-    session::prune_aged(
-        paths,
-        std::time::Duration::from_secs(session_ttl_secs(paths)),
-    );
-    gate::reap_stale_claims(paths);
-
-    // Private snapshots dir so a concurrent pulse tick can't tear our readings.
-    let snap = std::env::temp_dir().join(format!(
-        "looop-run.{}-{}",
-        std::process::id(),
-        chrono::Local::now().format("%H%M%S%f")
-    ));
-    let _ = fs::create_dir_all(&snap);
-    let _tmp = TempDir { path: snap.clone() };
-    sensor::run_all(paths, &snap, false);
-
-    let cfg = Config::load(paths)?;
-    let runner_name = cfg.default_runner().unwrap_or_default();
-    let Some(tick_cmd) = cfg.runner_cmd(&runner_name, "tick") else {
-        eprintln!("looop run: no tick command for runner '{runner_name}'");
-        return Ok(ExitCode::from(1));
-    };
-
-    let run_id = format!("run-{id}-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
-    let run_dir = paths.runs_dir().join(&run_id);
-    let _ = fs::create_dir_all(&run_dir);
-    let prompt_file = run_dir.join("prompt.md");
-    let _ = fs::write(&prompt_file, prompt::build_prompt(paths, Some(id), &snap));
-
-    let t0 = Instant::now();
-    util::event(
-        Level::Step,
-        "run.start",
-        &format!("manual run — goal '{id}' · {runner_name} is thinking"),
-        &[
-            ("goal", serde_json::json!(id)),
-            ("runner", serde_json::json!(runner_name)),
-        ],
-    );
-
-    let tee: Vec<PathBuf> = vec![run_dir.join("output.log"), paths.data_dir.join("tick.log")];
-    let cost_env = [
-        ("LOOOP_COST_KIND", "goal"),
-        ("LOOOP_COST_RUNNER", runner_name.as_str()),
-        ("LOOOP_COST_ID", id),
-    ];
-    runner::run_streamed(paths, &tick_cmd, &prompt_file, &cost_env, &tee, true);
-
-    let last_line = fs::read_to_string(paths.journal())
-        .ok()
-        .and_then(|j| j.lines().last().map(str::to_owned))
-        .unwrap_or_else(|| "(no line)".into());
-    let secs = t0.elapsed().as_secs();
-    util::event(
-        Level::Ok,
-        "run.done",
-        &format!("run done in {secs}s · {last_line}"),
-        &[
-            ("secs", serde_json::json!(secs)),
-            ("goal", serde_json::json!(id)),
-            ("journal", serde_json::json!(last_line)),
-            ("replay", serde_json::json!(run_dir.display().to_string())),
-        ],
-    );
-
-    tick::prune_runs(paths);
-    surface::surface_attention(paths);
-    Ok(ExitCode::SUCCESS)
 }

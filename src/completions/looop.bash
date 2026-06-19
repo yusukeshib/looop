@@ -1,10 +1,3 @@
-# Resolve looop's data dir the same way paths.rs does:
-#   $LOOOP_DATA_DIR  or  ${XDG_STATE_HOME:-$HOME/.local/state}/looop
-__looop_data_dir() {
-    local default="${XDG_STATE_HOME:-$HOME/.local/state}/looop"
-    printf '%s' "${LOOOP_DATA_DIR:-$default}"
-}
-
 # Resolve the session-fleet dir the same way paths.rs does: sessions live at
 # <LOOOP_DATA_DIR>/sessions/<id> (the fleet root is the data dir itself).
 __looop_sessions_dir() {
@@ -16,7 +9,7 @@ _looop() {
     local cur prev words cword
     _init_completion || return
 
-    local subcommands="up down watch run tick ls status log shot send key expect wait wait-idle resize restart start-session attach detach kill flag unflag prune cost config version help"
+    local subcommands="up down watch tick ls status log shot send key expect wait wait-idle resize restart start-session attach detach kill flag unflag prune cost config version help"
 
     # session ids including the pulse (for read/observe verbs)
     __looop_session_list() {
@@ -40,18 +33,6 @@ _looop() {
     [[ -z "$subcmd" ]] && return
 
     case "$subcmd" in
-        run)
-            if [[ $cword -eq 2 ]]; then
-                local data goals="" g name
-                data=$(__looop_data_dir)
-                for g in "$data"/goals/*.md "$data"/goals/archive/*.md; do
-                    [[ -f "$g" ]] || continue
-                    name=$(basename "$g" .md)
-                    [[ -n "$name" ]] && goals+=" $name"
-                done
-                COMPREPLY=($(compgen -W "$goals" -- "$cur"))
-            fi
-            ;;
         attach|kill|flag|unflag|restart)
             if [[ $cword -eq 2 ]]; then
                 local dir workers="" s name

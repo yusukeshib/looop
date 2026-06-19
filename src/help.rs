@@ -24,13 +24,6 @@ Usage:
                                 tail -f (Ctrl-C to stop). `looop watch pulse`
                                 watches the loop itself. No input — use attach
                                 for that.
-  looop run <goal-id>            run ONE goal NOW (manual override): a forced,
-                                goal-focused move, ignoring priority order and
-                                the world-unchanged skip; works while the pulse
-                                runs. <goal-id> = goals/<id>.md basename.
-                                e.g. looop run setup ; looop run morning-standup
-                                (a bare `looop run` is gone — the pulse only runs
-                                detached now; start it with `looop up`.)
   looop tick                     run a single beat and exit (debug / cron)
   looop status [--json]          structured snapshot of the loop's live state
                                 (pulse, last tick, workers, cost) — for an
@@ -66,9 +59,8 @@ Usage:
                                 auto-reaps only ones older than the retention
                                 window each tick — LOOOP_SESSION_TTL, default 3d)
   looop cost [today|all|--json]   report LLM spend recorded in the cost ledger
-                                (ticks + manual goal runs are metered
-                                automatically; workers self-report via
-                                'looop _cost')
+                                (ticks are metered automatically; workers
+                                self-report via 'looop _cost')
   looop config zsh|bash          print shell integration (completions);
                                 add eval "$(looop config zsh)" to your ~/.zshrc
                                 (or eval "$(looop config bash)" to ~/.bashrc)
