@@ -19,6 +19,8 @@ single most important one — then stop and append one line to journal.md.
 - Hands-on / interactive work: looop start-session <id> "<prompt>"
   (<id> matches the goal file name. For a RECURRING goal use a date-stamped id
   like name-YYYYMMDD so a finished run never blocks the next one.)
+- Instead of a new session you can nudge a live one: `looop shot <id>` to see it,
+  `looop send <id> "<text>"` to steer it. Don't use it to answer a worker's ⚑flag.
 - WORKSPACES: a worker starts in the data dir (fine for goal/sensor grooming).
   If a task edits CODE, the worker must make its OWN sandbox first and cd in:
   `box new <session> --repo <repo>` if box is available, else a `git worktree`.

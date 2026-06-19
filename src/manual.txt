@@ -54,6 +54,21 @@ RULES (the invariants that keep this safe and legible)
      lone exception is a human-gated meta session (setup / playbook grooming),
      which shows a diff and waits for approval (RULE 3) before touching policy.
 
+DRIVING A SESSION (a session is a live terminal, not a black box)
+  A worker runs under a real PTY, so you can both WATCH it and TALK to it from
+  outside — the same primitives a human or a script would use:
+    observe   looop shot <id>        the current screen
+              looop log <id> -f      follow its output (tail -f)
+              looop status           pulse + all sessions at a glance
+    drive     looop send <id> TEXT   type into its stdin
+              looop key  <id> KEY    named keys (Enter, C-c, Up, …)
+              looop expect <id> RE   block until a regex appears (scriptable)
+              looop wait[-idle] <id> block until exit / until output settles
+    manage    looop resize / restart / attach / detach
+  This makes a session driveable by hand, by a shell script (expect-style), or by
+  the pulse itself as one move. Human-gated decisions still go through ⚑flags
+  (RULE 3/4) — driving is for steering and automation, not for answering a flag.
+
 CODE / CONFIG / DATA are cleanly separated (all overridable by env)
   EXEC    this one binary                          the program (portable)
   CONFIG  ${XDG_CONFIG_HOME:-~/.config}/looop.json  one file: runner wiring
