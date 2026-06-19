@@ -5,7 +5,7 @@
 use crate::config::Config;
 use crate::paths::Paths;
 use crate::util::Level;
-use crate::{events, gate, prompt, runner, seed, sensor, session, surface, util};
+use crate::{events, executor, gate, prompt, runner, seed, sensor, session, surface, util};
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
@@ -107,6 +107,26 @@ pub fn tick(paths: &Paths) -> bool {
     if runner::run_streamed(paths, &tick_cmd, &prompt_file, &cost_env, &tee) {
         let _ = fs::write(paths.data_dir.join(".last-tick-hash"), format!("{hash}\n"));
         acted = true;
+
+        // Typed-action path: if the decider wrote .decision.json, looop is the
+        // sole executor of its single move. Additive for now — a no-op until the
+        // prompt cutover tells the decider to emit a decision instead of acting.
+        match executor::consume_decision(paths) {
+            Some(Ok(summary)) => util::event(
+                Level::Ok,
+                "tick.move",
+                &summary,
+                &[("move", serde_json::json!(summary))],
+            ),
+            Some(Err(e)) => util::event(
+                Level::Error,
+                "tick.move_failed",
+                &format!("decision failed: {e}"),
+                &[("error", serde_json::json!(e.to_string()))],
+            ),
+            None => {}
+        }
+
         let last_line = journal_tail(paths);
         let secs = t0.elapsed().as_secs();
         util::event(
