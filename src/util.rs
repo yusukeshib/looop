@@ -116,6 +116,18 @@ impl Level {
             Level::Error => red(),
         }
     }
+    /// The human-facing sigil for this line. Carries the signal in human mode
+    /// (the machine `event` name is JSON-only), so importance reads at a glance:
+    /// `·` heartbeat, `→` a step starting, `✓` success/decision, `⚡`/`✗` trouble.
+    fn glyph(self) -> &'static str {
+        match self {
+            Level::Info => "·",
+            Level::Step => "→",
+            Level::Ok => "✓",
+            Level::Warn => "⚡",
+            Level::Error => "✗",
+        }
+    }
 }
 
 /// The one structured log primitive the pulse uses. Human mode prints a single
@@ -127,22 +139,47 @@ pub fn event(level: Level, event: &str, msg: &str, fields: &[(&str, serde_json::
     if is_json() {
         let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
         println!("{}", json_event_line(&ts, level, event, msg, fields));
-    } else {
-        let c = level.color();
-        let reset = if c.is_empty() { "" } else { rst() };
-        println!(
-            "{}[{}]{} {}{}{}{} {}{}",
-            dim(),
-            hms(),
-            rst(),
-            c,
-            event,
-            reset,
-            dim(),
-            msg,
-            rst()
-        );
+        return;
     }
+    // Human mode is a *rendering* of the structured event, not a dump of it.
+    // Color encodes IMPORTANCE so the lines a watcher cares about (decisions,
+    // failures, flags) pop and the heartbeat (sense summary, sleep, skip,
+    // cadence) recedes. The machine `event` name is intentionally omitted — the
+    // glyph + msg say it for a human; the name lives in the JSON stream.
+    let glyph = level.glyph();
+    if matches!(level, Level::Info) {
+        // Heartbeat: the whole line is dim so it sits quietly in the background.
+        println!("{}[{}] {} {}{}", dim(), hms(), glyph, msg, rst());
+        return;
+    }
+    let c = level.color();
+    let bold = if matches!(level, Level::Ok | Level::Error) {
+        b()
+    } else {
+        ""
+    };
+    // Warnings/errors tint the whole message; success/step keep the body in the
+    // default fg (a long journal line stays readable) and let the colored glyph
+    // carry the signal.
+    let msg_c = if matches!(level, Level::Warn | Level::Error) {
+        c
+    } else {
+        ""
+    };
+    let msg_rst = if msg_c.is_empty() { "" } else { rst() };
+    println!(
+        "{}[{}]{} {}{}{}{} {}{}{}",
+        dim(),
+        hms(),
+        rst(),
+        bold,
+        c,
+        glyph,
+        rst(),
+        msg_c,
+        msg,
+        msg_rst
+    );
 }
 
 /// Build one NDJSON object line for a structured event. Always carries the
@@ -301,5 +338,15 @@ mod tests {
         assert_eq!(Level::Ok.tag(), "ok");
         assert_eq!(Level::Warn.tag(), "warn");
         assert_eq!(Level::Error.tag(), "error");
+    }
+
+    #[test]
+    fn level_glyphs_map_importance() {
+        // Heartbeat recedes; decision and trouble each get a distinct sigil.
+        assert_eq!(Level::Info.glyph(), "·");
+        assert_eq!(Level::Step.glyph(), "→");
+        assert_eq!(Level::Ok.glyph(), "✓");
+        assert_eq!(Level::Warn.glyph(), "⚡");
+        assert_eq!(Level::Error.glyph(), "✗");
     }
 }
