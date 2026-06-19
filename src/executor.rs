@@ -499,7 +499,15 @@ mod tests {
         )
         .unwrap();
         assert_eq!(summary, "notify · goals A and B conflict");
-        assert!(execute(&p, &Action::SendNotification { message: "  ".into() }).is_err());
+        assert!(
+            execute(
+                &p,
+                &Action::SendNotification {
+                    message: "  ".into()
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]
