@@ -69,10 +69,10 @@ impl Paths {
         }
     }
 
-    /// The session fleet for this profile, as an explicit babysit context. The
-    /// state root is the data dir itself, so sessions live at
-    /// `<LOOOP_DATA_DIR>/sessions/<id>` — self-contained per profile, with no
-    /// `$BABYSIT_DIR` and no shared `~/.babysit`. (babysit nests sessions under
+    /// This profile's session store, as an explicit context. The state root is
+    /// the data dir itself, so sessions live at `<LOOOP_DATA_DIR>/sessions/<id>`
+    /// — self-contained per profile, configured by an explicit path rather than
+    /// any ambient environment. (The library nests sessions under
     /// `<root>/sessions/`, so the root is the data dir, not a `sessions` subdir.)
     pub fn sessions(&self) -> ::babysit::Babysit {
         ::babysit::Babysit::new(&self.data_dir)

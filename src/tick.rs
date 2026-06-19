@@ -5,7 +5,7 @@
 use crate::config::Config;
 use crate::paths::Paths;
 use crate::util::Level;
-use crate::{babysit, events, gate, prompt, runner, seed, sensor, surface, util};
+use crate::{events, gate, prompt, runner, seed, sensor, session, surface, util};
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
@@ -18,7 +18,7 @@ pub fn tick(paths: &Paths) -> bool {
     events::emit(paths, "tick_start", serde_json::json!({}));
 
     // 0. housekeeping (deterministic, no AI).
-    babysit::prune(paths);
+    session::prune(paths);
     gate::reap_stale_claims(paths);
 
     // 1. sense — level-triggered: wipe last beat's snapshots first.

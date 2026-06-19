@@ -53,8 +53,8 @@ Everything lives as plain files in the data dir (a git repo = the loop's memory)
 | `reports/`      | deliverables a human reads (persists across ticks)                 |
 
 **Workers** are the hands. When a move needs real, multi-step work, the loop
-spawns an agent session (via [`babysit`](https://github.com/yusukeshib/babysit))
-that runs detached, in parallel, and reconciles its task on its own. Workers
+spawns an agent session that runs detached, in parallel, and reconciles its task
+on its own. Workers
 that touch code provision their own sandbox first; the loop itself knows nothing
 about repos.
 
@@ -71,7 +71,7 @@ looop up --watch    # start it and follow its output (Ctrl-C stops watching, not
 looop watch pulse   # follow a running pulse's output any time
 ```
 
-The pulse always runs detached now (babysit-supervised) — there is no foreground
+The pulse always runs detached now (supervised in the background) — there is no foreground
 `looop run`. Watch it live with `looop up --watch` / `looop watch pulse`, or add
 `--json` for a machine-readable NDJSON stream.
 
@@ -122,7 +122,7 @@ This adds tab completion for every subcommand plus dynamic completion for
 `looop run <goal-id>` (your `goals/*.md`) and `looop attach|kill|flag|unflag
 <id>` (this profile's live worker sessions). Completions resolve `LOOOP_DATA_DIR`
 the same way the binary does, so an isolated profile completes its own goals and
-fleet.
+sessions.
 
 To change judgment: edit `PLAYBOOK.md` — it takes effect next tick.
 
@@ -171,24 +171,24 @@ looop version   # -> looop 0.1.0
 looop help
 ```
 
-Runtime deps: just an LLM runner (`pi` or `claude`). The worker fleet (babysit)
-is linked as a **library** and driven entirely in-process — spawn, list, attach,
-kill, flag, prune all run inside `looop`, so **no `babysit` binary is required**.
-looop hands the library an explicit state root (`$LOOOP_DATA_DIR/sessions`), so
-it never sets `$BABYSIT_DIR` and never shares the global `~/.babysit`; session
-ids are bare (the pulse is `pulse`). (Workers that touch code also need `git` or
-`box` to sandbox themselves, but that's a worker concern, not a prerequisite for
-the pulse.)
+Runtime deps: just an LLM runner (`pi` or `claude`). looop is a single
+self-contained binary — spawning, listing, attaching, killing, flagging and
+pruning worker sessions all run in-process, no extra executable required.
+Sessions are stored under `$LOOOP_DATA_DIR/sessions`, self-contained per profile:
+looop sets no extra environment and shares no global state, and session ids are
+bare (the pulse is `pulse`). (Workers that touch code also need `git` or `box`
+to sandbox themselves, but that's a worker concern, not a prerequisite for the
+pulse.)
 
 ## Config & data
 
 - **Config** — `$XDG_CONFIG_HOME/looop.json` (override `LOOOP_CONFIG`). One file:
   runner wiring and tick cadence. Default runner is `pi`; `claude` is built in.
 - **Data / memory** — `$XDG_STATE_HOME/looop/` (override `LOOOP_DATA_DIR`). A git
-  repo holding the PLAYBOOK, goals, journal, and sensors. The worker + pulse
-  fleet lives under `sessions/` in the same dir, so a profile is fully
+  repo holding the PLAYBOOK, goals, journal, and sensors. Worker and pulse
+  sessions live under `sessions/` in the same dir, so a profile is fully
   self-contained. Pointing `LOOOP_DATA_DIR` elsewhere gives you an isolated
-  **profile** with its own fleet.
+  **profile** with its own sessions.
 
 LLM spend is metered automatically (ticks, manual runs, and self-reporting
 workers) into an append-only ledger; see `looop cost`.

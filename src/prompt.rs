@@ -3,8 +3,8 @@
 //! `build_prompt`. The instruction text is verbatim; only the marked dynamic
 //! fields (data dir, binary path, local-time strings) are substituted.
 
-use crate::babysit;
 use crate::paths::Paths;
+use crate::session;
 use crate::util;
 use std::fmt::Write as _;
 use std::fs;
@@ -132,7 +132,7 @@ pub fn build_prompt(paths: &Paths, focus: Option<&str>, snap_dir: &Path) -> Stri
 
     // WORKER SESSIONS.
     out.push_str("\n=== WORKER SESSIONS (babysit; ⚑note = the worker is waiting for you) ===\n");
-    let sessions = babysit::list_workers(paths);
+    let sessions = session::list_workers(paths);
     if sessions.is_empty() {
         out.push_str("(none)\n");
     } else {

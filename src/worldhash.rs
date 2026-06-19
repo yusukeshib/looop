@@ -8,8 +8,8 @@
 //!   * worker sessions: only the STABLE signal (id/state/exit_code/note), never
 //!     the ever-incrementing age, so a tick fires on a real transition.
 
-use crate::babysit;
 use crate::paths::Paths;
+use crate::session;
 use crate::util;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -78,7 +78,7 @@ pub fn world_hash(paths: &Paths) -> String {
 
     // Worker sessions: stable signal only (id state exit_code note), null-faithful.
     // Workers only — the pulse's own session must not feed its own wake signal.
-    for s in babysit::list_workers(paths) {
+    for s in session::list_workers(paths) {
         let exit = s
             .exit_code
             .map(|c| c.to_string())

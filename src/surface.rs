@@ -3,9 +3,9 @@
 //! window. attention.md is reserved for genuine blockers; worker flags are
 //! shown inline.
 
-use crate::babysit;
 use crate::events;
 use crate::paths::Paths;
+use crate::session;
 use crate::util;
 use std::fs;
 use std::process::{Command, Stdio};
@@ -13,7 +13,7 @@ use std::process::{Command, Stdio};
 pub fn surface_attention(paths: &Paths) {
     let lhd = paths.looop_hint_env();
 
-    let flags: Vec<String> = babysit::list_workers(paths)
+    let flags: Vec<String> = session::list_workers(paths)
         .into_iter()
         .filter(|s| s.flagged())
         .map(|s| {
@@ -79,7 +79,7 @@ fn tmux_surface(paths: &Paths) {
         return; // no server running
     }
 
-    let flagged_ids: Vec<String> = babysit::list_workers(paths)
+    let flagged_ids: Vec<String> = session::list_workers(paths)
         .into_iter()
         .filter(|s| s.flagged())
         .map(|s| s.id)

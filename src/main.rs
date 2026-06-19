@@ -6,7 +6,6 @@
 //! worker spawn (`start-session` -> `babysit run -d`), because babysit's detacher
 //! re-execs its own binary as the supervisor.
 
-mod babysit;
 mod config;
 mod cost;
 mod deps;
@@ -63,7 +62,7 @@ fn main() -> ExitCode {
         // supervisor (`looop run --detached-id <id> -- <cmd>`). Route straight
         // to serve_worker; no deps check, no pulse.
         "run" | "loop" if rest.first().map(String::as_str) == Some("--detached-id") => {
-            babysit::run_detached_worker(rest).map(|c| ExitCode::from(c.clamp(0, 255) as u8))
+            session::run_detached_worker(rest).map(|c| ExitCode::from(c.clamp(0, 255) as u8))
         }
         // `looop run <goal>` is the manual one-shot (forced single move). A bare
         // `looop run` (foreground pulse) is gone: the pulse only ever runs as a
@@ -197,7 +196,7 @@ fn ls_inproc(paths: &Paths, rest: &[String]) -> Result<ExitCode> {
             _ => {} // ignore unknown flags
         }
     }
-    match babysit::ls(paths, json, watch, interval) {
+    match session::ls(paths, json, watch, interval) {
         Ok(()) => Ok(ExitCode::SUCCESS),
         Err(_) => Ok(ExitCode::from(1)),
     }

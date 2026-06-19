@@ -7,7 +7,7 @@
 use crate::config::Config;
 use crate::paths::Paths;
 use crate::util::Level;
-use crate::{babysit, gate, prompt, runner, seed, sensor, surface, tick, util};
+use crate::{gate, prompt, runner, seed, sensor, session, surface, tick, util};
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
@@ -81,7 +81,7 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
             Level::Info,
             "pulse.profile",
             &format!(
-                "profile fleet under {d} (LOOOP_DATA_DIR={d} looop ls)",
+                "this profile's sessions live under {d} (LOOOP_DATA_DIR={d} looop ls)",
                 d = paths.data_dir.display()
             ),
             &[(
@@ -95,7 +95,7 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
         let acted = tick::tick(paths);
         let mut want = if acted {
             busy
-        } else if babysit::any_worker_alive(paths) {
+        } else if session::any_worker_alive(paths) {
             active
         } else {
             idle
@@ -122,7 +122,7 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
         }
         let reason = if acted {
             "busy"
-        } else if babysit::any_worker_alive(paths) {
+        } else if session::any_worker_alive(paths) {
             "active"
         } else {
             "idle"
@@ -192,7 +192,7 @@ pub fn cmd_run_goal(paths: &Paths, id: &str) -> Result<ExitCode> {
         }
     }
 
-    babysit::prune(paths);
+    session::prune(paths);
     gate::reap_stale_claims(paths);
 
     // Private snapshots dir so a concurrent pulse tick can't tear our readings.

@@ -13,11 +13,36 @@
 //! session's `output.log`. Watch it live with `looop attach pulse`, or check
 //! the fleet with `looop ls`.
 
-use crate::babysit::{self, PULSE_SESSION};
 use crate::paths::Paths;
+use crate::session::{self, PULSE_SESSION};
 use crate::{run, util};
 use anyhow::Result;
 use std::process::ExitCode;
+
+/// Parsed `looop up` flags. A tiny typed surface so the command rejects
+/// unknown arguments instead of silently ignoring them.
+struct UpOpts {
+    watch: bool,
+    json: bool,
+}
+
+impl UpOpts {
+    /// Parse `up`'s argv, returning `Err(bad_arg)` on the first unknown token.
+    fn parse(args: &[String]) -> std::result::Result<Self, String> {
+        let mut o = UpOpts {
+            watch: false,
+            json: false,
+        };
+        for a in args {
+            match a.as_str() {
+                "--watch" | "-w" => o.watch = true,
+                "--json" => o.json = true,
+                other => return Err(other.to_string()),
+            }
+        }
+        Ok(o)
+    }
+}
 
 /// `looop up [--watch] [--json]` — ensure the pulse is running as a detached
 /// service. Idempotent: a live pulse is left alone; a dead corpse is pruned so
@@ -25,19 +50,25 @@ use std::process::ExitCode;
 /// output.log (machine-readable for an agent). `--watch` follows that output
 /// after starting (Ctrl-C to stop the window; the pulse keeps running).
 pub fn cmd_up(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let watch = args.iter().any(|a| a == "--watch" || a == "-w");
-    let json = args.iter().any(|a| a == "--json");
+    let opts = match UpOpts::parse(args) {
+        Ok(o) => o,
+        Err(bad) => {
+            eprintln!("looop up: unknown option '{bad}' (expected --watch/-w and/or --json)");
+            return Ok(ExitCode::from(1));
+        }
+    };
+    let UpOpts { watch, json } = opts;
 
-    if babysit::is_alive(paths, PULSE_SESSION) {
+    if session::is_alive(paths, PULSE_SESSION) {
         println!("looop: pulse already running ({PULSE_SESSION}) — see it: looop ls");
         if watch {
             println!("looop: watching {PULSE_SESSION} (Ctrl-C to stop watching)");
-            babysit::watch(paths, PULSE_SESSION)?;
+            session::watch(paths, PULSE_SESSION)?;
         }
         return Ok(ExitCode::SUCCESS);
     }
-    if babysit::status_exists(paths, PULSE_SESSION) {
-        babysit::prune(paths); // reuse the id held by a dead corpse
+    if session::status_exists(paths, PULSE_SESSION) {
+        session::prune(paths); // reuse the id held by a dead corpse
     }
 
     // Propagate the output format to the detached pulse: spawn_detached re-execs
@@ -51,7 +82,7 @@ pub fn cmd_up(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     // supervisor, which spawns this command under a PTY. `_pulse` then runs the
     // real loop (and takes the single-instance lock inside cmd_run).
     let bin = paths.bin.to_string_lossy().to_string();
-    babysit::spawn_detached(paths, vec![bin, "_pulse".to_string()], PULSE_SESSION)?;
+    session::spawn_detached(paths, vec![bin, "_pulse".to_string()], PULSE_SESSION)?;
 
     println!(
         "looop: pulse started ({PULSE_SESSION}){}",
@@ -62,7 +93,7 @@ pub fn cmd_up(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     println!("  stop:  {}looop down", paths.looop_hint_env());
     if watch {
         println!("looop: watching {PULSE_SESSION} (Ctrl-C to stop watching)");
-        babysit::watch(paths, PULSE_SESSION)?;
+        session::watch(paths, PULSE_SESSION)?;
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -71,13 +102,13 @@ pub fn cmd_up(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 /// is stale-reclaimed on the next `looop up` (cmd_run checks pid liveness), so
 /// no extra cleanup is needed here.
 pub fn cmd_down(paths: &Paths) -> Result<ExitCode> {
-    if !babysit::status_exists(paths, PULSE_SESSION) {
+    if !session::status_exists(paths, PULSE_SESSION) {
         println!("looop: no pulse session to stop");
         return Ok(ExitCode::SUCCESS);
     }
-    match babysit::kill(paths, PULSE_SESSION) {
+    match session::kill(paths, PULSE_SESSION) {
         Ok(()) => {
-            babysit::prune(paths);
+            session::prune(paths);
             println!("looop: pulse stopped");
             Ok(ExitCode::SUCCESS)
         }

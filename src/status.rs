@@ -5,7 +5,7 @@
 
 use crate::config::Config;
 use crate::paths::Paths;
-use crate::{babysit, util};
+use crate::{session, util};
 use anyhow::Result;
 use std::fs;
 use std::process::ExitCode;
@@ -63,7 +63,7 @@ fn build(paths: &Paths) -> serde_json::Value {
                 .unwrap_or_default()
         });
 
-    let workers: Vec<serde_json::Value> = babysit::list_workers(paths)
+    let workers: Vec<serde_json::Value> = session::list_workers(paths)
         .into_iter()
         .map(|s| {
             serde_json::json!({
