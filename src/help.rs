@@ -75,17 +75,17 @@ Usage:
   looop help                     show this help
 
 Paths (override via env LOOOP_CONFIG / LOOOP_DATA_DIR):
-  config  {config}
-  data    {data}
-  fleet   {fleet}
+  config    {config}
+  data      {data}
+  sessions  {fleet}
 
-looop is a single self-contained binary: the worker fleet (babysit) is linked
+looop is a single self-contained binary: session management (babysit) is linked
 as a LIBRARY and driven entirely in-process — no `babysit` executable required.
-The fleet is self-contained per profile: sessions live under <data>/sessions,
-keyed by a bare id (the pulse is `pulse`). looop passes that root to the library
+Sessions are self-contained per profile: they live under <data>/sessions, keyed
+by a bare id (the pulse is `pulse`). looop passes that root to the library
 explicitly — it never sets $BABYSIT_DIR and never touches a shared ~/.babysit.
   looop ls                      list worker sessions (⚑ = waiting for you)
-  looop ls --watch              watch the fleet live, in place
+  looop ls --watch              watch sessions live, in place
   looop attach <id>             enter a waiting session and talk to it
   looop kill <id>               end a session ; looop flag/unflag <id> ; looop prune
 

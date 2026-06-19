@@ -147,8 +147,10 @@ pub fn event(level: Level, event: &str, msg: &str, fields: &[(&str, serde_json::
     // cadence) recedes. The machine `event` name is intentionally omitted — the
     // glyph + msg say it for a human; the name lives in the JSON stream.
     let glyph = level.glyph();
-    if matches!(level, Level::Info) {
-        // Heartbeat: the whole line is dim so it sits quietly in the background.
+    if matches!(level, Level::Info | Level::Step) {
+        // Heartbeat & transient "starting" steps: the whole line is dim so it
+        // sits quietly in the background and lets the OUTCOME (✓/✗) stand out.
+        // The glyph still differs (`·` vs `→`) so a step still reads as a step.
         println!("{}[{}] {} {}{}", dim(), hms(), glyph, msg, rst());
         return;
     }

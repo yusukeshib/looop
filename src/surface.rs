@@ -13,17 +13,10 @@ use std::process::{Command, Stdio};
 pub fn surface_attention(paths: &Paths) {
     let lhd = paths.looop_hint_env();
 
-    let flags: Vec<String> = session::list_workers(paths)
+    let flagged: Vec<(String, String)> = session::list_workers(paths)
         .into_iter()
         .filter(|s| s.flagged())
-        .map(|s| {
-            let note = s.note.clone().unwrap_or_default();
-            let short = s.id.as_str();
-            format!(
-                "  ⚑ {id}\n     {note}\n     → {lhd}looop attach {short}",
-                id = s.id
-            )
-        })
+        .map(|s| (s.id.clone(), s.note.clone().unwrap_or_default()))
         .collect();
 
     let att = fs::read_to_string(paths.data_dir.join("attention.md"))
@@ -36,28 +29,50 @@ pub fn surface_attention(paths: &Paths) {
                 .join("\n")
         });
 
-    if flags.is_empty() && att.is_none() {
+    if flagged.is_empty() && att.is_none() {
         return;
     }
 
-    util::log(&format!(
-        "{}{}👁  NEEDS YOU{}",
-        util::yel(),
-        util::b(),
-        util::rst()
-    ));
-    if let Some(att) = &att {
-        println!("{att}");
-    }
-    for f in &flags {
-        println!("{f}");
+    if util::is_json() {
+        // Machine stream: ONE structured event. Never emit the raw multi-line
+        // human banner here — it would corrupt the pulse's NDJSON under --json.
+        let flags_json: Vec<serde_json::Value> = flagged
+            .iter()
+            .map(|(id, note)| serde_json::json!({ "id": id, "note": note }))
+            .collect();
+        util::event(
+            util::Level::Warn,
+            "attention",
+            &format!(
+                "{} flagged · attention.md: {}",
+                flagged.len(),
+                att.is_some()
+            ),
+            &[
+                ("flags", serde_json::json!(flags_json)),
+                ("attention", serde_json::json!(att.is_some())),
+            ],
+        );
+    } else {
+        util::log(&format!(
+            "{}{}👁  NEEDS YOU{}",
+            util::yel(),
+            util::b(),
+            util::rst()
+        ));
+        if let Some(att) = &att {
+            println!("{att}");
+        }
+        for (id, note) in &flagged {
+            println!("  ⚑ {id}\n     {note}\n     → {lhd}looop attach {id}");
+        }
     }
 
     events::emit(
         paths,
         "needs_you",
         serde_json::json!({
-            "flags": flags.len(),
+            "flags": flagged.len(),
             "attention": att.is_some(),
         }),
     );

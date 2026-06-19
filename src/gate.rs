@@ -38,13 +38,18 @@ pub fn reap_stale_claims(paths: &Paths) {
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string();
-            util::log(&format!(
-                "  {}reaped stale claim {} (session '{}' not alive){}",
-                util::dim(),
-                name,
-                if sess.is_empty() { "?" } else { &sess },
-                util::rst()
-            ));
+            util::event(
+                util::Level::Info,
+                "claim.reaped",
+                &format!(
+                    "reaped stale claim {name} (session '{}' not alive)",
+                    if sess.is_empty() { "?" } else { &sess }
+                ),
+                &[
+                    ("claim", serde_json::json!(name)),
+                    ("session", serde_json::json!(sess)),
+                ],
+            );
             events::emit(
                 paths,
                 "claim_reaped",

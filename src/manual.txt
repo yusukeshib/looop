@@ -62,7 +62,7 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
           └ override with $LOOOP_DATA_DIR
             PLAYBOOK.md  goals/  journal.md  sensors/*.sh   <- commit these
             snapshots/ prompts/ runs/ .lock .last-tick-hash <- scratch
-            sessions/<id>/  <- the worker + pulse fleet (babysit state, per
+            sessions/<id>/  <- worker + pulse sessions (babysit state, per
                                profile; no $BABYSIT_DIR, no shared ~/.babysit)
             (runs/<id>/{prompt.md,output.log} = a replayable archive per beat)
 
@@ -74,7 +74,7 @@ BOOTSTRAP
   a goal; the program only seeds.
 
 DEPENDENCIES
-  Just the configured agent CLI (claude or pi). The worker fleet (babysit) is
+  Just the configured agent CLI (claude or pi). Session management (babysit) is
   LINKED IN as a library and runs in-process — no babysit binary is required.
   The pulse provisions NO workspaces; a worker that touches code makes its own
   sandbox (box if available, else git worktree), so box/git are worker concerns,
