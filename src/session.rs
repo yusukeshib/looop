@@ -560,6 +560,12 @@ pub fn kill(paths: &Paths, session: &str) -> anyhow::Result<()> {
     rt().block_on(paths.sessions().kill(Some(session.to_string()), false))
 }
 
+/// Like `kill` but swallows babysit's "killed session …" stdout line, so a
+/// caller that prints its own message (e.g. `looop down`) stays single-line.
+pub fn kill_quiet(paths: &Paths, session: &str) -> anyhow::Result<()> {
+    suppress_stdout(|| kill(paths, session))
+}
+
 /// `looop flag <id> [msg]` — raise a session's attention flag.
 pub fn flag(paths: &Paths, session: &str, message: Option<String>) -> anyhow::Result<()> {
     rt().block_on(

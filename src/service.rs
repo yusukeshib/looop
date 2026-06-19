@@ -104,7 +104,7 @@ pub fn cmd_down(paths: &Paths) -> Result<ExitCode> {
         println!("looop: no pulse session to stop");
         return Ok(ExitCode::SUCCESS);
     }
-    match session::kill(paths, PULSE_SESSION) {
+    match session::kill_quiet(paths, PULSE_SESSION) {
         Ok(()) => {
             session::prune(paths);
             println!("looop: pulse stopped");
