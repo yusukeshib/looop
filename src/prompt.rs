@@ -43,6 +43,20 @@ Moves:
   <id> matches the goal file name. The worker starts in the data dir; if its
   task edits CODE it must provision its OWN sandbox first (box if available, else
   git worktree) and cd in — say so in the prompt. Never edit code in the data dir.
+- observe / steer an EXISTING session instead of spawning a new one. The live
+  sessions are already listed below, but you can look closer for free (these are
+  read-only and do NOT count as your move):
+    __BIN__ shot <id>            its current visible screen
+    __BIN__ log <id> --tail 40   its recent output
+  And you MAY drive one as your single move when a live worker already owns the
+  task and just needs a nudge (steer it, send a value it asked of YOU not the
+  human, or interrupt a wedged run):
+    __BIN__ send <id> "<text>"   type into its stdin
+    __BIN__ key  <id> Enter      send a keystroke (Enter, C-c, …)
+    __BIN__ restart <id>         restart a wedged worker's command
+  Prefer this over a SECOND worker when one already exists for the goal. NEVER
+  use send/key to answer something a worker raised a ⚑flag for — those are for
+  the HUMAN; leave the flag up and do nothing on it.
 - change the PLAYBOOK: edit PLAYBOOK.md directly. The PLAYBOOK is the guardrail;
   your edit takes effect next tick. Be deliberate — only harden a drift into a
   rule once it actually hurts (RULE 5).
