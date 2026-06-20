@@ -11,7 +11,7 @@
 //!     `looop _ cost` at end-of-session (an AI-facing callback, like `flag`).
 //! Both append one JSON line to the cost ledger; `looop cost` reports over it.
 
-use crate::config::Config;
+use crate::config::{Config, CostMode, CostSpec};
 use crate::paths::Paths;
 use anyhow::Result;
 use std::fs::OpenOptions;
@@ -85,27 +85,57 @@ pub fn cmd_cost_record(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// Accumulates LLM spend from a runner's NDJSON stream. The two supported tick
-/// runners report cost in different shapes, so the meter keeps both readings and
+/// Accumulates LLM spend from a runner's NDJSON stream.
+///
+/// With no `spec`, the meter understands the two BUILT-IN runner shapes and
 /// resolves them at the end (H3):
 ///   • pi (`--mode json`) emits per-message `usage.cost.total` — we SUM them.
 ///   • claude (`--output-format stream-json`) emits ONE `result.total_cost_usd`
 ///     that is already the CUMULATIVE run total — we take it verbatim.
 /// claude's authoritative total wins when present, so the two readings are never
 /// added together (no double counting); pi's running sum is the fallback.
+///
+/// With a `spec` (a CUSTOM runner declaring its cost shape in config), ONLY that
+/// spec is applied — so the budget breaker (H2) can meter any runner instead of
+/// failing open on an unrecognized stream.
 #[derive(Default)]
 pub(crate) struct CostMeter {
     pi_sum: f64,
     claude_total: Option<f64>,
+    spec: Option<CostSpec>,
+    spec_sum: f64,
+    spec_total: Option<f64>,
 }
 
 impl CostMeter {
+    /// A meter driven by a custom runner's [`CostSpec`]; `None` falls back to the
+    /// built-in pi/claude shapes (identical to `CostMeter::default()`).
+    pub(crate) fn new(spec: Option<CostSpec>) -> Self {
+        CostMeter {
+            spec,
+            ..Default::default()
+        }
+    }
+
     /// Fold one NDJSON line into the running cost. Non-JSON lines and events
     /// without usage data are ignored.
     pub(crate) fn ingest(&mut self, line: &str) {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             return;
         };
+        // A custom spec takes over completely — the built-in shapes are not mixed
+        // in, so a custom stream can't accidentally double-count.
+        if let Some(spec) = &self.spec {
+            if v.get("type").and_then(|t| t.as_str()) == Some(spec.type_tag.as_str())
+                && let Some(c) = v.pointer(&spec.pointer).and_then(|c| c.as_f64())
+            {
+                match spec.mode {
+                    CostMode::Sum => self.spec_sum += c,
+                    CostMode::Total => self.spec_total = Some(c),
+                }
+            }
+            return;
+        }
         match v.get("type").and_then(|t| t.as_str()) {
             Some("message_end") => {
                 self.pi_sum += v
@@ -122,9 +152,13 @@ impl CostMeter {
         }
     }
 
-    /// The resolved spend for the run: claude's authoritative cumulative total
-    /// when present, else pi's per-message sum.
+    /// The resolved spend for the run. With a spec: the cumulative total (`total`
+    /// mode) or the per-event sum (`sum` mode). Without: claude's authoritative
+    /// cumulative total when present, else pi's per-message sum.
     pub(crate) fn total(&self) -> f64 {
+        if self.spec.is_some() {
+            return self.spec_total.unwrap_or(self.spec_sum);
+        }
         self.claude_total.unwrap_or(self.pi_sum)
     }
 }
@@ -388,6 +422,59 @@ mod tests {
     #[test]
     fn cost_meter_empty_stream_is_zero() {
         assert_eq!(CostMeter::default().total(), 0.0);
+    }
+
+    #[test]
+    fn cost_meter_spec_sum_mode_adds_matching_events() {
+        let spec = CostSpec {
+            type_tag: "usage".into(),
+            pointer: "/spend".into(),
+            mode: CostMode::Sum,
+        };
+        let mut m = CostMeter::new(Some(spec));
+        m.ingest(r#"{"type":"usage","spend":0.10}"#);
+        m.ingest(r#"{"type":"usage","spend":0.05}"#);
+        m.ingest(r#"{"type":"other","spend":9.0}"#); // wrong type — ignored
+        // Built-in shapes are NOT mixed in when a spec is active.
+        m.ingest(r#"{"type":"result","total_cost_usd":99.0}"#);
+        assert!((m.total() - 0.15).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cost_meter_spec_total_mode_takes_last_value() {
+        let spec = CostSpec {
+            type_tag: "final".into(),
+            pointer: "/cost/usd".into(),
+            mode: CostMode::Total,
+        };
+        let mut m = CostMeter::new(Some(spec));
+        m.ingest(r#"{"type":"final","cost":{"usd":1.0}}"#);
+        m.ingest(r#"{"type":"final","cost":{"usd":2.5}}"#);
+        assert!((m.total() - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn runner_cost_spec_parses_and_defaults_mode_to_sum() {
+        let cfg = Config {
+            root: json!({
+                "runners": {
+                    "custom": { "cost": { "type": "usage", "pointer": "/x" } },
+                    "full": { "cost": { "type": "r", "pointer": "/y", "mode": "total" } },
+                    "bare": { "tick": "echo hi" }
+                }
+            }),
+        };
+        assert_eq!(
+            cfg.runner_cost_spec("custom"),
+            Some(CostSpec {
+                type_tag: "usage".into(),
+                pointer: "/x".into(),
+                mode: CostMode::Sum,
+            })
+        );
+        assert_eq!(cfg.runner_cost_spec("full").unwrap().mode, CostMode::Total);
+        assert_eq!(cfg.runner_cost_spec("bare"), None);
+        assert_eq!(cfg.runner_cost_spec("missing"), None);
     }
 
     #[test]

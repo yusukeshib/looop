@@ -55,6 +55,26 @@ pub const DEFAULT_CONFIG: &str = r#"{
 }
 "#;
 
+/// How a runner reports spend on its NDJSON stream. Built-in shapes (pi/claude)
+/// need no spec; a CUSTOM runner declares one so the budget breaker (H2) can
+/// actually meter it instead of silently failing open. Config shape:
+///   "cost": { "type": "<ndjson .type>", "pointer": "/json/pointer",
+///             "mode": "sum" | "total" }
+/// `sum` adds the value from every matching event (per-message usage); `total`
+/// takes the last value verbatim (a cumulative run total).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CostSpec {
+    pub type_tag: String,
+    pub pointer: String,
+    pub mode: CostMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CostMode {
+    Sum,
+    Total,
+}
+
 /// The parsed config — kept as a generic JSON value so the runner table stays
 /// open-ended (mirrors the bash `jq` lookups rather than a rigid schema).
 pub struct Config {
@@ -102,6 +122,24 @@ impl Config {
     pub fn active_runner_cmd(&self, key: &str) -> Option<String> {
         let name = self.default_runner()?;
         self.runner_cmd(&name, key)
+    }
+
+    /// `.runners[<name>].cost` — a custom runner's cost-extraction spec, if any.
+    /// `None` means "use the built-in pi/claude shapes" (the default). A spec is
+    /// only honored when both `type` and `pointer` are present strings.
+    pub fn runner_cost_spec(&self, name: &str) -> Option<CostSpec> {
+        let c = self.root.get("runners")?.get(name)?.get("cost")?;
+        let type_tag = c.get("type")?.as_str()?.to_string();
+        let pointer = c.get("pointer")?.as_str()?.to_string();
+        let mode = match c.get("mode").and_then(|m| m.as_str()).unwrap_or("sum") {
+            "total" => CostMode::Total,
+            _ => CostMode::Sum,
+        };
+        Some(CostSpec {
+            type_tag,
+            pointer,
+            mode,
+        })
     }
 }
 

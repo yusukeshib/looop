@@ -11,6 +11,7 @@
 //! external formatter and looop never re-execs itself to post-process its own
 //! child — the old `| "$LOOOP_BIN" _ fmt` pipe seam is gone.
 
+use crate::config::Config;
 use crate::cost::{self, CostMeter};
 use crate::paths::Paths;
 use crate::util;
@@ -59,7 +60,12 @@ pub fn run_streamed(
     };
 
     let mut sinks: Vec<File> = tee.iter().filter_map(|p| File::create(p).ok()).collect();
-    let mut meter = CostMeter::default();
+    // A custom runner can declare its cost shape in config; built-in pi/claude
+    // need no spec. This is what lets the budget breaker meter any runner.
+    let spec = Config::load(paths)
+        .ok()
+        .and_then(|c| c.runner_cost_spec(cost_runner));
+    let mut meter = CostMeter::new(spec);
 
     for line in BufReader::new(out).lines() {
         let Ok(line) = line else { break };
