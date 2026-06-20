@@ -61,7 +61,11 @@ pub fn cmd_serve(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         // supervisor, which spawns this command under a PTY. `_ pulse` then runs
         // the real loop (and takes the single-instance lock inside cmd_run).
         let bin = paths.bin.to_string_lossy().to_string();
-        session::spawn_detached(paths, vec![bin, "_pulse".to_string()], PULSE_SESSION)?;
+        session::spawn_detached(
+            paths,
+            vec![bin, "_".to_string(), "pulse".to_string()],
+            PULSE_SESSION,
+        )?;
         // The detached supervisor needs a beat to register the session; wait so
         // the follow below doesn't race it and get `no session matching pulse`.
         session::await_alive(paths, PULSE_SESSION, Duration::from_secs(5));
