@@ -126,7 +126,7 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
     let busy = interval("LOOOP_BUSY_INTERVAL", &cfg, "busy_interval", idle);
     let active = interval("LOOOP_ACTIVE_INTERVAL", &cfg, "active_interval", idle);
 
-    // Single-instance lock (mkdir-based; macOS has no flock).
+    // Single-instance lock (flock-based; released by the kernel on exit/crash).
     let Some(_guard) = acquire_lock(paths) else {
         let oldpid = fs::read_to_string(paths.lock().join("pid")).unwrap_or_default();
         eprintln!("looop: already running (pid {})", oldpid.trim());
@@ -166,14 +166,14 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
     // changes on its own. Reset every beat; only a fresh override re-arms it.
     let mut force = false;
     loop {
-        let acted = tick::tick(paths, force);
+        let outcome = tick::tick(paths, force);
         force = false;
 
         // Pick the base cadence ONCE: a beat that moved is "busy"; otherwise a
         // live worker keeps us "active"; an idle world waits the longest. Both
         // the interval and its label come from this single classification, so
         // any_worker_alive() is probed at most once per beat (not twice).
-        let (mut want, mut reason) = if acted {
+        let (mut want, mut reason) = if outcome.acted {
             (busy, "busy")
         } else if session::any_worker_alive(paths) {
             (active, "active")
@@ -181,28 +181,24 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
             (idle, "idle")
         };
 
-        // One-shot AI cadence override via .next-interval (clamped 5..3600).
-        let reqf = paths.data_dir.join(".next-interval");
-        if let Ok(raw) = fs::read_to_string(&reqf) {
-            let digits: String = raw.chars().filter(|c| c.is_ascii_digit()).collect();
-            let _ = fs::remove_file(&reqf);
-            if let Ok(mut req) = digits.parse::<u64>() {
-                req = req.clamp(5, 3600);
-                util::event(
-                    Level::Info,
-                    "cadence",
-                    &format!("AI cadence override: next beat in {req}s (default {want}s)"),
-                    &[
-                        ("secs", serde_json::json!(req)),
-                        ("default", serde_json::json!(want)),
-                    ],
-                );
-                want = req;
-                reason = "override";
-                // The override also forces the next beat to re-decide even if the
-                // world is unchanged (time-based follow-up, not just a sleep nudge).
-                force = true;
-            }
+        // One-shot AI cadence nudge, handed straight back from the beat
+        // in-memory (no `.next-interval` file). Clamped 5..3600.
+        if let Some(req) = outcome.next_interval_s {
+            let req = req.clamp(5, 3600);
+            util::event(
+                Level::Info,
+                "cadence",
+                &format!("AI cadence override: next beat in {req}s (default {want}s)"),
+                &[
+                    ("secs", serde_json::json!(req)),
+                    ("default", serde_json::json!(want)),
+                ],
+            );
+            want = req;
+            reason = "override";
+            // The nudge also forces the next beat to re-decide even if the world
+            // is unchanged (time-based follow-up, not just a sleep nudge).
+            force = true;
         }
         util::event(
             Level::Info,

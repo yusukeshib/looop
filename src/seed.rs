@@ -25,7 +25,6 @@ claims/
 reports/
 .lock/
 .last-tick-hash
-.next-interval
 .tick-backoff
 .cost-unmetered
 .goal-activity.json

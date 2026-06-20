@@ -76,7 +76,7 @@ pub struct Decision {
     /// executor falls back to a generated summary).
     pub journal: String,
     /// Optional one-shot cadence nudge (seconds); NOT a move. Handed to the
-    /// pulse via the same `.next-interval` file the loop already clamps + reads.
+    /// pulse loop in-process via `Decided.next_interval_s` (the loop clamps it).
     pub next_interval_s: Option<u64>,
 }
 
@@ -332,13 +332,11 @@ pub fn consume_decision(paths: &Paths) -> Option<Result<Decided>> {
             decision.journal.clone()
         };
         append_journal(paths, &journal)?;
-        if let Some(secs) = decision.next_interval_s {
-            let _ = fs::write(paths.data_dir.join(".next-interval"), format!("{secs}\n"));
-        }
         Ok(Decided {
             kind: kind(&decision.action),
             summary,
             journal,
+            next_interval_s: decision.next_interval_s,
         })
     })())
 }
@@ -351,6 +349,9 @@ pub struct Decided {
     pub kind: &'static str,
     pub summary: String,
     pub journal: String,
+    /// The decider's one-shot cadence nudge (seconds), passed straight back to
+    /// the pulse loop in-process — no `.next-interval` file round-trip.
+    pub next_interval_s: Option<u64>,
 }
 
 #[cfg(test)]
@@ -514,14 +515,13 @@ mod tests {
         assert_eq!(d.kind, "noop");
         assert_eq!(d.summary, "noop · all quiet");
         assert_eq!(d.journal, "did nothing");
+        // The cadence nudge rides back on the Decided struct, not a file.
+        assert_eq!(d.next_interval_s, Some(30));
         assert!(!path.exists(), "decision file is one-shot");
 
         let journal = fs::read_to_string(p.journal()).unwrap();
         assert!(journal.contains("did nothing"), "journal line appended");
         assert!(journal.starts_with("- "), "canonical journal prefix");
-
-        let next = fs::read_to_string(p.data_dir.join(".next-interval")).unwrap();
-        assert_eq!(next.trim(), "30");
     }
 
     #[test]

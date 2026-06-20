@@ -75,9 +75,29 @@ fn can_skip(hash: &str, last: &str, force: bool) -> bool {
     hash == last && !force
 }
 
-/// Run one beat. Returns whether the AI actually acted (drives cadence).
-/// `force` bypasses the unchanged-world skip once (see [`can_skip`]).
-pub fn tick(paths: &Paths, force: bool) -> bool {
+/// What one beat produced: whether the AI acted (drives cadence classification)
+/// and the decider's optional one-shot cadence nudge. The nudge rides back to the
+/// pulse loop IN-MEMORY here — there is no `.next-interval` file round-trip for
+/// what is purely an in-process handoff between [`tick`] and the run loop.
+pub struct TickOutcome {
+    pub acted: bool,
+    pub next_interval_s: Option<u64>,
+}
+
+impl TickOutcome {
+    /// A beat that did not act and requested no cadence change (skips, backoff,
+    /// config/budget gates).
+    fn idle() -> Self {
+        TickOutcome {
+            acted: false,
+            next_interval_s: None,
+        }
+    }
+}
+
+/// Run one beat. `force` bypasses the unchanged-world skip once (see
+/// [`can_skip`]).
+pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
     let _ = seed::ensure_dirs(paths);
     events::emit(paths, "tick_start", serde_json::json!({}));
 
@@ -111,7 +131,7 @@ pub fn tick(paths: &Paths, force: bool) -> bool {
             &[],
         );
         events::emit(paths, "world_unchanged", serde_json::json!({}));
-        return false;
+        return TickOutcome::idle();
     }
     if hash == last && force {
         util::event(
@@ -150,7 +170,7 @@ pub fn tick(paths: &Paths, force: bool) -> bool {
                 "tick_backoff",
                 serde_json::json!({ "fails": fails, "retry_in_s": remain }),
             );
-            return false;
+            return TickOutcome::idle();
         }
     }
 
@@ -159,7 +179,7 @@ pub fn tick(paths: &Paths, force: bool) -> bool {
         Ok(c) => c,
         Err(e) => {
             util::event(Level::Error, "tick.error", &format!("config: {e}"), &[]);
-            return false;
+            return TickOutcome::idle();
         }
     };
     let runner_name = cfg.default_runner().unwrap_or_default();
@@ -170,7 +190,7 @@ pub fn tick(paths: &Paths, force: bool) -> bool {
             &format!("no tick command for runner '{runner_name}'"),
             &[("runner", serde_json::json!(runner_name))],
         );
-        return false;
+        return TickOutcome::idle();
     };
 
     // The runner+spec signature for fail-closed unmetered tracking: a change to
@@ -203,7 +223,7 @@ pub fn tick(paths: &Paths, force: bool) -> bool {
                 "budget_exceeded",
                 serde_json::json!({ "spent_usd": spent, "max_daily_usd": max }),
             );
-            return false;
+            return TickOutcome::idle();
         }
         // Fail-closed: if a budget is set but this runner keeps producing no cost
         // (the breaker can't measure it), refuse to spend blindly rather than
@@ -223,7 +243,7 @@ pub fn tick(paths: &Paths, force: bool) -> bool {
                 "budget_unmetered",
                 serde_json::json!({ "runner": runner_name }),
             );
-            return false;
+            return TickOutcome::idle();
         }
     }
 
@@ -315,10 +335,11 @@ pub fn tick(paths: &Paths, force: bool) -> bool {
     // (H1) and leaves the hash uncommitted so a transient issue retries — the
     // three failure shapes share that handling and differ only in how the log
     // line reads.
-    let acted = match (runner_ok, outcome) {
+    let (acted, next_interval_s) = match (runner_ok, outcome) {
         (true, Some(Ok(d))) => {
             let _ = fs::write(paths.data_dir.join(".last-tick-hash"), format!("{hash}\n"));
             clear_backoff(paths);
+            let next_interval_s = d.next_interval_s;
             let cost = tick_cost(paths, &cost_id);
             let cost_str = cost.map(|c| format!(" · ${c:.4}")).unwrap_or_default();
             util::event(
@@ -339,7 +360,7 @@ pub fn tick(paths: &Paths, force: bool) -> bool {
                 "decided",
                 serde_json::json!({ "run_id": cost_id, "action": d.kind, "journal": d.journal }),
             );
-            true
+            (true, next_interval_s)
         }
         failure => {
             let fails = record_backoff(paths, &hash);
@@ -382,12 +403,15 @@ pub fn tick(paths: &Paths, force: bool) -> bool {
                 "tick_failed",
                 serde_json::json!({ "run_id": cost_id }),
             );
-            false
+            (false, None)
         }
     };
 
     prune_runs(paths);
-    acted
+    TickOutcome {
+        acted,
+        next_interval_s,
+    }
 }
 
 /// Best-effort: this tick's recorded spend, read back from the cost ledger
