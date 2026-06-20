@@ -1,11 +1,10 @@
 //! Cross-cutting helpers: colors, timestamps, logging, content hashing.
 //!
 //! RULE 2 — the pulse is unbreakable code; these are the small deterministic
-//! primitives it leans on. Timestamps that feed the AI prompt are taken from the
-//! system `date` (parity with the bash version's TZ handling); everything else
-//! uses chrono for speed.
+//! primitives it leans on. Everything here is pure in-process Rust — timestamps
+//! and TZ via chrono, hashing via FNV-1a, liveness via a direct `kill(pid, 0)`
+//! syscall — so the pulse never depends on `date`/`shasum`/`kill` being on PATH.
 
-use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 static COLOR: OnceLock<bool> = OnceLock::new();
@@ -212,17 +211,15 @@ pub fn hms() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
-/// Run the system `date` with a `+`-format and return trimmed stdout. Used only
-/// for the few TZ-sensitive strings embedded in the tick prompt, so they match
-/// the bash version's libc formatting exactly (e.g. `%Z` => "EDT").
+/// Local wall-clock formatted with a chrono strftime pattern. Used for the
+/// TZ-sensitive strings embedded in the tick prompt. The bash version shelled
+/// out to `date` to render `%Z` as a libc abbreviation ("EDT"); chrono renders
+/// `%Z` on `Local` as the numeric offset ("-04:00") instead, which is
+/// unambiguous for the AI reading the prompt and needs no subprocess or PATH
+/// dependency. Format strings are controlled constants, so `format` never sees
+/// an invalid specifier.
 pub fn date_fmt(fmt: &str) -> String {
-    Command::new("date")
-        .arg(format!("+{fmt}"))
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
-        .unwrap_or_default()
+    chrono::Local::now().format(fmt).to_string()
 }
 
 /// Content hash for `world_hash` — deterministic FNV-1a (128-bit), computed
@@ -270,17 +267,28 @@ fn is_executable(_p: &std::path::Path) -> bool {
     true
 }
 
-/// `kill -0 <pid>` — is the process alive? Shelled out for portability parity.
+/// Is the process alive? A direct `kill(pid, 0)` syscall (no subprocess) — the
+/// FFI shape mirrors `main::restore_sigpipe`'s raw `signal` declaration, so we
+/// stay crate-free. `kill(pid, 0)` sends no signal but performs the existence +
+/// permission check: it returns 0 when the process exists and is signalable,
+/// matching the old `kill -0` exit status exactly (EPERM/ESRCH both → not 0 →
+/// treated as not-alive, as the shell did).
+#[cfg(unix)]
 pub fn pid_alive(pid: &str) -> bool {
-    if pid.is_empty() {
+    let Ok(pid) = pid.trim().parse::<i32>() else {
+        return false;
+    };
+    if pid <= 0 {
         return false;
     }
-    Command::new("kill")
-        .args(["-0", pid])
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe { kill(pid, 0) == 0 }
+}
+#[cfg(not(unix))]
+pub fn pid_alive(_pid: &str) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -338,5 +346,16 @@ mod tests {
         let h = content_hash(b"");
         assert_eq!(h.len(), 32);
         assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_detects_self_and_rejects_garbage() {
+        // Our own process is always signalable by ourselves.
+        assert!(pid_alive(&std::process::id().to_string()));
+        assert!(!pid_alive("not-a-pid"));
+        assert!(!pid_alive(""));
+        assert!(!pid_alive("0"));
+        assert!(!pid_alive("-1"));
     }
 }
