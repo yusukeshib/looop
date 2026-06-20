@@ -52,9 +52,16 @@ Each box is meant to land as its own commit.
   can be metered; (2) fail-closed — if a budget is set but the runner stays
   unmetered for `UNMETERED_LIMIT` consecutive runs, the breaker opens and skips
   the AI (self-heals when the runner/spec signature changes).
-- [ ] **Claims are advisory only.** `start_worker` doesn't check `claims/`, and a
-  worker writes its lease voluntarily; nothing enforces one-worker-per-goal. The
-  "lease" (K8s analogy) has no real mutual exclusion.
+- [x] **Claims are advisory only.** Per-goal duplication was already prevented by
+  the same-id alive guard in `cmd_start_session`; the real gap was the
+  resource-level lease being a non-atomic `printf > claims/<name>.json` (a
+  last-writer-wins TOCTOU race a worker could also just skip). *Done:* added
+  `looop claim <name>` / `looop unclaim <name>` — an atomic (`O_EXCL`),
+  liveness-aware test-and-set that exits non-zero when a LIVE session holds the
+  lease and reclaims a stale one. The worker CONTRACT now uses it instead of raw
+  file ops, so the lease is a real mutex. (looop still can't pre-know an
+  arbitrary worker-chosen resource name, so enforcement is at the claim primitive,
+  not at spawn — which is the right layer.)
 - [ ] **`current_exe` re-exec fragility.** The detached supervisor re-execs the
   running binary; an upgrade / `nix gc` / move during a long-lived pulse can leave
   `current_exe` pointing at a stale or deleted inode. *Note:* the re-exec lives in

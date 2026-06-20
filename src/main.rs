@@ -114,6 +114,12 @@ fn main() -> ExitCode {
         "kill" => deps::require_deps(&paths).and_then(|_| session::cmd_kill(&paths, rest)),
         "flag" => deps::require_deps(&paths).and_then(|_| session::cmd_flag(&paths, rest)),
         "unflag" => deps::require_deps(&paths).and_then(|_| session::cmd_unflag(&paths, rest)),
+        // Lease primitives — the same worker↔loop coordination family as flag/unflag
+        // (clean, top-level, usable by a worker via the CONTRACT or by a human),
+        // not raw plumbing like `_ cost`. Atomic, liveness-aware test-and-set so
+        // two workers can't race the same resource.
+        "claim" => deps::require_deps(&paths).and_then(|_| gate::cmd_claim(&paths, rest)),
+        "unclaim" => deps::require_deps(&paths).and_then(|_| gate::cmd_unclaim(&paths, rest)),
         "prune" => deps::require_deps(&paths).and_then(|_| session::cmd_prune(&paths, rest)),
         "config" => match rest.first().map(String::as_str) {
             Some("zsh") => {

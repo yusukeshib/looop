@@ -32,13 +32,14 @@ const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
   (this lets the pulse prune the corpse). NEVER do this mid-task or while waiting
   on a human.
 - LEASE (ONLY if the PLAYBOOK/goal tells you to claim this task) — announce
-  ownership BEFORE any work so a tick or sibling can't duplicate/race you, and
-  release it when done:
-    mkdir -p claims && printf '{"session":"%s","name":"%s"}\n' "$LOOOP_SESSION_ID" "<name>" > "claims/<name>.json"
-  (<name> and any extra fields are defined by the goal — e.g. one file per repo.)
-  Delete claims/<name>.json the instant the task is fully done, right before the
-  kill above. If you crash the pulse auto-reaps your claim; on a clean finish YOU
-  delete it. NEVER sit/sleep/poll while holding a claim — act and move on.
+  ownership BEFORE any work so a tick or sibling can't duplicate/race you:
+    "$LOOOP_BIN" claim <name>     # atomic test-and-set; <name> defined by the goal (e.g. one per repo)
+  This EXITS NON-ZERO if a live session already holds <name> — if so, do NOT
+  proceed: flag the human or pick other work, never race the holder. Release it
+  the instant the task is fully done, right before the kill above:
+    "$LOOOP_BIN" unclaim <name>
+  If you crash the pulse auto-reaps your claim; on a clean finish YOU release it.
+  NEVER sit/sleep/poll while holding a claim — act and move on.
 - SINGLE-WRITER DATA DIR: the pulse (the tick AI) is the SOLE writer of the
   policy files — PLAYBOOK.md, goals/ and sensors/. By default you write ONLY to
   claims/ (your lease), reports/ (deliverables) and your own code sandbox. Do

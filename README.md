@@ -107,6 +107,8 @@ looop resize <id> <COLSxROWS>  resize a session's terminal
 looop attach <id> | detach <id>   attach/force-detach a terminal (Ctrl-\ Ctrl-\)
 looop restart <id>             restart a worker's wrapped command
 looop kill|flag|unflag <id>    manage a worker; looop prune clears finished ones
+looop claim|unclaim <name>     atomic resource lease (one worker per resource);
+                               `claim` exits non-zero if a live session holds it
 looop journal [--tail N]       read the decision log (one line per move; --tail N)
 looop cost [today|all|--json]  report LLM spend from the cost ledger
 looop config zsh|bash          print shell integration (tab completions)

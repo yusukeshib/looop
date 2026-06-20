@@ -55,6 +55,9 @@ Usage:
   looop kill <id>                terminate a worker session
   looop flag <id> [message]      raise a worker's attention flag
   looop unflag <id>              clear a worker's attention flag
+  looop claim <name>             atomically take a resource lease (exit 1 if a
+                                live session holds it); release with unclaim
+  looop unclaim <name>           release a lease you own
   looop prune                    clear ALL finished worker corpses now (the pulse
                                 auto-reaps only ones older than the retention
                                 window each tick — LOOOP_SESSION_TTL, default 3d)
