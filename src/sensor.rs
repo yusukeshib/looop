@@ -20,6 +20,14 @@ fn env_num(var: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+/// Read up to the last `max` bytes of a file as a trimmed lossy string (the
+/// stderr tail surfaced to the decider on a sensor failure). Empty when absent.
+fn read_tail(path: &Path, max: usize) -> String {
+    let bytes = fs::read(path).unwrap_or_default();
+    let start = bytes.len().saturating_sub(max);
+    String::from_utf8_lossy(&bytes[start..]).trim().to_string()
+}
+
 /// Run ONE sensor with a portable timeout + size cap. Returns its exit status
 /// (124 = timed out, per coreutils). `out`/`err` receive stdout/stderr.
 fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
@@ -54,12 +62,33 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
         Err(_) => 1,
     };
 
+    // A FAILED sensor (non-zero exit, incl. rc 124 = timed out) otherwise leaves
+    // whatever partial/empty stdout it wrote as the snapshot, and its stderr only
+    // lands in the .err file the prompt never reads — so the decider reasons over
+    // a blank/garbage world and may noop blindly. Replace the snapshot with a
+    // normalized {signal,detail} error object: the failure now reaches the prompt
+    // AND the world hash (only .signal feeds it, so a stable break wakes the loop
+    // once, volatile stderr in .detail doesn't re-wake it, and FIXING the sensor
+    // — stdout differs again — wakes the loop next beat).
+    if rc != 0 {
+        let msg = if rc == 124 {
+            format!("sensor timed out after {to}s (LOOOP_SENSOR_TIMEOUT)")
+        } else {
+            "sensor exited non-zero — fix the script or its environment".to_string()
+        };
+        let blob = serde_json::json!({
+            "signal": { "error": true, "exit_code": rc },
+            "detail": { "message": msg, "stderr": read_tail(err, 1024) },
+        });
+        let _ = fs::write(out, format!("{blob}\n"));
+        return rc;
+    }
+
     // Context backpressure: a successful reading over the cap is replaced with a
     // tiny error object so the pulse stops paying for the blob and the AI sees
     // the misbehavior.
     let cap = env_num("LOOOP_SENSOR_MAX_BYTES", 8192);
-    if rc == 0
-        && cap != 0
+    if cap != 0
         && let Ok(meta) = fs::metadata(out)
     {
         let sz = meta.len();
@@ -363,6 +392,41 @@ mod tests {
         let p = Paths::temp();
         let v = sys_claims(&p);
         assert_eq!(v["signal"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn failed_user_sensor_becomes_error_snapshot() {
+        let p = Paths::temp();
+        let snap = p.snapshots_dir();
+        fs::create_dir_all(&snap).unwrap();
+        fs::create_dir_all(p.sensors_dir()).unwrap();
+        let script = p.sensors_dir().join("boom.sh");
+        fs::write(&script, "#!/usr/bin/env bash\necho 'kaboom' >&2\nexit 3\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = fs::metadata(&script).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&script, perm).unwrap();
+        }
+
+        let r = Sensor::User(script).sense(&p, &snap);
+        assert!(!r.ok, "a non-zero exit is a failure");
+        let body = fs::read_to_string(snap.join("sensor-boom.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // The failure is a normalized {signal,detail} object the decider can read.
+        assert_eq!(v["signal"]["error"], serde_json::json!(true));
+        assert_eq!(v["signal"]["exit_code"], serde_json::json!(3));
+        assert!(
+            v["detail"]["stderr"].as_str().unwrap().contains("kaboom"),
+            "stderr tail reaches the prompt"
+        );
+        // Only .signal feeds the world hash: a stable break wakes the loop once,
+        // not on every volatile stderr change.
+        assert_eq!(
+            crate::worldhash::wake_signal(v.clone()),
+            serde_json::json!({ "error": true, "exit_code": 3 })
+        );
     }
 
     #[test]

@@ -25,6 +25,7 @@
 //!     `medium` budget is reserved for the worker's multi-step execution.
 //!   * `claude` pins no model on either command, so both inherit the CLI default
 //!     — equal, which still satisfies "tick not weaker than worker".
+//!
 //! Cost stays bounded because the world-hash gate skips the AI entirely when
 //! nothing changed, and the tick emits only one tiny decision. Operators who want
 //! to trade decision quality for cost can drop the tick model in this file.

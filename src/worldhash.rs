@@ -39,7 +39,7 @@ fn rel(paths: &Paths, p: &Path) -> String {
 /// whole. Volatile `.detail` is dropped so it reaches the prompt but never the
 /// change-detection hash. `serde_json::Value` serializes objects with sorted
 /// keys (BTreeMap), matching `jq -cS`'s canonical form.
-fn wake_signal(v: serde_json::Value) -> serde_json::Value {
+pub(crate) fn wake_signal(v: serde_json::Value) -> serde_json::Value {
     match &v {
         serde_json::Value::Object(m) if m.contains_key("signal") => {
             m.get("signal").cloned().unwrap_or(serde_json::Value::Null)
