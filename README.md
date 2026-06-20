@@ -171,7 +171,7 @@ cargo install --git https://github.com/yusukeshib/looop.git --locked looop
 ### Verify
 
 ```sh
-looop version   # -> looop 0.1.0
+looop version   # prints the installed version (e.g. looop 0.13.0)
 looop help
 ```
 

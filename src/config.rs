@@ -19,12 +19,15 @@
 //!
 //! MODEL ALLOCATION (M4): the tick is the highest-leverage call — it picks the
 //! single move that steers everything — so it must NOT run on a weaker model than
-//! the workers it directs. The default tick therefore uses the same strong model
-//! as the worker (claude-opus-4-8). Cost stays bounded because the world-hash gate
-//! skips the AI entirely when nothing changed, and the tick emits only one tiny
-//! decision; the heavier `medium` thinking budget is reserved for the worker,
-//! which does the actual multi-step execution. Operators who want to trade
-//! decision quality for cost can drop the tick model back to sonnet in this file.
+//! the workers it directs. This is enforced per runner:
+//!   * `pi` pins both tick and worker to the same strong model (claude-opus-4-8);
+//!     the tick runs at `--thinking low` (one tiny decision) while the heavier
+//!     `medium` budget is reserved for the worker's multi-step execution.
+//!   * `claude` pins no model on either command, so both inherit the CLI default
+//!     — equal, which still satisfies "tick not weaker than worker".
+//! Cost stays bounded because the world-hash gate skips the AI entirely when
+//! nothing changed, and the tick emits only one tiny decision. Operators who want
+//! to trade decision quality for cost can drop the tick model in this file.
 
 use crate::paths::Paths;
 use anyhow::{Context, Result};
