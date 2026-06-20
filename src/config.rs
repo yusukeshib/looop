@@ -4,15 +4,18 @@
 //! disposable AI move (stdin = the tick prompt). `interactive` = how to launch
 //! a worker agent; {{prompt_file}} is substituted with the worker's prompt file.
 //!
-//! TICK COST ACCOUNTING (H3): both runners pipe their tick through `_ fmt`, which
-//! meters spend into the cost ledger. pi emits per-message usage (`_ fmt` sums it);
+//! TICK COST ACCOUNTING (H3): `runner::run_streamed` meters every tick IN-PROCESS
+//! off the runner's NDJSON stdout. pi emits per-message usage (the meter sums it);
 //! claude emits a single cumulative `total_cost_usd` in its stream-json `result`
-//! event (`_ fmt` takes it as-is). Previously the claude tick ran as plain
-//! `claude -p` with no `_ fmt` seam, so `looop cost` always showed $0 for claude
-//! ticks — accounting was asymmetric between runners. The default now routes
-//! claude through `--output-format stream-json | _ fmt` so both runners meter
-//! symmetrically. (Worker sessions still self-report via `looop _ cost`,
-//! independent of the tick seam.)
+//! event (the meter takes it as-is). Both runners therefore need their structured
+//! stream enabled in the tick command (pi: `--mode json`, claude:
+//! `--output-format stream-json --verbose`), but NEITHER pipes through an external
+//! formatter — there is no `| _ fmt` seam anymore. (Worker sessions self-report
+//! via `looop _ cost`, independent of the tick meter.)
+//!
+//! BACK-COMPAT: a stored `looop.json` written before this change may still end
+//! its tick command with `| "$LOOOP_BIN" _ fmt`. `runner_cmd` strips that trailing
+//! seam on load (see `strip_fmt_seam`), so old configs keep working unchanged.
 //!
 //! MODEL ALLOCATION (M4): the tick is the highest-leverage call — it picks the
 //! single move that steers everything — so it must NOT run on a weaker model than
@@ -27,17 +30,20 @@ use crate::paths::Paths;
 use anyhow::{Context, Result};
 use std::fs;
 
-/// The inline default config, byte-identical to the bash `default_config`.
+/// The inline default config. Originally a copy of the bash `default_config`,
+/// it now diverges deliberately: the tick commands no longer carry the
+/// `| "$LOOOP_BIN" _ fmt` seam, since formatting + cost metering run in-process
+/// (see `runner::run_streamed`).
 pub const DEFAULT_CONFIG: &str = r#"{
   "default": "pi",
   "runners": {
     "claude": {
-      "tick": "claude -p --output-format stream-json --verbose --dangerously-skip-permissions | \"$LOOOP_BIN\" _ fmt",
+      "tick": "claude -p --output-format stream-json --verbose --dangerously-skip-permissions",
       "interactive": "claude \"$(cat {{prompt_file}})\"",
       "resume": "claude --resume"
     },
     "pi": {
-      "tick": "pi -p --mode json -ne --model claude-opus-4-8 --thinking low 'Execute the looop tick instructions provided on stdin.' | \"$LOOOP_BIN\" _ fmt",
+      "tick": "pi -p --mode json -ne --model claude-opus-4-8 --thinking low 'Execute the looop tick instructions provided on stdin.'",
       "interactive": "pi --model claude-opus-4-8 --thinking medium @{{prompt_file}}",
       "resume": "pi --session"
     }
@@ -75,13 +81,17 @@ impl Config {
     }
 
     /// `.runners[<name>].<key>` — e.g. the `tick` / `interactive` command.
+    ///
+    /// Any trailing `| "$LOOOP_BIN" _ fmt` seam from a pre-in-process-metering
+    /// config is stripped here (`strip_fmt_seam`), so stored configs written
+    /// before the formatter moved in-process keep working without re-seeding.
     pub fn runner_cmd(&self, name: &str, key: &str) -> Option<String> {
         self.root
             .get("runners")?
             .get(name)?
             .get(key)?
             .as_str()
-            .map(str::to_owned)
+            .map(strip_fmt_seam)
     }
 
     /// The active runner's command for `key`, resolving `.default` first.
@@ -89,6 +99,29 @@ impl Config {
         let name = self.default_runner()?;
         self.runner_cmd(&name, key)
     }
+}
+
+/// Strip a trailing `| <bin> _ fmt` (or `_fmt`) seam from a runner command.
+///
+/// Tick formatting + cost metering moved in-process (`runner::run_streamed`), so
+/// the old external pipe is dead. Older `looop.json` files still carry it; rather
+/// than force a re-seed (which would clobber user edits) we drop the seam on load.
+/// Only the LAST pipe segment is inspected, and only when it is recognisably the
+/// fmt seam (mentions the looop binary and ends in `_ fmt`/`_fmt`) — any other
+/// user pipeline is left untouched.
+fn strip_fmt_seam(cmd: &str) -> String {
+    if let Some(idx) = cmd.rfind('|') {
+        let tail: String = cmd[idx + 1..]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        let is_fmt = (tail.ends_with("_ fmt") || tail.ends_with("_fmt"))
+            && (tail.contains("LOOOP_BIN") || tail.contains("looop"));
+        if is_fmt {
+            return cmd[..idx].trim_end().to_string();
+        }
+    }
+    cmd.to_string()
 }
 
 /// Seed $LOOOP_CONFIG with the inline default if it does not exist yet.
@@ -102,4 +135,36 @@ pub fn ensure_config(paths: &Paths) -> Result<()> {
             .with_context(|| format!("seeding config {}", paths.config.display()))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::strip_fmt_seam;
+
+    #[test]
+    fn strips_trailing_fmt_seam() {
+        assert_eq!(
+            strip_fmt_seam("pi -p --mode json | \"$LOOOP_BIN\" _ fmt"),
+            "pi -p --mode json"
+        );
+        // Joined verb form (`_fmt`) and bare `looop` binary token both match.
+        assert_eq!(strip_fmt_seam("claude -p | looop _fmt"), "claude -p");
+    }
+
+    #[test]
+    fn leaves_unrelated_pipelines_untouched() {
+        let cmd = "pi -p --mode json | jq .";
+        assert_eq!(strip_fmt_seam(cmd), cmd);
+        let plain = "pi -p --mode json";
+        assert_eq!(strip_fmt_seam(plain), plain);
+        // A trailing pipe that is not the fmt seam stays put.
+        let other = "claude -p | tee out.log";
+        assert_eq!(strip_fmt_seam(other), other);
+    }
+
+    #[test]
+    fn default_config_has_no_fmt_seam() {
+        assert!(!super::DEFAULT_CONFIG.contains("_ fmt"));
+        assert!(!super::DEFAULT_CONFIG.contains("_fmt"));
+    }
 }

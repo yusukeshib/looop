@@ -91,16 +91,17 @@ fn main() -> ExitCode {
         "resize" => deps::require_deps(&paths).and_then(|_| session::cmd_resize(&paths, rest)),
         "restart" => deps::require_deps(&paths).and_then(|_| session::cmd_restart(&paths, rest)),
         "detach" => deps::require_deps(&paths).and_then(|_| session::cmd_detach(&paths, rest)),
-        // Hidden internal verbs, grouped under `_`: `looop _ pulse|fmt|cost`.
-        // Not for human use; called by looop itself (detached pulse spawn, the
-        // tick `_ fmt` pipe seam, and workers self-reporting via `_ cost`).
+        // Hidden internal verbs, grouped under `_`: `looop _ pulse|cost`.
+        // Not for human use; called by looop itself (detached pulse spawn) or by
+        // worker agents self-reporting spend via `_ cost` (an AI-facing callback,
+        // like `flag`). Tick formatting + cost metering are NOT here — they run
+        // in-process in `runner::run_streamed`, not via an external pipe seam.
         "_" => match rest.first().map(String::as_str) {
             // The headless pulse body babysit wraps under a PTY (a bare `looop`).
             Some("pulse") => deps::require_deps(&paths).and_then(|_| service::cmd_pulse(&paths)),
-            Some("fmt") => cost::cmd_fmt(&paths),
             Some("cost") => cost::cmd_cost_record(&paths, &rest[1..]),
             other => {
-                eprintln!("looop _: unknown internal verb {other:?} (expected: pulse, fmt, cost)");
+                eprintln!("looop _: unknown internal verb {other:?} (expected: pulse, cost)");
                 Ok(ExitCode::from(1))
             }
         },

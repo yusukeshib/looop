@@ -1,12 +1,10 @@
 //! Cross-cutting helpers: colors, timestamps, logging, content hashing.
 //!
 //! RULE 2 — the pulse is unbreakable code; these are the small deterministic
-//! primitives it leans on. Timestamps that feed the AI prompt are taken from the
-//! system `date` (parity with the bash version's TZ handling); everything else
-//! uses chrono for speed.
+//! primitives it leans on. Everything here is pure in-process Rust — timestamps
+//! and TZ via chrono, hashing via FNV-1a, liveness via a direct `kill(pid, 0)`
+//! syscall — so the pulse never depends on `date`/`shasum`/`kill` being on PATH.
 
-use std::io::Write;
-use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 static COLOR: OnceLock<bool> = OnceLock::new();
@@ -41,7 +39,7 @@ pub fn init_color() {
         }
     };
     let _ = COLOR.set(enabled);
-    // Export so children (`looop _ fmt`, sensors, workers) inherit the decision.
+    // Export so children (the tick runner, sensors, workers) inherit the decision.
     unsafe { std::env::set_var("LOOOP_COLOR", if enabled { "1" } else { "0" }) };
 }
 
@@ -213,51 +211,37 @@ pub fn hms() -> String {
     chrono::Local::now().format("%H:%M:%S").to_string()
 }
 
-/// Run the system `date` with a `+`-format and return trimmed stdout. Used only
-/// for the few TZ-sensitive strings embedded in the tick prompt, so they match
-/// the bash version's libc formatting exactly (e.g. `%Z` => "EDT").
+/// Local wall-clock formatted with a chrono strftime pattern. Used for the
+/// TZ-sensitive strings embedded in the tick prompt. The bash version shelled
+/// out to `date` to render `%Z` as a libc abbreviation ("EDT"); chrono renders
+/// `%Z` on `Local` as the numeric offset ("-04:00") instead, which is
+/// unambiguous for the AI reading the prompt and needs no subprocess or PATH
+/// dependency. Format strings are controlled constants, so `format` never sees
+/// an invalid specifier.
 pub fn date_fmt(fmt: &str) -> String {
-    Command::new("date")
-        .arg(format!("+{fmt}"))
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim_end().to_string())
-        .unwrap_or_default()
+    chrono::Local::now().format(fmt).to_string()
 }
 
-/// Portable content hash for `world_hash`: prefer `shasum`, then `sha1sum`,
-/// then POSIX `cksum`. Feeds `input` on stdin and returns the first field of
-/// the tool's output — byte-for-byte parity with the bash `_hash`.
+/// Content hash for `world_hash` — deterministic FNV-1a (128-bit), computed
+/// in-process. The bash version shelled out to `shasum`/`sha1sum`/`cksum`; the
+/// port carried that over, which (a) made hashing an UNDECLARED dependency and
+/// (b) silently returned an empty string when none of those tools was on $PATH,
+/// which collapses `world_hash` to a constant so the pulse never wakes. A native
+/// hash removes the subprocess, the hidden dependency, and that silent-stall
+/// failure mode. Only requirement: stable across runs (it is — fixed constants),
+/// so `.last-tick-hash` stays comparable beat to beat. The exact digest differs
+/// from the old shell tools, so the first beat after upgrading sees one
+/// (harmless) "world changed".
 pub fn content_hash(input: &[u8]) -> String {
-    let tool = if on_path("shasum") {
-        "shasum"
-    } else if on_path("sha1sum") {
-        "sha1sum"
-    } else {
-        "cksum"
-    };
-    let mut child = match Command::new(tool)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(_) => return String::new(),
-    };
-    if let Some(mut si) = child.stdin.take() {
-        let _ = si.write_all(input);
+    // FNV-1a, 128-bit (offset basis + prime per the FNV spec).
+    const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
+    const PRIME: u128 = 0x0000000001000000000000000000013b;
+    let mut h = OFFSET;
+    for &b in input {
+        h ^= b as u128;
+        h = h.wrapping_mul(PRIME);
     }
-    let out = match child.wait_with_output() {
-        Ok(o) => o,
-        Err(_) => return String::new(),
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .split_whitespace()
-        .next()
-        .unwrap_or("")
-        .to_string()
+    format!("{h:032x}")
 }
 
 /// `command -v <cmd>` — true if found and executable on $PATH.
@@ -283,17 +267,28 @@ fn is_executable(_p: &std::path::Path) -> bool {
     true
 }
 
-/// `kill -0 <pid>` — is the process alive? Shelled out for portability parity.
+/// Is the process alive? A direct `kill(pid, 0)` syscall (no subprocess) — the
+/// FFI shape mirrors `main::restore_sigpipe`'s raw `signal` declaration, so we
+/// stay crate-free. `kill(pid, 0)` sends no signal but performs the existence +
+/// permission check: it returns 0 when the process exists and is signalable,
+/// matching the old `kill -0` exit status exactly (EPERM/ESRCH both → not 0 →
+/// treated as not-alive, as the shell did).
+#[cfg(unix)]
 pub fn pid_alive(pid: &str) -> bool {
-    if pid.is_empty() {
+    let Ok(pid) = pid.trim().parse::<i32>() else {
+        return false;
+    };
+    if pid <= 0 {
         return false;
     }
-    Command::new("kill")
-        .args(["-0", pid])
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    unsafe { kill(pid, 0) == 0 }
+}
+#[cfg(not(unix))]
+pub fn pid_alive(_pid: &str) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -339,5 +334,28 @@ mod tests {
         assert_eq!(Level::Ok.glyph(), "✓");
         assert_eq!(Level::Warn.glyph(), "⚡");
         assert_eq!(Level::Error.glyph(), "✗");
+    }
+
+    #[test]
+    fn content_hash_is_deterministic_and_change_sensitive() {
+        // Stable across calls (so `.last-tick-hash` stays comparable).
+        assert_eq!(content_hash(b"hello world"), content_hash(b"hello world"));
+        // Distinct inputs hash differently.
+        assert_ne!(content_hash(b"hello world"), content_hash(b"hello worle"));
+        // 128-bit digest is rendered as 32 lowercase hex chars, never empty.
+        let h = content_hash(b"");
+        assert_eq!(h.len(), 32);
+        assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_alive_detects_self_and_rejects_garbage() {
+        // Our own process is always signalable by ourselves.
+        assert!(pid_alive(&std::process::id().to_string()));
+        assert!(!pid_alive("not-a-pid"));
+        assert!(!pid_alive(""));
+        assert!(!pid_alive("0"));
+        assert!(!pid_alive("-1"));
     }
 }

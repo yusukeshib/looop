@@ -1,25 +1,26 @@
-//! LLM cost accounting + the progressive output formatter (`looop _ fmt`).
+//! LLM cost accounting + the progressive output formatter.
 //!
 //! Spend reaches the ledger through two seams — INTENTIONALLY two, because the
 //! two AI process models are different, not because the logic is duplicated:
 //!   • tick / goal runs are one-shot, non-interactive, and looop owns their
-//!     stdout, so we pipe them through `_ fmt`, which renders progress live AND
-//!     meters spend off the same NDJSON stream (see `CostMeter`).
+//!     stdout: `runner::run_streamed` reads that NDJSON stream IN-PROCESS,
+//!     rendering progress live (`format_line`) AND metering spend off the same
+//!     stream (`CostMeter`). No external formatter process, no self-pipe.
 //!   • worker sessions are long-lived, interactive, and self-supervising — looop
 //!     never pipes their stdout, so the agent self-reports its own total via
-//!     `looop _ cost` at end-of-session.
+//!     `looop _ cost` at end-of-session (an AI-facing callback, like `flag`).
 //! Both append one JSON line to the cost ledger; `looop cost` reports over it.
 
 use crate::config::Config;
 use crate::paths::Paths;
 use anyhow::Result;
 use std::fs::OpenOptions;
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::process::ExitCode;
 
 /// Total USD recorded in the ledger for the current LOCAL day. The ledger is the
-/// single source of truth for spend (both tick `_ fmt` and worker `_ cost` append
-/// to it), so summing it survives pulse restarts (H2 — the daily cap must be
+/// single source of truth for spend (both the in-process tick meter and worker
+/// `_ cost` append to it), so summing it survives pulse restarts (H2 — the daily cap must be
 /// process-independent state on disk, not in-memory loop state).
 pub fn spent_today(paths: &Paths) -> f64 {
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
@@ -93,7 +94,7 @@ pub fn cmd_cost_record(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 /// claude's authoritative total wins when present, so the two readings are never
 /// added together (no double counting); pi's running sum is the fallback.
 #[derive(Default)]
-struct CostMeter {
+pub(crate) struct CostMeter {
     pi_sum: f64,
     claude_total: Option<f64>,
 }
@@ -101,7 +102,7 @@ struct CostMeter {
 impl CostMeter {
     /// Fold one NDJSON line into the running cost. Non-JSON lines and events
     /// without usage data are ignored.
-    fn ingest(&mut self, line: &str) {
+    pub(crate) fn ingest(&mut self, line: &str) {
         let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
             return;
         };
@@ -123,42 +124,15 @@ impl CostMeter {
 
     /// The resolved spend for the run: claude's authoritative cumulative total
     /// when present, else pi's per-message sum.
-    fn total(&self) -> f64 {
+    pub(crate) fn total(&self) -> f64 {
         self.claude_total.unwrap_or(self.pi_sum)
     }
 }
 
-/// `looop _ fmt` — read a runner's NDJSON stream on stdin, print friendly progress
-/// live, and (when LOOOP_COST_* is set) meter spend into the ledger. The two
-/// responsibilities are kept separate: `format_line` renders, `CostMeter` meters.
-pub fn cmd_fmt(paths: &Paths) -> Result<ExitCode> {
-    let metering = std::env::var("LOOOP_COST_KIND").is_ok();
-    let mut meter = CostMeter::default();
-    let stdin = std::io::stdin();
-    let mut stdout = std::io::stdout();
-
-    for line in stdin.lock().lines() {
-        let Ok(line) = line else { break };
-        if let Some(rendered) = format_line(&line) {
-            let _ = writeln!(stdout, "{rendered}");
-            let _ = stdout.flush();
-        }
-        if metering {
-            meter.ingest(&line);
-        }
-    }
-
-    if metering {
-        let kind = std::env::var("LOOOP_COST_KIND").unwrap_or_default();
-        let id = std::env::var("LOOOP_COST_ID").unwrap_or_default();
-        let runner = std::env::var("LOOOP_COST_RUNNER").unwrap_or_default();
-        record_cost(paths, &kind, &id, &runner, &format!("{:.6}", meter.total()));
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
 /// Render one NDJSON event line; `None` means "emit nothing" (mirrors jq empty).
-fn format_line(line: &str) -> Option<String> {
+/// Used in-process by `runner::run_streamed` to turn the tick runner's raw
+/// stream into the friendly progress lines archived to runs/<id>/output.log.
+pub(crate) fn format_line(line: &str) -> Option<String> {
     use crate::util::{cyan, dim, red, rst};
     let Ok(e) = serde_json::from_str::<serde_json::Value>(line) else {
         // Non-JSON: pass through unchanged, but swallow empty lines.

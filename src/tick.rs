@@ -208,11 +208,6 @@ pub fn tick(paths: &Paths) -> bool {
     // `looop watch pulse` shows only `tick.*`/`sense.*` events. Replay the full
     // detail from runs/<id>/output.log or tick.log.
     let tee: Vec<PathBuf> = vec![run_dir.join("output.log"), paths.data_dir.join("tick.log")];
-    let cost_env = [
-        ("LOOOP_COST_KIND", "tick"),
-        ("LOOOP_COST_RUNNER", runner_name.as_str()),
-        ("LOOOP_COST_ID", cost_id.as_str()),
-    ];
 
     // Typed-action path: looop is the SOLE executor of the decider's single move.
     // The runner emits ONE JSON action to .decision.json; we execute it, journal
@@ -220,7 +215,15 @@ pub fn tick(paths: &Paths) -> bool {
     // ONLY when a usable decision was produced — a runner crash, a malformed
     // decision, or no decision all count as failures that arm exponential
     // backoff (H1) and leave the hash uncommitted so a transient issue retries.
-    let runner_ok = runner::run_streamed(paths, &tick_cmd, &prompt_file, &cost_env, &tee);
+    let runner_ok = runner::run_streamed(
+        paths,
+        &tick_cmd,
+        &prompt_file,
+        "tick",
+        &cost_id,
+        &runner_name,
+        &tee,
+    );
     let secs = t0.elapsed().as_secs();
     let outcome = if runner_ok {
         executor::consume_decision(paths)
@@ -309,9 +312,9 @@ pub fn tick(paths: &Paths) -> bool {
     acted
 }
 
-/// Best-effort: this tick's recorded spend, read back from the cost ledger (the
-/// runner's `_ fmt` seam writes the row before `run_streamed` returns). `None`
-/// when the runner doesn't meter (e.g. the claude tick) or nothing was recorded.
+/// Best-effort: this tick's recorded spend, read back from the cost ledger
+/// (`run_streamed` meters the run in-process and writes the row before it
+/// returns). `None` when the runner emitted no usage data or nothing was recorded.
 fn tick_cost(paths: &Paths, cost_id: &str) -> Option<f64> {
     let text = fs::read_to_string(paths.cost_ledger()).ok()?;
     text.lines()
