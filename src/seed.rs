@@ -26,6 +26,8 @@ reports/
 .lock/
 .last-tick-hash
 .next-interval
+.tick-backoff
+.cost-unmetered
 tick.log
 events.jsonl
 cost.jsonl

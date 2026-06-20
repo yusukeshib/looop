@@ -173,6 +173,14 @@ pub fn tick(paths: &Paths, force: bool) -> bool {
         return false;
     };
 
+    // The runner+spec signature for fail-closed unmetered tracking: a change to
+    // either (switching runners, adding a cost spec) resets the breaker so the
+    // new config gets a fresh attempt.
+    let cost_sig = format!(
+        "{runner_name}|{}",
+        cfg.runner_cost_spec(&runner_name).is_some()
+    );
+
     // 3b. budget circuit breaker (H2): once today's ledger total reaches the
     // configured ceiling, skip the AI entirely so a runaway loop can't bill past
     // the cap. Off by default; clears at local midnight.
@@ -194,6 +202,26 @@ pub fn tick(paths: &Paths, force: bool) -> bool {
                 paths,
                 "budget_exceeded",
                 serde_json::json!({ "spent_usd": spent, "max_daily_usd": max }),
+            );
+            return false;
+        }
+        // Fail-closed: if a budget is set but this runner keeps producing no cost
+        // (the breaker can't measure it), refuse to spend blindly rather than
+        // fail open. Self-heals when the runner/spec signature changes.
+        if crate::cost::unmetered_blocked(paths, &cost_sig) {
+            util::event(
+                Level::Warn,
+                "tick.budget_unmetered",
+                &format!(
+                    "runner '{runner_name}' produced no cost for {n} consecutive runs and a budget is set — skipping AI (declare a runner `cost` spec, or use pi/claude)",
+                    n = crate::cost::UNMETERED_LIMIT
+                ),
+                &[("runner", serde_json::json!(runner_name))],
+            );
+            events::emit(
+                paths,
+                "budget_unmetered",
+                serde_json::json!({ "runner": runner_name }),
             );
             return false;
         }
@@ -250,26 +278,34 @@ pub fn tick(paths: &Paths, force: bool) -> bool {
         None
     };
 
-    // Fail-open guard: the budget breaker (H2) can only enforce a cap if runs are
-    // metered, and metering is wired to the pi/claude NDJSON shapes. A custom
-    // runner produces no cost row, so `max_daily_usd` would silently never trip.
-    // If a budget is set but this run recorded nothing, warn once per process so
-    // the operator learns the breaker is inert here — not on the bill.
-    if runner_ok
-        && crate::cost::daily_budget(&cfg).is_some()
-        && tick_cost(paths, &cost_id).is_none()
-    {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if !WARNED.swap(true, Ordering::Relaxed) {
+    // Fail-closed accounting: the budget breaker (H2) can only enforce a cap if
+    // runs are metered. If a budget is set, track whether THIS run recorded a
+    // cost: a metered run clears the counter; an unmetered one increments it, and
+    // once it reaches the limit the pre-run check above opens the breaker. So a
+    // runner the meter can't read can't run away — it stalls after a bounded
+    // number of unmetered runs instead of billing forever.
+    if runner_ok && crate::cost::daily_budget(&cfg).is_some() {
+        if tick_cost(paths, &cost_id).is_none() {
+            let n = crate::cost::record_unmetered(paths, &cost_sig);
+            let limit = crate::cost::UNMETERED_LIMIT;
+            let tail = if n >= limit {
+                "breaker now open".to_string()
+            } else {
+                format!("{n}/{limit} before the breaker opens")
+            };
             util::event(
                 Level::Warn,
                 "tick.unmetered",
                 &format!(
-                    "max_daily_usd is set but runner '{runner_name}' produced no cost row — the budget breaker cannot enforce a cap for this runner"
+                    "max_daily_usd is set but runner '{runner_name}' produced no cost row ({tail}) — declare a runner `cost` spec, or use pi/claude"
                 ),
-                &[("runner", serde_json::json!(runner_name))],
+                &[
+                    ("runner", serde_json::json!(runner_name)),
+                    ("count", serde_json::json!(n)),
+                ],
             );
+        } else {
+            crate::cost::clear_unmetered(paths);
         }
     }
 

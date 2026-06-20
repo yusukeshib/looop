@@ -80,7 +80,10 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
           └ override with $LOOOP_CONFIG            (seeded inline if absent)
             optional knobs: interval/busy_interval/active_interval (cadence),
             session_ttl (corpse retention), max_daily_usd (skip ticks once the
-            day's metered spend hits the cap — a billing circuit breaker).
+            day's metered spend hits the cap — a billing circuit breaker; if a
+            budget is set and a runner stays UNMETERED it fails CLOSED after a
+            few runs). pi/claude are metered built-in; a custom runner declares
+            its shape via a per-runner "cost":{type,pointer,mode} spec.
   DATA    ${XDG_STATE_HOME:-~/.local/state}/looop/  the file-based memory
           └ override with $LOOOP_DATA_DIR
             PLAYBOOK.md  goals/  journal.md  sensors/*.sh   <- the durable memory

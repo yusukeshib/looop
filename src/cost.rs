@@ -48,6 +48,54 @@ pub fn daily_budget(cfg: &Config) -> Option<f64> {
         .filter(|x| *x > 0.0)
 }
 
+/// Fail-closed budget breaker state. When a budget is set but a completed run
+/// records NO cost, the breaker can't guarantee the cap. After this many
+/// CONSECUTIVE unmetered runs at the same runner+spec signature, the breaker
+/// opens (the pulse stops calling the AI) rather than fail open. It self-heals:
+/// changing the runner or adding a cost spec changes the signature and resets the
+/// count, giving the new config a fresh attempt.
+pub const UNMETERED_LIMIT: u32 = 3;
+
+fn unmetered_path(paths: &Paths) -> std::path::PathBuf {
+    paths.data_dir.join(".cost-unmetered")
+}
+
+/// Read `(signature, consecutive_count)`; `None` when absent/unparseable.
+fn read_unmetered(paths: &Paths) -> Option<(String, u32)> {
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(unmetered_path(paths)).ok()?).ok()?;
+    let sig = v.get("sig")?.as_str()?.to_string();
+    let count = v.get("count").and_then(|c| c.as_u64()).unwrap_or(0) as u32;
+    Some((sig, count))
+}
+
+/// Record one unmetered run at `sig`; returns the new consecutive count. The
+/// counter resets to 1 when `sig` differs from the previous record (a NEW
+/// runner/spec deserves a fresh attempt).
+pub fn record_unmetered(paths: &Paths, sig: &str) -> u32 {
+    let count = match read_unmetered(paths) {
+        Some((s, n)) if s == sig => n + 1,
+        _ => 1,
+    };
+    let _ = std::fs::write(
+        unmetered_path(paths),
+        serde_json::json!({ "sig": sig, "count": count }).to_string(),
+    );
+    count
+}
+
+/// Clear the unmetered counter (a metered run proves the breaker can measure).
+pub fn clear_unmetered(paths: &Paths) {
+    let _ = std::fs::remove_file(unmetered_path(paths));
+}
+
+/// Whether the fail-closed breaker is OPEN for `sig`: at least [`UNMETERED_LIMIT`]
+/// consecutive unmetered runs at this exact signature. A signature mismatch
+/// (config changed) reads as closed, so the new config gets a fresh attempt.
+pub fn unmetered_blocked(paths: &Paths, sig: &str) -> bool {
+    matches!(read_unmetered(paths), Some((s, n)) if s == sig && n >= UNMETERED_LIMIT)
+}
+
 /// Append one ledger line if `cost` parses to a positive amount.
 pub fn record_cost(paths: &Paths, kind: &str, id: &str, runner: &str, cost: &str) {
     let Ok(amount) = cost.trim().parse::<f64>() else {
@@ -501,6 +549,37 @@ mod tests {
         );
         std::fs::write(p.cost_ledger(), body).unwrap();
         assert!((spent_today(&p) - 1.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn unmetered_counts_per_signature_and_opens_at_limit() {
+        let p = Paths::temp();
+        assert!(
+            !unmetered_blocked(&p, "pi|false"),
+            "closed before any record"
+        );
+
+        // Consecutive unmetered runs at the same signature escalate.
+        for i in 1..UNMETERED_LIMIT {
+            assert_eq!(record_unmetered(&p, "custom|false"), i);
+            assert!(
+                !unmetered_blocked(&p, "custom|false"),
+                "still closed below the limit"
+            );
+        }
+        assert_eq!(record_unmetered(&p, "custom|false"), UNMETERED_LIMIT);
+        assert!(
+            unmetered_blocked(&p, "custom|false"),
+            "breaker opens at the limit"
+        );
+
+        // A different signature (config changed) reads as closed and resets.
+        assert!(!unmetered_blocked(&p, "custom|true"));
+        assert_eq!(record_unmetered(&p, "custom|true"), 1);
+
+        // A metered run clears the counter entirely.
+        clear_unmetered(&p);
+        assert!(!unmetered_blocked(&p, "custom|true"));
     }
 
     #[test]
