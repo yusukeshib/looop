@@ -30,7 +30,10 @@ use crate::paths::Paths;
 use anyhow::{Context, Result};
 use std::fs;
 
-/// The inline default config, byte-identical to the bash `default_config`.
+/// The inline default config. Originally a copy of the bash `default_config`,
+/// it now diverges deliberately: the tick commands no longer carry the
+/// `| "$LOOOP_BIN" _ fmt` seam, since formatting + cost metering run in-process
+/// (see `runner::run_streamed`).
 pub const DEFAULT_CONFIG: &str = r#"{
   "default": "pi",
   "runners": {
