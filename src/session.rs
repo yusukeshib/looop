@@ -720,9 +720,15 @@ pub fn watch(paths: &Paths, session: &str) -> anyhow::Result<()> {
 }
 
 /// Foreground stream for `looop`: follow a session's output live, but return
-/// (rather than letting Ctrl-C kill the whole process) when the user interrupts
-/// OR the followed session exits. The caller (`cmd_serve`) then runs teardown,
-/// so closing the window stops the loop instead of orphaning it.
+/// (rather than letting a stop signal kill the whole process) when the user
+/// interrupts OR the followed session exits. The caller (`cmd_serve`) then runs
+/// teardown, so closing the window stops the loop instead of orphaning it.
+///
+/// BOTH Ctrl-C (SIGINT) and SIGTERM return cleanly here: a plain `kill <pid>`,
+/// `pkill`, or a service manager (systemd/launchd) stops via SIGTERM, and if we
+/// only caught SIGINT the default SIGTERM action would terminate the process
+/// before `stop_all` ran — leaving every worker orphaned (the exact surprise the
+/// teardown exists to prevent).
 pub fn serve_follow(paths: &Paths, session: &str) -> anyhow::Result<()> {
     rt().block_on(async {
         let bs = paths.sessions();
@@ -735,9 +741,22 @@ pub fn serve_follow(paths: &Paths, session: &str) -> anyhow::Result<()> {
             true,  // follow
             false, // json
         );
-        tokio::select! {
-            r = follow => r,                       // pulse exited / log ended
-            _ = tokio::signal::ctrl_c() => Ok(()), // user pressed Ctrl-C
+        #[cfg(unix)]
+        {
+            let mut term =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+            tokio::select! {
+                r = follow => r,                       // pulse exited / log ended
+                _ = tokio::signal::ctrl_c() => Ok(()), // user pressed Ctrl-C (SIGINT)
+                _ = term.recv() => Ok(()),             // kill/pkill/systemd (SIGTERM)
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                r = follow => r,                       // pulse exited / log ended
+                _ = tokio::signal::ctrl_c() => Ok(()), // user pressed Ctrl-C
+            }
         }
     })
 }
