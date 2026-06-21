@@ -398,10 +398,19 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
                 }
             };
             util::event(level, code, &msg, &fields);
+            // Persist the failure shape to the DURABLE log too: events.jsonl is the
+            // only post-mortem trail (tick.log is per-run scratch, util::event is the
+            // transient pulse stream). Without code/reason/fails here, a beat that
+            // "decided but failed" leaves no record of WHY — see H1 diagnosis.
             events::emit(
                 paths,
                 "tick_failed",
-                serde_json::json!({ "run_id": cost_id }),
+                serde_json::json!({
+                    "run_id": cost_id,
+                    "code": code,
+                    "reason": msg,
+                    "fails": fails,
+                }),
             );
             (false, None)
         }
