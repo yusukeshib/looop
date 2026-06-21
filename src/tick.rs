@@ -37,30 +37,37 @@ fn backoff_path(paths: &Paths) -> PathBuf {
     paths.data_dir.join(".tick-backoff")
 }
 
-/// Read backoff state as `(world_hash, consecutive_fails, last_fail_unix)`.
-/// `None` when absent/unparseable (no backoff in effect).
-fn read_backoff(paths: &Paths) -> Option<(String, u32, u64)> {
+/// Read backoff state as `(world_hash, policy_hash, consecutive_fails,
+/// last_fail_unix)`. `None` when absent/unparseable (no backoff in effect).
+fn read_backoff(paths: &Paths) -> Option<(String, String, u32, u64)> {
     let v: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(backoff_path(paths)).ok()?).ok()?;
     let hash = v.get("hash")?.as_str()?.to_string();
+    let phash = v
+        .get("phash")
+        .and_then(|x| x.as_str())
+        .unwrap_or_default()
+        .to_string();
     let fails = v.get("fails").and_then(|f| f.as_u64()).unwrap_or(0) as u32;
     let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
-    Some((hash, fails, ts))
+    Some((hash, phash, fails, ts))
 }
 
 fn clear_backoff(paths: &Paths) {
     let _ = fs::remove_file(backoff_path(paths));
 }
 
-/// Record a failed attempt at `hash`; returns the new consecutive-fail count.
-/// The counter resets when the world state differs from the previous failure
-/// (a NEW situation deserves a fresh, immediate attempt).
-fn record_backoff(paths: &Paths, hash: &str) -> u32 {
-    let fails = match read_backoff(paths) {
-        Some((h, n, _)) if h == hash => n + 1,
-        _ => 1,
-    };
-    let body = serde_json::json!({ "hash": hash, "fails": fails, "ts": now_unix() }).to_string();
+/// Record a failed attempt; returns the new CONSECUTIVE-fail count. The counter
+/// increments on EVERY failure regardless of how the world hash moved — a failing
+/// action that mutates the world each beat would otherwise look "new" forever and
+/// reset the count, defeating the backoff and billing without bound. Only a
+/// SUCCESS ([`clear_backoff`]) — or a human policy edit (see the gate in [`tick`])
+/// — resets it. `phash` (the policy half) is stored so the gate can spot a human
+/// intervention and retry promptly.
+fn record_backoff(paths: &Paths, hash: &str, phash: &str) -> u32 {
+    let fails = read_backoff(paths).map(|(_, _, n, _)| n + 1).unwrap_or(1);
+    let body = serde_json::json!({ "hash": hash, "phash": phash, "fails": fails, "ts": now_unix() })
+        .to_string();
     let _ = fs::write(backoff_path(paths), body);
     fails
 }
@@ -148,35 +155,44 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
         );
     }
 
-    // 2b. backoff (H1): if THIS exact world state has been failing, wait out an
-    // exponential window before burning another AI call. Without this, a tick
-    // that fails every time (bad runner, broken creds) never commits its hash,
-    // so the world looks "changed" forever and retries every cadence — infinite
-    // retries and infinite spend.
-    if let Some((bhash, fails, ts)) = read_backoff(paths)
-        && bhash == hash
+    // 2b. backoff (H1): after consecutive FAILED beats, wait out an exponential
+    // window before burning another AI call. Without this, a tick that fails
+    // every time (bad runner, broken creds) never commits its hash, so the world
+    // looks "changed" forever and retries every cadence — infinite retries and
+    // infinite spend. We back off on the consecutive-fail COUNT regardless of
+    // world-hash churn (a failing run_shell can mutate the world every beat),
+    // EXCEPT when the policy half (PLAYBOOK/goals) changed since the last failure
+    // — that's a human steering the loop, so we drop the backoff and retry now.
+    let policy = crate::worldhash::policy_hash(paths);
+    if let Some((_bhash, bphash, fails, ts)) = read_backoff(paths)
+        && fails > 0
     {
-        let wait = backoff_delay(fails);
-        let elapsed = now_unix().saturating_sub(ts);
-        if elapsed < wait {
-            let remain = wait - elapsed;
-            util::event(
-                Level::Warn,
-                "tick.backoff",
-                &format!(
-                    "world changed but last {fails} attempt(s) failed — backing off ~{remain}s before retry"
-                ),
-                &[
-                    ("fails", serde_json::json!(fails)),
-                    ("retry_in_s", serde_json::json!(remain)),
-                ],
-            );
-            events::emit(
-                paths,
-                "tick_backoff",
-                serde_json::json!({ "fails": fails, "retry_in_s": remain }),
-            );
-            return TickOutcome::idle();
+        if bphash != policy {
+            // A human edited PLAYBOOK/goals since the failure — explicit "try now".
+            clear_backoff(paths);
+        } else {
+            let wait = backoff_delay(fails);
+            let elapsed = now_unix().saturating_sub(ts);
+            if elapsed < wait {
+                let remain = wait - elapsed;
+                util::event(
+                    Level::Warn,
+                    "tick.backoff",
+                    &format!(
+                        "last {fails} beat(s) failed — backing off ~{remain}s before retry (edit PLAYBOOK/goals to retry now)"
+                    ),
+                    &[
+                        ("fails", serde_json::json!(fails)),
+                        ("retry_in_s", serde_json::json!(remain)),
+                    ],
+                );
+                events::emit(
+                    paths,
+                    "tick_backoff",
+                    serde_json::json!({ "fails": fails, "retry_in_s": remain }),
+                );
+                return TickOutcome::idle();
+            }
         }
     }
 
@@ -369,7 +385,7 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
             (true, next_interval_s)
         }
         failure => {
-            let fails = record_backoff(paths, &hash);
+            let fails = record_backoff(paths, &hash, &policy);
             let replay = run_dir.display().to_string();
             let mut fields = vec![
                 ("secs", serde_json::json!(secs)),
@@ -513,15 +529,17 @@ mod tests {
     }
 
     #[test]
-    fn backoff_counts_consecutive_same_hash_and_resets_on_change() {
+    fn backoff_counts_consecutive_failures_regardless_of_hash() {
         let p = Paths::temp();
         assert!(read_backoff(&p).is_none());
-        assert_eq!(record_backoff(&p, "h1"), 1);
-        assert_eq!(record_backoff(&p, "h1"), 2);
-        let (h, n, _) = read_backoff(&p).unwrap();
-        assert_eq!((h.as_str(), n), ("h1", 2));
-        // a NEW world state restarts the counter (fresh, immediate attempt)
-        assert_eq!(record_backoff(&p, "h2"), 1);
+        assert_eq!(record_backoff(&p, "h1", "pol"), 1);
+        assert_eq!(record_backoff(&p, "h1", "pol"), 2);
+        // A DIFFERENT world hash STILL increments — a failing action that churns
+        // the world can't reset the backoff (that was the runaway-spend hole).
+        assert_eq!(record_backoff(&p, "h2", "pol"), 3);
+        let (h, ph, n, _) = read_backoff(&p).unwrap();
+        assert_eq!((h.as_str(), ph.as_str(), n), ("h2", "pol", 3));
+        // Only a success clears it.
         clear_backoff(&p);
         assert!(read_backoff(&p).is_none());
     }

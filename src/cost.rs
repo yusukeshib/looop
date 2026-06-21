@@ -39,13 +39,33 @@ pub fn spent_today(paths: &Paths) -> f64 {
         .sum()
 }
 
-/// The configured daily spend ceiling (`max_daily_usd`), if set to a positive
-/// number. `None` disables the circuit breaker (the default).
+/// Safety-net daily ceiling used when neither the config key nor the env var is
+/// set. The breaker is ON BY DEFAULT (a runaway loop must not bill forever);
+/// raise it in config, or set `max_daily_usd: 0` / `LOOOP_MAX_DAILY_USD=0` to
+/// turn the breaker off entirely.
+pub const DEFAULT_DAILY_BUDGET_USD: f64 = 10.0;
+
+/// The daily spend ceiling for the circuit breaker. Resolution order:
+/// `LOOOP_MAX_DAILY_USD` env > config `max_daily_usd` > [`DEFAULT_DAILY_BUDGET_USD`].
+/// A value `<= 0` (in env or config) explicitly DISABLES the breaker; an unset /
+/// unparseable key falls through to the default (fail-closed: we'd rather cap by
+/// default than spend without bound).
 pub fn daily_budget(cfg: &Config) -> Option<f64> {
-    cfg.root
+    // Env wins: an explicit 0 (or negative) disables, a positive value caps.
+    if let Ok(v) = std::env::var("LOOOP_MAX_DAILY_USD")
+        && let Ok(n) = v.trim().parse::<f64>()
+    {
+        return (n > 0.0).then_some(n);
+    }
+    match cfg
+        .root
         .get("max_daily_usd")
         .and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|n| n as f64)))
-        .filter(|x| *x > 0.0)
+    {
+        Some(x) if x > 0.0 => Some(x), // explicit positive cap
+        Some(_) => None,               // explicit 0 / negative: breaker OFF
+        None => Some(DEFAULT_DAILY_BUDGET_USD), // unset/unparseable: default cap
+    }
 }
 
 /// Fail-closed budget breaker state. When a budget is set but a completed run
@@ -530,8 +550,13 @@ mod tests {
         let cfg = |v: serde_json::Value| Config { root: v };
         assert_eq!(daily_budget(&cfg(json!({"max_daily_usd": 5.0}))), Some(5.0));
         assert_eq!(daily_budget(&cfg(json!({"max_daily_usd": 10}))), Some(10.0));
+        // 0 (or negative) explicitly turns the breaker OFF.
         assert_eq!(daily_budget(&cfg(json!({"max_daily_usd": 0}))), None);
-        assert_eq!(daily_budget(&cfg(json!({}))), None);
+        // Unset => the safety-net default is ON (breaker default-on).
+        assert_eq!(
+            daily_budget(&cfg(json!({}))),
+            Some(DEFAULT_DAILY_BUDGET_USD)
+        );
     }
 
     #[test]

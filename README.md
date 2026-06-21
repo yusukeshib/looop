@@ -207,4 +207,7 @@ pulse.)
   sessions.
 
 LLM spend is metered automatically (ticks and self-reporting workers) into an
-append-only ledger; see `looop cost`.
+append-only ledger; see `looop cost`. A daily budget breaker is **on by default**
+(`$10/day`): once the day's metered spend hits the cap the loop stops calling the
+LLM until local midnight. Raise it with `max_daily_usd` in config (or
+`LOOOP_MAX_DAILY_USD`), or set it to `0` to disable the breaker.
