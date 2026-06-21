@@ -62,8 +62,8 @@ pub fn daily_budget(cfg: &Config) -> Option<f64> {
         .get("max_daily_usd")
         .and_then(|v| v.as_f64().or_else(|| v.as_u64().map(|n| n as f64)))
     {
-        Some(x) if x > 0.0 => Some(x), // explicit positive cap
-        Some(_) => None,               // explicit 0 / negative: breaker OFF
+        Some(x) if x > 0.0 => Some(x),          // explicit positive cap
+        Some(_) => None,                        // explicit 0 / negative: breaker OFF
         None => Some(DEFAULT_DAILY_BUDGET_USD), // unset/unparseable: default cap
     }
 }

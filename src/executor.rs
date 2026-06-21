@@ -699,7 +699,9 @@ mod tests {
             id: String::new()
         }));
         // Idempotent overwrites / self-guarded / harmless-resend actions are not.
-        assert!(!is_non_idempotent(&Action::Noop { reason: String::new() }));
+        assert!(!is_non_idempotent(&Action::Noop {
+            reason: String::new()
+        }));
         assert!(!is_non_idempotent(&Action::WriteGoal {
             id: "g".into(),
             body: "b".into()

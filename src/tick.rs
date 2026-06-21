@@ -66,8 +66,9 @@ fn clear_backoff(paths: &Paths) {
 /// intervention and retry promptly.
 fn record_backoff(paths: &Paths, hash: &str, phash: &str) -> u32 {
     let fails = read_backoff(paths).map(|(_, _, n, _)| n + 1).unwrap_or(1);
-    let body = serde_json::json!({ "hash": hash, "phash": phash, "fails": fails, "ts": now_unix() })
-        .to_string();
+    let body =
+        serde_json::json!({ "hash": hash, "phash": phash, "fails": fails, "ts": now_unix() })
+            .to_string();
     let _ = fs::write(backoff_path(paths), body);
     fails
 }
