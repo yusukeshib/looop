@@ -150,6 +150,32 @@ fn sorted_glob(dir: &Path, ext: &str) -> Vec<PathBuf> {
     v
 }
 
+/// The single most-neglected goal: the top-level `goals/*.md` looop has gone
+/// longest without acting on (a goal never acted on outranks any acted one).
+/// `None` when there are no goals. Computed by looop — not left to the AI to scan
+/// — so the fairness nudge names a concrete goal the decider must justify
+/// skipping (RULE: one move/beat can otherwise starve the quiet goals).
+fn most_neglected_goal(paths: &Paths) -> Option<String> {
+    let activity: serde_json::Map<String, serde_json::Value> =
+        fs::read_to_string(paths.goal_activity())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+    let mut goals: Vec<String> = fs::read_dir(paths.goals_dir())
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().map(|x| x == "md").unwrap_or(false))
+        .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
+        .collect();
+    goals.sort(); // deterministic tie-break
+    // last-acted unix; never-acted => 0 (oldest possible) => ranked most neglected.
+    goals
+        .into_iter()
+        .min_by_key(|id| activity.get(id).and_then(|v| v.as_u64()).unwrap_or(0))
+}
+
 fn tail_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(n);
@@ -208,6 +234,21 @@ pub fn build_prompt(paths: &Paths, snap_dir: &Path) -> String {
         out.push('\n');
     }
 
+    // FAIRNESS (computed by looop, not left to the AI to eyeball sys-goals).
+    // Naming the concrete most-neglected goal turns the advisory staleness
+    // reading into a directive the decider must answer to: serve it, or justify
+    // skipping it in the journal.
+    if let Some(g) = most_neglected_goal(paths) {
+        out.push_str("\n=== FAIRNESS (computed by looop) ===\n");
+        let _ = writeln!(
+            out,
+            "Most neglected goal: `{g}`. You make ONE move per beat, so a loud,\n\
+             constantly-changing goal can starve the quiet ones. If `{g}` is READY and\n\
+             not clearly lower priority than the alternatives, prefer it THIS beat.\n\
+             Otherwise, say in your `journal` why you're skipping it."
+        );
+    }
+
     // RECENT JOURNAL.
     out.push_str("\n=== RECENT JOURNAL ===\n");
     match fs::read_to_string(paths.journal()) {
@@ -258,5 +299,46 @@ mod tests {
         );
         assert!(out.contains("PB RULES"), "playbook body inlined");
         assert!(out.contains("triage the inbox"), "goal body inlined");
+    }
+
+    #[test]
+    fn never_acted_goal_outranks_an_acted_one_for_fairness() {
+        let p = fixture(); // has goals/triage.md
+        fs::write(p.goals_dir().join("ship.md"), b"ship it\n").unwrap();
+        // triage was acted on recently; ship never has => ship is most neglected.
+        fs::write(
+            p.goal_activity(),
+            format!(r#"{{"triage":{}}}"#, util::now_unix()),
+        )
+        .unwrap();
+        assert_eq!(most_neglected_goal(&p), Some("ship".into()));
+
+        let out = build_prompt(&p, &p.snapshots_dir());
+        assert!(out.contains("=== FAIRNESS (computed by looop) ==="));
+        assert!(out.contains("Most neglected goal: `ship`"));
+    }
+
+    #[test]
+    fn fairness_picks_the_oldest_acted_goal_when_all_acted() {
+        let p = fixture();
+        fs::write(p.goals_dir().join("ship.md"), b"ship it\n").unwrap();
+        let now = util::now_unix();
+        // triage acted long ago, ship acted just now => triage is most neglected.
+        fs::write(
+            p.goal_activity(),
+            format!(r#"{{"triage":{},"ship":{now}}}"#, now - 9999),
+        )
+        .unwrap();
+        assert_eq!(most_neglected_goal(&p), Some("triage".into()));
+    }
+
+    #[test]
+    fn no_goals_means_no_fairness_section() {
+        let p = Paths::temp();
+        fs::create_dir_all(p.goals_dir()).unwrap();
+        fs::write(p.playbook(), b"pb\n").unwrap();
+        assert_eq!(most_neglected_goal(&p), None);
+        let out = build_prompt(&p, &p.snapshots_dir());
+        assert!(!out.contains("=== FAIRNESS"));
     }
 }
