@@ -9,8 +9,38 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+/// The immutable minimal norms. Unlike the PLAYBOOK (which the AI may rewrite via
+/// `write_playbook`), this lives in the binary and CANNOT be edited by any move.
+/// It is injected ahead of the PLAYBOOK and OVERRIDES it on any conflict, so the
+/// loop can't weaken its own irreversibility/run_shell guardrails by grooming the
+/// PLAYBOOK. The PLAYBOOK is operational tuning UNDER this constitution.
+const CONSTITUTION: &str = r#"These norms are FIXED (compiled into looop). They override the PLAYBOOK on any
+conflict, and no move — including write_playbook — can remove or weaken them.
+
+1. NEVER do irreversible things automatically: merging, deploying, deleting data,
+   closing issues, publishing public comments, force-pushing, sending money. For
+   any of these: PREPARE fully, then start (or steer) a worker that raises a
+   ⚯lag and WAITS for a human. The human approves by attaching — never the AI.
+2. run_shell is ONE ad-hoc, REVERSIBLE, NON-DESTRUCTIVE command only (a query, a
+   draft, a read). Anything irreversible/destructive (rule 1) must NOT go through
+   run_shell; it must go through a worker + ⚯lag. When unsure, treat it as
+   irreversible.
+3. SINGLE-WRITER POLICY FILES: only the pulse (this tick) writes PLAYBOOK.md,
+   goals/ and sensors/, and only via the typed actions below — never by editing
+   files directly.
+4. ASK, DON'T GUESS: when you lack the information or authority to choose safely,
+   surface it (send_notification, or a worker ⚯lag) rather than guess. Asking is
+   cheaper than a wrong irreversible move.
+5. write_playbook may tune priorities and add rules, but MUST keep these five
+   norms intact. The PLAYBOOK refines judgment beneath them; it never overrides
+   them.
+"#;
+
 const INSTRUCTIONS: &str = r#"You are "looop", a personal operations agent. This is one tick of a loop; your
 process is disposable. Your working directory is the loop's DATA dir (__DATA__).
+
+A fixed CONSTITUTION (below, compiled into looop) sets the non-negotiable norms.
+It OVERRIDES the PLAYBOOK on any conflict, and no move can weaken it.
 
 Read the PLAYBOOK, goals, sensor readings and sessions below, then decide the
 SINGLE most important move — and stop.
@@ -134,6 +164,12 @@ pub fn build_prompt(paths: &Paths, snap_dir: &Path) -> String {
         .replace("__NOW__", &util::date_fmt("%Y-%m-%d %H:%M %Z"));
     out.push_str(&instr);
 
+    // CONSTITUTION (immutable, binary-embedded) — ahead of the PLAYBOOK and
+    // overriding it. The AI can rewrite the PLAYBOOK but never this.
+    out.push_str("=== CONSTITUTION (immutable — overrides PLAYBOOK) ===\n");
+    out.push_str(CONSTITUTION);
+    out.push('\n');
+
     // PLAYBOOK.
     out.push_str("=== PLAYBOOK ===\n");
     out.push_str(&fs::read_to_string(paths.playbook()).unwrap_or_default());
@@ -203,6 +239,7 @@ mod tests {
         let p = fixture();
         let out = build_prompt(&p, &p.snapshots_dir());
         for marker in [
+            "=== CONSTITUTION (immutable — overrides PLAYBOOK) ===",
             "=== PLAYBOOK ===",
             "=== GOALS ===",
             "=== SENSOR READINGS ===",
@@ -210,6 +247,15 @@ mod tests {
         ] {
             assert!(out.contains(marker), "missing section: {marker}");
         }
+        // The immutable norms are inlined ahead of the (mutable) PLAYBOOK.
+        assert!(
+            out.find("=== CONSTITUTION").unwrap() < out.find("=== PLAYBOOK").unwrap(),
+            "constitution must precede the playbook"
+        );
+        assert!(
+            out.contains("no move — including write_playbook — can remove or weaken them"),
+            "constitution states its own immutability"
+        );
         assert!(out.contains("PB RULES"), "playbook body inlined");
         assert!(out.contains("triage the inbox"), "goal body inlined");
     }

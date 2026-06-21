@@ -46,7 +46,10 @@ RULES (the invariants that keep this safe and legible)
      program never "thinks"; it only gathers context and runs the AI once.
   3. NEVER DO IRREVERSIBLE THINGS AUTOMATICALLY (merge, public comments, closing
      issues, deleting data). Prepare fully, then a worker session raises a
-     flag (looop _ flag) and waits for a human. Encode this in the PLAYBOOK.
+     flag (looop _ flag) and waits for a human. This is part of the immutable
+     CONSTITUTION compiled into looop and injected ahead of the PLAYBOOK every
+     tick — write_playbook can refine judgment beneath it but can never weaken
+     it (so the loop can't groom away its own guardrails).
   4. BE INQUISITIVE. When a worker lacks context it asks (flag + wait) rather
      than guessing. Asking is cheaper than a wrong irreversible move.
   5. ADD STRUCTURE LATER. Only harden a drift into a PLAYBOOK rule or a check
