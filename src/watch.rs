@@ -34,7 +34,6 @@ use ratatui::crossterm::event::{
     MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
-use ratatui::layout::Margin;
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
@@ -47,12 +46,18 @@ const TICK: Duration = Duration::from_millis(250);
 /// keeping enough scrollback to fill the pane.
 const TAIL_BYTES: u64 = 256 * 1024;
 
-/// Column width of the virtual terminal we replay the log through. looop spawns
-/// every detached worker with `size = None` (see `session::spawn_detached`),
-/// so babysit allocates its default 80×24 PTY — the recorded stream is an
-/// 80-column stream, and we must replay it at that width or the wrapping/cursor
-/// math drifts. The row count is taken from the live pane height at draw time.
-const PTY_COLS: u16 = 80;
+/// Recorded PTY geometry of every detached worker. looop spawns with
+/// `size = None` (see `session::spawn_detached`), so babysit allocates its
+/// default `DEFAULT_SCREENSHOT_SIZE` PTY (80×24). The `output.log` is therefore
+/// a stream meant for THIS exact grid: an interactive agent positions its
+/// cursor, clears lines, and scrolls assuming these dimensions. We MUST replay
+/// at the recorded size — both rows AND cols — or absolute cursor moves and the
+/// scroll region drift (babysit's own screenshot path replays at the same
+/// size). Sourced straight from babysit so the two can never skew. The live
+/// pane height only controls how much of the (scrollback + screen) we show, not
+/// the grid the stream is parsed against.
+const PTY_ROWS: u16 = render::DEFAULT_SCREENSHOT_SIZE.0;
+const PTY_COLS: u16 = render::DEFAULT_SCREENSHOT_SIZE.1;
 
 /// How many rows of scrollback the virtual terminal retains. The agents don't
 /// use the alternate screen (they redraw in place on the primary screen), so
@@ -145,6 +150,30 @@ struct App {
     /// on it can be mapped back to a `scroll_back` position. `None` when the
     /// pane isn't scrollable (no scrollbar rendered).
     scrollbar: Option<ScrollbarHit>,
+    /// Persistent vt100 replay of the selected session's log (fed incrementally
+    /// across frames). `None` until a session with a log file is selected.
+    log: Option<LogReplay>,
+    /// Whether we're capturing the mouse. ON (default) routes wheel/scrollbar to
+    /// us; toggled OFF with `m` so the terminal's own drag-to-select works.
+    mouse_capture: bool,
+}
+
+/// Persistent vt100 replay of one session's `output.log`. We keep the parser
+/// across frames and feed it ONLY newly-appended bytes (tracked by `offset`),
+/// instead of re-parsing a fixed tail every frame. That preserves the full
+/// scrollback history, never corrupts the screen with a tail cut mid-escape,
+/// and lets a paused viewport stay put as new output streams in.
+struct LogReplay {
+    /// Session id this replay belongs to (rebuilt when the selection changes).
+    id: String,
+    parser: vt100::Parser,
+    /// Bytes of `output.log` already fed to the parser.
+    offset: u64,
+    /// Scrollback depth after the last feed, to measure how far the tail moved
+    /// (so a scrolled-back viewport can be nudged to stay anchored).
+    prev_scrollback: usize,
+    /// Total bytes ever fed — 0 means the file exists but is empty.
+    seen: u64,
 }
 
 /// The scrollbar's on-screen track and the scrollback depth it represents,
@@ -153,8 +182,8 @@ struct App {
 struct ScrollbarHit {
     /// Area the `Scrollbar` widget was rendered into (column = `right()-1`).
     area: Rect,
-    /// Maximum scrollback rows (`scroll_back` ranges `0..=max_back`).
-    max_back: usize,
+    /// Maximum scroll depth (`scroll_back` ranges `0..=max_scroll`).
+    max_scroll: usize,
 }
 
 impl App {
@@ -177,6 +206,8 @@ impl App {
             configured,
             hidden,
             scrollbar: None,
+            log: None,
+            mouse_capture: true,
         }
     }
 
@@ -200,10 +231,10 @@ impl App {
             0
         } else {
             let frac = (row - a.top()) as f64 / span as f64;
-            (frac * hit.max_back as f64).round() as usize
+            (frac * hit.max_scroll as f64).round() as usize
         };
         // pos counts from the top (oldest); scroll_back counts from the tail.
-        self.scroll_back = hit.max_back.saturating_sub(pos);
+        self.scroll_back = hit.max_scroll.saturating_sub(pos);
         true
     }
 
@@ -243,6 +274,74 @@ impl App {
         }
     }
 
+    /// Bring the persistent log replay in sync with the selected session's
+    /// `output.log`: (re)build the parser on a selection change or a truncated
+    /// file, then feed any newly-appended bytes. Keeps a paused viewport
+    /// anchored by nudging `scroll_back` when the tail grows.
+    fn sync_log(&mut self, paths: &Paths) {
+        let Some(id) = self.selected_id().map(str::to_string) else {
+            self.log = None;
+            return;
+        };
+        let path = paths.sessions().output_log_path(&id);
+        let Ok(meta) = std::fs::metadata(&path) else {
+            self.log = None; // no log file yet
+            return;
+        };
+        let len = meta.len();
+
+        let reset = match &self.log {
+            // New session, or the file was truncated/rotated under us.
+            Some(l) => l.id != id || len < l.offset,
+            None => true,
+        };
+
+        if reset {
+            // Initial load is bounded to the last TAIL_BYTES so opening a
+            // session with a huge log stays cheap; from here we only feed the
+            // freshly-appended tail.
+            let mut parser = vt100::Parser::new(PTY_ROWS, PTY_COLS, SCROLLBACK_ROWS);
+            if len > 0
+                && let Ok(b) = read_tail_bytes(&path, TAIL_BYTES)
+            {
+                parser.process(&b);
+            }
+            let prev_scrollback = scrollback_len(&mut parser);
+            let start = len.saturating_sub(TAIL_BYTES);
+            self.log = Some(LogReplay {
+                id,
+                parser,
+                offset: len,
+                prev_scrollback,
+                seen: len - start,
+            });
+            return;
+        }
+
+        // Feed only what was appended since the last frame.
+        let Some(l) = self.log.as_mut() else { return };
+        if len <= l.offset {
+            return;
+        }
+        let delta = match read_from(&path, l.offset) {
+            Ok(b) => {
+                l.seen += b.len() as u64;
+                l.offset = len;
+                l.parser.process(&b);
+                let sb = scrollback_len(&mut l.parser);
+                let d = sb.saturating_sub(l.prev_scrollback);
+                l.prev_scrollback = sb;
+                d
+            }
+            Err(_) => 0,
+        };
+        // Anchor a paused viewport: as rows scroll off the top, scroll back by
+        // the same amount so the lines under the reader's eyes stay put.
+        if self.scroll_back > 0 && delta > 0 {
+            self.scroll_back = self.scroll_back.saturating_add(delta);
+        }
+    }
+
     fn run(&mut self, terminal: &mut ratatui::DefaultTerminal, paths: &Paths) -> Result<()> {
         let mut last_refresh = Instant::now()
             .checked_sub(TICK)
@@ -253,13 +352,12 @@ impl App {
                 last_refresh = Instant::now();
             }
 
-            // Read the tailed log fresh each frame: cheap (bounded bytes) and
-            // always current. `None` = no log file yet; `Some(empty)` = file
-            // exists but no output. The vt100 replay happens in `draw_log`,
-            // where the pane height (the screen's row count) is known.
-            let raw = self.selected_id().and_then(|id| read_log_tail(paths, id));
+            // Feed any newly-appended log bytes into the persistent parser
+            // (cheap: metadata + an incremental read). The vt100 replay screen
+            // is then drawn in `draw_log`.
+            self.sync_log(paths);
 
-            terminal.draw(|f| self.draw(f, raw.as_deref()))?;
+            terminal.draw(|f| self.draw(f))?;
 
             if event::poll(TICK)? {
                 match event::read()? {
@@ -277,6 +375,16 @@ impl App {
                                     None => Some(self.configured),
                                 };
                                 self.refresh(paths);
+                            }
+                            KeyCode::Char('m') => {
+                                // Toggle mouse capture: OFF hands drags back to
+                                // the terminal so text selection works again.
+                                self.mouse_capture = !self.mouse_capture;
+                                let _ = if self.mouse_capture {
+                                    execute!(std::io::stdout(), EnableMouseCapture)
+                                } else {
+                                    execute!(std::io::stdout(), DisableMouseCapture)
+                                };
                             }
                             KeyCode::PageUp => {
                                 self.scroll_back = self.scroll_back.saturating_add(10)
@@ -314,95 +422,126 @@ impl App {
         Ok(())
     }
 
-    fn draw(&mut self, frame: &mut Frame, raw: Option<&[u8]>) {
+    fn draw(&mut self, frame: &mut Frame) {
         // Selector grows with the fleet but is capped so the log keeps the room.
         let rows = self.sessions.len().clamp(1, 8) as u16;
         let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(rows + 2)])
             .split(frame.area());
 
-        self.draw_log(frame, chunks[0], raw);
+        self.draw_log(frame, chunks[0]);
         self.draw_selector(frame, chunks[1]);
     }
 
-    fn draw_log(&mut self, frame: &mut Frame, area: Rect, raw: Option<&[u8]>) {
+    fn draw_log(&mut self, frame: &mut Frame, area: Rect) {
         // Cleared each frame; set below only when a scrollbar is actually drawn.
         self.scrollbar = None;
         let follow = self.scroll_back == 0;
         let id = self.selected_id().unwrap_or("—").to_string();
-        let title = if follow {
-            format!(" {id} — live ")
+
+        // Borderless: a single header line, then the log fills the rest at full
+        // width. No box — side borders would eat into the 80-column stream and
+        // get swept up by terminal text selection; the id + follow state live in
+        // this one line instead.
+        let status = if follow {
+            "live"
         } else {
-            format!(" {id} — scrolled (End=live) ")
+            "scrolled · End=live"
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .title_style(Style::default().add_modifier(Modifier::BOLD));
+        let header = Line::from(vec![
+            Span::styled(
+                format!(" {id} "),
+                Style::default().add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("— {status}"), Style::default().fg(Color::DarkGray)),
+        ]);
+        let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+        frame.render_widget(Paragraph::new(header), parts[0]);
+        let body = parts[1];
 
-        // Empty / missing log: a dim hint, and we can't be scrolled.
-        let bytes = match raw {
-            Some(b) if !b.is_empty() => b,
-            other => {
-                self.scroll_back = 0;
-                let hint = if other.is_none() {
-                    format!("(no log for '{id}')")
-                } else {
-                    "(no output yet)".to_string()
-                };
-                let para = Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)))
-                    .block(block);
-                frame.render_widget(para, area);
-                return;
+        // No log file, or a file that exists but is empty: a dim hint; the view
+        // can't be scrolled.
+        let hint = match &self.log {
+            None => Some(format!("(no log for '{id}')")),
+            Some(l) if l.seen == 0 => Some("(no output yet)".to_string()),
+            Some(_) => None,
+        };
+        if let Some(hint) = hint {
+            self.scroll_back = 0;
+            let para = Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)));
+            frame.render_widget(para, body);
+            return;
+        }
+
+        let pane_h = body.height.max(1) as usize;
+        let log = self.log.as_mut().expect("log present: None handled above");
+        let rows = log.parser.screen().size().0 as usize; // recorded grid height
+
+        // Probe scrollback depth and clamp the viewport. The pane is filled from
+        // the combined (scrollback + live screen) history, bottom-anchored
+        // `back` rows from the tail (0 = follow). `max_scroll` is chosen so Home
+        // lands the OLDEST line at the top of the pane, not just the oldest
+        // screenful at the bottom.
+        log.parser.screen_mut().set_scrollback(usize::MAX);
+        let max_back = log.parser.screen().scrollback();
+        let total = max_back + rows;
+        let max_scroll = total.saturating_sub(pane_h);
+        let back = self.scroll_back.min(max_scroll);
+        self.scroll_back = back;
+
+        // Tile the pane in chunks of one screen (`rows`): each vt100 render is a
+        // screenful at a scrollback offset; we stitch enough of them to fill
+        // `pane_h`, placing each line by its distance from the live tail.
+        let mut window: Vec<Option<Line>> = vec![None; pane_h];
+        let mut t = 0usize;
+        loop {
+            let off = (back + t * rows).min(max_back);
+            log.parser.screen_mut().set_scrollback(off);
+            // babysit's renderer emits per-row ANSI (SGR only, no cursor motion)
+            // which ansi-to-tui parses into styled lines cleanly; trim=false
+            // keeps the full-height screenful so row indexing is stable.
+            let shot = render::render_screen(log.parser.screen(), ShotFormat::Ansi, false);
+            let screen = shot
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            let text = screen
+                .into_text()
+                .unwrap_or_else(|_| Text::from(screen.to_string()));
+            for (r, line) in text.lines.iter().enumerate().take(rows) {
+                if let Some(pos) = place_row(off, r, rows, back, pane_h)
+                    && window[pos].is_none()
+                {
+                    window[pos] = Some(line.clone());
+                }
             }
-        };
+            if off == max_back {
+                break; // can't scroll any further into history
+            }
+            t += 1;
+            if t > pane_h / rows.max(1) + 2 {
+                break; // safety: bounded by the pane height, never unbounded
+            }
+        }
 
-        // Replay the raw PTY tail through a virtual terminal sized to the pane
-        // (rows) at the recorded width (cols), so an interactive agent's
-        // in-place redraws collapse into the actual on-screen grid instead of a
-        // garbled append of every frame. The parser keeps scrollback, so the
-        // history that scrolled off the top stays reachable.
-        let rows = area.height.saturating_sub(2).max(1); // minus borders
-        let mut parser = vt100::Parser::new(rows, PTY_COLS, SCROLLBACK_ROWS);
-        parser.process(bytes);
+        // window[0] is the bottom row; render top→bottom, blanks where history
+        // runs out (the oldest screenful sitting below the top of the pane).
+        let lines: Vec<Line> = (0..pane_h)
+            .rev()
+            .map(|k| window[k].take().unwrap_or_else(|| Line::from("")))
+            .collect();
+        frame.render_widget(Paragraph::new(Text::from(lines)), body);
 
-        // Probe the real scrollback depth (clamped), then position the viewport:
-        // scroll_back rows back from the live tail (0 = follow).
-        parser.screen_mut().set_scrollback(usize::MAX);
-        let max_back = parser.screen().scrollback();
-        let back = self.scroll_back.min(max_back);
-        self.scroll_back = back; // clamp Home's usize::MAX to the real maximum
-        parser.screen_mut().set_scrollback(back);
-
-        // Reuse babysit's renderer: it turns the vt100 grid into per-row ANSI
-        // (SGR only, no cursor motion) which ansi-to-tui parses into styled
-        // lines cleanly. `trim=false` keeps a stable full-height viewport.
-        let shot = render::render_screen(parser.screen(), ShotFormat::Ansi, false);
-        let screen = shot
-            .get("text")
-            .and_then(|v| v.as_str())
-            .unwrap_or_default();
-        let text = screen
-            .into_text()
-            .unwrap_or_else(|_| Text::from(screen.to_string()));
-
-        let para = Paragraph::new(text).block(block);
-        frame.render_widget(para, area);
-
-        // Scrollbar on the right border, reflecting position in the scrollback.
-        if max_back > 0 {
-            let mut state = ScrollbarState::new(max_back).position(max_back - back);
+        // Scrollbar at the body's right edge, reflecting position in the range.
+        if max_scroll > 0 {
+            let mut state = ScrollbarState::new(max_scroll).position(max_scroll - back);
             let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("↑"))
                 .end_symbol(Some("↓"));
-            let bar_area = area.inner(Margin {
-                vertical: 1,
-                horizontal: 0,
-            });
-            frame.render_stateful_widget(bar, bar_area, &mut state);
+            frame.render_stateful_widget(bar, body, &mut state);
             // Remember where it landed so mouse clicks/drags can target it.
             self.scrollbar = Some(ScrollbarHit {
-                area: bar_area,
-                max_back,
+                area: body,
+                max_scroll,
             });
         }
     }
@@ -417,14 +556,22 @@ impl App {
             self.sessions.iter().map(session_row).collect()
         };
 
-        let title = match self.window {
-            Some(_) if self.hidden > 0 => format!(
-                " sessions ({} hidden)  ↑/↓ select · a all · q quit ",
-                self.hidden
-            ),
-            Some(_) => String::from(" sessions  ↑/↓ select · a all · q quit "),
-            None => String::from(" sessions (all)  ↑/↓ select · a recent · q quit "),
+        let scope = match self.window {
+            Some(_) if self.hidden > 0 => format!(" ({} hidden)", self.hidden),
+            Some(_) => String::new(),
+            None => String::from(" (all)"),
         };
+        let recency = if self.window.is_some() {
+            "a all"
+        } else {
+            "a recent"
+        };
+        let mouse = if self.mouse_capture {
+            "m mouse:on"
+        } else {
+            "m mouse:off(select)"
+        };
+        let title = format!(" sessions{scope}  ↑/↓ select · {recency} · {mouse} · q quit ");
         let list = List::new(items)
             .block(
                 Block::default()
@@ -485,14 +632,41 @@ fn session_row(s: &Session) -> ListItem<'static> {
     ]))
 }
 
-/// Read the tail of a session's raw PTY `output.log`, bounded to [`TAIL_BYTES`].
-/// `None` = no log file (yet); `Some(bytes)` otherwise (possibly empty). The
-/// bytes are NOT cleaned here — `draw_log` replays them through a vt100 virtual
-/// terminal, which is what correctly resolves the cursor moves / line clears an
-/// interactive agent emits.
-fn read_log_tail(paths: &Paths, id: &str) -> Option<Vec<u8>> {
-    let path = paths.sessions().output_log_path(id);
-    read_tail_bytes(&path, TAIL_BYTES).ok()
+/// Map one rendered screen row to its slot in the pane, or `None` if it falls
+/// outside the visible window. `off` is the row's scrollback offset, `r` its
+/// index within the `rows`-tall screen (0 = top), `back` the bottom-anchored
+/// scroll position, `pane_h` the visible height. Slot 0 is the bottom row.
+///
+/// `ft` is the row's distance from the live tail: at scrollback `off`, the
+/// screen's bottom row (`r == rows-1`) sits `off` rows back, and each row up
+/// adds one. A row is visible iff its `ft` lands in `[back, back + pane_h)`.
+fn place_row(off: usize, r: usize, rows: usize, back: usize, pane_h: usize) -> Option<usize> {
+    let ft = off + (rows - 1 - r);
+    if ft >= back && ft < back + pane_h {
+        Some(ft - back)
+    } else {
+        None
+    }
+}
+
+/// Probe a parser's current scrollback depth (rows above the live screen).
+/// Leaves the viewport parked at the oldest line; the next `draw_log`
+/// repositions it before rendering.
+fn scrollback_len(parser: &mut vt100::Parser) -> usize {
+    parser.screen_mut().set_scrollback(usize::MAX);
+    parser.screen().scrollback()
+}
+
+/// Read `path` from byte `start` to EOF — the bytes appended since the last
+/// frame, fed incrementally into the persistent parser.
+fn read_from(path: &std::path::Path, start: u64) -> std::io::Result<Vec<u8>> {
+    let mut f = std::fs::File::open(path)?;
+    if start > 0 {
+        f.seek(SeekFrom::Start(start))?;
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 /// Read at most `max` bytes from the end of `path`. The first line may be
@@ -559,5 +733,38 @@ mod tests {
     fn tail_missing_file_is_err() {
         let p = std::env::temp_dir().join("looop-watch-test-does-not-exist");
         assert!(read_tail_bytes(&p, 64).is_err());
+    }
+
+    #[test]
+    fn place_row_follows_tail() {
+        // 24-row screen, 24-row pane, following the tail (back = 0).
+        // off = 0 (the live screen): bottom row (r=23) -> slot 0, top (r=0) -> 23.
+        assert_eq!(place_row(0, 23, 24, 0, 24), Some(0));
+        assert_eq!(place_row(0, 0, 24, 0, 24), Some(23));
+        // A row from a higher scrollback offset is above the visible window.
+        assert_eq!(place_row(24, 23, 24, 0, 24), None);
+    }
+
+    #[test]
+    fn place_row_scrolled_back() {
+        // Scrolled back 10 rows: the live screen's bottom 10 rows fall below the
+        // window; rows at ft in [10, 34) are visible. off=0 bottom row ft=0 -> out.
+        assert_eq!(place_row(0, 23, 24, 10, 24), None); // ft=0, below window
+        assert_eq!(place_row(0, 0, 24, 10, 24), Some(13)); // ft=23 -> slot 13
+        // The next screenful up (off=24) supplies the top of the pane.
+        assert_eq!(place_row(24, 23, 24, 10, 24), Some(14)); // ft=24 -> slot 14
+        assert_eq!(place_row(24, 14, 24, 10, 24), Some(23)); // ft=33 -> slot 23 (top)
+        assert_eq!(place_row(24, 13, 24, 10, 24), None); // ft=34, above window
+    }
+
+    #[test]
+    fn place_row_taller_pane_tiles() {
+        // 24-row screen into a 50-row pane: a single screenful can't fill it, so
+        // higher offsets contribute the upper rows. Live screen fills slots 0..24.
+        assert_eq!(place_row(0, 23, 24, 0, 50), Some(0));
+        assert_eq!(place_row(0, 0, 24, 0, 50), Some(23));
+        // The screenful one tile up fills slots 24..48.
+        assert_eq!(place_row(24, 23, 24, 0, 50), Some(24));
+        assert_eq!(place_row(24, 0, 24, 0, 50), Some(47));
     }
 }
