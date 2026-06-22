@@ -33,7 +33,6 @@ Usage:
   looop _ goal write <id> [body|stdin] | _ goal archive <id>
   looop _ sensor write <name> [script|stdin]
   looop _ playbook write [body|stdin]
-  looop _ notify <message…>                  surface a notice (journaled)
 
   WORKER self-callbacks (auto-injected CONTRACT — not for humans):
   looop _ ask <id> --prompt "…" [--ref P] [--options a,b]   ask + block for answer

@@ -17,6 +17,7 @@ _looop() {
             cmds=(
                 'up:Start the pulse (sensing loop, detached)'
                 'down:Stop the pulse and all workers'
+                'watch:Observe the fleet (live log + session selector)'
                 'cost:Report LLM spend from the cost ledger'
                 'config:Output shell integration (eval "$(looop config zsh)")'
                 'version:Print the looop version'
@@ -28,6 +29,12 @@ _looop() {
             case $words[1] in
                 up)
                     _arguments '--json[Pulse logs NDJSON]'
+                    ;;
+                watch)
+                    _arguments \
+                        '--since[Recency window for hiding stale sessions (e.g. 1d, 12h, 30m)]:duration' \
+                        '(--since)--all[Show every session, no recency filter]' \
+                        '1:session id'
                     ;;
                 cost)
                     _arguments \

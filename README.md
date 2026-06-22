@@ -36,8 +36,8 @@ the peer who shapes goals and answers what only a human can.
 2. **DECIDE** — when the world changed, looop hands the PLAYBOOK + goals +
    readings + pending asks to the `tick` runner, which emits ONE typed move.
 3. **ACT** — looop executes that move (and gates risky ones): write a
-   goal/sensor/PLAYBOOK, run one reversible shell command, start a worker, or
-   notify you. One move per beat; a daily budget breaker caps spend.
+   goal/sensor/PLAYBOOK, run one reversible shell command, or start a worker.
+   One move per beat; a daily budget breaker caps spend.
 4. **HUMAN** — you steer by editing goals/PLAYBOOK (observed next beat); a worker
    that needs a human decision `ask`s and waits. Irreversible things never happen
    without your explicit yes.
@@ -95,8 +95,9 @@ optional sugar for doing that in chat. `looop up --json` makes the pulse log
 machine-readable NDJSON.
 
 On the first run looop seeds a starter PLAYBOOK and a `setup` goal whose only job
-is to **notify you to configure it** — run a concierge (or edit goals/PLAYBOOK
-directly) to replace the starter with your real work. After that it just runs.
+is to **invite you to configure it** (a journal note the concierge relays) — run a
+concierge (or edit goals/PLAYBOOK directly) to replace the starter with your real
+work. After that it just runs.
 
 ## Commands
 
@@ -114,7 +115,6 @@ looop _ state [--json] | _ wait [--json]   read current world state
 looop _ answer <ask_id> "<text>"           resolve a worker's pending ask
 looop _ goal write <id> [body|stdin] | _ goal archive <id>
 looop _ sensor write <name> [script|stdin] | _ playbook write [body|stdin]
-looop _ notify <message…>                  surface a notice (journaled)
 
 # WORKER self-callbacks (auto-injected contract — not human commands)
 looop _ ask <id> --prompt "…" [--ref P] [--options a,b]   ask + block for answer

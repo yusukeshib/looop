@@ -1,6 +1,6 @@
 [package]
 name = "looop"
-version = "0.18.1"
+version = "0.19.0"
 edition = "2024"
 description = "A tiny, portable, Kubernetes-shaped control loop for your work"
 license = "MIT"
@@ -33,6 +33,12 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io
 # pane stays colored.
 ratatui = "0.30"
 ansi-to-tui = "8"
+# `looop watch` replays the raw PTY `output.log` through a virtual terminal so
+# an interactive agent's in-place redraws (cursor moves, line clears) render as
+# the actual SCREEN instead of a garbled append of every frame. babysit already
+# depends on vt100 (and exposes `render::render_screen`); we pin it directly to
+# name the `vt100::Parser`/`Screen` types and drive scrollback ourselves.
+vt100 = "0.16"
 
 [profile.release]
 strip = true

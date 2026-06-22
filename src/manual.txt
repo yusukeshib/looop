@@ -66,7 +66,6 @@ VERBS (for you / the concierge — looop does NOT need these to act):
   looop _ goal write <id> [body|stdin] | _ goal archive <id>
   looop _ sensor write <name> [script|stdin]
   looop _ playbook write [body|stdin]
-  looop _ notify <message…>          surface a notice (journaled)
   (multi-line bodies: omit the inline body and pipe it on stdin / heredoc.)
 
 WORKER CONTRACT (auto-injected into every worker — for reference)
@@ -97,8 +96,9 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
 BOOTSTRAP
   A fresh data dir is seeded once with a starter PLAYBOOK + goals/setup.md +
   goals/playbook-daily.md + sensors/today.sh, all embedded in this binary. The
-  starter goal's top priority is for looop to interview you (via a notification /
-  ask) and rewrite the seed into your real goals + PLAYBOOK.
+  starter goal's top priority is for looop to invite you (via a journal note the
+  concierge relays) to configure it, then rewrite the seed into your real goals +
+  PLAYBOOK.
 
 DEPENDENCIES
   Just the configured agent CLI (claude or pi) — used BOTH for looop's per-beat

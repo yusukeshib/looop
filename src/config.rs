@@ -96,22 +96,6 @@ impl Config {
         Ok(Config { root })
     }
 
-    /// `.notification` — an OPTIONAL shell command template looop runs when a
-    /// `send_notification` action fires (a worker flagged the human, or the pulse
-    /// is blocked on a human edit). looop substitutes `{{message}}` / `{{id}}`
-    /// and also exports `$LOOOP_MESSAGE` / `$LOOOP_ID`, then spawns it detached
-    /// (best-effort — a failure never fails the tick). Typical value pops a tmux
-    /// window onto the flagged worker:
-    ///   "notification": "tmux new-window -n looop 'looop attach {{id}}'"
-    pub fn notification(&self) -> Option<String> {
-        self.root
-            .get("notification")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_owned)
-    }
-
     /// The active runner name (`.default`).
     pub fn default_runner(&self) -> Option<String> {
         self.root

@@ -6,7 +6,7 @@
 //!   * AUTONOMOUS — looop's per-beat decide: the `tick` runner writes ONE JSON
 //!     action to `.decision.json`; [`consume_decision`] parses + executes it.
 //!     This is the primary driver — looop is the brain.
-//!   * MANUAL — the `looop _ …` verbs (cmd_goal/sensor/playbook/run/worker/notify)
+//!   * MANUAL — the `looop _ …` verbs (cmd_goal/sensor/playbook/run/worker)
 //!     a human or concierge calls to steer by hand. Same [`Action`]s, same gates.
 //!
 //! looop is the SOLE executor either way: judgment (free to inspect) stays
@@ -49,13 +49,6 @@ pub enum Action {
     WritePlaybook { body: String },
     /// Spawn a worker session for hands-on work.
     StartWorker { id: String, prompt: String },
-    /// Surface a blocker / notice to the human. Journaled; if `notification` is
-    /// wired in config, looop also fires that command (best-effort).
-    SendNotification {
-        message: String,
-        #[serde(default)]
-        id: String,
-    },
 }
 
 /// Reject a file-name segment that could escape the data dir or hit a dotfile.
@@ -77,15 +70,13 @@ pub fn kind(action: &Action) -> &'static str {
         Action::WriteSensor { .. } => "sensor",
         Action::WritePlaybook { .. } => "playbook",
         Action::StartWorker { .. } => "worker",
-        Action::SendNotification { .. } => "notify",
     }
 }
 
 /// The goal id an action targets, if any — used to stamp the per-goal activity
 /// ledger that drives the `sys-goals` staleness reading (so the decider can see
 /// which goals it's been neglecting and avoid starving them). Actions with no
-/// goal association (noop, run_shell, write_sensor, write_playbook, notify)
-/// return None.
+/// goal association (noop, run_shell, write_sensor, write_playbook) return None.
 fn goal_of(action: &Action) -> Option<String> {
     match action {
         Action::WriteGoal { id, .. } => Some(id.clone()),
@@ -109,17 +100,13 @@ fn record_goal_activity(paths: &Paths, id: &str) {
 }
 
 /// Whether re-running this action a second time can cause a DUPLICATE,
-/// non-reversible effect (a second PR comment, a second notification fired).
-/// These are the actions the write-ahead intent log guards (H: crash between
-/// the side effect and the world-hash commit must not silently double-fire).
-/// Everything else is an idempotent overwrite (write_goal/sensor/playbook),
-/// has its own dedup guard (start_worker's same-id alive check), or is a
-/// best-effort nudge whose re-send is harmless.
+/// non-reversible effect (a second PR comment). These are the actions the
+/// write-ahead intent log guards (H: crash between the side effect and the
+/// world-hash commit must not silently double-fire). Everything else is an
+/// idempotent overwrite (write_goal/sensor/playbook) or has its own dedup guard
+/// (start_worker's same-id alive check).
 fn is_non_idempotent(action: &Action) -> bool {
-    matches!(
-        action,
-        Action::RunShell { .. } | Action::SendNotification { .. }
-    )
+    matches!(action, Action::RunShell { .. })
 }
 
 /// A stable fingerprint of a non-idempotent action's payload, so a crash report
@@ -128,9 +115,6 @@ fn is_non_idempotent(action: &Action) -> bool {
 fn action_fingerprint(action: &Action) -> String {
     let canon = match action {
         Action::RunShell { cmd, .. } => format!("run_shell\n{cmd}"),
-        Action::SendNotification { message, id } => {
-            format!("send_notification\n{message}\n{id}")
-        }
         _ => kind(action).to_string(),
     };
     crate::util::content_hash(canon.as_bytes())
@@ -157,7 +141,7 @@ fn clear_intent(paths: &Paths) {
 }
 
 /// At beat start: if a write-ahead intent record survived, the previous beat
-/// died mid non-idempotent side effect (run_shell / send_notification) before
+/// died mid non-idempotent side effect (run_shell) before
 /// it could commit the world hash. We do NOT auto-retry (a duplicate command is
 /// worse than a missed one); we surface it durably so a human can check whether
 /// the command actually ran. Idempotent. Returns true when an interrupted
@@ -288,43 +272,7 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
             }
             Ok(format!("start-worker {id}"))
         }
-
-        Action::SendNotification { message, id } => {
-            let msg = message.trim();
-            if msg.is_empty() {
-                bail!("send_notification: empty message");
-            }
-            // The journal line IS the notice. If the operator wired a
-            // `notification` command in config, also fire it (best-effort,
-            // detached — a failed hook never fails the tick) so a flag can pop
-            // a tmux window onto the waiting worker.
-            fire_notification_hook(paths, msg, id.trim());
-            Ok(format!("notify · {msg}"))
-        }
     }
-}
-
-/// Fire the operator's optional `notification` command (config `.notification`)
-/// when a `send_notification` action runs. Substitutes `{{message}}` / `{{id}}`
-/// and exports `$LOOOP_MESSAGE` / `$LOOOP_ID`, then spawns it DETACHED via bash
-/// in the data dir. Best-effort: a missing hook, a config error, or a spawn
-/// failure is silently ignored — the notice is already journaled, so the hook is
-/// pure surfacing and must never fail (or block) the tick.
-fn fire_notification_hook(paths: &Paths, message: &str, id: &str) {
-    let Ok(cfg) = crate::config::Config::load(paths) else {
-        return;
-    };
-    let Some(cmd) = cfg.notification() else {
-        return;
-    };
-    let rendered = cmd.replace("{{message}}", message).replace("{{id}}", id);
-    let _ = std::process::Command::new("bash")
-        .arg("-c") // non-login: inherit looop's env, don't re-source the login profile
-        .arg(&rendered)
-        .current_dir(&paths.data_dir)
-        .env("LOOOP_MESSAGE", message)
-        .env("LOOOP_ID", id)
-        .spawn(); // detached — do NOT wait; the tick moves on immediately
 }
 
 /// Append one journal line in the canonical `- YYYY-MM-DD HH:MM <text>` format
@@ -590,28 +538,6 @@ pub fn cmd_worker_start(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     )?)
 }
 
-/// `looop _ notify <message…> [--id WORKER]` — surface a notice to the human.
-pub fn cmd_notify(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let (journal, mut rest) = take_journal(args);
-    let mut id = String::new();
-    if let Some(i) = rest.iter().position(|a| a == "--id") {
-        rest.remove(i);
-        if i < rest.len() {
-            id = rest.remove(i);
-        }
-    }
-    let message = rest.join(" ");
-    if message.trim().is_empty() {
-        eprintln!("usage: looop _ notify <message…> [--id WORKER]");
-        return Ok(ExitCode::from(1));
-    }
-    ok(run_action(
-        paths,
-        &Action::SendNotification { message, id },
-        journal.as_deref(),
-    )?)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -669,39 +595,10 @@ mod tests {
     }
 
     #[test]
-    fn notify_journals_and_rejects_empty() {
-        let p = Paths::temp();
-        let summary = run_action(
-            &p,
-            &Action::SendNotification {
-                message: "goals A and B conflict".into(),
-                id: String::new(),
-            },
-            None,
-        )
-        .unwrap();
-        assert_eq!(summary, "notify · goals A and B conflict");
-        assert!(
-            execute(
-                &p,
-                &Action::SendNotification {
-                    message: "  ".into(),
-                    id: String::new(),
-                }
-            )
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn only_run_shell_and_notification_are_guarded() {
+    fn only_run_shell_is_guarded() {
         assert!(is_non_idempotent(&Action::RunShell {
             cmd: "gh pr comment".into(),
             reason: String::new()
-        }));
-        assert!(is_non_idempotent(&Action::SendNotification {
-            message: "x".into(),
-            id: String::new()
         }));
         assert!(!is_non_idempotent(&Action::WriteGoal {
             id: "g".into(),
@@ -718,11 +615,11 @@ mod tests {
         let p = Paths::temp();
         run_action(
             &p,
-            &Action::SendNotification {
-                message: "creds expired".into(),
-                id: String::new(),
+            &Action::RunShell {
+                cmd: "true".into(),
+                reason: "noop check".into(),
             },
-            Some("told human"),
+            Some("ran a guarded command"),
         )
         .unwrap();
         assert!(
@@ -786,9 +683,9 @@ mod tests {
             Some("ship".into())
         );
         assert_eq!(
-            goal_of(&Action::SendNotification {
-                message: "x".into(),
-                id: String::new(),
+            goal_of(&Action::RunShell {
+                cmd: "echo hi".into(),
+                reason: String::new(),
             }),
             None
         );
