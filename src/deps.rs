@@ -4,8 +4,9 @@
 //! missing, fail fast with install instructions. Unlike the bash version, the
 //! Rust port needs neither `jq` (JSON is handled in-process by serde_json) nor
 //! the `babysit` binary (babysit is linked as a library and the whole worker
-//! fleet — spawn / list / attach / kill / flag / prune — runs in-process). The
-//! single hard prerequisite is the configured tick runner (pi/claude).
+//! fleet — spawn / list / attach / kill / prune — runs in-process). The
+//! single hard prerequisite is the configured runner (pi/claude) used to launch
+//! the root agent and worker sessions.
 
 use crate::config::Config;
 use crate::paths::Paths;
@@ -13,7 +14,7 @@ use anyhow::{Result, bail};
 
 fn dep_hint(cmd: &str) -> &'static str {
     match cmd {
-        "pi" => "see https://github.com/earendil-works/pi  (the default tick runner)",
+        "pi" => "see https://github.com/earendil-works/pi  (the default runner)",
         "claude" => "see https://docs.claude.com/claude-code",
         _ => "see the tool's docs",
     }
@@ -48,12 +49,14 @@ fn is_executable(_p: &std::path::Path) -> bool {
 pub fn require_deps(paths: &Paths) -> Result<()> {
     let mut missing: Vec<(String, &'static str)> = Vec::new();
 
-    // The tick itself shells out to the configured runner (pi/claude), so a
-    // missing runner binary is a hard prereq too. Resolve from $LOOOP_CONFIG
-    // when present, else the inline default, and check its first token.
+    // looop launches the root agent + workers through the configured runner's
+    // `interactive` command (pi/claude), so a missing runner binary is a hard
+    // prereq. Resolve from $LOOOP_CONFIG when present, else the inline default,
+    // and check its first token.
     if let Ok(cfg) = Config::load(paths)
-        && let Some(tick_cmd) = cfg.active_runner_cmd("tick")
-        && let Some(bin) = tick_cmd.split_whitespace().next()
+        && let Some(name) = cfg.default_runner()
+        && let Some(cmd) = cfg.runner_cmd(&name, "interactive")
+        && let Some(bin) = cmd.split_whitespace().next()
         && !bin.is_empty()
         && !on_path(bin)
     {

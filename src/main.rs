@@ -17,16 +17,13 @@ mod events;
 mod executor;
 mod gate;
 mod help;
-mod journal;
+mod mailbox;
 mod paths;
-mod prompt;
 mod run;
-mod runner;
 mod seed;
 mod sensor;
 mod service;
 mod session;
-mod status;
 mod tick;
 mod util;
 mod worldhash;
@@ -43,17 +40,11 @@ fn main() -> ExitCode {
     util::init_color();
 
     let args: Vec<String> = std::env::args().skip(1).collect();
-    // A bare `looop` (or `looop --json`) IS the command: it brings the pulse up
-    // as a session, streams it, and tears it down on exit. There is no detached
-    // up/down pair anymore — the foreground invocation owns the loop's lifecycle.
+    // A bare `looop` is no longer a command: the loop runs as the `looop up`
+    // service (pulse + root agent). With no verb, show the manual.
     let Some(cmd) = args.first().map(String::as_str) else {
-        return match deps::require_deps(&paths).and_then(|_| service::cmd_serve(&paths, &[])) {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("{e}");
-                ExitCode::from(1)
-            }
-        };
+        help::print(&paths);
+        return ExitCode::SUCCESS;
     };
     let rest = &args[1..];
 
@@ -73,68 +64,73 @@ fn main() -> ExitCode {
         "run" if rest.first().map(String::as_str) == Some("--detached-id") => {
             session::run_detached_worker(rest).map(|c| ExitCode::from(c.clamp(0, 255) as u8))
         }
-        // A leading flag with no verb is still the foreground serve (`looop --json`).
-        "--json" => deps::require_deps(&paths).and_then(|_| service::cmd_serve(&paths, &args)),
-        // The pulse foreground + its read-only window.
-        "watch" => deps::require_deps(&paths).and_then(|_| session::cmd_watch(&paths, rest)),
-        "log" | "logs" => deps::require_deps(&paths).and_then(|_| session::cmd_log(&paths, rest)),
-        "shot" | "screenshot" => {
-            deps::require_deps(&paths).and_then(|_| session::cmd_screenshot(&paths, rest))
+        // Service control: bring the pulse up / tear it (and workers) down. The
+        // root agent is a pi/claude session YOU run separately, not looop-managed.
+        "up" => deps::require_deps(&paths).and_then(|_| service::cmd_up(&paths, rest)),
+        "down" => deps::require_deps(&paths).and_then(|_| service::cmd_down(&paths)),
+        // Machine-facing verbs, grouped under `_`. Two audiences: the ROOT AGENT
+        // (tick/answer/goal/sensor/playbook/run/notify/worker) and the WORKER
+        // self-callbacks (ask/kill/claim/unclaim/cost). `_ pulse` is looop's own
+        // detached spawn. None are human-facing — humans use `up`/`down`.
+        "_" => {
+            match rest.first().map(String::as_str) {
+                Some("pulse") => {
+                    deps::require_deps(&paths).and_then(|_| service::cmd_pulse(&paths))
+                }
+                // Root agent: read state (now / blocking) + drive the world.
+                Some("state") => {
+                    deps::require_deps(&paths).and_then(|_| tick::cmd_state(&paths, &rest[1..]))
+                }
+                Some("wait") => {
+                    deps::require_deps(&paths).and_then(|_| tick::cmd_wait(&paths, &rest[1..]))
+                }
+                Some("answer") => {
+                    deps::require_deps(&paths).and_then(|_| mailbox::cmd_answer(&paths, &rest[1..]))
+                }
+                Some("goal") => {
+                    deps::require_deps(&paths).and_then(|_| executor::cmd_goal(&paths, &rest[1..]))
+                }
+                Some("sensor") => deps::require_deps(&paths)
+                    .and_then(|_| executor::cmd_sensor(&paths, &rest[1..])),
+                Some("playbook") => deps::require_deps(&paths)
+                    .and_then(|_| executor::cmd_playbook(&paths, &rest[1..])),
+                Some("run") => {
+                    deps::require_deps(&paths).and_then(|_| executor::cmd_run(&paths, &rest[1..]))
+                }
+                Some("notify") => deps::require_deps(&paths)
+                    .and_then(|_| executor::cmd_notify(&paths, &rest[1..])),
+                Some("worker") => match rest.get(1).map(String::as_str) {
+                    Some("start") => deps::require_deps(&paths)
+                        .and_then(|_| executor::cmd_worker_start(&paths, &rest[2..])),
+                    Some("kill") => deps::require_deps(&paths)
+                        .and_then(|_| session::cmd_kill(&paths, &rest[2..])),
+                    other => {
+                        eprintln!("looop _ worker: unknown subverb {other:?} (start, kill)");
+                        Ok(ExitCode::from(1))
+                    }
+                },
+                // Worker self-callbacks (auto-injected CONTRACT).
+                Some("ask") => {
+                    deps::require_deps(&paths).and_then(|_| mailbox::cmd_ask(&paths, &rest[1..]))
+                }
+                Some("kill") => {
+                    deps::require_deps(&paths).and_then(|_| session::cmd_kill(&paths, &rest[1..]))
+                }
+                Some("claim") => {
+                    deps::require_deps(&paths).and_then(|_| gate::cmd_claim(&paths, &rest[1..]))
+                }
+                Some("unclaim") => {
+                    deps::require_deps(&paths).and_then(|_| gate::cmd_unclaim(&paths, &rest[1..]))
+                }
+                Some("cost") => cost::cmd_cost_record(&paths, &rest[1..]),
+                other => {
+                    eprintln!(
+                        "looop _: unknown internal verb {other:?} (root: state, wait, answer, goal, sensor, playbook, run, notify, worker; worker: ask, kill, claim, unclaim, cost; pulse)"
+                    );
+                    Ok(ExitCode::from(1))
+                }
+            }
         }
-        "send" => deps::require_deps(&paths).and_then(|_| session::cmd_send(&paths, rest)),
-        "key" => deps::require_deps(&paths).and_then(|_| session::cmd_key(&paths, rest)),
-        "expect" => deps::require_deps(&paths).and_then(|_| session::cmd_expect(&paths, rest)),
-        "wait" => deps::require_deps(&paths).and_then(|_| session::cmd_wait(&paths, rest)),
-        "wait-idle" => {
-            deps::require_deps(&paths).and_then(|_| session::cmd_wait_idle(&paths, rest))
-        }
-        "resize" => deps::require_deps(&paths).and_then(|_| session::cmd_resize(&paths, rest)),
-        "restart" => deps::require_deps(&paths).and_then(|_| session::cmd_restart(&paths, rest)),
-        "detach" => deps::require_deps(&paths).and_then(|_| session::cmd_detach(&paths, rest)),
-        // Hidden internal verbs, grouped under `_`: `looop _ pulse|cost`.
-        // Not for human use; called by looop itself (detached pulse spawn) or by
-        // worker agents self-reporting spend via `_ cost` (an AI-facing callback,
-        // like `flag`). Tick formatting + cost metering are NOT here — they run
-        // in-process in `runner::run_streamed`, not via an external pipe seam.
-        "_" => match rest.first().map(String::as_str) {
-            // The headless pulse body babysit wraps under a PTY (a bare `looop`).
-            Some("pulse") => deps::require_deps(&paths).and_then(|_| service::cmd_pulse(&paths)),
-            Some("cost") => cost::cmd_cost_record(&paths, &rest[1..]),
-            // Worker self-control callbacks, invoked by the auto-injected CONTRACT
-            // — NOT by a human. Grouped under `_` (like `_ cost`) so a person can't
-            // imperatively flag/kill/lease a worker out from under the loop; humans
-            // steer by editing goals/PLAYBOOK and attaching, never by these verbs.
-            Some("flag") => {
-                deps::require_deps(&paths).and_then(|_| session::cmd_flag(&paths, &rest[1..]))
-            }
-            Some("unflag") => {
-                deps::require_deps(&paths).and_then(|_| session::cmd_unflag(&paths, &rest[1..]))
-            }
-            Some("kill") => {
-                deps::require_deps(&paths).and_then(|_| session::cmd_kill(&paths, &rest[1..]))
-            }
-            // Atomic, liveness-aware lease test-and-set so two workers can't race
-            // the same resource.
-            Some("claim") => {
-                deps::require_deps(&paths).and_then(|_| gate::cmd_claim(&paths, &rest[1..]))
-            }
-            Some("unclaim") => {
-                deps::require_deps(&paths).and_then(|_| gate::cmd_unclaim(&paths, &rest[1..]))
-            }
-            other => {
-                eprintln!(
-                    "looop _: unknown internal verb {other:?} (expected: pulse, cost, flag, unflag, kill, claim, unclaim)"
-                );
-                Ok(ExitCode::from(1))
-            }
-        },
-        "ls" => deps::require_deps(&paths).and_then(|_| ls_inproc(&paths, rest)),
-        "status" => status::cmd_status(&paths, rest),
-        "start-session" => {
-            deps::require_deps(&paths).and_then(|_| session::cmd_start_session(&paths, rest))
-        }
-        "attach" => deps::require_deps(&paths).and_then(|_| session::cmd_attach(&paths, rest)),
-        "prune" => deps::require_deps(&paths).and_then(|_| session::cmd_prune(&paths, rest)),
         "config" => match rest.first().map(String::as_str) {
             Some("zsh") => {
                 print!("{}", include_str!("completions/looop.zsh"));
@@ -151,12 +147,9 @@ fn main() -> ExitCode {
                 Ok(ExitCode::from(1))
             }
         },
-        "journal" => journal::cmd_journal(&paths, rest),
         "cost" => cost::cmd_cost(&paths, rest),
         other => {
-            eprintln!(
-                "looop: unknown command '{other}' (run `looop` to start the loop; or: watch <id>, ls, status, journal, log, shot, send, key, expect, wait, wait-idle, resize, restart, attach, detach, prune, help)"
-            );
+            eprintln!("looop: unknown command '{other}' (up, down, cost, config, version, help)");
             Ok(ExitCode::from(1))
         }
     };
@@ -206,32 +199,6 @@ fn export_env(paths: &Paths) {
     // NB: no $BABYSIT_DIR. looop never configures the babysit library through the
     // environment — it passes an explicit context (`paths.sessions()`) to every
     // call, and the detached worker receives its root via `--root`.
-}
-
-/// `looop ls [--json] [--watch] [--interval <dur>]` — render the fleet table
-/// IN-PROCESS via the babysit library (no `babysit` binary). Parses the same
-/// flags babysit ls accepts.
-fn ls_inproc(paths: &Paths, rest: &[String]) -> Result<ExitCode> {
-    let mut json = false;
-    let mut watch = false;
-    let mut interval = "2s".to_string();
-    let mut it = rest.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--json" => json = true,
-            "--watch" | "-w" => watch = true,
-            "--interval" | "-n" => {
-                if let Some(v) = it.next() {
-                    interval = v.clone();
-                }
-            }
-            _ => {} // ignore unknown flags
-        }
-    }
-    match session::ls(paths, json, watch, interval) {
-        Ok(()) => Ok(ExitCode::SUCCESS),
-        Err(_) => Ok(ExitCode::from(1)),
-    }
 }
 
 #[cfg(test)]

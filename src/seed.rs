@@ -23,11 +23,10 @@ prompts/
 runs/
 claims/
 reports/
+asks/
+answers/
 .lock/
-.decision.json
 .last-tick-hash
-.tick-backoff
-.cost-unmetered
 .goal-activity.json
 tick.log
 events.jsonl
@@ -52,6 +51,8 @@ pub fn ensure_dirs(paths: &Paths) -> Result<()> {
         paths.snapshots_dir(),
         paths.claims_dir(),
         paths.reports_dir(),
+        paths.asks_dir(),
+        paths.answers_dir(),
         paths.runs_dir(),
         paths.goals_dir().join("archive"),
         paths.prompts_dir(),
