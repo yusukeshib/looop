@@ -187,9 +187,13 @@ pub fn cmd_ask(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 /// Root-agent callback: resolve a pending ask. Writes `answers/<ask_id>.json`,
 /// which unblocks the worker's `_ ask`. Refuses an unknown ask id.
 pub fn cmd_answer(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let Some((ask_id, rest)) = args.split_first() else {
+    // `--force` may sit anywhere in the args; pull it out before positional
+    // parsing so it never leaks into the answer body.
+    let force = args.iter().any(|a| a == "--force");
+    let positional: Vec<String> = args.iter().filter(|a| *a != "--force").cloned().collect();
+    let Some((ask_id, rest)) = positional.split_first() else {
         eprintln!(
-            "usage: looop _ answer <ask_id> <text…|->  (omit text or pass `-` to read stdin/heredoc)"
+            "usage: looop _ answer <ask_id> <text…|-> [--force]  (omit text or pass `-` to read stdin/heredoc)"
         );
         return Ok(ExitCode::from(1));
     };
@@ -216,8 +220,11 @@ pub fn cmd_answer(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     }
     fs::create_dir_all(paths.answers_dir())?;
     let answer_path = paths.answers_dir().join(format!("{ask_id}.json"));
-    if answer_path.is_file() {
-        eprintln!("looop _ answer: overwriting the existing answer for {ask_id}");
+    // Answers are durable: refuse to clobber one already given unless `--force`.
+    // A worker that has already read its answer has moved on, so a stray re-answer
+    // is almost always a misfire — fail loudly instead of silently overwriting.
+    if answer_path.is_file() && !force {
+        bail!("answer: {ask_id:?} is already answered (pass --force to overwrite)");
     }
     let body = serde_json::json!({ "answer": text, "ts": util::now_unix() });
     fs::write(&answer_path, serde_json::to_string_pretty(&body)?)?;
@@ -307,7 +314,7 @@ mod tests {
     }
 
     #[test]
-    fn answer_can_overwrite_a_prior_answer() {
+    fn answer_refuses_to_overwrite_without_force_but_allows_with_force() {
         let p = Paths::temp();
         fs::create_dir_all(p.asks_dir()).unwrap();
         fs::create_dir_all(p.answers_dir()).unwrap();
@@ -317,8 +324,11 @@ mod tests {
         )
         .unwrap();
         cmd_answer(&p, &["w-1".into(), "first".into()]).unwrap();
-        // A re-answer overwrites (lets the human recover from a bad answer).
-        cmd_answer(&p, &["w-1".into(), "second".into()]).unwrap();
+        // A bare re-answer is refused (a stray re-answer is almost always a misfire).
+        assert!(cmd_answer(&p, &["w-1".into(), "second".into()]).is_err());
+        assert_eq!(read_answer(&p, "w-1").as_deref(), Some("first"));
+        // `--force` lets the human deliberately recover from a bad answer.
+        cmd_answer(&p, &["w-1".into(), "second".into(), "--force".into()]).unwrap();
         assert_eq!(read_answer(&p, "w-1").as_deref(), Some("second"));
     }
 

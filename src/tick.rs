@@ -630,9 +630,45 @@ fn wait_for_change(paths: &Paths, filter: WaitFilter) -> Vec<String> {
     }
 }
 
+/// Render a unix-seconds age as a compact human delta ("just now", "4m", "2h",
+/// "3d") so the plain `_ state` / `_ wait` output can show how long an ask has
+/// been waiting without the caller doing clock math.
+fn fmt_ago(ts: u64) -> String {
+    let now = util::now_unix();
+    let secs = now.saturating_sub(ts);
+    if secs < 45 {
+        "just now".to_string()
+    } else if secs < 90 {
+        "1m ago".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
+/// First line of `s`, trimmed and clipped to `max` chars (… suffix when cut), so
+/// a multi-line ask prompt collapses to a single readable summary line.
+fn one_line(s: &str, max: usize) -> String {
+    let first = s.lines().next().unwrap_or("").trim();
+    if first.chars().count() > max {
+        let head: String = first.chars().take(max.saturating_sub(1)).collect();
+        format!("{head}…")
+    } else {
+        first.to_string()
+    }
+}
+
 /// Print the current state. `--json` = full structured object; else a summary.
 /// `changed` (set by `_ wait`) is surfaced as a `changed: […]` diff summary so a
 /// caller knows WHICH categories moved without re-diffing the whole state.
+///
+/// The plain summary is intentionally rich enough to STAND ALONE: pending asks
+/// (with age), the live worker fleet, each sensor's wake signal, and the last
+/// few journal lines — so a concierge woken by `_ wait` never has to follow up
+/// with `tail journal.md` / `_ state --json | jq` to see what actually moved.
 fn print_state(paths: &Paths, args: &[String], changed: Option<&[String]>) -> Result<ExitCode> {
     let mut s = state(paths);
     if let (Some(ch), Some(obj)) = (changed, s.as_object_mut()) {
@@ -652,17 +688,81 @@ fn print_state(paths: &Paths, args: &[String], changed: Option<&[String]>) -> Re
             }
         );
     }
-    let asks = s["asks"].as_array().map(|a| a.len()).unwrap_or(0);
-    let workers = s["workers"].as_array().map(|a| a.len()).unwrap_or(0);
+    let asks = s["asks"].as_array().cloned().unwrap_or_default();
+    let workers = s["workers"].as_array().cloned().unwrap_or_default();
     let goals = s["goals"].as_array().map(|a| a.len()).unwrap_or(0);
-    println!("asks: {asks}  ·  workers: {workers}  ·  goals: {goals}");
-    for a in s["asks"].as_array().cloned().unwrap_or_default() {
-        println!(
-            "  ⚑ {} ({}): {}",
+    let live = workers
+        .iter()
+        .filter(|w| w["alive"].as_bool().unwrap_or(false))
+        .count();
+    println!(
+        "asks: {}  ·  workers: {live} live / {}  ·  goals: {goals}",
+        asks.len(),
+        workers.len()
+    );
+
+    // Pending asks, each with WHICH worker + HOW LONG it has been waiting, so the
+    // freshness of a blocked decision is obvious at a glance.
+    for a in &asks {
+        let mut head = format!(
+            "  ⚑ {} ({} · {}): {}",
             a["id"].as_str().unwrap_or("?"),
             a["worker"].as_str().unwrap_or("?"),
-            a["prompt"].as_str().unwrap_or("")
+            fmt_ago(a["ts"].as_u64().unwrap_or(0)),
+            one_line(a["prompt"].as_str().unwrap_or(""), 100),
         );
+        if let Some(r) = a["reference"].as_str().filter(|r| !r.is_empty()) {
+            head.push_str(&format!("\n      ref: {r}"));
+        }
+        if let Some(opts) = a["options"].as_array().filter(|o| !o.is_empty()) {
+            let opts: Vec<&str> = opts.iter().filter_map(|o| o.as_str()).collect();
+            head.push_str(&format!("\n      options: {}", opts.join(", ")));
+        }
+        println!("{head}");
+    }
+
+    // Sensor readings — one line per snapshot's wake SIGNAL. This is where a
+    // user `gh`/PR-review sensor surfaces (e.g. a stale CHANGES_REQUESTED), so
+    // the concierge sees PR state in `_ state` instead of shelling out to `gh`.
+    let snaps = s["snapshots"].as_object().cloned().unwrap_or_default();
+    if !snaps.is_empty() {
+        println!("sensors:");
+        for (k, v) in &snaps {
+            let signal = crate::worldhash::wake_signal(v.clone());
+            println!("  {k}: {}", one_line(&signal.to_string(), 100));
+        }
+    }
+
+    // Live workers — id + state, so "who is running" needs no `--json | jq`.
+    let alive: Vec<&serde_json::Value> = workers
+        .iter()
+        .filter(|w| w["alive"].as_bool().unwrap_or(false))
+        .collect();
+    if !alive.is_empty() {
+        println!("workers (live):");
+        for w in alive {
+            println!(
+                "  ● {}  {}",
+                w["id"].as_str().unwrap_or("?"),
+                w["state"].as_str().unwrap_or("?")
+            );
+        }
+    }
+
+    // Last few journal lines — so a `changed: journal` wake is self-explanatory
+    // and the caller never has to `tail journal.md` to learn what looop just did.
+    let jtail = s["journal_tail"].as_array().cloned().unwrap_or_default();
+    let recent: Vec<&str> = jtail
+        .iter()
+        .rev()
+        .take(3)
+        .filter_map(|l| l.as_str())
+        .collect();
+    if !recent.is_empty() {
+        println!("journal (latest):");
+        for l in recent.into_iter().rev() {
+            println!("  {l}");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

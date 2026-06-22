@@ -16,7 +16,7 @@
         # configured LLM runner (pi/claude) is the user's to provide.
         looop = pkgs.rustPlatform.buildRustPackage {
           pname = "looop";
-          version = "0.22.0";
+          version = "0.23.0";
           src = ./.;
 
           cargoLock.lockFile = ./Cargo.lock;

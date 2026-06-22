@@ -116,7 +116,7 @@ looop _ wait [--json] [--only-asks|--actionable]   block until change; prints a
                                            `changed: […]` diff (--actionable =
                                            asks/journal only, --only-asks = asks)
 looop _ asks [--json]                      pending asks only (concierge's narrow view)
-looop _ answer <ask_id> "<text>"|-          resolve an ask (`-`/empty body = stdin/heredoc)
+looop _ answer <ask_id> "<text>"|- [--force]  resolve an ask (`-`/empty body = stdin/heredoc; --force to overwrite an already-answered ask)
 looop _ goal write <id> [body|stdin] | _ goal archive <id>
 looop _ sensor write <name> [script|stdin] | _ playbook write [body|stdin]
 
@@ -130,6 +130,50 @@ looop decides autonomously; the `looop _ …` STEER verbs let you (or a concierg
 inspect state, answer asks, and edit goals/sensors/PLAYBOOK by hand, and
 **workers** self-report (ask, kill, claim, unclaim, cost) via the auto-injected
 contract.
+
+## Sensors
+
+A sensor is a script in `sensors/` that prints **one JSON object** to stdout each
+beat — looop's window onto the outside world. looop itself knows nothing about
+GitHub, Linear, Grafana, …; you teach it by dropping a sensor. The pulse runs
+every `sensors/*.sh` each beat and stores the output in `snapshots/<name>.json`.
+
+Split the JSON into two keys:
+
+- **`signal`** — the part that should WAKE the loop. A change here flips the
+  world hash, so the next beat re-decides (and `_ wait` reports it). Keep it
+  small and stable: counts, states, ids — not timestamps.
+- **`detail`** — volatile context that reaches the decide prompt but NEVER wakes
+  the loop (e.g. "last checked at …"). Without a `signal` key the whole object is
+  treated as the wake signal.
+
+### Example: a GitHub PR-review sensor
+
+Surface stale `CHANGES_REQUESTED` PRs so looop (and the concierge via `_ state`)
+sees review state without anyone shelling out to `gh`:
+
+```sh
+# sensors/gh.sh  (requires an authenticated `gh`)
+#!/usr/bin/env bash
+set -euo pipefail
+cr=$(gh pr list --search "review:changes-requested" --json number --jq 'length')
+open=$(gh pr list --state open --json number --jq 'length')
+# signal wakes the loop on a count change; detail is just context for the prompt.
+jq -cn --argjson cr "$cr" --argjson open "$open" \
+  '{signal: {open_prs: $open, changes_requested: $cr},
+    detail: {checked_at: (now | todate)}}'
+```
+
+Install it with `looop _ sensor write gh < sensors/gh.sh` (or drop the file in the
+data dir's `sensors/` directly). Its reading then shows up in `looop _ state`:
+
+```
+sensors:
+  gh: {"changes_requested":1,"open_prs":2}
+```
+
+and a change to `changes_requested` wakes the loop so the PLAYBOOK can react
+(e.g. spawn a worker to nudge the PR, or `ask` you to merge).
 
 ## Shell integration
 

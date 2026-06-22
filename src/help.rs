@@ -30,7 +30,7 @@ Usage:
   STEER (you, or a concierge acting for you — looop does NOT need these to act):
   looop _ state [--json] | _ wait [--json] [--only-asks|--actionable]  read state
   looop _ asks [--json]                      pending asks only (concierge's narrow view)
-  looop _ answer <ask_id> "<text>"|-          resolve a worker's ask (`-`/empty = stdin)
+  looop _ answer <ask_id> "<text>"|- [--force]  resolve a worker's ask (`-`/empty = stdin; --force to re-answer)
   looop _ goal write <id> [body|stdin] | _ goal archive <id>
   looop _ sensor write <name> [script|stdin]
   looop _ playbook write [body|stdin]
