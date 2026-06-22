@@ -47,10 +47,6 @@ pub fn cmd_up(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         session::await_alive(paths, PULSE_SESSION, Duration::from_secs(5));
         println!("looop: pulse started{}", if json { " [json]" } else { "" });
     }
-    println!(
-        "looop: now start your agent and point it at looop, e.g.\n  \
-         pi   # then: \"observe looop — loop on `looop _ wait --json` and act; read `looop --help`\""
-    );
     Ok(ExitCode::SUCCESS)
 }
 

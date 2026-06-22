@@ -19,6 +19,8 @@ Usage:
                                 --json makes the pulse log NDJSON. Then start your
                                 agent yourself and tell it to observe looop.
   looop down                     stop the pulse and all workers
+  looop watch [<id>]             observer TUI: live colored log + session selector
+                                (read-only; <id> preselects, e.g. `looop watch pulse`)
   looop cost [today|all|--json]  report LLM spend (agents self-report via `_ cost`)
   looop config zsh|bash          print shell integration (completions)
   looop version | help           print version / show this help

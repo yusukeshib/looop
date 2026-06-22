@@ -26,6 +26,13 @@ babysit = { version = "0.12", default-features = false }
 # supervisor (serve_worker), which babysit runs under a multi-thread runtime
 # (`#[tokio::main]`). Match that so the in-process worker behaves identically.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "signal"] }
+# `looop watch`: a two-pane TUI (live colored log + running-session selector).
+# ratatui re-exports its crossterm backend, so we drive terminal setup/events
+# through `ratatui::crossterm` and don't pin crossterm separately. ansi-to-tui
+# parses the PTY log's ANSI/SGR escapes into styled ratatui lines so the log
+# pane stays colored.
+ratatui = "0.30"
+ansi-to-tui = "8"
 
 [profile.release]
 strip = true

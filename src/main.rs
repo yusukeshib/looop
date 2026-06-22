@@ -26,6 +26,7 @@ mod service;
 mod session;
 mod tick;
 mod util;
+mod watch;
 mod worldhash;
 
 use anyhow::Result;
@@ -68,6 +69,10 @@ fn main() -> ExitCode {
         // root agent is a pi/claude session YOU run separately, not looop-managed.
         "up" => deps::require_deps(&paths).and_then(|_| service::cmd_up(&paths, rest)),
         "down" => deps::require_deps(&paths).and_then(|_| service::cmd_down(&paths)),
+        // Read-only observer TUI: tail the colored log of any running session
+        // (pulse or worker) with a live selector. No deps gate — it only reads
+        // logs + lists sessions, never launches an agent.
+        "watch" => watch::cmd_watch(&paths, rest),
         // Machine-facing verbs, grouped under `_`. Two audiences: the ROOT AGENT
         // (tick/answer/goal/sensor/playbook/run/notify/worker) and the WORKER
         // self-callbacks (ask/kill/claim/unclaim/cost). `_ pulse` is looop's own
@@ -149,7 +154,9 @@ fn main() -> ExitCode {
         },
         "cost" => cost::cmd_cost(&paths, rest),
         other => {
-            eprintln!("looop: unknown command '{other}' (up, down, cost, config, version, help)");
+            eprintln!(
+                "looop: unknown command '{other}' (up, down, watch, cost, config, version, help)"
+            );
             Ok(ExitCode::from(1))
         }
     };
