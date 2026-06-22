@@ -23,7 +23,7 @@ Usage:
                                 (read-only; <id> preselects, e.g. `looop watch pulse`)
                                 hides dead sessions idle > 1d; --since 12h/30m to
                                 widen, --all to show every session, `a` toggles live
-  looop cost [today|all|--json]  report LLM spend (per-beat + workers)
+  looop cost                     report LLM spend by day (per-beat + workers)
   looop config zsh|bash          print shell integration (completions)
   looop version | help           print version / show this help
 

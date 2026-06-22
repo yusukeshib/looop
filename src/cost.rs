@@ -318,9 +318,88 @@ fn local_day(ts: &str) -> String {
         .unwrap_or_default()
 }
 
-pub fn cmd_cost(paths: &Paths, args: &[String]) -> Result<ExitCode> {
+/// Aggregate ledger rows by local calendar day.
+///
+/// Returns `(day, total_usd, calls)` tuples sorted ascending by day (BTreeMap
+/// order). Rows whose `ts` cannot be parsed collapse to an empty-string day and
+/// sort first; their cost still counts toward the grand total.
+fn by_day(rows: &[serde_json::Value]) -> Vec<(String, f64, usize)> {
+    let mut map: std::collections::BTreeMap<String, (f64, usize)> =
+        std::collections::BTreeMap::new();
+    for r in rows {
+        let day = r
+            .get("ts")
+            .and_then(|t| t.as_str())
+            .map(local_day)
+            .unwrap_or_default();
+        let cost = r.get("cost_usd").and_then(|c| c.as_f64()).unwrap_or(0.0);
+        let e = map.entry(day).or_insert((0.0, 0));
+        e.0 += cost;
+        e.1 += 1;
+    }
+    map.into_iter().map(|(d, (c, n))| (d, c, n)).collect()
+}
+
+/// Render a fixed-width text table. `right` flags which columns are right
+/// aligned (numbers). An optional `footer` row is printed below a second
+/// separator. Every emitted line is prefixed with `indent`.
+fn table(
+    headers: &[&str],
+    rows: &[Vec<String>],
+    right: &[bool],
+    footer: Option<&[String]>,
+    indent: &str,
+) -> String {
+    let cols = headers.len();
+    let mut w: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
+    let widen = |w: &mut [usize], row: &[String]| {
+        for (i, c) in row.iter().enumerate() {
+            w[i] = w[i].max(c.chars().count());
+        }
+    };
+    for row in rows {
+        widen(&mut w, row);
+    }
+    if let Some(f) = footer {
+        widen(&mut w, f);
+    }
+
+    let pad = |s: &str, i: usize| -> String {
+        let gap = " ".repeat(w[i].saturating_sub(s.chars().count()));
+        if right[i] {
+            format!("{gap}{s}")
+        } else {
+            format!("{s}{gap}")
+        }
+    };
+    let line = |cells: &[String]| -> String {
+        let rendered: Vec<String> = cells.iter().enumerate().map(|(i, c)| pad(c, i)).collect();
+        format!("{indent}{}", rendered.join("   "))
+    };
+    let sep_w: usize = w.iter().sum::<usize>() + 3 * (cols.saturating_sub(1));
+    let sep = format!("{indent}{}", "─".repeat(sep_w));
+
+    let mut out = String::new();
+    let hdr: Vec<String> = headers.iter().map(|h| h.to_string()).collect();
+    out.push_str(&line(&hdr));
+    out.push('\n');
+    out.push_str(&sep);
+    out.push('\n');
+    for row in rows {
+        out.push_str(&line(row));
+        out.push('\n');
+    }
+    if let Some(f) = footer {
+        out.push_str(&sep);
+        out.push('\n');
+        out.push_str(&line(f));
+        out.push('\n');
+    }
+    out
+}
+
+pub fn cmd_cost(paths: &Paths, _args: &[String]) -> Result<ExitCode> {
     let ledger = paths.cost_ledger();
-    let mode = args.first().map(String::as_str).unwrap_or("all");
 
     if !ledger.is_file() {
         println!("looop: no LLM cost recorded yet.");
@@ -339,65 +418,45 @@ pub fn cmd_cost(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         .filter(|v| v.is_object())
         .collect();
 
-    if mode == "--json" {
-        println!("{}", serde_json::to_string_pretty(&rows)?);
+    let days = by_day(&rows);
+    let grand_total: f64 = days.iter().map(|(_, c, _)| c).sum();
+    let grand_calls: usize = days.iter().map(|(_, _, n)| n).sum();
+
+    println!("looop cost — by day (local)");
+    println!();
+
+    if days.is_empty() {
+        println!("  (no cost recorded yet)");
         return Ok(ExitCode::SUCCESS);
     }
 
-    let today = match mode {
-        "all" => String::new(),
-        "today" => chrono::Local::now().format("%Y-%m-%d").to_string(),
-        _ => {
-            eprintln!("usage: looop cost [today|all|--json]");
-            return Ok(ExitCode::from(1));
-        }
-    };
-
-    let filtered: Vec<&serde_json::Value> = rows
+    let body: Vec<Vec<String>> = days
         .iter()
-        .filter(|r| {
-            today.is_empty()
-                || r.get("ts")
-                    .and_then(|t| t.as_str())
-                    .map(|ts| local_day(ts) == today)
-                    .unwrap_or(false)
+        .map(|(day, cost, calls)| {
+            let label = if day.is_empty() {
+                "?".to_string()
+            } else {
+                day.clone()
+            };
+            vec![label, calls.to_string(), usd(*cost)]
         })
         .collect();
+    let footer = vec![
+        "Total".to_string(),
+        grand_calls.to_string(),
+        usd(grand_total),
+    ];
 
-    let cost_of = |r: &serde_json::Value| r.get("cost_usd").and_then(|c| c.as_f64()).unwrap_or(0.0);
-    let total: f64 = filtered.iter().map(|r| cost_of(r)).sum();
-
-    let scope = if today.is_empty() {
-        "all time".to_string()
-    } else {
-        format!("today ({today} local)")
-    };
-    println!("looop cost — {scope}");
-    println!("  total: {}  ({} calls)", usd(total), filtered.len());
-
-    if !filtered.is_empty() {
-        let group = |key: &str| -> Vec<(String, f64)> {
-            let mut map: std::collections::BTreeMap<String, f64> =
-                std::collections::BTreeMap::new();
-            for r in &filtered {
-                let k = r
-                    .get(key)
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("?")
-                    .to_string();
-                *map.entry(k).or_insert(0.0) += cost_of(r);
-            }
-            map.into_iter().collect()
-        };
-        println!("  by kind:");
-        for (k, v) in group("kind") {
-            println!("    {k}: {}", usd(v));
-        }
-        println!("  by runner:");
-        for (k, v) in group("runner") {
-            println!("    {k}: {}", usd(v));
-        }
-    }
+    print!(
+        "{}",
+        table(
+            &["Day", "Calls", "Cost"],
+            &body,
+            &[false, true, true],
+            Some(&footer),
+            "  ",
+        )
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -574,6 +633,46 @@ mod tests {
         );
         std::fs::write(p.cost_ledger(), body).unwrap();
         assert!((spent_today(&p) - 1.75).abs() < 1e-9);
+    }
+
+    #[test]
+    fn by_day_groups_and_counts_per_local_day() {
+        let row = |ts: &str, c: f64| {
+            serde_json::from_str::<serde_json::Value>(&format!(
+                r#"{{"ts":"{ts}","kind":"tick","id":"x","runner":"pi","cost_usd":{c}}}"#
+            ))
+            .unwrap()
+        };
+        // Two rows on the same UTC day, one on another; ts uses Z so local_day is
+        // deterministic only when the local offset keeps them on the same date —
+        // assert on counts/totals which are offset-stable within a single day.
+        let rows = vec![
+            row("2026-06-20T01:00:00Z", 0.5),
+            row("2026-06-20T02:00:00Z", 1.25),
+            row("2026-06-21T12:00:00Z", 2.0),
+        ];
+        let days = by_day(&rows);
+        let total: f64 = days.iter().map(|(_, c, _)| c).sum();
+        let calls: usize = days.iter().map(|(_, _, n)| n).sum();
+        assert!((total - 3.75).abs() < 1e-9, "grand total sums every row");
+        assert_eq!(calls, 3, "every row counted once");
+        // BTreeMap order => ascending day labels.
+        let labels: Vec<&str> = days.iter().map(|(d, _, _)| d.as_str()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort_unstable();
+        assert_eq!(labels, sorted, "days sorted ascending");
+    }
+
+    #[test]
+    fn by_day_unparseable_ts_collapses_to_empty_day() {
+        let bad = serde_json::from_str::<serde_json::Value>(
+            r#"{"ts":"not-a-date","kind":"tick","id":"x","runner":"pi","cost_usd":1.0}"#,
+        )
+        .unwrap();
+        let days = by_day(&[bad]);
+        assert_eq!(days.len(), 1);
+        assert_eq!(days[0].0, "", "garbage ts -> empty day key");
+        assert!((days[0].1 - 1.0).abs() < 1e-9, "cost still counted");
     }
 
     #[test]
