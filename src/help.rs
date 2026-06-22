@@ -23,7 +23,8 @@ Usage:
   looop config zsh|bash          print shell integration (completions)
   looop version | help           print version / show this help
 
-  ROOT AGENT (the pi/claude session YOU run — see the CONTRACT above):
+  ROOT-AGENT VERBS (your agent session emits these in its loop — you rarely type
+  them yourself; see the CONTRACT above):
   looop _ state [--json] | _ wait [--json]             read state (blocking with --wait)
   looop _ answer <ask_id> "<text>"           resolve a worker's pending ask
   looop _ goal write <id> [body|stdin] | _ goal archive <id>

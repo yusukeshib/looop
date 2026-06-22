@@ -38,9 +38,14 @@ ONE BEAT (the pulse, judgment-free)
   the root agent watches the world hash the pulse keeps fresh.
 
 ============================================================================
-ROOT AGENT OPERATING CONTRACT  (the pi/claude session YOU run against looop)
+ROOT AGENT OPERATING CONTRACT  (read by the AGENT SESSION, not by you-the-human)
 ============================================================================
-Your loop is one line:  while true; do  state=$(looop _ wait --json); act on it; done
+This contract is for the autonomous pi/claude session you launch and point at
+looop — IT is what emits every `looop _ …` verb below, in a running loop. You
+(the human) only run `up`/`down` and talk to that agent in chat; you rarely type
+a `_` verb yourself. "You" from here down means that agent session, not you.
+
+Its loop is one line:  while true; do  state=$(looop _ wait --json); act on it; done
 
   • `looop _ wait --json` BLOCKS until there is something to act on (a
     pending ask, or the world changed) and returns the state:
