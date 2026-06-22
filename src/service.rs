@@ -1,10 +1,9 @@
 //! Service control — `looop up` / `looop down`.
 //!
-//! `looop up` starts the PULSE: a detached, judgment-free sensing loop that keeps
-//! `snapshots/` fresh. That is all looop runs. The JUDGMENT lives in a root agent
-//! (a pi/claude session YOU start in another window and tell to observe looop) —
-//! looop does not launch or manage it. The root agent watches the world by
-//! blocking on `looop _ wait` and acts through the `looop _ …` verbs.
+//! `looop up` starts the PULSE: looop's detached, AUTONOMOUS loop — it senses,
+//! decides ONE move per changed beat, and runs the worker fleet. That is looop.
+//! You steer it by editing goals/PLAYBOOK and answering worker asks (optionally
+//! through a concierge — a pi/claude session you point at looop to watch + relay).
 //! `looop down` stops the pulse and every live worker.
 
 use crate::paths::Paths;
@@ -14,9 +13,9 @@ use anyhow::Result;
 use std::process::ExitCode;
 use std::time::Duration;
 
-/// `looop up [--json]` — start the pulse (idempotent). Then start your own agent
-/// (pi/claude) in another window and tell it to observe looop:
-///   "watch looop: loop on `looop _ wait --json` and act; read `looop --help`."
+/// `looop up [--json]` — start the autonomous pulse (idempotent). looop runs
+/// itself from there; steer by editing goals/PLAYBOOK or run a concierge to watch
+/// and relay (`looop watch`, or a pi/claude session pointed at `looop _ state`).
 pub fn cmd_up(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     let mut json = false;
     for a in args {
@@ -86,6 +85,9 @@ pub fn cmd_down(paths: &Paths) -> Result<ExitCode> {
 
 /// `looop _ pulse` (internal) — the headless pulse body babysit wraps. It is the
 /// judgment-free sensing loop (`run::cmd_run`) running under a PTY.
+/// `looop _ pulse` — looop's own detached spawn target: run the autonomous loop
+/// in the foreground of this (detached) process. Not human-facing; `looop up`
+/// spawns it.
 pub fn cmd_pulse(paths: &Paths) -> Result<ExitCode> {
     run::cmd_run(paths)
 }

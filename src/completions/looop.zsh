@@ -1,8 +1,8 @@
 #compdef looop
 
-# looop's human surface is tiny: start/stop the pulse, check spend, shell
-# integration. Everything else is driven by the root agent you run separately
-# (the `looop _ …` verbs), not completed here.
+# looop's human surface is tiny: start/stop the autonomous pulse, watch it, check
+# spend, shell integration. The `looop _ …` steer/worker verbs (used by you, a
+# concierge, or workers) are not completed here.
 _looop() {
     local curcontext="$curcontext" state line
     typeset -A opt_args
@@ -20,7 +20,7 @@ _looop() {
                 'cost:Report LLM spend from the cost ledger'
                 'config:Output shell integration (eval "$(looop config zsh)")'
                 'version:Print the looop version'
-                'help:Show the full design manual + root-agent contract'
+                'help:Show the full design manual'
             )
             _describe 'command' cmds
             ;;

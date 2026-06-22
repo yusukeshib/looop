@@ -19,7 +19,9 @@ mod gate;
 mod help;
 mod mailbox;
 mod paths;
+mod prompt;
 mod run;
+mod runner;
 mod seed;
 mod sensor;
 mod service;
@@ -42,7 +44,7 @@ fn main() -> ExitCode {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     // A bare `looop` is no longer a command: the loop runs as the `looop up`
-    // service (pulse + root agent). With no verb, show the manual.
+    // service (the autonomous pulse). With no verb, show the manual.
     let Some(cmd) = args.first().map(String::as_str) else {
         help::print(&paths);
         return ExitCode::SUCCESS;
@@ -65,18 +67,18 @@ fn main() -> ExitCode {
         "run" if rest.first().map(String::as_str) == Some("--detached-id") => {
             session::run_detached_worker(rest).map(|c| ExitCode::from(c.clamp(0, 255) as u8))
         }
-        // Service control: bring the pulse up / tear it (and workers) down. The
-        // root agent is a pi/claude session YOU run separately, not looop-managed.
+        // Service control: bring the autonomous pulse up / tear it (and workers)
+        // down. looop decides on its own; you steer via goals/PLAYBOOK + asks.
         "up" => deps::require_deps(&paths).and_then(|_| service::cmd_up(&paths, rest)),
         "down" => deps::require_deps(&paths).and_then(|_| service::cmd_down(&paths)),
         // Read-only observer TUI: tail the colored log of any running session
         // (pulse or worker) with a live selector. No deps gate — it only reads
         // logs + lists sessions, never launches an agent.
         "watch" => watch::cmd_watch(&paths, rest),
-        // Machine-facing verbs, grouped under `_`. Two audiences: the ROOT AGENT
-        // (tick/answer/goal/sensor/playbook/run/notify/worker) and the WORKER
-        // self-callbacks (ask/kill/claim/unclaim/cost). `_ pulse` is looop's own
-        // detached spawn. None are human-facing — humans use `up`/`down`.
+        // Machine-facing verbs, grouped under `_`. Two audiences: STEER verbs
+        // (state/wait/answer/goal/sensor/playbook/notify) the human or a concierge
+        // uses to inspect + steer + answer asks, and the WORKER self-callbacks
+        // (ask/kill/claim/unclaim/cost). `_ pulse` is looop's own detached spawn.
         "_" => {
             match rest.first().map(String::as_str) {
                 Some("pulse") => {

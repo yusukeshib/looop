@@ -14,27 +14,23 @@ pub fn print(paths: &Paths) {
     println!(
         r#"
 Usage:
-  HUMAN (that's nearly all you run — the rest you do through your agent):
-  looop up [--json]              start the pulse (sensing loop, detached).
-                                --json makes the pulse log NDJSON. Then start your
-                                agent yourself and tell it to observe looop.
+  HUMAN (looop runs itself — this is nearly all you touch):
+  looop up [--json]              start the pulse: the autonomous loop (sense +
+                                decide + run workers), detached. --json logs NDJSON.
   looop down                     stop the pulse and all workers
   looop watch [<id>]             observer TUI: live colored log + session selector
                                 (read-only; <id> preselects, e.g. `looop watch pulse`)
-  looop cost [today|all|--json]  report LLM spend (agents self-report via `_ cost`)
+  looop cost [today|all|--json]  report LLM spend (per-beat + workers)
   looop config zsh|bash          print shell integration (completions)
   looop version | help           print version / show this help
 
-  ROOT-AGENT VERBS (your agent session emits these in its loop — you rarely type
-  them yourself; see the CONTRACT above):
-  looop _ state [--json] | _ wait [--json]             read state (blocking with --wait)
+  STEER (you, or a concierge acting for you — looop does NOT need these to act):
+  looop _ state [--json] | _ wait [--json]             read state (blocking with `_ wait`)
   looop _ answer <ask_id> "<text>"           resolve a worker's pending ask
   looop _ goal write <id> [body|stdin] | _ goal archive <id>
   looop _ sensor write <name> [script|stdin]
   looop _ playbook write [body|stdin]
-  looop _ run <cmd…> [--reason T]            ONE reversible shell command
-  looop _ worker start <id> <prompt…> | _ worker kill <id>
-  looop _ notify <message…>                  surface a notice to the human
+  looop _ notify <message…>                  surface a notice (journaled)
 
   WORKER self-callbacks (auto-injected CONTRACT — not for humans):
   looop _ ask <id> --prompt "…" [--ref P] [--options a,b]   ask + block for answer
@@ -47,15 +43,15 @@ Paths (override via env LOOOP_CONFIG / LOOOP_DATA_DIR):
 
 looop is a single self-contained binary: session management (babysit) is linked
 as a LIBRARY and driven entirely in-process — no `babysit` executable required.
-You run your own agent and tell it to observe looop (loop on `looop _ wait
---json`); it decides and drives looop through the `_ …` verbs. Worker self-control
-verbs (ask / kill / claim / unclaim / cost) are auto-injected callbacks.
+looop decides autonomously each beat and drives itself through the typed actions;
+the `_ …` verbs above are for YOU (or a concierge) to steer + answer asks, and the
+worker self-callbacks (ask / kill / claim / unclaim / cost) are auto-injected.
 
-The root agent launches each worker in the data dir; a worker that touches code
-provisions its OWN sandbox (box if available, else git worktree). looop itself
-has no notion of repos. Change judgment with `looop _ playbook write` / `_ goal
-write` — it takes effect next beat. (looop does not version the data dir; `git
-init` it yourself for history.)"#,
+looop launches each worker in the data dir; a worker that touches code provisions
+its OWN sandbox (box if available, else git worktree). looop itself has no notion
+of repos. Steer it by editing goals / the PLAYBOOK (`looop _ goal write` /
+`_ playbook write`) — it takes effect next beat. (looop does not version the data
+dir; `git init` it yourself for history.)"#,
         config = paths.config.display(),
         data = paths.data_dir.display(),
         fleet = paths.data_dir.join("sessions").display(),

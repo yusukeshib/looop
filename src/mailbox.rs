@@ -1,16 +1,16 @@
-//! ask/answer mailbox — the worker ↔ root-agent question channel.
+//! ask/answer mailbox — the worker ↔ human question channel.
 //!
-//! This replaces the old `_ flag` + attach-and-type-into-stdin path. A worker
-//! that needs a human/root decision calls `looop _ ask <id> --prompt "…"`, which
-//! writes a durable question file under `asks/` and then BLOCKS until a matching
-//! `answers/` file appears, printing the answer to stdout. The root agent
-//! discovers pending asks (via `looop _ state --json`), decides or relays to the
-//! human, and replies with `looop _ answer <ask_id> "…"`.
+//! A worker that needs a decision only a HUMAN can make calls `looop _ ask <id>
+//! --prompt "…"`, which writes a durable question file under `asks/` and then
+//! BLOCKS until a matching `answers/` file appears, printing the answer to stdout.
+//! The human answers with `looop _ answer <ask_id> "…"` — directly, or through the
+//! concierge (a pi/claude session that surfaces pending asks and relays). looop's
+//! own decide loop sees pending asks in its prompt but does NOT answer them: they
+//! are the human's call.
 //!
 //! Why files (not stdin / a socket): durability + level-triggering (RULE 2).
 //! The mailbox survives a pulse crash, needs no live process to relay, and works
-//! for a head-less worker that can't sit at a tmux prompt. The pulse senses a
-//! new ask as just another world change and pokes the root agent.
+//! for a head-less worker that can't sit at a tmux prompt.
 
 use crate::paths::Paths;
 use crate::util;
@@ -78,8 +78,9 @@ fn read_answer(paths: &Paths, ask_id: &str) -> Option<String> {
     v.get("answer").and_then(|x| x.as_str()).map(str::to_owned)
 }
 
-/// All asks that have NO matching answer yet. Read-only; used by `_ state` (so the
-/// root agent sees what's waiting) and by the pulse (so it knows to poke).
+/// All asks that have NO matching answer yet. Read-only; used by `_ state` and
+/// the decide prompt (so looop sees what's blocked) and by `looop watch`/the
+/// concierge (so the human sees what's waiting on them).
 pub fn pending(paths: &Paths) -> Vec<Ask> {
     let mut out = Vec::new();
     for e in fs::read_dir(paths.asks_dir())
@@ -103,7 +104,8 @@ pub fn pending(paths: &Paths) -> Vec<Ask> {
 /// `looop _ ask <worker> --prompt "…" [--ref PATH] [--options a,b,c]`
 ///
 /// Worker self-callback (CONTRACT). Writes the ask, then BLOCKS polling answers/
-/// until the root agent replies, printing the answer to stdout and exiting 0.
+/// until the human replies (`looop _ answer`), printing the answer to stdout and
+/// exiting 0.
 /// `<worker>` defaults to `$LOOOP_SESSION_ID` when omitted.
 pub fn cmd_ask(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     let mut worker = String::new();
@@ -162,7 +164,8 @@ pub fn cmd_ask(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         ],
     );
 
-    // Block until answered. The root agent sees this ask via `looop _ wait`
+    // Block until answered. The human sees this ask (via `looop watch` / the
+    // concierge / `looop _ state`) and replies with `looop _ answer`.
     // (the pulse keeps the world fresh) and replies via `looop _ answer <id>`.
     let poll = Duration::from_millis(
         std::env::var("LOOOP_ASK_POLL_MS")

@@ -1,18 +1,21 @@
-//! EXECUTE — the typed actions that mutate looop's world, exposed as `looop _ …`
-//! verbs the ROOT AGENT calls. Each verb builds one [`Action`] and runs it
-//! through [`run_action`], which journals the move and (for the non-idempotent
-//! ones) write-ahead-logs the intent so a crash mid side-effect is surfaced, not
-//! silently re-fired.
+//! EXECUTE — the typed actions that mutate looop's world. Each is built one of two
+//! ways and run through the same gated path ([`run_action`], which journals the
+//! move and write-ahead-logs the intent for non-idempotent ones so a crash mid
+//! side-effect is surfaced, not silently re-fired):
 //!
-//! Historically the decide phase was looop's OWN LLM call: the tick wrote one
-//! JSON action to `.decision.json` and looop executed it. The judgment now lives
-//! in the root agent (an external pi/claude session); looop no longer decides.
-//! What survives is the execution half — these typed, gated mutations — re-homed
-//! from "the thing the tick AI emitted" to "the verbs the root agent invokes".
+//!   * AUTONOMOUS — looop's per-beat decide: the `tick` runner writes ONE JSON
+//!     action to `.decision.json`; [`consume_decision`] parses + executes it.
+//!     This is the primary driver — looop is the brain.
+//!   * MANUAL — the `looop _ …` verbs (cmd_goal/sensor/playbook/run/worker/notify)
+//!     a human or concierge calls to steer by hand. Same [`Action`]s, same gates.
+//!
+//! looop is the SOLE executor either way: judgment (free to inspect) stays
+//! separate from EXECUTION (gated, logged), so risky moves can be checked.
 
 use crate::paths::Paths;
 use crate::session;
 use anyhow::{Context, Result, bail};
+use serde::Deserialize;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
@@ -20,12 +23,22 @@ use std::process::ExitCode;
 
 /// One typed mutation of looop's world. Built by the `_ …` verb handlers below
 /// (no longer deserialized from an LLM decision) and run through [`run_action`].
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Deserialize, PartialEq)]
+#[serde(tag = "action", rename_all = "snake_case")]
 pub enum Action {
+    /// A valid move when nothing needs doing (the decider's explicit "hold").
+    Noop {
+        #[serde(default)]
+        reason: String,
+    },
     /// The escape hatch: one ad-hoc, reversible shell command (gh query, draft,
     /// …). looop runs it (and can gate it) — arbitrary power, but ONE command,
     /// logged, not an open-ended agent session.
-    RunShell { cmd: String, reason: String },
+    RunShell {
+        cmd: String,
+        #[serde(default)]
+        reason: String,
+    },
     /// Create or update goals/<id>.md.
     WriteGoal { id: String, body: String },
     /// Move goals/<id>.md -> goals/archive/<id>.md.
@@ -38,7 +51,11 @@ pub enum Action {
     StartWorker { id: String, prompt: String },
     /// Surface a blocker / notice to the human. Journaled; if `notification` is
     /// wired in config, looop also fires that command (best-effort).
-    SendNotification { message: String, id: String },
+    SendNotification {
+        message: String,
+        #[serde(default)]
+        id: String,
+    },
 }
 
 /// Reject a file-name segment that could escape the data dir or hit a dotfile.
@@ -53,6 +70,7 @@ fn safe_segment(kind: &str, id: &str) -> Result<()> {
 /// line and the `action` field on the decided event.
 pub fn kind(action: &Action) -> &'static str {
     match action {
+        Action::Noop { .. } => "noop",
         Action::RunShell { .. } => "shell",
         Action::WriteGoal { .. } => "goal",
         Action::ArchiveGoal { .. } => "archive",
@@ -196,6 +214,11 @@ pub fn execute(paths: &Paths, action: &Action) -> Result<String> {
 
 fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
     match action {
+        Action::Noop { reason } => Ok(if reason.trim().is_empty() {
+            "noop".to_string()
+        } else {
+            format!("noop · {}", reason.trim())
+        }),
         Action::RunShell { cmd, reason } => {
             // `bash -c` (NOT `-lc`): a non-interactive, non-login shell sources no
             // rc files, so the command runs against looop's inherited environment
@@ -316,6 +339,86 @@ fn append_journal(paths: &Paths, line: &str) -> Result<()> {
     Ok(())
 }
 
+/// The decider drops its single move here (one JSON object) in the data dir;
+/// looop reads it, executes it, and removes it. This is what keeps judgment
+/// (the LLM, free to inspect) separate from EXECUTION (looop, the sole gated
+/// actor): the move is data looop runs, not a command the model runs itself.
+pub const DECISION_FILE: &str = ".decision.json";
+
+/// One tick's decision: the action plus the metadata that rides alongside it.
+#[derive(Debug, PartialEq)]
+pub struct Decision {
+    pub action: Action,
+    /// The one journal line looop appends after executing (may be empty; the
+    /// executor falls back to a generated summary).
+    pub journal: String,
+    /// Optional one-shot cadence nudge (seconds); NOT a move. Handed to the pulse
+    /// loop in-process via `Decided.next_interval_s` (the loop clamps it).
+    pub next_interval_s: Option<u64>,
+}
+
+impl Decision {
+    /// Parse one decision object. `journal` / `next_interval_s` are lifted out;
+    /// the remainder is decoded into the tagged `Action`.
+    pub fn parse(json: &str) -> Result<Decision> {
+        let v: serde_json::Value =
+            serde_json::from_str(json.trim()).context("decision is not valid JSON")?;
+        let journal = v
+            .get("journal")
+            .and_then(|x| x.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let next_interval_s = v.get("next_interval_s").and_then(|x| x.as_u64());
+        let action: Action =
+            serde_json::from_value(v).context("decision has no/unknown \"action\"")?;
+        Ok(Decision {
+            action,
+            journal,
+            next_interval_s,
+        })
+    }
+}
+
+/// What looop executed this beat: the action category, the executor's concise
+/// summary, the journal line appended, and the decider's one-shot cadence nudge.
+#[derive(Debug, PartialEq)]
+pub struct Decided {
+    pub kind: &'static str,
+    pub summary: String,
+    pub journal: String,
+    pub next_interval_s: Option<u64>,
+}
+
+/// Read + execute the decider's `.decision.json` (one-shot: removed win or lose).
+/// `None` ⇒ the decider wrote nothing (no move this beat). `Some(Err)` ⇒ a
+/// malformed decision or a failed execute. Reuses [`run_action`] so the move is
+/// WAL-guarded, goal-activity-stamped, and journaled exactly like a manual verb.
+pub fn consume_decision(paths: &Paths) -> Option<Result<Decided>> {
+    let path = paths.data_dir.join(DECISION_FILE);
+    let raw = fs::read_to_string(&path).ok()?; // None ⇒ decider wrote nothing
+    let _ = fs::remove_file(&path); // one-shot, win or lose
+    Some((|| {
+        let decision = Decision::parse(&raw)?;
+        let journal = if decision.journal.trim().is_empty() {
+            None
+        } else {
+            Some(decision.journal.as_str())
+        };
+        let summary = run_action(paths, &decision.action, journal)?;
+        let journal_line = if decision.journal.trim().is_empty() {
+            summary.clone()
+        } else {
+            decision.journal.clone()
+        };
+        Ok(Decided {
+            kind: kind(&decision.action),
+            summary,
+            journal: journal_line,
+            next_interval_s: decision.next_interval_s,
+        })
+    })())
+}
+
 /// Run one typed action: write-ahead-log the intent for non-idempotent moves,
 /// execute, stamp per-goal activity, and append the journal line. `journal`
 /// overrides the auto-generated summary as the logged "why" when non-empty.
@@ -345,7 +448,7 @@ pub fn run_action(paths: &Paths, action: &Action, journal: Option<&str>) -> Resu
 }
 
 /// Resolve an action body from positional args, falling back to stdin when none
-/// are given (so the root agent can heredoc a multi-line goal/PLAYBOOK body).
+/// are given (so a human/concierge can heredoc a multi-line goal/PLAYBOOK body).
 fn body_or_stdin(rest: &[String]) -> Result<String> {
     if !rest.is_empty() {
         return Ok(rest.join(" "));
