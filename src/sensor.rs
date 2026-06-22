@@ -206,24 +206,20 @@ fn all_sensors(paths: &Paths) -> Vec<Sensor> {
 
 /// System sensor: the live worker fleet (the pulse excludes itself, so it never
 /// feeds its own wake signal). The wake SIGNAL is each worker's stable identity
-/// — id/state/exit_code, plus a ⚑note ONLY while the worker is alive (a note on
-/// a corpse is stale, so it neither wakes the loop nor reaches the decider).
-/// Sorted by id so the snapshot — and thus the hash — is order-stable.
+/// — id/state/exit_code — so a worker starting or dying moves the world hash and
+/// wakes a blocked `looop _ wait`. Sorted by id so the snapshot (and hash) is
+/// order-stable.
 fn sys_sessions(paths: &Paths) -> serde_json::Value {
     let mut workers = session::list_workers(paths);
     workers.sort_by(|a, b| a.id.cmp(&b.id));
     let signal: Vec<serde_json::Value> = workers
         .iter()
         .map(|s| {
-            let mut o = serde_json::json!({
+            serde_json::json!({
                 "id": s.id,
                 "state": s.state,
                 "exit_code": s.exit_code,
-            });
-            if s.alive && s.note.is_some() {
-                o["note"] = serde_json::json!(s.note);
-            }
-            o
+            })
         })
         .collect();
     serde_json::json!({ "signal": signal, "detail": { "count": workers.len() } })

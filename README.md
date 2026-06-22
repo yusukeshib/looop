@@ -1,45 +1,49 @@
 # looop
 
-A tiny, portable, Kubernetes-shaped control loop for your work.
+A tiny, portable control plane for agent-driven work.
 
-`looop` watches the things you care about (GitHub, Linear, Grafana, …), and once
-per beat asks an LLM for **exactly one move** toward your goals — which looop
-then executes, and stops. It's a single self-contained binary with no daemon, no
-database, no server.
+`looop` watches the things you care about (GitHub, Linear, Grafana, …) and runs
+your worker fleet. The **judgment lives outside looop**: a *root agent* (a
+pi/claude session looop starts) reads the world and decides the next move,
+driving looop through a small set of verbs. looop itself never calls an LLM — it
+is the unbreakable plumbing; the root agent is the brain. One self-contained
+binary, no database, no server.
 
 ![looop running a tick](demo.png)
 
-One full beat (sense → decide → journal), then the next beat skips the LLM
-entirely because nothing in the world changed.
-
 ## How it works
 
-Like a Kubernetes controller, every **tick** reconciles *desired state* against
-*observed state* and takes one step to close the gap:
+Three parts. looop senses; a root agent (a pi/claude session YOU run) decides;
+workers do the hands-on work.
 
 ```
-       ┌─────────────────────────────────────────────┐
-       │  sense → diff → decide ONE move → act → log   │
-       └─────────────────────────────────────────────┘
-                          one tick
-
-1. SENSE    run every sensors/*.sh → each prints one JSON snapshot of the world
-2. DIFF     hash (PLAYBOOK + goals + snapshots + workers). Unchanged since
-            last tick? → skip, no LLM call (cheap, level-triggered)
-3. DECIDE   hand the PLAYBOOK + goals + snapshots + live workers to the LLM;
-            it emits THE single most important move as ONE typed action (JSON)
-4. ACT      looop — not the LLM — executes that one action: edit a goal/sensor/
-            PLAYBOOK, run one gated shell command, or start/steer a worker
-5. LOG      looop appends one line to journal.md, surfaces anything that needs you
+   pulse (looop, no LLM)            root agent (a pi/claude YOU run)   workers
+   ─────────────────────           ──────────────────────────   ───────
+   sense every beat,                while: `looop _ wait --json`       real agents
+   keep snapshots fresh       ◄───  (blocks till something to do)      doing multi-
+   (that's all it does)             decide ONE move → `looop _ …`  ──▶  step work
+                                    answer asks / relay to you        `ask` + wait
 ```
 
-Each tick is **stateless and disposable**: the process carries nothing in
-memory between beats — all state lives in files (goals, snapshots, journal,
-claims). Because of that the loop is **level-triggered**, not edge-triggered:
-every tick re-derives what to do from the *current* world (snapshots are wiped
-and re-sensed each beat), so a crashed tick, renamed sensor, or dead worker just
-self-heals on the next beat. Kill the pulse anytime; the next tick picks up
-exactly where the world is, not where a remembered cursor left off.
+1. **SENSE** — the pulse runs every `sensors/*.sh` each beat (cheap, no LLM),
+   keeping `snapshots/` fresh. That is all it does.
+2. **WAIT** — the root agent blocks on `looop _ wait --json`, which returns the
+   moment a worker raises an `ask` or the world changes. looop does not push to
+   the agent; the agent pulls. (No daemon poking anything, no attach.)
+3. **DECIDE & ACT** — the agent picks ONE move and drives looop via verbs: write
+   a goal/sensor/PLAYBOOK, run one gated shell command, start a worker, or
+   `looop _ answer` a worker's ask.
+4. **HUMAN** — you talk to that agent directly (you launched it); it relays
+   anything that needs you and never does irreversible things without your yes.
+
+State lives entirely in files (goals, snapshots, journal, mailbox), so it is
+**level-triggered**: the pulse re-senses from scratch every beat and a crashed
+pulse just re-reads the unanswered asks on restart.
+
+The human-in-the-loop path is a durable **mailbox**, not a tmux prompt: a worker
+that needs a decision runs one blocking `looop _ ask …` and waits; the root agent
+sees it in `looop _ wait`, answers it (or relays to you) with `looop _ answer`.
+No attach, no stdin wrangling — it works for headless workers.
 
 ## Concepts
 
@@ -52,75 +56,71 @@ Everything lives as plain files in the data dir (the loop's memory):
 | `sensors/*.sh`  | observers — each prints **one JSON object** describing the world   |
 | `journal.md`    | the action log — one line per move                                 |
 | `claims/`       | leases — a worker writes one to *own* a task; stale ones auto-reap |
-| `reports/`      | deliverables a human reads (persists across ticks)                 |
+| `reports/`      | deliverables a human reads (persists across beats)                 |
+| `asks/` `answers/` | the worker ↔ root-agent mailbox (questions + answers)           |
 
-**Workers** are the hands. When a move needs real, multi-step work, the loop
-spawns an agent session that runs detached, in parallel, and reconciles its task
-on its own. Workers
-that touch code provision their own sandbox first; the loop itself knows nothing
-about repos.
+**Workers** are the hands. When a move needs real, multi-step work, the root
+agent spawns an agent session that runs detached, in parallel, and reconciles its
+task on its own. Workers that touch code provision their own sandbox first; looop
+itself knows nothing about repos.
 
-**Humans in the loop.** Workers never guess and never send OS notifications.
-When one needs a decision it raises a flag and waits; the pulse pops a tmux
-window you can't miss. You attach, answer, and it continues. Irreversible
-actions (merges, deploys, deletes) always require your explicit approval.
+**Humans in the loop.** You talk to the *root agent* directly — it is a pi/claude
+session YOU launched — never to workers. A worker that needs a decision runs
+`looop _ ask` and blocks; the root agent sees it in `looop _ wait`, answers it or
+relays the question to you in chat and replies with `looop _ answer`. Irreversible
+actions (merges, deploys, deletes) always require your explicit approval in chat.
 
 ## Quick start
 
 ```sh
-looop               # run the loop in the FOREGROUND: start the pulse, stream it,
-                    # and tear it (and its workers) down on Ctrl-C
-looop --json        # same, but emit machine-readable NDJSON to the pulse's log
-looop watch pulse   # follow a running pulse's output read-only, any time
+looop up            # start the pulse (the sensing loop), detached
+# then, in another window, start your agent and point it at looop:
+pi                  # then say: "observe looop — loop on `looop _ wait --json`
+                    #            and act on it; read `looop --help` first"
+looop down          # stop the pulse and all workers
 ```
 
-The loop runs in the foreground: a bare `looop` brings the pulse up as a
-supervised session, streams its output, and on exit (Ctrl-C, or the pulse dying)
-tears the pulse AND its workers down. There is no detached up/down pair — to run
-it unattended, background the command (`looop &` / `nohup looop &`). Add `--json`
-for a machine-readable NDJSON stream.
+`looop up` starts only the pulse. The judgment is a pi/claude session **you**
+run and tell to observe looop — looop does not launch or manage it. There is no
+bare-`looop` foreground mode and no attach: the agent pulls state with
+`looop _ wait`, and you talk to that agent in its own window. `looop up --json`
+makes the pulse log machine-readable NDJSON.
 
-On the first run the loop seeds a starter PLAYBOOK and a `setup` goal whose only
-job is to **interview you** and rewrite the PLAYBOOK, goals, and sensors to match
-your real work. After that it just runs.
+On the first run looop seeds a starter PLAYBOOK and a `setup` goal whose only job
+is for the root agent to **interview you** and rewrite the PLAYBOOK, goals, and
+sensors to match your real work. After that it just runs.
 
 ## Commands
 
 ```sh
-looop [--json]                 run the loop in the FOREGROUND: bring the pulse up,
-                               stream it, and tear pulse + workers down on exit
-                               (Ctrl-C, or the pulse dying). --json = NDJSON
-                               output. Background it (looop &) to run unattended.
-looop watch <id>               follow a session's output read-only (tail -f);
-                               `looop watch pulse` watches the loop itself
-looop status [--json]          structured snapshot of the loop's live state
-                               (for an external observer / AI watching it)
-looop ls [--watch]             list this profile's worker sessions (⚑ = waiting)
-looop log <id> [--tail N] [--grep RE] [--follow] [--json]
-                               show / tail / grep / follow a session's output
-looop shot <id> [--ansi|--json]   render a session's current visible screen
-looop send <id> <text...>      type text into a session's stdin
-looop key <id> <KEY...>        send named keys (Enter, Up, C-c, …)
-looop expect <id> <REGEX>      block until a regex appears (exit 124 on timeout)
-looop wait <id> | wait-idle <id>  block until exit / until output is quiet
-looop resize <id> <COLSxROWS>  resize a session's terminal
-looop attach <id> | detach <id>   attach/force-detach a terminal (Ctrl-\ Ctrl-\)
-looop restart <id>             restart a worker's wrapped command
-looop prune                    clear finished worker corpses now
-looop journal [--tail N]       read the decision log (one line per move; --tail N)
-looop cost [today|all|--json]  report LLM spend from the cost ledger
+# HUMAN (that's nearly all you run)
+looop up [--json]              start the pulse (sensing loop, detached)
+looop down                     stop the pulse and all workers
+looop cost [today|all|--json]  report LLM spend (agents self-report via `_ cost`)
 looop config zsh|bash          print shell integration (tab completions)
-looop version | help           (looop help = the full design manual)
+looop version | help           (looop help = the full design manual + contract)
+
+# ROOT AGENT (the pi/claude session YOU run) — see the CONTRACT in `looop help`
+looop _ wait [--json]                      block until something to act on, then read
+looop _ state [--json]                     read current world state (one-shot)
+looop _ answer <ask_id> "<text>"           resolve a worker's pending ask
+looop _ goal write <id> [body|stdin] | _ goal archive <id>
+looop _ sensor write <name> [script|stdin] | _ playbook write [body|stdin]
+looop _ run <cmd…> [--reason T]            ONE reversible shell command
+looop _ worker start <id> <prompt…> | _ worker kill <id>
+looop _ notify <message…>                  surface a notice to the human
+
+# WORKER self-callbacks (auto-injected contract — not human commands)
+looop _ ask <id> --prompt "…" [--ref P] [--options a,b]   ask + block for answer
+looop _ kill <id> | _ claim <name> | _ unclaim <name> | _ cost <…>
 ```
 
-The verbs above are the public surface: read-only **observe** (watch, log, shot,
-status, ls, journal, cost) plus **drive** (send, key, expect, wait, resize,
-restart, attach) — usable by a human, a script, or an external agent watching the
-loop from outside. A worker's **self-control** callbacks — `flag` / `unflag` /
-`kill` (end itself) / `claim` / `unclaim` — are internal `looop _ <verb>` verbs
-the auto-injected worker contract invokes about *itself*; a human doesn't reach in
-and run them, they steer by editing goals/PLAYBOOK and attaching to a flagged
-worker.
+The human surface is tiny — essentially `up`/`down` (plus `cost`/`config`). You
+run your own agent and tell it to observe looop; everything else you do by
+talking to that agent. The `looop _ …` verbs are machine-facing: the **root
+agent** drives the world (wait, state, answer, goal, sensor, playbook, run,
+worker, notify), and **workers** self-report (ask, kill, claim, unclaim, cost)
+via the auto-injected contract.
 
 ## Shell integration
 
@@ -132,12 +132,10 @@ eval "$(looop config zsh)"
 eval "$(looop config bash)"
 ```
 
-This adds tab completion for every subcommand plus dynamic completion for
-`looop attach|restart <id>` (this profile's live worker sessions).
-Completions resolve `LOOOP_DATA_DIR` the same way the binary does, so an isolated
-profile completes its own sessions.
+This adds tab completion for looop's (small) human command surface.
 
-To change judgment: edit `PLAYBOOK.md` — it takes effect next tick.
+To change judgment: have the root agent run `looop _ playbook write` (or edit a
+goal) — it takes effect next beat.
 
 ## Install
 
@@ -184,30 +182,29 @@ looop version   # prints the installed version (e.g. looop 0.13.0)
 looop help
 ```
 
-Runtime deps: just an LLM runner (`pi` or `claude`). looop is a single
-self-contained binary — spawning, listing, attaching, killing, flagging and
-pruning worker sessions all run in-process, no extra executable required.
+Runtime deps: just an LLM runner (`pi` or `claude`) — used to launch the root
+agent and workers. looop is a single self-contained binary — spawning, listing,
+killing and pruning sessions all run in-process, no extra executable required.
 Sessions are stored under `$LOOOP_DATA_DIR/sessions`, self-contained per profile:
 looop sets no extra environment and shares no global state, and session ids are
 bare (the pulse is `pulse`). (Workers that touch code also need `git` or `box`
-to sandbox themselves, but that's a worker concern, not a prerequisite for the
-pulse.)
+to sandbox themselves, but that's a worker concern.)
 
 ## Config & data
 
 - **Config** — `$LOOOP_DATA_DIR/config.json` (override `LOOOP_CONFIG`). Lives
   inside the data dir so a profile is fully self-contained. One file: runner
-  wiring and tick cadence. Default runner is `pi`; `claude` is built in.
+  wiring (an `interactive` command per runner) plus the pulse `interval`. Default
+  runner is `pi`; `claude` is built in.
 - **Data / memory** — `$XDG_STATE_HOME/looop/` (override `LOOOP_DATA_DIR`). A
   plain directory holding the PLAYBOOK, goals, journal, and sensors. looop does
   not version it for you — `git init` the data dir yourself if you want history
-  and rollback of your policy files. Worker and pulse sessions live under
-  `sessions/` in the same dir, so a profile is fully self-contained. Pointing
-  `LOOOP_DATA_DIR` elsewhere gives you an isolated **profile** with its own
-  sessions.
+  and rollback of your policy files. Worker, pulse and root-agent sessions live
+  under `sessions/` in the same dir, so a profile is fully self-contained.
+  Pointing `LOOOP_DATA_DIR` elsewhere gives you an isolated **profile** with its
+  own sessions.
 
-LLM spend is metered automatically (ticks and self-reporting workers) into an
-append-only ledger; see `looop cost`. A daily budget breaker is **on by default**
-(`$10/day`): once the day's metered spend hits the cap the loop stops calling the
-LLM until local midnight. Raise it with `max_daily_usd` in config (or
-`LOOOP_MAX_DAILY_USD`), or set it to `0` to disable the breaker.
+LLM spend is recorded in an append-only ledger when agents (workers and the root
+agent) self-report via `looop _ cost`; see `looop cost`. looop runs no LLM of its
+own, so there is no tick metering or daily-budget breaker — cost control lives in
+whatever harness runs your root agent.

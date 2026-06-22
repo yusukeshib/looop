@@ -19,15 +19,15 @@ fn shell_quote(s: &str) -> String {
 
 const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
 - Never send notifications (no terminal-notifier or any OS notification). You are
-  an agent; only the pulse notifies.
-- When you need a human decision / info / approval, do NOT guess — use ONLY this
-  and then wait right there:
-    "$LOOOP_BIN" _ flag __ID__ "<what you are waiting for / what you need to ask>"
-  Once flagged, the pulse relays your note to the human, who attaches over tmux
-  to answer (their reply flows into your stdin).
-- When the wait is resolved (you got your answer), unflag before continuing:
-    "$LOOOP_BIN" _ unflag __ID__
-- When the task is 100% complete and nothing is flagged, end your own session:
+  an agent; only looop notifies.
+- When you need a human decision / info / approval, do NOT guess — ASK and WAIT.
+  This ONE command writes your question to the mailbox and BLOCKS until the root
+  agent (or human) answers, printing the answer to stdout:
+    answer=$("$LOOOP_BIN" _ ask __ID__ --prompt "<what you need to know>")
+  (optionally --ref reports/x.md and/or --options a,b). Use $answer and continue.
+  You do NOT need a terminal, stdin, or attach — just call it and read its output.
+  Ask once per question; it returns only when answered.
+- When the task is 100% complete and nothing is waiting, end your own session:
     "$LOOOP_BIN" _ kill __ID__
   (this lets the pulse prune the corpse). NEVER do this mid-task or while waiting
   on a human.
@@ -182,20 +182,6 @@ fn reject_pulse(session: &str, verb: &str) -> bool {
     }
 }
 
-/// `looop attach <id>` — attach the terminal to a worker session (in-process).
-pub fn cmd_attach(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let Some(id) = args.first() else {
-        eprintln!("usage: looop attach <id>");
-        return Ok(ExitCode::from(1));
-    };
-    let session = full_session(id);
-    if reject_pulse(&session, "attach") {
-        return Ok(ExitCode::from(1));
-    }
-    let code = attach(paths, &session)?;
-    Ok(ExitCode::from(code.clamp(0, 255) as u8))
-}
-
 /// `looop _ kill <id>` — terminate a worker session (in-process). Internal
 /// worker self-control callback (CONTRACT), not a human-facing verb.
 pub fn cmd_kill(paths: &Paths, args: &[String]) -> Result<ExitCode> {
@@ -208,297 +194,6 @@ pub fn cmd_kill(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     kill(paths, &session)?;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `looop _ flag <id> [message]` — raise a worker's attention flag (in-process).
-/// Internal worker self-control callback (CONTRACT), not a human-facing verb.
-pub fn cmd_flag(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let Some(id) = args.first() else {
-        eprintln!("usage: looop _ flag <id> [message]");
-        return Ok(ExitCode::from(1));
-    };
-    let message = if args.len() > 1 {
-        Some(args[1..].join(" "))
-    } else {
-        None
-    };
-    let session = full_session(id);
-    if reject_pulse(&session, "flag") {
-        return Ok(ExitCode::from(1));
-    }
-    flag(paths, &session, message)?;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `looop _ unflag <id>` — clear a worker's attention flag (in-process).
-/// Internal worker self-control callback (CONTRACT), not a human-facing verb.
-pub fn cmd_unflag(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let Some(id) = args.first() else {
-        eprintln!("usage: looop _ unflag <id>");
-        return Ok(ExitCode::from(1));
-    };
-    let session = full_session(id);
-    if reject_pulse(&session, "unflag") {
-        return Ok(ExitCode::from(1));
-    }
-    unflag(paths, &session)?;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `looop prune` — clear finished/dead worker corpses (in-process). The pulse
-/// also does this every tick; this is the on-demand verb.
-pub fn cmd_prune(paths: &Paths, _args: &[String]) -> Result<ExitCode> {
-    prune(paths);
-    println!("pruned finished worker sessions");
-    Ok(ExitCode::SUCCESS)
-}
-
-// ---- thin argv helpers (looop parses argv by hand, no clap) ----------------
-
-/// Is `flag` present anywhere in `args`?
-fn has(args: &[String], flag: &str) -> bool {
-    args.iter().any(|a| a == flag)
-}
-
-/// Value of `--flag value` or `--flag=value`, if present.
-fn val(args: &[String], flag: &str) -> Option<String> {
-    let eq = format!("{flag}=");
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == flag {
-            return it.next().cloned();
-        }
-        if let Some(v) = a.strip_prefix(&eq) {
-            return Some(v.to_string());
-        }
-    }
-    None
-}
-
-/// Positional (non-flag) args, skipping the value that follows each value-taking
-/// flag in `value_flags`. `--flag=value` forms are dropped as flags too.
-fn positionals(args: &[String], value_flags: &[&str]) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut skip = false;
-    for a in args {
-        if skip {
-            skip = false;
-            continue;
-        }
-        if a.starts_with('-') && a.len() > 1 {
-            if value_flags.contains(&a.as_str()) {
-                skip = true;
-            }
-            continue;
-        }
-        out.push(a.clone());
-    }
-    out
-}
-
-/// `looop watch <id>` — follow a session's output read-only (Ctrl-C to stop).
-/// Accepts `pulse` to watch the loop itself.
-pub fn cmd_watch(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let Some(id) = positionals(args, &[]).first().cloned() else {
-        eprintln!("usage: looop watch <id>   (e.g. looop watch pulse)");
-        return Ok(ExitCode::from(1));
-    };
-    watch(paths, &full_session(&id))?;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `looop log <id> [--tail N] [--grep RE] [--raw] [--since N] [--follow|-f] [--json]`
-pub fn cmd_log(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let pos = positionals(args, &["--tail", "--grep", "--since"]);
-    let Some(id) = pos.first().cloned() else {
-        eprintln!(
-            "usage: looop log <id> [--tail N] [--grep RE] [--raw] [--since N] [--follow] [--json]"
-        );
-        return Ok(ExitCode::from(1));
-    };
-    let tail = val(args, "--tail").and_then(|v| v.parse().ok());
-    let grep = val(args, "--grep");
-    let since = val(args, "--since").and_then(|v| v.parse().ok());
-    let raw = has(args, "--raw");
-    let follow = has(args, "--follow") || has(args, "-f");
-    let json = has(args, "--json");
-    log(
-        paths,
-        &full_session(&id),
-        tail,
-        grep,
-        raw,
-        since,
-        follow,
-        json,
-    )?;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `looop shot <id> [--ansi|--json] [--trim]` — render the current screen.
-pub fn cmd_screenshot(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    use ::babysit::cli::ShotFormat;
-    let Some(id) = positionals(args, &["--format"]).first().cloned() else {
-        eprintln!("usage: looop shot <id> [--ansi|--json] [--trim]");
-        return Ok(ExitCode::from(1));
-    };
-    let format = match val(args, "--format").as_deref() {
-        Some("ansi") => ShotFormat::Ansi,
-        Some("json") => ShotFormat::Json,
-        Some("plain") | None => {
-            if has(args, "--json") {
-                ShotFormat::Json
-            } else if has(args, "--ansi") {
-                ShotFormat::Ansi
-            } else {
-                ShotFormat::Plain
-            }
-        }
-        Some(other) => {
-            eprintln!("looop shot: unknown --format '{other}' (plain|ansi|json)");
-            return Ok(ExitCode::from(1));
-        }
-    };
-    screenshot(paths, &full_session(&id), format, has(args, "--trim"))?;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `looop send <id> <text...> [-n|--no-newline] [--json]`
-pub fn cmd_send(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let pos = positionals(args, &[]);
-    let Some((id, text)) = pos.split_first() else {
-        eprintln!("usage: looop send <id> <text...> [-n] [--json]");
-        return Ok(ExitCode::from(1));
-    };
-    if text.is_empty() {
-        eprintln!("usage: looop send <id> <text...> [-n] [--json]");
-        return Ok(ExitCode::from(1));
-    }
-    let newline = !(has(args, "-n") || has(args, "--no-newline"));
-    let session = full_session(id);
-    if reject_pulse(&session, "send") {
-        return Ok(ExitCode::from(1));
-    }
-    send(
-        paths,
-        &session,
-        text.join(" "),
-        newline,
-        has(args, "--json"),
-    )?;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `looop key <id> <KEY...> [--json]` — send named keys (Enter, Up, C-c, …).
-pub fn cmd_key(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let pos = positionals(args, &[]);
-    let Some((id, keys)) = pos.split_first() else {
-        eprintln!("usage: looop key <id> <KEY...>   (e.g. looop key foo Enter C-c)");
-        return Ok(ExitCode::from(1));
-    };
-    if keys.is_empty() {
-        eprintln!("usage: looop key <id> <KEY...>   (e.g. looop key foo Enter C-c)");
-        return Ok(ExitCode::from(1));
-    }
-    let session = full_session(id);
-    if reject_pulse(&session, "key") {
-        return Ok(ExitCode::from(1));
-    }
-    key(paths, &session, keys.to_vec(), has(args, "--json"))?;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `looop expect <id> <REGEX> [--timeout DUR] [--from-now] [--raw] [--screen] [--json] [--since N]`
-pub fn cmd_expect(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let pos = positionals(args, &["--timeout", "--since"]);
-    let (Some(id), Some(pattern)) = (pos.first(), pos.get(1)) else {
-        eprintln!(
-            "usage: looop expect <id> <REGEX> [--timeout DUR] [--from-now] [--raw] [--screen] [--json]"
-        );
-        return Ok(ExitCode::from(1));
-    };
-    let timeout = val(args, "--timeout").unwrap_or_else(|| "30s".into());
-    let since = val(args, "--since").and_then(|v| v.parse().ok());
-    let code = expect(
-        paths,
-        &full_session(id),
-        pattern.clone(),
-        timeout,
-        since,
-        has(args, "--from-now"),
-        has(args, "--raw"),
-        has(args, "--screen"),
-        has(args, "--json"),
-    )?;
-    Ok(ExitCode::from(code.clamp(0, 255) as u8))
-}
-
-/// `looop wait <id> [--timeout DUR]` — block until exit; returns its exit code.
-pub fn cmd_wait(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let Some(id) = positionals(args, &["--timeout"]).first().cloned() else {
-        eprintln!("usage: looop wait <id> [--timeout DUR]");
-        return Ok(ExitCode::from(1));
-    };
-    let code = wait(paths, &full_session(&id), val(args, "--timeout"))?;
-    Ok(ExitCode::from(code.clamp(0, 255) as u8))
-}
-
-/// `looop wait-idle <id> [--settle DUR] [--timeout DUR]` — block until quiet.
-pub fn cmd_wait_idle(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let Some(id) = positionals(args, &["--settle", "--timeout"])
-        .first()
-        .cloned()
-    else {
-        eprintln!("usage: looop wait-idle <id> [--settle DUR] [--timeout DUR]");
-        return Ok(ExitCode::from(1));
-    };
-    let settle = val(args, "--settle").unwrap_or_else(|| "500ms".into());
-    let timeout = val(args, "--timeout").unwrap_or_else(|| "30s".into());
-    let code = wait_idle(paths, &full_session(&id), settle, timeout)?;
-    Ok(ExitCode::from(code.clamp(0, 255) as u8))
-}
-
-/// `looop resize <id> <COLSxROWS> [--json]` — resize a session's terminal.
-pub fn cmd_resize(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let pos = positionals(args, &[]);
-    let (Some(id), Some(size)) = (pos.first(), pos.get(1)) else {
-        eprintln!("usage: looop resize <id> <COLSxROWS>   (e.g. looop resize foo 120x40)");
-        return Ok(ExitCode::from(1));
-    };
-    let session = full_session(id);
-    if reject_pulse(&session, "resize") {
-        return Ok(ExitCode::from(1));
-    }
-    resize(paths, &session, size.clone(), has(args, "--json"))?;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `looop restart <id> [--json]` — restart the wrapped command in a session.
-pub fn cmd_restart(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let Some(id) = positionals(args, &[]).first().cloned() else {
-        eprintln!("usage: looop restart <id>");
-        return Ok(ExitCode::from(1));
-    };
-    let session = full_session(&id);
-    if reject_pulse(&session, "restart") {
-        return Ok(ExitCode::from(1));
-    }
-    restart(paths, &session, has(args, "--json"))?;
-    Ok(ExitCode::SUCCESS)
-}
-
-/// `looop detach <id> [--json]` — force-detach any other terminal from a session.
-pub fn cmd_detach(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let Some(id) = positionals(args, &[]).first().cloned() else {
-        eprintln!("usage: looop detach <id>");
-        return Ok(ExitCode::from(1));
-    };
-    let session = full_session(&id);
-    if reject_pulse(&session, "detach") {
-        return Ok(ExitCode::from(1));
-    }
-    detach(paths, &session, has(args, "--json"))?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -539,17 +234,12 @@ pub struct Session {
     pub state: String,
     pub alive: bool,
     pub exit_code: Option<i64>,
-    pub note: Option<String>,
 }
 
 impl Session {
     /// The pulse session is the control loop, not a worker.
     pub fn is_pulse(&self) -> bool {
         self.id == PULSE_SESSION
-    }
-    /// True when the session has raised a flag (a non-empty note).
-    pub fn flagged(&self) -> bool {
-        self.note.as_deref().map(|n| !n.is_empty()).unwrap_or(false)
     }
 }
 
@@ -559,7 +249,6 @@ fn project(info: ::babysit::SessionInfo) -> Session {
         state: info.state,
         alive: info.alive,
         exit_code: info.exit_code.map(|c| c as i64),
-        note: info.note,
     }
 }
 
@@ -636,12 +325,6 @@ pub fn prune_aged(paths: &Paths, max_age: std::time::Duration) {
     });
 }
 
-/// Reap EVERY dead corpse now, no retention — the explicit `looop prune` verb's
-/// "clean it all up" semantics.
-pub fn prune(paths: &Paths) {
-    prune_aged(paths, std::time::Duration::ZERO);
-}
-
 /// Targeted reap: remove just `session`'s dir IF it's a dead corpse, so its id
 /// can be reused — without disturbing sibling sessions' retained transcripts.
 /// Used when reclaiming one specific id (the pulse on `up`/`down`, a worker id
@@ -675,215 +358,6 @@ pub fn kill(paths: &Paths, session: &str) -> anyhow::Result<()> {
 /// caller that prints its own message (e.g. the foreground teardown) stays single-line.
 pub fn kill_quiet(paths: &Paths, session: &str) -> anyhow::Result<()> {
     suppress_stdout(|| kill(paths, session))
-}
-
-/// `looop _ flag <id> [msg]` — raise a session's attention flag.
-pub fn flag(paths: &Paths, session: &str, message: Option<String>) -> anyhow::Result<()> {
-    rt().block_on(
-        paths
-            .sessions()
-            .flag(Some(session.to_string()), message, false),
-    )
-}
-
-/// `looop _ unflag <id>` — clear a session's attention flag.
-pub fn unflag(paths: &Paths, session: &str) -> anyhow::Result<()> {
-    rt().block_on(paths.sessions().unflag(Some(session.to_string()), false))
-}
-
-/// `looop attach <id>` — attach the terminal to a session; returns its exit code.
-pub fn attach(paths: &Paths, session: &str) -> anyhow::Result<i32> {
-    let bs = paths.sessions();
-    rt().block_on(::babysit::attach::attach(&bs, Some(session.to_string())))
-}
-
-/// `looop detach <id>` — force-detach any other terminal attached to a session.
-pub fn detach(paths: &Paths, session: &str, json: bool) -> anyhow::Result<()> {
-    let bs = paths.sessions();
-    rt().block_on(::babysit::attach::detach(
-        &bs,
-        Some(session.to_string()),
-        json,
-    ))
-}
-
-/// `looop watch <id>` — follow a session's output read-only (tail -f): the full
-/// log so far, then live output until the session exits. The non-interactive
-/// twin of `attach`, so it preserves the session's ANSI color (`raw`) — the
-/// pulse runs under a PTY and emits colored lines we want to show as-is.
-pub fn watch(paths: &Paths, session: &str) -> anyhow::Result<()> {
-    rt().block_on(paths.sessions().log(
-        Some(session.to_string()),
-        None,  // tail: whole log, then follow
-        None,  // grep
-        true,  // raw: keep ANSI color (twin of attach, not a cleaned log)
-        None,  // since: from the start
-        true,  // follow
-        false, // json
-    ))
-}
-
-/// Foreground stream for `looop`: follow a session's output live, but return
-/// (rather than letting a stop signal kill the whole process) when the user
-/// interrupts OR the followed session exits. The caller (`cmd_serve`) then runs
-/// teardown, so closing the window stops the loop instead of orphaning it.
-///
-/// BOTH Ctrl-C (SIGINT) and SIGTERM return cleanly here: a plain `kill <pid>`,
-/// `pkill`, or a service manager (systemd/launchd) stops via SIGTERM, and if we
-/// only caught SIGINT the default SIGTERM action would terminate the process
-/// before `stop_all` ran — leaving every worker orphaned (the exact surprise the
-/// teardown exists to prevent).
-pub fn serve_follow(paths: &Paths, session: &str) -> anyhow::Result<()> {
-    rt().block_on(async {
-        let bs = paths.sessions();
-        let follow = bs.log(
-            Some(session.to_string()),
-            None,  // tail: whole log, then follow
-            None,  // grep
-            true,  // raw: keep ANSI color
-            None,  // since: from the start
-            true,  // follow
-            false, // json
-        );
-        #[cfg(unix)]
-        {
-            let mut term =
-                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-            tokio::select! {
-                r = follow => r,                       // pulse exited / log ended
-                _ = tokio::signal::ctrl_c() => Ok(()), // user pressed Ctrl-C (SIGINT)
-                _ = term.recv() => Ok(()),             // kill/pkill/systemd (SIGTERM)
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            tokio::select! {
-                r = follow => r,                       // pulse exited / log ended
-                _ = tokio::signal::ctrl_c() => Ok(()), // user pressed Ctrl-C
-            }
-        }
-    })
-}
-
-/// `looop log <id>` — show / tail / grep / follow a session's recorded output.
-#[allow(clippy::too_many_arguments)]
-pub fn log(
-    paths: &Paths,
-    session: &str,
-    tail: Option<usize>,
-    grep: Option<String>,
-    raw: bool,
-    since: Option<u64>,
-    follow: bool,
-    json: bool,
-) -> anyhow::Result<()> {
-    rt().block_on(paths.sessions().log(
-        Some(session.to_string()),
-        tail,
-        grep,
-        raw,
-        since,
-        follow,
-        json,
-    ))
-}
-
-/// `looop shot <id>` — render the session's current visible screen.
-pub fn screenshot(
-    paths: &Paths,
-    session: &str,
-    format: ::babysit::cli::ShotFormat,
-    trim: bool,
-) -> anyhow::Result<()> {
-    rt().block_on(
-        paths
-            .sessions()
-            .screenshot(Some(session.to_string()), format, trim),
-    )
-}
-
-/// `looop send <id> <text>` — type text into a session's stdin.
-pub fn send(
-    paths: &Paths,
-    session: &str,
-    text: String,
-    newline: bool,
-    json: bool,
-) -> anyhow::Result<()> {
-    rt().block_on(
-        paths
-            .sessions()
-            .send(Some(session.to_string()), text, newline, json),
-    )
-}
-
-/// `looop key <id> <KEY...>` — send named keys (Enter, Up, C-c, …) to a session.
-pub fn key(paths: &Paths, session: &str, keys: Vec<String>, json: bool) -> anyhow::Result<()> {
-    rt().block_on(paths.sessions().key(Some(session.to_string()), keys, json))
-}
-
-/// `looop expect <id> <REGEX>` — block until a regex appears; exit 124 on timeout.
-#[allow(clippy::too_many_arguments)]
-pub fn expect(
-    paths: &Paths,
-    session: &str,
-    pattern: String,
-    timeout: String,
-    since: Option<u64>,
-    from_now: bool,
-    raw: bool,
-    screen: bool,
-    json: bool,
-) -> anyhow::Result<i32> {
-    rt().block_on(paths.sessions().expect(
-        Some(session.to_string()),
-        pattern,
-        timeout,
-        since,
-        from_now,
-        raw,
-        screen,
-        json,
-    ))
-}
-
-/// `looop wait <id>` — block until the session exits; returns its exit code.
-pub fn wait(paths: &Paths, session: &str, timeout: Option<String>) -> anyhow::Result<i32> {
-    rt().block_on(paths.sessions().wait(Some(session.to_string()), timeout))
-}
-
-/// `looop wait-idle <id>` — block until output is quiet for `settle`.
-pub fn wait_idle(
-    paths: &Paths,
-    session: &str,
-    settle: String,
-    timeout: String,
-) -> anyhow::Result<i32> {
-    rt().block_on(
-        paths
-            .sessions()
-            .wait_idle(Some(session.to_string()), settle, timeout),
-    )
-}
-
-/// `looop resize <id> <COLSxROWS>` — resize a session's terminal.
-pub fn resize(paths: &Paths, session: &str, size: String, json: bool) -> anyhow::Result<()> {
-    rt().block_on(
-        paths
-            .sessions()
-            .resize(Some(session.to_string()), size, json),
-    )
-}
-
-/// `looop restart <id>` — restart the wrapped command in a session.
-pub fn restart(paths: &Paths, session: &str, json: bool) -> anyhow::Result<()> {
-    rt().block_on(paths.sessions().restart(Some(session.to_string()), json))
-}
-
-/// `looop ls [--json] [--watch] [--interval <dur>]` — render the fleet table
-/// IN-PROCESS via babysit's own list renderer.
-pub fn ls(paths: &Paths, json: bool, watch: bool, interval: String) -> anyhow::Result<()> {
-    rt().block_on(paths.sessions().list(json, watch, interval))
 }
 
 /// Spawn a detached worker IN-PROCESS. babysit's parent path re-execs
@@ -996,11 +470,6 @@ pub fn is_alive(paths: &Paths, session: &str) -> bool {
     list(paths).iter().any(|s| s.id == session && s.alive)
 }
 
-/// Any looop worker currently in flight?
-pub fn any_worker_alive(paths: &Paths) -> bool {
-    list_workers(paths).iter().any(|s| s.alive)
-}
-
 /// Block (briefly) until a session is registered and alive. For callers that
 /// spawn detached then immediately follow it (e.g. the foreground `looop`): the
 /// supervisor needs a beat to register the session, so following it instantly
@@ -1023,24 +492,16 @@ pub fn await_alive(paths: &Paths, session: &str, timeout: std::time::Duration) -
 mod tests {
     use super::*;
 
-    fn sess(id: &str, note: Option<&str>) -> Session {
+    fn sess(id: &str) -> Session {
         Session {
             id: id.to_string(),
-            note: note.map(str::to_string),
             ..Default::default()
         }
     }
 
     #[test]
     fn pulse_is_recognized() {
-        assert!(sess(PULSE_SESSION, None).is_pulse());
-        assert!(!sess("triage", None).is_pulse());
-    }
-
-    #[test]
-    fn flagged_iff_nonempty_note() {
-        assert!(sess("x", Some("help")).flagged());
-        assert!(!sess("x", Some("")).flagged());
-        assert!(!sess("x", None).flagged());
+        assert!(sess(PULSE_SESSION).is_pulse());
+        assert!(!sess("triage").is_pulse());
     }
 }

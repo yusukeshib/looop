@@ -1,14 +1,19 @@
-//! The pulse (`looop`) — the control loop itself.
+//! The pulse (`looop _ pulse`) — the cheap, judgment-free sensing loop.
 //!
-//! The pulse is a single-instance, level-triggered reconcile loop: tick, choose
-//! the next cadence, sleep, repeat. It is the SOLE writer of the policy files
-//! (PLAYBOOK/goals/sensors) and the journal — there is no imperative override
-//! that races it; humans steer it by editing the desired state it reconciles.
+//! The pulse no longer decides anything (judgment moved to the root agent — a
+//! pi/claude session YOU run, which looop does not manage). Each beat it just
+//! senses the world: wipe + re-run every sensor so `snapshots/` reflects reality.
+//! That is all. The root agent learns of changes by blocking on
+//! `looop _ wait`, which watches the world hash the pulse keeps fresh.
+//!
+//! It is a single-instance loop (flock) and the SOLE senser, so two beats never
+//! wipe `snapshots/` under each other. No LLM call, so the cadence is one cheap
+//! interval.
 
 use crate::config::Config;
 use crate::paths::Paths;
 use crate::util::Level;
-use crate::{seed, session, tick, util};
+use crate::{seed, tick, util};
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
@@ -69,14 +74,14 @@ fn try_flock(_f: &std::fs::File) -> bool {
     true // best-effort: single-instance enforcement is unix-only
 }
 
-/// Whether a live pulse currently holds the single-instance lock. Used by
-/// `looop status` from a SEPARATE process: open the lock file read-only and try
-/// to take the flock; if we CAN take it, nobody holds it (we release it again on
-/// drop) — so the pulse is NOT running. A crashed pulse that left the lock file
-/// behind therefore reads as "not running", with no PID-reuse false positive.
+/// Whether a live pulse currently holds the single-instance flock. The
+/// authoritative "is the loop actually running" probe (a babysit session can be
+/// alive while its inner loop has crashed): open the lock file read-only and try
+/// to take the flock; if we CAN, nobody holds it. Exercised by the lock tests.
+#[allow(dead_code)]
 pub(crate) fn pulse_running(paths: &Paths) -> bool {
     let Ok(f) = std::fs::File::open(paths.lock().join("lock")) else {
-        return false; // never started, or already cleaned up
+        return false;
     };
     !try_flock(&f)
 }
@@ -122,9 +127,7 @@ fn acquire_lock(paths: &Paths) -> Option<LockGuard> {
 pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
     seed::ensure_dirs(paths)?;
     let cfg = Config::load(paths)?;
-    let idle = interval("LOOOP_INTERVAL", &cfg, "interval", 60);
-    let busy = interval("LOOOP_BUSY_INTERVAL", &cfg, "busy_interval", idle);
-    let active = interval("LOOOP_ACTIVE_INTERVAL", &cfg, "active_interval", idle);
+    let beat = interval("LOOOP_INTERVAL", &cfg, "interval", 60);
 
     // Single-instance lock (flock-based; released by the kernel on exit/crash).
     let Some(_guard) = acquire_lock(paths) else {
@@ -133,17 +136,11 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     };
 
-    let runner_name = cfg.default_runner().unwrap_or_else(|| "?".into());
     util::event(
         Level::Ok,
         "pulse.start",
-        &format!("pulse started · idle {idle}s / busy {busy}s · runner {runner_name}"),
-        &[
-            ("idle", serde_json::json!(idle)),
-            ("busy", serde_json::json!(busy)),
-            ("active", serde_json::json!(active)),
-            ("runner", serde_json::json!(runner_name)),
-        ],
+        &format!("pulse started · sensing every {beat}s (root agent watches via `looop _ wait`)"),
+        &[("interval", serde_json::json!(beat))],
     );
     if !paths.default_profile {
         util::event(
@@ -160,56 +157,11 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
         );
     }
 
-    // When the previous beat emitted a `next_interval_s` nudge, the next beat is
-    // a FORCED re-decide: it bypasses the unchanged-world skip once, so a goal
-    // can schedule a time-based follow-up instead of going silent until the world
-    // changes on its own. Reset every beat; only a fresh override re-arms it.
-    let mut force = false;
+    // Sense forever. The root agent watches the resulting world hash via
+    // `looop _ wait`; the pulse just keeps snapshots/ fresh.
     loop {
-        let outcome = tick::tick(paths, force);
-        force = false;
-
-        // Pick the base cadence ONCE: a beat that moved is "busy"; otherwise a
-        // live worker keeps us "active"; an idle world waits the longest. Both
-        // the interval and its label come from this single classification, so
-        // any_worker_alive() is probed at most once per beat (not twice).
-        let (mut want, mut reason) = if outcome.acted {
-            (busy, "busy")
-        } else if session::any_worker_alive(paths) {
-            (active, "active")
-        } else {
-            (idle, "idle")
-        };
-
-        // One-shot AI cadence nudge, handed straight back from the beat
-        // in-memory (no `.next-interval` file). Clamped 5..3600.
-        if let Some(req) = outcome.next_interval_s {
-            let req = req.clamp(5, 3600);
-            util::event(
-                Level::Info,
-                "cadence",
-                &format!("AI cadence override: next beat in {req}s (default {want}s)"),
-                &[
-                    ("secs", serde_json::json!(req)),
-                    ("default", serde_json::json!(want)),
-                ],
-            );
-            want = req;
-            reason = "override";
-            // The nudge also forces the next beat to re-decide even if the world
-            // is unchanged (time-based follow-up, not just a sleep nudge).
-            force = true;
-        }
-        util::event(
-            Level::Info,
-            "sleep",
-            &format!("next beat in {want}s ({reason})"),
-            &[
-                ("secs", serde_json::json!(want)),
-                ("reason", serde_json::json!(reason)),
-            ],
-        );
-        std::thread::sleep(Duration::from_secs(want));
+        let _ = tick::sense(paths);
+        std::thread::sleep(Duration::from_secs(beat));
     }
 }
 

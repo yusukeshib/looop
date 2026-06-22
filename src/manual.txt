@@ -1,116 +1,108 @@
-looop — a tiny, portable, Kubernetes-shaped control loop for your work.
+looop — a tiny, portable control plane for agent-driven work.
 
 This single binary IS the whole program: principles, rules, and defaults all
 live inside it. Install one binary and run it — no README, no helper dir.
 
 THE IDEA
-  Arrive in the morning, look at the state of the world, make the single most
-  important move, repeat. Now a machine does that. It is a reconciliation loop,
-  exactly like Kubernetes — with one deliberate twist (see RULE 1):
+  looop runs a control plane with the judgment OUTSIDE it. looop senses the
+  world, runs the worker fleet, and carries messages between workers and you. The
+  JUDGMENT lives in a ROOT AGENT — a pi/claude session YOU start and tell to
+  observe looop. looop does NOT launch or manage that agent; it only provides the
+  state and the verbs the agent drives. looop itself never calls an LLM — it is
+  the unbreakable plumbing; the root agent is the brain.
 
-    Kubernetes            looop
-    ----------            -----
-    desired state (YAML)  goals/*.md         how things should be (inert files)
-    etcd                  the data dir       PLAYBOOK + goals + journal = memory
-    informers / watch     sensors/*.sh       scripts that print the world as JSON
-    reconcile loop        the pulse (looop) observe -> diff -> one move per tick
-    scheduler policy      PLAYBOOK.md        priorities + guardrails, in prose
-    Job / Pod             worker session     a real agent doing hands-on work
-    Pod sandbox           box workspace      a git worktree per session
+    role          who                  what it does
+    ----          ---                  ------------
+    sensing       the pulse (looop)     run sensors every beat; keep snapshots fresh
+    judgment      the root agent        block on `looop _ wait`, decide ONE
+                  (a pi/claude YOU run)  move, drive looop via `looop _ …` verbs
+    hands         worker sessions       real agents doing multi-step work; when they
+                                        need a decision they `ask` and wait
+    memory        the data dir          PLAYBOOK + goals + journal + mailbox = files
 
-THE THREE NOUNS
-  PLAYBOOK.md   judgment in prose: priorities, guardrails, rules. Humans AND the
-                AI grow it. It is data (lives with goals + journal).
-  goals/*.md    the desired state. One file per goal: a 'goal:' frontmatter line
-                + free-form dated notes. The AI creates/updates/archives them;
-                they are evaluated every tick but NEVER executed.
-  session       an agent actually working — born only for hands-on work, runs in
-                a box workspace under babysit, gone when finished.
+HOW IT RUNS
+  1. `looop up` — start the pulse (a detached, judgment-free sensing loop that
+     keeps `snapshots/` fresh). That is all looop runs.
+  2. Start your agent yourself, in another window, and tell it to observe looop:
+        pi      # then: "observe looop — loop on `looop _ wait --json` and
+                #         act on it; read `looop --help` first."
+  3. `looop down` — stop the pulse and every live worker.
+  The human talks to that agent. There is no looop-managed root session and no
+  attach — you run the agent; looop just feeds it state.
 
-ONE BEAT (a tick)
-  1. run sensors/*.sh -> snapshot the world as JSON (fresh every tick)
-  2. if nothing changed since last tick -> do nothing (cheap, no AI call)
-     ("changed" = PLAYBOOK + goals + each sensor's .signal + session transitions.
-      NOTE: editing a sensor SCRIPT does not itself wake the loop — only the
-      reading it emits does. PLAYBOOK/goals edits wake the loop immediately.)
-  3. else hand PLAYBOOK + goals + sensor readings + sessions to the AI, which
-     EMITS exactly ONE typed action (to .decision.json); looop executes it and
-     appends ONE line to journal.md
-  4. the AI process is disposable — all memory is the files in the data dir
+ONE BEAT (the pulse, judgment-free)
+  Each beat the pulse wipes + re-runs every `sensors/*.sh` so `snapshots/`
+  reflects the world (cheap, no LLM). It is the SOLE senser (no two beats race)
+  and a single-instance loop (flock). Cadence is one interval (config `interval`,
+  default 60s). The pulse does nothing else — it doesn't decide and doesn't poke;
+  the root agent watches the world hash the pulse keeps fresh.
 
-RULES (the invariants that keep this safe and legible)
-  1. ONE TICK = ONE MOVE — enforced. The AI only EMITS one typed action; looop is
-     the SOLE executor, so a tick does at most one move and leaves one journal
-     line no matter how the model misbehaves ("do nothing" = the noop action).
-  2. THE PULSE IS UNBREAKABLE SHELL, JUDGMENT IS THE AI, MEMORY IS FILES. This
-     program never "thinks"; it only gathers context and runs the AI once.
-  3. NEVER DO IRREVERSIBLE THINGS AUTOMATICALLY (merge, public comments, closing
-     issues, deleting data). Prepare fully, then a worker session raises a
-     flag (looop _ flag) and waits for a human. This is part of the immutable
-     CONSTITUTION compiled into looop and injected ahead of the PLAYBOOK every
-     tick — write_playbook can refine judgment beneath it but can never weaken
-     it (so the loop can't groom away its own guardrails).
-  4. BE INQUISITIVE. When a worker lacks context it asks (flag + wait) rather
-     than guessing. Asking is cheaper than a wrong irreversible move.
-  5. ADD STRUCTURE LATER. Only harden a drift into a PLAYBOOK rule or a check
-     once it actually hurts. Never build machinery in advance.
-  6. LEVEL-TRIGGERED. Each tick re-observes from scratch; the loop keeps no
-     "what I was waiting for" state. Re-running after days off is just a tick.
-  7. SINGLE-WRITER POLICY FILES. The pulse (the tick AI) is the sole writer of
-     PLAYBOOK.md, goals/ and sensors/. Workers write only to claims/, reports/
-     and their own code sandbox — never racing the pulse on policy files. The
-     lone exception is a human-gated meta session (setup / playbook grooming),
-     which shows a diff and waits for approval (RULE 3) before touching policy.
+============================================================================
+ROOT AGENT OPERATING CONTRACT  (the pi/claude session YOU run against looop)
+============================================================================
+Your loop is one line:  while true; do  state=$(looop _ wait --json); act on it; done
 
-DRIVING A SESSION (a session is a live terminal, not a black box)
-  A worker runs under a real PTY, so you can both WATCH it and TALK to it from
-  outside — the same primitives a human or a script would use:
-    observe   looop shot <id>        the current screen
-              looop log <id> -f      follow its output (tail -f)
-              looop status           pulse + all sessions at a glance
-    drive     looop send <id> TEXT   type into its stdin
-              looop key  <id> KEY    named keys (Enter, C-c, Up, …)
-              looop expect <id> RE   block until a regex appears (scriptable)
-              looop wait[-idle] <id> block until exit / until output settles
-    manage    looop resize / restart / attach / detach
-  This makes a session driveable by hand, by a shell script (expect-style), or by
-  the pulse itself as one move. Human-gated decisions still go through ⚑flags
-  (RULE 3/4) — driving is for steering and automation, not for answering a flag.
+  • `looop _ wait --json` BLOCKS until there is something to act on (a
+    pending ask, or the world changed) and returns the state:
+      { world_hash, snapshots{name:reading}, asks[{id,worker,prompt,reference,
+        options}], workers[{id,state,alive}], goals[id], journal_tail[] }
+    (drop --wait for a one-shot read, e.g. when the human asks you something.)
+  • Decide the SINGLE most important move and act with a verb below.
+  • If a worker raised an `ask`: decide it yourself when you safely can, otherwise
+    ask the human in chat, then `looop _ answer <ask_id> "<answer>"`.
+
+VERBS (you call these; they mutate the world and journal the move):
+  looop _ state [--json] | _ wait [--json]     read state (blocking with --wait)
+  looop _ answer <ask_id> "<text>"   resolve a worker's pending ask
+  looop _ goal write <id> [body|stdin] | _ goal archive <id>
+  looop _ sensor write <name> [script|stdin]
+  looop _ playbook write [body|stdin]
+  looop _ run <cmd…> [--reason T]    ONE ad-hoc REVERSIBLE shell command
+  looop _ worker start <id> <prompt…>   spawn a worker for hands-on work
+  looop _ worker kill <id>           end a worker session
+  looop _ notify <message…>          surface a notice to the human (journaled)
+  (multi-line bodies: omit the inline body and pipe it on stdin / heredoc.)
+
+INVARIANTS (never weaken these):
+  • NEVER do irreversible things (merge, deploy, delete, publish, pay) without the
+    human's explicit approval in chat. `_ run` is ONE reversible command only;
+    anything irreversible goes to a worker that `ask`s the human first.
+  • SINGLE-WRITER: change PLAYBOOK / goals / sensors ONLY through the verbs above,
+    never by editing files directly (the pulse reads them every beat).
+  • ASK, DON'T GUESS: when you lack info or authority, ask the human in chat.
+
+WORKER CONTRACT (auto-injected into every worker — for reference)
+  A worker that needs a human decision runs ONE blocking call and waits:
+     answer=$("$LOOOP_BIN" _ ask "$LOOOP_SESSION_ID" --prompt "…" [--ref P] [--options a,b])
+  It needs no terminal/attach — `ask` returns when answered. Workers write only to
+  claims/, reports/ and their own code sandbox; they end themselves with `_ kill`
+  and lease shared resources with `_ claim`/`_ unclaim`; they self-report spend
+  with `_ cost`.
 
 CODE / CONFIG / DATA are cleanly separated (all overridable by env)
   EXEC    this one binary                          the program (portable)
   CONFIG  <DATA>/config.json                       one file: runner wiring
           └ override with $LOOOP_CONFIG            (seeded inline if absent)
-            optional knobs: interval/busy_interval/active_interval (cadence),
-            session_ttl (corpse retention), max_daily_usd (skip ticks once the
-            day's metered spend hits the cap — a billing circuit breaker. It is
-            ON BY DEFAULT at $10/day; raise it, or set max_daily_usd:0 (or
-            LOOOP_MAX_DAILY_USD=0) to turn it OFF. If a budget is in effect and a
-            runner stays UNMETERED it fails CLOSED after a few runs). pi/claude
-            are metered built-in; a custom runner declares its shape via a
-            per-runner "cost":{type,pointer,mode} spec.
+            A runner needs ONE command — `interactive` (how to launch an agent
+            session for each worker). Optional: `interval` (pulse cadence),
+            `session_ttl` (corpse retention).
   DATA    ${XDG_STATE_HOME:-~/.local/state}/looop/  the file-based memory
           └ override with $LOOOP_DATA_DIR
-            PLAYBOOK.md  goals/  journal.md  sensors/*.sh   <- the durable memory
-            snapshots/ prompts/ runs/ .lock .last-tick-hash <- scratch
-            sessions/<id>/  <- worker + pulse sessions (babysit state, per
-                               profile; no $BABYSIT_DIR, no shared ~/.babysit).
-                               System scratch: auto-reaped after a retention
-                               window ($LOOOP_SESSION_TTL / session_ttl, def 3d).
-                               Deliverables go to reports/, NOT here.
-            (runs/<id>/{prompt.md,output.log} = a replayable archive per beat)
+            PLAYBOOK.md  goals/  journal.md  sensors/*.sh   <- durable memory
+            asks/ answers/   <- the worker <-> root-agent mailbox
+            snapshots/ prompts/ .lock .last-tick-hash       <- scratch
+            reports/         <- worker deliverables a human reads (persist)
+            sessions/<id>/   <- worker + pulse sessions (babysit state, per
+                                profile; auto-reaped after session_ttl, 3d).
 
 BOOTSTRAP
   A fresh data dir is seeded once with a starter PLAYBOOK + goals/setup.md +
   goals/playbook-daily.md + sensors/today.sh, all embedded in this binary. The
-  starter PLAYBOOK's top priority is an interactive setup session (goals/setup.md)
-  that interviews you and rewrites the seed into your real config. Setup is just
-  a goal; the program only seeds.
+  starter PLAYBOOK's top priority is for the root agent to interview you and
+  rewrite the seed into your real config.
 
 DEPENDENCIES
-  Just the configured agent CLI (claude or pi). Session management (babysit) is
-  LINKED IN as a library and runs in-process — no babysit binary is required.
-  The pulse provisions NO workspaces; a worker that touches code makes its own
-  sandbox (box if available, else git worktree), so box/git are worker concerns,
-  not pulse prerequisites. (gh and other tools are used only by sensor scripts /
-  worker agents — looop never requires them.)
+  Just the configured agent CLI (claude or pi) — used to launch workers (and it
+  is what you run as the root agent). Session management (babysit) is LINKED IN
+  as a library and runs in-process; no babysit binary is required. A worker that
+  touches code makes its own sandbox (box if available, else git worktree).

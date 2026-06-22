@@ -14,57 +14,28 @@ pub fn print(paths: &Paths) {
     println!(
         r#"
 Usage:
-  looop [--json]                 run the loop in the FOREGROUND: bring the pulse
-                                up as a supervised session, stream its output,
-                                and on exit (Ctrl-C, or the pulse dying) tear the
-                                pulse AND its workers down. There is no detached
-                                mode — closing this stops the loop. --json makes
-                                the pulse emit NDJSON to its log (agent-readable).
-                                To run unattended, background it (looop & / nohup).
-  looop watch <id>               follow a session's output read-only, like
-                                tail -f (Ctrl-C to stop). `looop watch pulse`
-                                watches the loop itself. No input — use attach
-                                for that.
-  looop status [--json]          structured snapshot of the loop's live state
-                                (pulse, last tick, workers, cost) — for an
-                                external observer / AI watching the loop
-  looop ls [--json] [--watch] [--interval <dur>]
-                                list this profile's worker sessions (⚑ = waiting),
-                                in-process; --watch refreshes live (Ctrl-C to stop)
-  looop start-session <id> "<prompt>" [runner]
-                                start a worker session (used by the tick AI)
-  looop attach <id>              attach your terminal to a worker (in-process;
-                                detach with Ctrl-\ Ctrl-\)
-  looop detach <id>              force-detach any other terminal from a session
-  looop log <id> [--tail N] [--grep RE] [--since N] [--follow] [--raw] [--json]
-                                show / tail / grep / follow a session's output
-  looop shot <id> [--ansi|--json] [--trim]
-                                render the session's current visible screen
-  looop send <id> <text...> [-n] [--json]
-                                type text into a session's stdin (-n: no newline)
-  looop key <id> <KEY...> [--json]
-                                send named keys (Enter, Up, Esc, C-c, F1, …)
-  looop expect <id> <REGEX> [--timeout DUR] [--from-now] [--screen] [--json]
-                                block until a regex appears (exit 124 on timeout)
-  looop wait <id> [--timeout DUR]
-                                block until the session exits; return its code
-  looop wait-idle <id> [--settle DUR] [--timeout DUR]
-                                block until output is quiet for --settle
-  looop resize <id> <COLSxROWS>  resize a session's terminal (e.g. 120x40)
-  looop restart <id>             restart the wrapped command in a session
-  looop prune                    clear ALL finished worker corpses now (the pulse
-                                auto-reaps only ones older than the retention
-                                window each tick — LOOOP_SESSION_TTL, default 3d)
-  looop journal [--tail N]       read the decision log (one timestamped line per
-                                move); --tail N shows only the last N
-  looop cost [today|all|--json]   report LLM spend recorded in the cost ledger
-                                (ticks are metered automatically; workers
-                                self-report via 'looop _ cost')
-  looop config zsh|bash          print shell integration (completions);
-                                add eval "$(looop config zsh)" to your ~/.zshrc
-                                (or eval "$(looop config bash)" to ~/.bashrc)
-  looop version                  print the looop version
-  looop help                     show this help
+  HUMAN (that's nearly all you run — the rest you do through your agent):
+  looop up [--json]              start the pulse (sensing loop, detached).
+                                --json makes the pulse log NDJSON. Then start your
+                                agent yourself and tell it to observe looop.
+  looop down                     stop the pulse and all workers
+  looop cost [today|all|--json]  report LLM spend (agents self-report via `_ cost`)
+  looop config zsh|bash          print shell integration (completions)
+  looop version | help           print version / show this help
+
+  ROOT AGENT (the pi/claude session YOU run — see the CONTRACT above):
+  looop _ state [--json] | _ wait [--json]             read state (blocking with --wait)
+  looop _ answer <ask_id> "<text>"           resolve a worker's pending ask
+  looop _ goal write <id> [body|stdin] | _ goal archive <id>
+  looop _ sensor write <name> [script|stdin]
+  looop _ playbook write [body|stdin]
+  looop _ run <cmd…> [--reason T]            ONE reversible shell command
+  looop _ worker start <id> <prompt…> | _ worker kill <id>
+  looop _ notify <message…>                  surface a notice to the human
+
+  WORKER self-callbacks (auto-injected CONTRACT — not for humans):
+  looop _ ask <id> --prompt "…" [--ref P] [--options a,b]   ask + block for answer
+  looop _ kill <id> | _ claim <name> | _ unclaim <name> | _ cost <…>
 
 Paths (override via env LOOOP_CONFIG / LOOOP_DATA_DIR):
   config    {config}
@@ -73,23 +44,15 @@ Paths (override via env LOOOP_CONFIG / LOOOP_DATA_DIR):
 
 looop is a single self-contained binary: session management (babysit) is linked
 as a LIBRARY and driven entirely in-process — no `babysit` executable required.
-Sessions are self-contained per profile: they live under <data>/sessions, keyed
-by a bare id (the pulse is `pulse`). looop passes that root to the library
-explicitly — it never sets $BABYSIT_DIR and never touches a shared ~/.babysit.
-  looop ls                      list worker sessions (⚑ = waiting for you)
-  looop ls --watch              watch sessions live, in place
-  looop attach <id>             enter a waiting session and talk to it ; looop prune
+You run your own agent and tell it to observe looop (loop on `looop _ wait
+--json`); it decides and drives looop through the `_ …` verbs. Worker self-control
+verbs (ask / kill / claim / unclaim / cost) are auto-injected callbacks.
 
-  (worker self-control verbs — flag/unflag/kill/claim/unclaim — are internal
-  `looop _ <verb>` callbacks the worker CONTRACT invokes, not human commands: a
-  human steers by editing goals/PLAYBOOK and attaching, never by these verbs.)
-
-The pulse launches each worker in the data dir; if a worker needs to touch code
-it provisions its OWN sandbox (box if available, else git worktree), as told by
-the PLAYBOOK. looop itself has no notion of repos.
-
-Fix judgment by editing PLAYBOOK.md (in the data dir) — it takes effect next
-tick. (looop does not version the data dir; `git init` it yourself for history.)"#,
+The root agent launches each worker in the data dir; a worker that touches code
+provisions its OWN sandbox (box if available, else git worktree). looop itself
+has no notion of repos. Change judgment with `looop _ playbook write` / `_ goal
+write` — it takes effect next beat. (looop does not version the data dir; `git
+init` it yourself for history.)"#,
         config = paths.config.display(),
         data = paths.data_dir.display(),
         fleet = paths.data_dir.join("sessions").display(),

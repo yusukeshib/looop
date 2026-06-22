@@ -76,17 +76,6 @@ fn hash_policy_into(paths: &Paths, buf: &mut Vec<u8>) {
     }
 }
 
-/// A hash of ONLY the policy half (PLAYBOOK + goals) — the part a HUMAN edits to
-/// steer the loop. Used by the failure backoff to tell "a human changed the
-/// desired state, retry now" apart from "our own failing action churned the
-/// sensor snapshots", so a churning failure still backs off (it can't reset the
-/// backoff just by changing the world).
-pub fn policy_hash(paths: &Paths) -> String {
-    let mut buf: Vec<u8> = Vec::new();
-    hash_policy_into(paths, &mut buf);
-    util::content_hash(&buf)
-}
-
 pub fn world_hash(paths: &Paths) -> String {
     let mut buf: Vec<u8> = Vec::new();
 

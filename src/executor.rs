@@ -1,50 +1,31 @@
-//! EXECUTE — looop deterministically performs the ONE typed action the decider
-//! emitted, then journals it. This is what makes RULE 1 real: the decide phase
-//! is symmetric with the sense phase (sensors emit JSON describing the world;
-//! the decider emits JSON describing its single move), and looop — the
-//! unbreakable shell — is the SOLE executor. A tick can therefore do at most one
-//! move no matter how the model misbehaves, and irreversible action types can be
-//! gated in code rather than by prompt discipline.
+//! EXECUTE — the typed actions that mutate looop's world, exposed as `looop _ …`
+//! verbs the ROOT AGENT calls. Each verb builds one [`Action`] and runs it
+//! through [`run_action`], which journals the move and (for the non-idempotent
+//! ones) write-ahead-logs the intent so a crash mid side-effect is surfaced, not
+//! silently re-fired.
 //!
-//! The decider's contract: write exactly one JSON object describing the move to
-//! `.decision.json` in the data dir, e.g.
-//! `{"action":"start_worker","id":"triage","prompt":"…","journal":"why"}`.
-//! `journal` (the one-line log entry looop appends) and `next_interval_s` (an
-//! optional cadence nudge, NOT a move) ride alongside the action tag and are
-//! lifted out before the action itself is decoded.
+//! Historically the decide phase was looop's OWN LLM call: the tick wrote one
+//! JSON action to `.decision.json` and looop executed it. The judgment now lives
+//! in the root agent (an external pi/claude session); looop no longer decides.
+//! What survives is the execution half — these typed, gated mutations — re-homed
+//! from "the thing the tick AI emitted" to "the verbs the root agent invokes".
 
 use crate::paths::Paths;
 use crate::session;
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::Write;
+use std::process::ExitCode;
 
-/// The one-shot file the decider writes its single move to (relative to the data
-/// dir). looop reads, executes, and deletes it each beat — a stale decision can
-/// never re-run (level-triggered).
-pub const DECISION_FILE: &str = ".decision.json";
-
-/// The single move the decider chose, tagged by `action`. Unknown sibling keys
-/// (journal, next_interval_s, reason, …) are ignored here — `Decision` lifts the
-/// metadata out before this is decoded.
-#[derive(Debug, Deserialize, PartialEq)]
-#[serde(tag = "action", rename_all = "snake_case")]
+/// One typed mutation of looop's world. Built by the `_ …` verb handlers below
+/// (no longer deserialized from an LLM decision) and run through [`run_action`].
+#[derive(Debug, PartialEq)]
 pub enum Action {
-    /// A valid move when nothing needs doing.
-    Noop {
-        #[serde(default)]
-        reason: String,
-    },
     /// The escape hatch: one ad-hoc, reversible shell command (gh query, draft,
     /// …). looop runs it (and can gate it) — arbitrary power, but ONE command,
     /// logged, not an open-ended agent session.
-    RunShell {
-        cmd: String,
-        #[serde(default)]
-        reason: String,
-    },
+    RunShell { cmd: String, reason: String },
     /// Create or update goals/<id>.md.
     WriteGoal { id: String, body: String },
     /// Move goals/<id>.md -> goals/archive/<id>.md.
@@ -55,58 +36,9 @@ pub enum Action {
     WritePlaybook { body: String },
     /// Spawn a worker session for hands-on work.
     StartWorker { id: String, prompt: String },
-    /// Type text into a live worker's stdin.
-    SteerSession { id: String, input: String },
-    /// Send named keys (Enter, C-c, …) to a live worker.
-    SendKey { id: String, keys: Vec<String> },
-    /// Restart a wedged worker's wrapped command.
-    RestartSession { id: String },
-    /// Surface a blocker / notice to the human. Journaled (and shown on the tick
-    /// line); if `notification` is wired in config, looop also fires that command
-    /// (e.g. pop a tmux window onto the flagged worker). `id` is the worker
-    /// session to attach when relaying a flag — it populates `{{id}}` / `$LOOOP_ID`
-    /// in the notification command. The human resolves the notice by editing the
-    /// world (a goal / the PLAYBOOK / creds) or attaching to the worker, which the
-    /// next tick observes — level-triggered, no reply channel.
-    SendNotification {
-        message: String,
-        #[serde(default)]
-        id: String,
-    },
-}
-
-/// One tick's decision: the action plus the metadata that rides alongside it.
-#[derive(Debug, PartialEq)]
-pub struct Decision {
-    pub action: Action,
-    /// The one journal line looop appends after executing (may be empty; the
-    /// executor falls back to a generated summary).
-    pub journal: String,
-    /// Optional one-shot cadence nudge (seconds); NOT a move. Handed to the
-    /// pulse loop in-process via `Decided.next_interval_s` (the loop clamps it).
-    pub next_interval_s: Option<u64>,
-}
-
-impl Decision {
-    /// Parse one decision object. `journal` / `next_interval_s` are lifted out;
-    /// the remainder is decoded into the tagged `Action`.
-    pub fn parse(json: &str) -> Result<Decision> {
-        let v: serde_json::Value =
-            serde_json::from_str(json.trim()).context("decision is not valid JSON")?;
-        let journal = v
-            .get("journal")
-            .and_then(|x| x.as_str())
-            .unwrap_or_default()
-            .to_string();
-        let next_interval_s = v.get("next_interval_s").and_then(|x| x.as_u64());
-        let action: Action =
-            serde_json::from_value(v).context("decision has no/unknown \"action\"")?;
-        Ok(Decision {
-            action,
-            journal,
-            next_interval_s,
-        })
-    }
+    /// Surface a blocker / notice to the human. Journaled; if `notification` is
+    /// wired in config, looop also fires that command (best-effort).
+    SendNotification { message: String, id: String },
 }
 
 /// Reject a file-name segment that could escape the data dir or hit a dotfile.
@@ -117,33 +49,16 @@ fn safe_segment(kind: &str, id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Normalize + guard a worker-session target: strip a legacy `looop-` prefix and
-/// refuse the reserved pulse id so a move can never hijack the control loop.
-fn worker_target(id: &str) -> Result<String> {
-    let s = id.strip_prefix("looop-").unwrap_or(id);
-    if s.is_empty() {
-        bail!("empty session id");
-    }
-    if s == session::PULSE_SESSION {
-        bail!("'{s}' is the pulse (the control loop), not a worker");
-    }
-    Ok(s.to_string())
-}
-
 /// A short, stable word naming the action's category — for the typed stdout
 /// line and the `action` field on the decided event.
 pub fn kind(action: &Action) -> &'static str {
     match action {
-        Action::Noop { .. } => "noop",
         Action::RunShell { .. } => "shell",
         Action::WriteGoal { .. } => "goal",
         Action::ArchiveGoal { .. } => "archive",
         Action::WriteSensor { .. } => "sensor",
         Action::WritePlaybook { .. } => "playbook",
         Action::StartWorker { .. } => "worker",
-        Action::SteerSession { .. } => "steer",
-        Action::SendKey { .. } => "key",
-        Action::RestartSession { .. } => "restart",
         Action::SendNotification { .. } => "notify",
     }
 }
@@ -158,9 +73,6 @@ fn goal_of(action: &Action) -> Option<String> {
         Action::WriteGoal { id, .. } => Some(id.clone()),
         Action::ArchiveGoal { id } => Some(id.clone()),
         Action::StartWorker { id, .. } => Some(id.clone()),
-        Action::SteerSession { id, .. }
-        | Action::SendKey { id, .. }
-        | Action::RestartSession { id } => worker_target(id).ok(),
         _ => None,
     }
 }
@@ -284,12 +196,6 @@ pub fn execute(paths: &Paths, action: &Action) -> Result<String> {
 
 fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
     match action {
-        Action::Noop { reason } => Ok(if reason.is_empty() {
-            "noop".into()
-        } else {
-            format!("noop · {reason}")
-        }),
-
         Action::RunShell { cmd, reason } => {
             // `bash -c` (NOT `-lc`): a non-interactive, non-login shell sources no
             // rc files, so the command runs against looop's inherited environment
@@ -360,24 +266,6 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
             Ok(format!("start-worker {id}"))
         }
 
-        Action::SteerSession { id, input } => {
-            let s = worker_target(id)?;
-            session::send(paths, &s, input.clone(), true, false)?;
-            Ok(format!("steer {s}"))
-        }
-
-        Action::SendKey { id, keys } => {
-            let s = worker_target(id)?;
-            session::key(paths, &s, keys.clone(), false)?;
-            Ok(format!("key {s} · {}", keys.join(" ")))
-        }
-
-        Action::RestartSession { id } => {
-            let s = worker_target(id)?;
-            session::restart(paths, &s, false)?;
-            Ok(format!("restart {s}"))
-        }
-
         Action::SendNotification { message, id } => {
             let msg = message.trim();
             if msg.is_empty() {
@@ -428,174 +316,202 @@ fn append_journal(paths: &Paths, line: &str) -> Result<()> {
     Ok(())
 }
 
-/// Consume the one-shot decision the decider left in `.decision.json` (if any):
-/// execute it, append the journal line, apply any cadence nudge, and remove the
-/// file so a stale decision can never re-run. Returns `None` when no decision
-/// was written this beat, else what was executed (or the parse/execution error
-/// — the file is removed regardless).
-pub fn consume_decision(paths: &Paths) -> Option<Result<Decided>> {
-    let path = paths.data_dir.join(DECISION_FILE);
-    let raw = fs::read_to_string(&path).ok()?; // None ⇒ decider wrote nothing
-    let _ = fs::remove_file(&path); // one-shot, win or lose
-
-    Some((|| {
-        let decision = Decision::parse(&raw)?;
-        // Write-ahead the intent for non-idempotent actions so a crash DURING the
-        // side effect (before the world hash is committed in tick) is detectable
-        // next beat instead of silently re-firing. clear_intent runs whether
-        // execute returns Ok or Err — both prove we survived the side effect.
-        let guarded = is_non_idempotent(&decision.action);
-        if guarded {
-            begin_intent(paths, &decision.action);
-        }
-        let exec_result = execute(paths, &decision.action);
-        if guarded {
-            clear_intent(paths);
-        }
-        let summary = exec_result?;
-        // Stamp per-goal activity so sys-goals can surface staleness (fairness:
-        // the decider sees which goals it's neglected and can avoid starving
-        // them) — only after a successful execute, so a failed move isn't counted.
-        if let Some(id) = goal_of(&decision.action) {
-            record_goal_activity(paths, &id);
-        }
-        let journal = if decision.journal.trim().is_empty() {
-            summary.clone()
-        } else {
-            decision.journal.clone()
-        };
-        append_journal(paths, &journal)?;
-        Ok(Decided {
-            kind: kind(&decision.action),
-            summary,
-            journal,
-            next_interval_s: decision.next_interval_s,
-        })
-    })())
+/// Run one typed action: write-ahead-log the intent for non-idempotent moves,
+/// execute, stamp per-goal activity, and append the journal line. `journal`
+/// overrides the auto-generated summary as the logged "why" when non-empty.
+/// Returns the executor's concise summary.
+pub fn run_action(paths: &Paths, action: &Action, journal: Option<&str>) -> Result<String> {
+    // Write-ahead the intent for non-idempotent actions so a crash DURING the
+    // side effect is detectable next beat instead of silently re-firing.
+    // clear_intent runs whether execute returns Ok or Err.
+    let guarded = is_non_idempotent(action);
+    if guarded {
+        begin_intent(paths, action);
+    }
+    let exec_result = execute(paths, action);
+    if guarded {
+        clear_intent(paths);
+    }
+    let summary = exec_result?;
+    if let Some(id) = goal_of(action) {
+        record_goal_activity(paths, &id);
+    }
+    let line = match journal {
+        Some(j) if !j.trim().is_empty() => j.trim().to_string(),
+        _ => summary.clone(),
+    };
+    append_journal(paths, &line)?;
+    Ok(summary)
 }
 
-/// What looop executed this beat: the action category, the executor's concise
-/// summary, and the journal line that was appended (the "why"). The caller
-/// renders the single typed stdout line from this.
-#[derive(Debug, PartialEq)]
-pub struct Decided {
-    pub kind: &'static str,
-    pub summary: String,
-    pub journal: String,
-    /// The decider's one-shot cadence nudge (seconds), passed straight back to
-    /// the pulse loop in-process — no `.next-interval` file round-trip.
-    pub next_interval_s: Option<u64>,
+/// Resolve an action body from positional args, falling back to stdin when none
+/// are given (so the root agent can heredoc a multi-line goal/PLAYBOOK body).
+fn body_or_stdin(rest: &[String]) -> Result<String> {
+    if !rest.is_empty() {
+        return Ok(rest.join(" "));
+    }
+    use std::io::Read;
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .context("reading body from stdin")?;
+    Ok(buf)
+}
+
+/// Strip `--journal <text>` from args, returning (journal, remaining args).
+fn take_journal(args: &[String]) -> (Option<String>, Vec<String>) {
+    let mut journal = None;
+    let mut rest = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if a == "--journal" {
+            journal = it.next().cloned();
+        } else {
+            rest.push(a.clone());
+        }
+    }
+    (journal, rest)
+}
+
+fn ok(summary: String) -> Result<ExitCode> {
+    println!("{summary}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `looop _ goal write <id> [body…|stdin]` | `looop _ goal archive <id>`
+pub fn cmd_goal(paths: &Paths, args: &[String]) -> Result<ExitCode> {
+    let (journal, rest) = take_journal(args);
+    match rest.first().map(String::as_str) {
+        Some("write") => {
+            let Some(id) = rest.get(1).cloned() else {
+                eprintln!("usage: looop _ goal write <id> [body…|stdin]");
+                return Ok(ExitCode::from(1));
+            };
+            let body = body_or_stdin(&rest[2.min(rest.len())..])?;
+            ok(run_action(
+                paths,
+                &Action::WriteGoal { id, body },
+                journal.as_deref(),
+            )?)
+        }
+        Some("archive") => {
+            let Some(id) = rest.get(1).cloned() else {
+                eprintln!("usage: looop _ goal archive <id>");
+                return Ok(ExitCode::from(1));
+            };
+            ok(run_action(
+                paths,
+                &Action::ArchiveGoal { id },
+                journal.as_deref(),
+            )?)
+        }
+        _ => {
+            eprintln!("usage: looop _ goal write <id> [body…] | looop _ goal archive <id>");
+            Ok(ExitCode::from(1))
+        }
+    }
+}
+
+/// `looop _ sensor write <name> [script…|stdin]`
+pub fn cmd_sensor(paths: &Paths, args: &[String]) -> Result<ExitCode> {
+    let (journal, rest) = take_journal(args);
+    if rest.first().map(String::as_str) != Some("write") {
+        eprintln!("usage: looop _ sensor write <name> [script…|stdin]");
+        return Ok(ExitCode::from(1));
+    }
+    let Some(name) = rest.get(1).cloned() else {
+        eprintln!("usage: looop _ sensor write <name> [script…|stdin]");
+        return Ok(ExitCode::from(1));
+    };
+    let script = body_or_stdin(&rest[2.min(rest.len())..])?;
+    ok(run_action(
+        paths,
+        &Action::WriteSensor { name, script },
+        journal.as_deref(),
+    )?)
+}
+
+/// `looop _ playbook write [body…|stdin]`
+pub fn cmd_playbook(paths: &Paths, args: &[String]) -> Result<ExitCode> {
+    let (journal, rest) = take_journal(args);
+    if rest.first().map(String::as_str) != Some("write") {
+        eprintln!("usage: looop _ playbook write [body…|stdin]");
+        return Ok(ExitCode::from(1));
+    }
+    let body = body_or_stdin(&rest[1.min(rest.len())..])?;
+    ok(run_action(
+        paths,
+        &Action::WritePlaybook { body },
+        journal.as_deref(),
+    )?)
+}
+
+/// `looop _ run <cmd…> [--reason TEXT]` — one ad-hoc, REVERSIBLE shell command.
+pub fn cmd_run(paths: &Paths, args: &[String]) -> Result<ExitCode> {
+    let (journal, mut rest) = take_journal(args);
+    let mut reason = String::new();
+    if let Some(i) = rest.iter().position(|a| a == "--reason") {
+        rest.remove(i);
+        if i < rest.len() {
+            reason = rest.remove(i);
+        }
+    }
+    let cmd = rest.join(" ");
+    if cmd.trim().is_empty() {
+        eprintln!("usage: looop _ run <cmd…> [--reason TEXT]");
+        return Ok(ExitCode::from(1));
+    }
+    ok(run_action(
+        paths,
+        &Action::RunShell { cmd, reason },
+        journal.as_deref(),
+    )?)
+}
+
+/// `looop _ worker start <id> <prompt…>` — spawn a worker session (journaled).
+pub fn cmd_worker_start(paths: &Paths, args: &[String]) -> Result<ExitCode> {
+    let (journal, rest) = take_journal(args);
+    let Some(id) = rest.first().cloned() else {
+        eprintln!("usage: looop _ worker start <id> <prompt…>");
+        return Ok(ExitCode::from(1));
+    };
+    let prompt = body_or_stdin(&rest[1.min(rest.len())..])?;
+    if prompt.trim().is_empty() {
+        eprintln!("usage: looop _ worker start <id> <prompt…>");
+        return Ok(ExitCode::from(1));
+    }
+    ok(run_action(
+        paths,
+        &Action::StartWorker { id, prompt },
+        journal.as_deref(),
+    )?)
+}
+
+/// `looop _ notify <message…> [--id WORKER]` — surface a notice to the human.
+pub fn cmd_notify(paths: &Paths, args: &[String]) -> Result<ExitCode> {
+    let (journal, mut rest) = take_journal(args);
+    let mut id = String::new();
+    if let Some(i) = rest.iter().position(|a| a == "--id") {
+        rest.remove(i);
+        if i < rest.len() {
+            id = rest.remove(i);
+        }
+    }
+    let message = rest.join(" ");
+    if message.trim().is_empty() {
+        eprintln!("usage: looop _ notify <message…> [--id WORKER]");
+        return Ok(ExitCode::from(1));
+    }
+    ok(run_action(
+        paths,
+        &Action::SendNotification { message, id },
+        journal.as_deref(),
+    )?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parses_noop_with_journal() {
-        let d = Decision::parse(r#"{"action":"noop","reason":"quiet","journal":"nothing to do"}"#)
-            .unwrap();
-        assert_eq!(
-            d.action,
-            Action::Noop {
-                reason: "quiet".into()
-            }
-        );
-        assert_eq!(d.journal, "nothing to do");
-        assert_eq!(d.next_interval_s, None);
-    }
-
-    #[test]
-    fn parses_start_worker_and_lifts_metadata() {
-        let d = Decision::parse(
-            r#"{"action":"start_worker","id":"triage","prompt":"do it","journal":"started triage","next_interval_s":15}"#,
-        )
-        .unwrap();
-        assert_eq!(
-            d.action,
-            Action::StartWorker {
-                id: "triage".into(),
-                prompt: "do it".into()
-            }
-        );
-        assert_eq!(d.journal, "started triage");
-        assert_eq!(d.next_interval_s, Some(15));
-    }
-
-    #[test]
-    fn parses_run_shell_escape_hatch() {
-        let d = Decision::parse(r#"{"action":"run_shell","cmd":"gh pr list","reason":"check"}"#)
-            .unwrap();
-        assert_eq!(
-            d.action,
-            Action::RunShell {
-                cmd: "gh pr list".into(),
-                reason: "check".into()
-            }
-        );
-    }
-
-    #[test]
-    fn parses_all_remaining_variants() {
-        for (json, want) in [
-            (
-                r#"{"action":"write_goal","id":"g","body":"b"}"#,
-                Action::WriteGoal {
-                    id: "g".into(),
-                    body: "b".into(),
-                },
-            ),
-            (
-                r#"{"action":"archive_goal","id":"g"}"#,
-                Action::ArchiveGoal { id: "g".into() },
-            ),
-            (
-                r#"{"action":"write_sensor","name":"n","script":"s"}"#,
-                Action::WriteSensor {
-                    name: "n".into(),
-                    script: "s".into(),
-                },
-            ),
-            (
-                r#"{"action":"write_playbook","body":"pb"}"#,
-                Action::WritePlaybook { body: "pb".into() },
-            ),
-            (
-                r#"{"action":"steer_session","id":"w","input":"y"}"#,
-                Action::SteerSession {
-                    id: "w".into(),
-                    input: "y".into(),
-                },
-            ),
-            (
-                r#"{"action":"send_key","id":"w","keys":["Enter"]}"#,
-                Action::SendKey {
-                    id: "w".into(),
-                    keys: vec!["Enter".into()],
-                },
-            ),
-            (
-                r#"{"action":"restart_session","id":"w"}"#,
-                Action::RestartSession { id: "w".into() },
-            ),
-            (
-                r#"{"action":"send_notification","message":"creds expired"}"#,
-                Action::SendNotification {
-                    message: "creds expired".into(),
-                    id: String::new(),
-                },
-            ),
-        ] {
-            assert_eq!(Decision::parse(json).unwrap().action, want, "json: {json}");
-        }
-    }
-
-    #[test]
-    fn rejects_garbage_and_unknown_actions() {
-        assert!(Decision::parse("not json").is_err());
-        assert!(Decision::parse(r#"{"action":"frobnicate"}"#).is_err());
-        assert!(Decision::parse(r#"{"reason":"no action tag"}"#).is_err());
-    }
 
     #[test]
     fn safe_segment_blocks_traversal() {
@@ -606,67 +522,59 @@ mod tests {
     }
 
     #[test]
-    fn worker_target_refuses_pulse_and_strips_prefix() {
-        assert_eq!(worker_target("triage").unwrap(), "triage");
-        assert_eq!(worker_target("looop-triage").unwrap(), "triage");
-        assert!(worker_target("pulse").is_err());
-        assert!(worker_target("").is_err());
-    }
-
-    #[test]
-    fn execute_write_and_archive_goal_round_trip() {
+    fn run_action_write_and_archive_goal_round_trip() {
         let p = Paths::temp();
         let body = "goal: ship it\nnotes here";
-        execute(
+        run_action(
             &p,
             &Action::WriteGoal {
                 id: "ship".into(),
                 body: body.into(),
             },
+            None,
         )
         .unwrap();
         let written = fs::read_to_string(p.goals_dir().join("ship.md")).unwrap();
         assert_eq!(written, format!("{body}\n"), "trailing newline normalized");
 
-        execute(&p, &Action::ArchiveGoal { id: "ship".into() }).unwrap();
+        run_action(&p, &Action::ArchiveGoal { id: "ship".into() }, None).unwrap();
         assert!(!p.goals_dir().join("ship.md").exists());
         assert!(p.goals_dir().join("archive").join("ship.md").exists());
     }
 
     #[test]
-    fn consume_decision_executes_journals_and_clears_file() {
+    fn run_action_journals_and_stamps_goal_activity() {
         let p = Paths::temp();
-        let path = p.data_dir.join(DECISION_FILE);
-        fs::write(
-            &path,
-            r#"{"action":"noop","reason":"all quiet","journal":"did nothing","next_interval_s":30}"#,
+        run_action(
+            &p,
+            &Action::WriteGoal {
+                id: "triage".into(),
+                body: "do it".into(),
+            },
+            Some("made triage"),
         )
         .unwrap();
-
-        let d = consume_decision(&p)
-            .expect("a decision was present")
-            .unwrap();
-        assert_eq!(d.kind, "noop");
-        assert_eq!(d.summary, "noop · all quiet");
-        assert_eq!(d.journal, "did nothing");
-        // The cadence nudge rides back on the Decided struct, not a file.
-        assert_eq!(d.next_interval_s, Some(30));
-        assert!(!path.exists(), "decision file is one-shot");
-
         let journal = fs::read_to_string(p.journal()).unwrap();
-        assert!(journal.contains("did nothing"), "journal line appended");
+        assert!(journal.contains("made triage"), "journal line appended");
         assert!(journal.starts_with("- "), "canonical journal prefix");
+        let act: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(p.goal_activity()).unwrap()).unwrap();
+        assert!(
+            act.get("triage").and_then(|v| v.as_u64()).is_some(),
+            "acting on a goal stamps its activity time"
+        );
     }
 
     #[test]
-    fn send_notification_journals_without_state_file() {
+    fn notify_journals_and_rejects_empty() {
         let p = Paths::temp();
-        let summary = execute(
+        let summary = run_action(
             &p,
             &Action::SendNotification {
                 message: "goals A and B conflict".into(),
                 id: String::new(),
             },
+            None,
         )
         .unwrap();
         assert_eq!(summary, "notify · goals A and B conflict");
@@ -683,12 +591,6 @@ mod tests {
     }
 
     #[test]
-    fn consume_decision_absent_is_none() {
-        let p = Paths::temp();
-        assert!(consume_decision(&p).is_none());
-    }
-
-    #[test]
     fn only_run_shell_and_notification_are_guarded() {
         assert!(is_non_idempotent(&Action::RunShell {
             cmd: "gh pr comment".into(),
@@ -697,10 +599,6 @@ mod tests {
         assert!(is_non_idempotent(&Action::SendNotification {
             message: "x".into(),
             id: String::new()
-        }));
-        // Idempotent overwrites / self-guarded / harmless-resend actions are not.
-        assert!(!is_non_idempotent(&Action::Noop {
-            reason: String::new()
         }));
         assert!(!is_non_idempotent(&Action::WriteGoal {
             id: "g".into(),
@@ -713,27 +611,27 @@ mod tests {
     }
 
     #[test]
-    fn consume_decision_clears_wal_around_a_guarded_action() {
+    fn run_action_clears_wal_around_a_guarded_action() {
         let p = Paths::temp();
-        fs::write(
-            p.data_dir.join(DECISION_FILE),
-            r#"{"action":"send_notification","message":"creds expired","journal":"told human"}"#,
+        run_action(
+            &p,
+            &Action::SendNotification {
+                message: "creds expired".into(),
+                id: String::new(),
+            },
+            Some("told human"),
         )
         .unwrap();
-        consume_decision(&p).expect("decision present").unwrap();
-        // A successful (non-crashing) beat leaves NO intent behind.
         assert!(
             !p.action_wal().exists(),
             "the write-ahead intent is cleared once execute returns"
         );
-        // And nothing to recover next beat.
         assert!(!warn_if_interrupted(&p), "no interrupted action to report");
     }
 
     #[test]
     fn warn_if_interrupted_detects_and_clears_a_stale_intent() {
         let p = Paths::temp();
-        // Simulate a crash mid side-effect: an intent record left behind.
         begin_intent(
             &p,
             &Action::RunShell {
@@ -746,11 +644,7 @@ mod tests {
             warn_if_interrupted(&p),
             "a leftover intent is reported as an interrupted beat"
         );
-        assert!(
-            !p.action_wal().exists(),
-            "the report is one-shot — the stale intent is cleared"
-        );
-        // Idempotent: a second pass finds nothing.
+        assert!(!p.action_wal().exists(), "the report is one-shot");
         assert!(!warn_if_interrupted(&p));
     }
 
@@ -768,7 +662,6 @@ mod tests {
             cmd: "echo b".into(),
             reason: "r1".into(),
         };
-        // Same cmd => same fingerprint (reason is not part of the effect).
         assert_eq!(action_fingerprint(&a), action_fingerprint(&a2));
         assert_ne!(action_fingerprint(&a), action_fingerprint(&b));
     }
@@ -789,39 +682,12 @@ mod tests {
             }),
             Some("ship".into())
         );
-        // A `looop-`-prefixed steer target normalizes to the bare goal id.
-        assert_eq!(
-            goal_of(&Action::SteerSession {
-                id: "looop-triage".into(),
-                input: "y".into()
-            }),
-            Some("triage".into())
-        );
-        // Non-goal actions contribute no activity.
-        assert_eq!(goal_of(&Action::Noop { reason: "".into() }), None);
         assert_eq!(
             goal_of(&Action::SendNotification {
                 message: "x".into(),
                 id: String::new(),
             }),
             None
-        );
-    }
-
-    #[test]
-    fn consume_decision_stamps_goal_activity() {
-        let p = Paths::temp();
-        fs::write(
-            p.data_dir.join(DECISION_FILE),
-            r#"{"action":"write_goal","id":"triage","body":"do it","journal":"made triage"}"#,
-        )
-        .unwrap();
-        consume_decision(&p).expect("decision present").unwrap();
-        let act: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(p.goal_activity()).unwrap()).unwrap();
-        assert!(
-            act.get("triage").and_then(|v| v.as_u64()).is_some(),
-            "acting on a goal stamps its activity time"
         );
     }
 }
