@@ -12,8 +12,12 @@
 //!   └─────────────────────────────────────────────────┘
 //!
 //! Read-only: it tails files and lists sessions, never sends input. The pulse
-//! and workers are PTY-backed, so their `output.log` carries ANSI color we
-//! render as-is. Selecting a row in the bottom pane re-points the log pane.
+//! and workers are PTY-backed, so their `output.log` is a RAW PTY transcript —
+//! an interactive agent (pi/claude) redraws in place (cursor moves, line/screen
+//! clears, carriage returns), so the raw bytes are NOT a clean line log. We
+//! replay the tail through a `vt100` virtual terminal and render the resulting
+//! SCREEN (with scrollback), instead of dumping every redraw frame as new
+//! lines. Selecting a row in the bottom pane re-points the log pane.
 
 use crate::paths::Paths;
 use crate::session::{self, Session};
@@ -23,19 +27,38 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
+use babysit::cli::ShotFormat;
+use babysit::render;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
     MouseEventKind,
 };
 use ratatui::crossterm::execute;
+use ratatui::layout::Margin;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
+};
 
 /// How often we re-list sessions and re-read the tailed log.
 const TICK: Duration = Duration::from_millis(250);
 /// Tail at most this many bytes of output.log — bounds work on huge logs while
 /// keeping enough scrollback to fill the pane.
 const TAIL_BYTES: u64 = 256 * 1024;
+
+/// Column width of the virtual terminal we replay the log through. looop spawns
+/// every detached worker with `size = None` (see `session::spawn_detached`),
+/// so babysit allocates its default 80×24 PTY — the recorded stream is an
+/// 80-column stream, and we must replay it at that width or the wrapping/cursor
+/// math drifts. The row count is taken from the live pane height at draw time.
+const PTY_COLS: u16 = 80;
+
+/// How many rows of scrollback the virtual terminal retains. The agents don't
+/// use the alternate screen (they redraw in place on the primary screen), so
+/// content that scrolls off the top lands here and stays reachable via
+/// PageUp/wheel/Home. Bounded so a long-running session can't grow unbounded.
+const SCROLLBACK_ROWS: usize = 10_000;
 
 /// Default recency window: hide dead sessions idle longer than this. Alive
 /// sessions and the pulse are always shown regardless. Override with `--since`,
@@ -189,13 +212,12 @@ impl App {
             }
 
             // Read the tailed log fresh each frame: cheap (bounded bytes) and
-            // always current.
-            let text = self
-                .selected_id()
-                .map(|id| read_log_tail(paths, id))
-                .unwrap_or_default();
+            // always current. `None` = no log file yet; `Some(empty)` = file
+            // exists but no output. The vt100 replay happens in `draw_log`,
+            // where the pane height (the screen's row count) is known.
+            let raw = self.selected_id().and_then(|id| read_log_tail(paths, id));
 
-            terminal.draw(|f| self.draw(f, &text))?;
+            terminal.draw(|f| self.draw(f, raw.as_deref()))?;
 
             if event::poll(TICK)? {
                 match event::read()? {
@@ -244,44 +266,93 @@ impl App {
         Ok(())
     }
 
-    fn draw(&mut self, frame: &mut Frame, log: &Text<'_>) {
+    fn draw(&mut self, frame: &mut Frame, raw: Option<&[u8]>) {
         // Selector grows with the fleet but is capped so the log keeps the room.
         let rows = self.sessions.len().clamp(1, 8) as u16;
         let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(rows + 2)])
             .split(frame.area());
 
-        self.draw_log(frame, chunks[0], log);
+        self.draw_log(frame, chunks[0], raw);
         self.draw_selector(frame, chunks[1]);
     }
 
-    fn draw_log(&mut self, frame: &mut Frame, area: Rect, log: &Text<'_>) {
+    fn draw_log(&mut self, frame: &mut Frame, area: Rect, raw: Option<&[u8]>) {
         let follow = self.scroll_back == 0;
-        let id = self.selected_id().unwrap_or("—");
+        let id = self.selected_id().unwrap_or("—").to_string();
         let title = if follow {
             format!(" {id} — live ")
         } else {
             format!(" {id} — scrolled (End=live) ")
         };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .title_style(Style::default().add_modifier(Modifier::BOLD));
 
-        // Show the slice of lines that fits, anchored to the bottom (the tail)
-        // unless the user has scrolled back. Slicing ourselves keeps the math
-        // simple and avoids wrap/scroll interactions.
-        let inner_h = area.height.saturating_sub(2) as usize; // minus borders
-        let total = log.lines.len();
-        let max_back = total.saturating_sub(inner_h);
+        // Empty / missing log: a dim hint, and we can't be scrolled.
+        let bytes = match raw {
+            Some(b) if !b.is_empty() => b,
+            other => {
+                self.scroll_back = 0;
+                let hint = if other.is_none() {
+                    format!("(no log for '{id}')")
+                } else {
+                    "(no output yet)".to_string()
+                };
+                let para = Paragraph::new(Span::styled(hint, Style::default().fg(Color::DarkGray)))
+                    .block(block);
+                frame.render_widget(para, area);
+                return;
+            }
+        };
+
+        // Replay the raw PTY tail through a virtual terminal sized to the pane
+        // (rows) at the recorded width (cols), so an interactive agent's
+        // in-place redraws collapse into the actual on-screen grid instead of a
+        // garbled append of every frame. The parser keeps scrollback, so the
+        // history that scrolled off the top stays reachable.
+        let rows = area.height.saturating_sub(2).max(1); // minus borders
+        let mut parser = vt100::Parser::new(rows, PTY_COLS, SCROLLBACK_ROWS);
+        parser.process(bytes);
+
+        // Probe the real scrollback depth (clamped), then position the viewport:
+        // scroll_back rows back from the live tail (0 = follow).
+        parser.screen_mut().set_scrollback(usize::MAX);
+        let max_back = parser.screen().scrollback();
         let back = self.scroll_back.min(max_back);
         self.scroll_back = back; // clamp Home's usize::MAX to the real maximum
-        let end = total - back;
-        let start = end.saturating_sub(inner_h);
-        let visible: Vec<Line> = log.lines[start..end].to_vec();
+        parser.screen_mut().set_scrollback(back);
 
-        let para = Paragraph::new(visible).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .title_style(Style::default().add_modifier(Modifier::BOLD)),
-        );
+        // Reuse babysit's renderer: it turns the vt100 grid into per-row ANSI
+        // (SGR only, no cursor motion) which ansi-to-tui parses into styled
+        // lines cleanly. `trim=false` keeps a stable full-height viewport.
+        let shot = render::render_screen(parser.screen(), ShotFormat::Ansi, false);
+        let screen = shot
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let text = screen
+            .into_text()
+            .unwrap_or_else(|_| Text::from(screen.to_string()));
+
+        let para = Paragraph::new(text).block(block);
         frame.render_widget(para, area);
+
+        // Scrollbar on the right border, reflecting position in the scrollback.
+        if max_back > 0 {
+            let mut state = ScrollbarState::new(max_back).position(max_back - back);
+            let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("↑"))
+                .end_symbol(Some("↓"));
+            frame.render_stateful_widget(
+                bar,
+                area.inner(Margin {
+                    vertical: 1,
+                    horizontal: 0,
+                }),
+                &mut state,
+            );
+        }
     }
 
     fn draw_selector(&mut self, frame: &mut Frame, area: Rect) {
@@ -309,7 +380,12 @@ impl App {
                     .title(title)
                     .title_style(Style::default().add_modifier(Modifier::BOLD)),
             )
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+            // Uniform white background on the selected row. REVERSED would
+            // flip each span's fg into its bg (green dot → green block, gray
+            // detail → gray block), which reads as a messy multicolored bar;
+            // forcing bg=white + fg=black patches over the per-span colors for
+            // one clean highlight.
+            .highlight_style(Style::default().bg(Color::White).fg(Color::Black))
             .highlight_symbol("> ");
         frame.render_stateful_widget(list, area, &mut self.list_state);
     }
@@ -357,32 +433,14 @@ fn session_row(s: &Session) -> ListItem<'static> {
     ]))
 }
 
-/// Read the tail of a session's `output.log` and parse its ANSI into styled
-/// ratatui text. Bounded to [`TAIL_BYTES`]; a missing/empty log yields a hint.
-fn read_log_tail(paths: &Paths, id: &str) -> Text<'static> {
+/// Read the tail of a session's raw PTY `output.log`, bounded to [`TAIL_BYTES`].
+/// `None` = no log file (yet); `Some(bytes)` otherwise (possibly empty). The
+/// bytes are NOT cleaned here — `draw_log` replays them through a vt100 virtual
+/// terminal, which is what correctly resolves the cursor moves / line clears an
+/// interactive agent emits.
+fn read_log_tail(paths: &Paths, id: &str) -> Option<Vec<u8>> {
     let path = paths.sessions().output_log_path(id);
-    let bytes = match read_tail_bytes(&path, TAIL_BYTES) {
-        Ok(b) if !b.is_empty() => b,
-        Ok(_) => {
-            return Text::from(Span::styled(
-                "(no output yet)",
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        Err(_) => {
-            return Text::from(Span::styled(
-                format!("(no log for '{id}')"),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-    };
-    // PTY logs use CRLF; drop the CR so lines don't render with stray carriage
-    // returns. ansi-to-tui turns SGR escapes into styled spans (and skips the
-    // cursor-movement escapes an interactive agent emits).
-    let cleaned = String::from_utf8_lossy(&bytes).replace('\r', "");
-    cleaned
-        .into_text()
-        .unwrap_or_else(|_| Text::from(cleaned.clone()))
+    read_tail_bytes(&path, TAIL_BYTES).ok()
 }
 
 /// Read at most `max` bytes from the end of `path`. The first line may be

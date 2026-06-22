@@ -76,7 +76,7 @@ fn main() -> ExitCode {
         // logs + lists sessions, never launches an agent.
         "watch" => watch::cmd_watch(&paths, rest),
         // Machine-facing verbs, grouped under `_`. Two audiences: STEER verbs
-        // (state/wait/answer/goal/sensor/playbook/notify) the human or a concierge
+        // (state/wait/answer/goal/sensor/playbook) the human or a concierge
         // uses to inspect + steer + answer asks, and the WORKER self-callbacks
         // (ask/kill/claim/unclaim/cost). `_ pulse` is looop's own detached spawn.
         "_" => {
@@ -104,8 +104,6 @@ fn main() -> ExitCode {
                 Some("run") => {
                     deps::require_deps(&paths).and_then(|_| executor::cmd_run(&paths, &rest[1..]))
                 }
-                Some("notify") => deps::require_deps(&paths)
-                    .and_then(|_| executor::cmd_notify(&paths, &rest[1..])),
                 Some("worker") => match rest.get(1).map(String::as_str) {
                     Some("start") => deps::require_deps(&paths)
                         .and_then(|_| executor::cmd_worker_start(&paths, &rest[2..])),
@@ -132,7 +130,7 @@ fn main() -> ExitCode {
                 Some("cost") => cost::cmd_cost_record(&paths, &rest[1..]),
                 other => {
                     eprintln!(
-                        "looop _: unknown internal verb {other:?} (root: state, wait, answer, goal, sensor, playbook, run, notify, worker; worker: ask, kill, claim, unclaim, cost; pulse)"
+                        "looop _: unknown internal verb {other:?} (root: state, wait, answer, goal, sensor, playbook, run, worker; worker: ask, kill, claim, unclaim, cost; pulse)"
                     );
                     Ok(ExitCode::from(1))
                 }
@@ -220,6 +218,7 @@ mod tests {
         let s = include_str!("completions/looop.zsh");
         assert!(s.contains("#compdef looop"), "missing #compdef tag");
         assert!(s.contains("compdef _looop looop"), "missing compdef call");
+        assert!(s.contains("'watch:"), "watch missing from zsh command list");
     }
 
     /// `looop config bash` must emit a script that registers the completion via
@@ -230,6 +229,10 @@ mod tests {
         assert!(
             s.contains("complete -F _looop looop"),
             "missing complete -F registration"
+        );
+        assert!(
+            s.contains("up down watch"),
+            "watch missing from bash subcommand list"
         );
     }
 }

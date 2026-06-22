@@ -3,8 +3,10 @@ goal: PLAYBOOK and goals reflect my real work (not the starter template)
 ---
 This loop is fresh: the PLAYBOOK + goals are still the generic starter and reflect
 no real work yet. You (looop) run HEADLESS — you can't interview anyone — so do NOT
-try to chat. The move for this goal is to `send_notification` ONCE that invites the
-human to configure you, then `noop` until real goals appear. Suggested notice:
+try to chat. The move for this goal is a `noop` ONCE whose journal line invites the
+human to configure you (the concierge — the pi/claude session the human runs to
+watch looop — reads the journal/state and relays it), then `noop` quietly until
+real goals appear. Suggested journal line:
 
   "looop is unconfigured. To set me up, run a concierge: `pi`, then say —
    'be my looop concierge: interview me about what to watch and push day to day,

@@ -19,7 +19,8 @@ fn shell_quote(s: &str) -> String {
 
 const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
 - Never send notifications (no terminal-notifier or any OS notification). You are
-  an agent; only looop notifies.
+  an agent; surface anything a human must see by ASKing (below) — the concierge
+  relays it.
 - When you need a human decision / info / approval, do NOT guess — ASK and WAIT.
   This ONE command writes your question to the mailbox and BLOCKS until the root
   agent (or human) answers, printing the answer to stdout:
