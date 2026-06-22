@@ -22,8 +22,8 @@ Usage:
                                 observer TUI: live colored log + session selector
                                 (read-only; <id> preselects, e.g. `looop watch pulse`)
                                 hides dead sessions idle > 1d; --since 12h/30m to
-                                widen, --all to show every session, `a` toggles live,
-                                `m` toggles mouse capture (off = select/copy text)
+                                widen, --all to show every session, `a` toggles live;
+                                scroll up reaches the first line; shift+drag to copy
   looop cost                     report LLM spend by day (per-beat + workers)
   looop config zsh|bash          print shell integration (completions)
   looop version | help           print version / show this help

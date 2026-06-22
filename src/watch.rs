@@ -15,9 +15,13 @@
 //! and workers are PTY-backed, so their `output.log` is a RAW PTY transcript —
 //! an interactive agent (pi/claude) redraws in place (cursor moves, line/screen
 //! clears, carriage returns), so the raw bytes are NOT a clean line log. We
-//! replay the tail through a `vt100` virtual terminal and render the resulting
-//! SCREEN (with scrollback), instead of dumping every redraw frame as new
-//! lines. Selecting a row in the bottom pane re-points the log pane.
+//! replay the WHOLE log through a `vt100` virtual terminal and render the
+//! resulting SCREEN plus its scrollback, instead of dumping every redraw frame
+//! as new lines — so scrolling up reaches the session's first line, not just a
+//! recent tail. Selecting a row in the bottom pane re-points the log pane.
+//!
+//! Mouse capture stays on (wheel scrolls, the scrollbar scrubs); hold Shift
+//! while dragging to use the terminal's own text selection / copy.
 
 use crate::paths::Paths;
 use crate::session::{self, Session};
@@ -42,9 +46,15 @@ use ratatui::widgets::{
 
 /// How often we re-list sessions and re-read the tailed log.
 const TICK: Duration = Duration::from_millis(250);
-/// Tail at most this many bytes of output.log — bounds work on huge logs while
-/// keeping enough scrollback to fill the pane.
-const TAIL_BYTES: u64 = 256 * 1024;
+/// Cap on the INITIAL replay read. We feed the WHOLE `output.log` so scrollback
+/// reaches the session's first line (the worker streams its transcript with
+/// newlines — only the status block repaints in place — so the full history is
+/// recoverable). This cap only bounds latency on pathological logs: at/below it
+/// we read from byte 0 (first line reachable); above it we fall back to the last
+/// `MAX_REPLAY_BYTES` (live tail preserved, oldest lines dropped). 16 MiB covers
+/// every observed session and parses in well under ~1.5s; from there we only
+/// ever feed the freshly-appended tail.
+const MAX_REPLAY_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Recorded PTY geometry of every detached worker. looop spawns with
 /// `size = None` (see `session::spawn_detached`), so babysit allocates its
@@ -62,8 +72,11 @@ const PTY_COLS: u16 = render::DEFAULT_SCREENSHOT_SIZE.1;
 /// How many rows of scrollback the virtual terminal retains. The agents don't
 /// use the alternate screen (they redraw in place on the primary screen), so
 /// content that scrolls off the top lands here and stays reachable via
-/// PageUp/wheel/Home. Bounded so a long-running session can't grow unbounded.
-const SCROLLBACK_ROWS: usize = 10_000;
+/// PageUp/wheel/Home. vt100 grows scrollback lazily (only rows that actually
+/// scrolled off cost memory), so this is just an upper bound; a long worker
+/// session can scroll well past 10k rows (a ~10 MiB log produced ~14k), so keep
+/// generous headroom to avoid silently dropping the oldest lines.
+const SCROLLBACK_ROWS: usize = 100_000;
 
 /// Default recency window: hide dead sessions idle longer than this. Alive
 /// sessions and the pulse are always shown regardless. Override with `--since`,
@@ -153,9 +166,6 @@ struct App {
     /// Persistent vt100 replay of the selected session's log (fed incrementally
     /// across frames). `None` until a session with a log file is selected.
     log: Option<LogReplay>,
-    /// Whether we're capturing the mouse. ON (default) routes wheel/scrollbar to
-    /// us; toggled OFF with `m` so the terminal's own drag-to-select works.
-    mouse_capture: bool,
 }
 
 /// Persistent vt100 replay of one session's `output.log`. We keep the parser
@@ -207,7 +217,6 @@ impl App {
             hidden,
             scrollbar: None,
             log: None,
-            mouse_capture: true,
         }
     }
 
@@ -297,17 +306,20 @@ impl App {
         };
 
         if reset {
-            // Initial load is bounded to the last TAIL_BYTES so opening a
-            // session with a huge log stays cheap; from here we only feed the
-            // freshly-appended tail.
+            // Replay the WHOLE file so scrollback reaches the first line; only a
+            // pathologically huge log falls back to the last MAX_REPLAY_BYTES
+            // (live tail kept, oldest lines dropped). From here we only ever feed
+            // the freshly-appended tail.
             let mut parser = vt100::Parser::new(PTY_ROWS, PTY_COLS, SCROLLBACK_ROWS);
+            // `0` for any log within the cap (first line reachable); only an
+            // over-cap log starts mid-stream at the last MAX_REPLAY_BYTES.
+            let start = len.saturating_sub(MAX_REPLAY_BYTES);
             if len > 0
-                && let Ok(b) = read_tail_bytes(&path, TAIL_BYTES)
+                && let Ok(b) = read_from(&path, start)
             {
                 parser.process(&b);
             }
             let prev_scrollback = scrollback_len(&mut parser);
-            let start = len.saturating_sub(TAIL_BYTES);
             self.log = Some(LogReplay {
                 id,
                 parser,
@@ -375,16 +387,6 @@ impl App {
                                     None => Some(self.configured),
                                 };
                                 self.refresh(paths);
-                            }
-                            KeyCode::Char('m') => {
-                                // Toggle mouse capture: OFF hands drags back to
-                                // the terminal so text selection works again.
-                                self.mouse_capture = !self.mouse_capture;
-                                let _ = if self.mouse_capture {
-                                    execute!(std::io::stdout(), EnableMouseCapture)
-                                } else {
-                                    execute!(std::io::stdout(), DisableMouseCapture)
-                                };
                             }
                             KeyCode::PageUp => {
                                 self.scroll_back = self.scroll_back.saturating_add(10)
@@ -566,12 +568,7 @@ impl App {
         } else {
             "a recent"
         };
-        let mouse = if self.mouse_capture {
-            "m mouse:on"
-        } else {
-            "m mouse:off(select)"
-        };
-        let title = format!(" sessions{scope}  ↑/↓ select · {recency} · {mouse} · q quit ");
+        let title = format!(" sessions{scope}  ↑/↓ select · {recency} · shift+drag copy · q quit ");
         let list = List::new(items)
             .block(
                 Block::default()
@@ -669,20 +666,6 @@ fn read_from(path: &std::path::Path, start: u64) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Read at most `max` bytes from the end of `path`. The first line may be
-/// partial (we seek mid-file); that's acceptable for a scrolling tail.
-fn read_tail_bytes(path: &std::path::Path, max: u64) -> std::io::Result<Vec<u8>> {
-    let mut f = std::fs::File::open(path)?;
-    let len = f.metadata()?.len();
-    let start = len.saturating_sub(max);
-    if start > 0 {
-        f.seek(SeekFrom::Start(start))?;
-    }
-    let mut buf = Vec::with_capacity((len - start) as usize);
-    f.read_to_end(&mut buf)?;
-    Ok(buf)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -715,24 +698,24 @@ mod tests {
     }
 
     #[test]
-    fn tail_returns_whole_small_file() {
-        let p = tmp("small", b"hello world");
-        assert_eq!(read_tail_bytes(&p, 1024).unwrap(), b"hello world");
+    fn read_from_start_returns_whole_file() {
+        let p = tmp("whole", b"hello world");
+        assert_eq!(read_from(&p, 0).unwrap(), b"hello world");
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
-    fn tail_caps_at_max_bytes_from_the_end() {
-        let p = tmp("big", b"0123456789");
-        // only the last 4 bytes are returned when the cap is smaller than the file
-        assert_eq!(read_tail_bytes(&p, 4).unwrap(), b"6789");
+    fn read_from_offset_returns_appended_tail() {
+        let p = tmp("appended", b"0123456789");
+        // Feeding incrementally: only the bytes after the last offset come back.
+        assert_eq!(read_from(&p, 6).unwrap(), b"6789");
         let _ = std::fs::remove_file(&p);
     }
 
     #[test]
-    fn tail_missing_file_is_err() {
+    fn read_from_missing_file_is_err() {
         let p = std::env::temp_dir().join("looop-watch-test-does-not-exist");
-        assert!(read_tail_bytes(&p, 64).is_err());
+        assert!(read_from(&p, 0).is_err());
     }
 
     #[test]
