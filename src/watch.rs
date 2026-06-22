@@ -23,7 +23,11 @@ use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
+    MouseEventKind,
+};
+use ratatui::crossterm::execute;
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
@@ -72,7 +76,12 @@ pub fn cmd_watch(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     }
 
     let mut terminal = ratatui::init();
+    // Capture the mouse so wheel events reach us as `Event::Mouse` instead of
+    // letting the terminal scroll its alternate screen out from under us (which
+    // corrupts the rendered panes).
+    let _ = execute!(std::io::stdout(), EnableMouseCapture);
     let res = App::new(paths, initial, window).run(&mut terminal, paths);
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res?;
     Ok(ExitCode::SUCCESS)
@@ -188,28 +197,46 @@ impl App {
 
             terminal.draw(|f| self.draw(f, &text))?;
 
-            if event::poll(TICK)?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-            {
-                let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Char('c') if ctrl => break,
-                    KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-                    KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-                    KeyCode::Char('a') => {
-                        // Toggle the recency filter: show all ↔ apply window.
-                        self.window = match self.window {
-                            Some(_) => None,
-                            None => Some(self.configured),
-                        };
-                        self.refresh(paths);
+            if event::poll(TICK)? {
+                match event::read()? {
+                    Event::Key(key) if key.kind == KeyEventKind::Press => {
+                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => break,
+                            KeyCode::Char('c') if ctrl => break,
+                            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+                            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+                            KeyCode::Char('a') => {
+                                // Toggle the recency filter: show all ↔ apply window.
+                                self.window = match self.window {
+                                    Some(_) => None,
+                                    None => Some(self.configured),
+                                };
+                                self.refresh(paths);
+                            }
+                            KeyCode::PageUp => {
+                                self.scroll_back = self.scroll_back.saturating_add(10)
+                            }
+                            KeyCode::PageDown => {
+                                self.scroll_back = self.scroll_back.saturating_sub(10)
+                            }
+                            KeyCode::Home => self.scroll_back = usize::MAX, // jump to oldest
+                            KeyCode::End => self.scroll_back = 0,           // back to live tail
+                            _ => {}
+                        }
                     }
-                    KeyCode::PageUp => self.scroll_back = self.scroll_back.saturating_add(10),
-                    KeyCode::PageDown => self.scroll_back = self.scroll_back.saturating_sub(10),
-                    KeyCode::Home => self.scroll_back = usize::MAX, // jump to oldest
-                    KeyCode::End => self.scroll_back = 0,           // back to live tail
+                    // Mouse wheel scrolls the log pane (3 lines per notch, the
+                    // usual terminal step). Capturing it ourselves is what keeps
+                    // the alternate screen from being scrolled and corrupted.
+                    Event::Mouse(m) => match m.kind {
+                        MouseEventKind::ScrollUp => {
+                            self.scroll_back = self.scroll_back.saturating_add(3)
+                        }
+                        MouseEventKind::ScrollDown => {
+                            self.scroll_back = self.scroll_back.saturating_sub(3)
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
