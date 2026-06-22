@@ -5,8 +5,8 @@
 //! Rust port needs neither `jq` (JSON is handled in-process by serde_json) nor
 //! the `babysit` binary (babysit is linked as a library and the whole worker
 //! fleet — spawn / list / attach / kill / prune — runs in-process). The
-//! single hard prerequisite is the configured runner (pi/claude) used to launch
-//! the root agent and worker sessions.
+//! single hard prerequisite is the configured runner (pi/claude) used for looop's
+//! per-beat decide (`tick`) and to launch worker sessions.
 
 use crate::config::Config;
 use crate::paths::Paths;
@@ -49,7 +49,7 @@ fn is_executable(_p: &std::path::Path) -> bool {
 pub fn require_deps(paths: &Paths) -> Result<()> {
     let mut missing: Vec<(String, &'static str)> = Vec::new();
 
-    // looop launches the root agent + workers through the configured runner's
+    // looop runs its per-beat decide + launches workers through the configured runner's
     // `interactive` command (pi/claude), so a missing runner binary is a hard
     // prereq. Resolve from $LOOOP_CONFIG when present, else the inline default,
     // and check its first token.

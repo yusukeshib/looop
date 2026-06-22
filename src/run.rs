@@ -1,14 +1,15 @@
-//! The pulse (`looop _ pulse`) — the cheap, judgment-free sensing loop.
+//! The pulse (`looop _ pulse`) — looop's AUTONOMOUS control loop.
 //!
-//! The pulse no longer decides anything (judgment moved to the root agent — a
-//! pi/claude session YOU run, which looop does not manage). Each beat it just
-//! senses the world: wipe + re-run every sensor so `snapshots/` reflects reality.
-//! That is all. The root agent learns of changes by blocking on
-//! `looop _ wait`, which watches the world hash the pulse keeps fresh.
+//! Each beat: sense the world, and — when it changed since last beat — hand it to
+//! the configured `tick` runner for ONE move, which looop executes through the
+//! typed [`crate::executor`] actions (RULE 1: one tick = one move). Judgment
+//! lives HERE, in looop; the human is a peer who steers by editing goals/PLAYBOOK
+//! and answers worker questions via the ask/answer mailbox (surfaced by the
+//! concierge — the human-facing interface agent, not a decision-maker).
 //!
-//! It is a single-instance loop (flock) and the SOLE senser, so two beats never
-//! wipe `snapshots/` under each other. No LLM call, so the cadence is one cheap
-//! interval.
+//! It is a single-instance loop (flock) and the SOLE senser/decider, so two beats
+//! never wipe `snapshots/` or decide under each other. An unchanged world skips
+//! the AI entirely, so a quiet loop is nearly free.
 
 use crate::config::Config;
 use crate::paths::Paths;
@@ -136,11 +137,15 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     };
 
+    let runner_name = cfg.default_runner().unwrap_or_else(|| "?".into());
     util::event(
         Level::Ok,
         "pulse.start",
-        &format!("pulse started · sensing every {beat}s (root agent watches via `looop _ wait`)"),
-        &[("interval", serde_json::json!(beat))],
+        &format!("pulse started · deciding every {beat}s · runner {runner_name}"),
+        &[
+            ("interval", serde_json::json!(beat)),
+            ("runner", serde_json::json!(runner_name)),
+        ],
     );
     if !paths.default_profile {
         util::event(
@@ -157,11 +162,45 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
         );
     }
 
-    // Sense forever. The root agent watches the resulting world hash via
-    // `looop _ wait`; the pulse just keeps snapshots/ fresh.
+    // Decide forever. `force` makes the next beat re-decide even if the world is
+    // unchanged — armed when a beat emits a `next_interval_s` nudge (a goal
+    // scheduling a time-based follow-up). Reset every beat; only a fresh nudge
+    // re-arms it.
+    let mut force = false;
     loop {
-        let _ = tick::sense(paths);
-        std::thread::sleep(Duration::from_secs(beat));
+        let outcome = tick::tick(paths, force);
+        force = false;
+
+        // One-shot AI cadence nudge, handed straight back from the beat in-memory
+        // (clamped 5..3600). It also forces the next beat to re-decide.
+        let mut want = beat;
+        if let Some(req) = outcome.next_interval_s {
+            let req = req.clamp(5, 3600);
+            util::event(
+                Level::Info,
+                "cadence",
+                &format!("AI cadence override: next beat in {req}s (default {beat}s)"),
+                &[
+                    ("secs", serde_json::json!(req)),
+                    ("default", serde_json::json!(beat)),
+                ],
+            );
+            want = req;
+            force = true;
+        }
+        util::event(
+            Level::Info,
+            "sleep",
+            &format!(
+                "next beat in {want}s ({})",
+                if outcome.acted { "acted" } else { "idle" }
+            ),
+            &[
+                ("secs", serde_json::json!(want)),
+                ("acted", serde_json::json!(outcome.acted)),
+            ],
+        );
+        std::thread::sleep(Duration::from_secs(want));
     }
 }
 
