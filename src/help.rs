@@ -18,8 +18,11 @@ Usage:
   looop up [--json]              start the pulse: the autonomous loop (sense +
                                 decide + run workers), detached. --json logs NDJSON.
   looop down                     stop the pulse and all workers
-  looop watch [<id>]             observer TUI: live colored log + session selector
+  looop watch [<id>] [--since <dur>] [--all]
+                                observer TUI: live colored log + session selector
                                 (read-only; <id> preselects, e.g. `looop watch pulse`)
+                                hides dead sessions idle > 1d; --since 12h/30m to
+                                widen, --all to show every session, `a` toggles live
   looop cost [today|all|--json]  report LLM spend (per-beat + workers)
   looop config zsh|bash          print shell integration (completions)
   looop version | help           print version / show this help

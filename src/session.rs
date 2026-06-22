@@ -234,12 +234,26 @@ pub struct Session {
     pub state: String,
     pub alive: bool,
     pub exit_code: Option<i64>,
+    /// RFC3339 timestamp of the session's last state change (babysit's
+    /// `last_change`). Empty when babysit didn't report one. `watch` parses
+    /// this to filter stale corpses out of the selector.
+    pub last_change: String,
 }
 
 impl Session {
     /// The pulse session is the control loop, not a worker.
     pub fn is_pulse(&self) -> bool {
         self.id == PULSE_SESSION
+    }
+
+    /// How long since this session last changed state, if its `last_change`
+    /// timestamp parses. `None` ⇒ undatable (treat as fresh — bias toward
+    /// keeping it visible).
+    pub fn idle_for(&self) -> Option<std::time::Duration> {
+        let ts = chrono::DateTime::parse_from_rfc3339(self.last_change.trim()).ok()?;
+        (chrono::Utc::now() - ts.with_timezone(&chrono::Utc))
+            .to_std()
+            .ok()
     }
 }
 
@@ -249,6 +263,7 @@ fn project(info: ::babysit::SessionInfo) -> Session {
         state: info.state,
         alive: info.alive,
         exit_code: info.exit_code.map(|c| c as i64),
+        last_change: info.last_change,
     }
 }
 
