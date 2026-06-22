@@ -31,7 +31,7 @@ use babysit::cli::ShotFormat;
 use babysit::render;
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseEventKind,
+    MouseButton, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::Margin;
@@ -141,6 +141,20 @@ struct App {
     configured: Duration,
     /// Sessions hidden by the window on the last refresh (footer hint).
     hidden: usize,
+    /// Geometry of the log scrollbar from the last draw, so mouse clicks/drags
+    /// on it can be mapped back to a `scroll_back` position. `None` when the
+    /// pane isn't scrollable (no scrollbar rendered).
+    scrollbar: Option<ScrollbarHit>,
+}
+
+/// The scrollbar's on-screen track and the scrollback depth it represents,
+/// captured during `draw_log` for the mouse handler to consume.
+#[derive(Clone, Copy)]
+struct ScrollbarHit {
+    /// Area the `Scrollbar` widget was rendered into (column = `right()-1`).
+    area: Rect,
+    /// Maximum scrollback rows (`scroll_back` ranges `0..=max_back`).
+    max_back: usize,
 }
 
 impl App {
@@ -162,7 +176,35 @@ impl App {
             window,
             configured,
             hidden,
+            scrollbar: None,
         }
+    }
+
+    /// Map a mouse position on the log scrollbar to a `scroll_back` value.
+    /// Returns `false` if the click/drag wasn't on the scrollbar (so the
+    /// caller can ignore it). The track is mapped linearly top→bottom:
+    /// top (↑) = oldest scrollback, bottom (↓) = live tail.
+    fn scrollbar_drag(&mut self, col: u16, row: u16) -> bool {
+        let Some(hit) = self.scrollbar else {
+            return false;
+        };
+        let a = hit.area;
+        // The vertical scrollbar lives in the rightmost column of its area.
+        // Accept clicks landing on that column (and the border just right of
+        // it, for a forgiving hit target) within the track's row range.
+        if col + 1 < a.right() || col > a.right() || row < a.top() || row >= a.bottom() {
+            return false;
+        }
+        let span = a.height.saturating_sub(1);
+        let pos = if span == 0 {
+            0
+        } else {
+            let frac = (row - a.top()) as f64 / span as f64;
+            (frac * hit.max_back as f64).round() as usize
+        };
+        // pos counts from the top (oldest); scroll_back counts from the tail.
+        self.scroll_back = hit.max_back.saturating_sub(pos);
+        true
     }
 
     fn selected_id(&self) -> Option<&str> {
@@ -257,6 +299,12 @@ impl App {
                         MouseEventKind::ScrollDown => {
                             self.scroll_back = self.scroll_back.saturating_sub(3)
                         }
+                        // Click or drag on the scrollbar jumps/scrubs the
+                        // viewport to that position in the scrollback.
+                        MouseEventKind::Down(MouseButton::Left)
+                        | MouseEventKind::Drag(MouseButton::Left) => {
+                            self.scrollbar_drag(m.column, m.row);
+                        }
                         _ => {}
                     },
                     _ => {}
@@ -277,6 +325,8 @@ impl App {
     }
 
     fn draw_log(&mut self, frame: &mut Frame, area: Rect, raw: Option<&[u8]>) {
+        // Cleared each frame; set below only when a scrollbar is actually drawn.
+        self.scrollbar = None;
         let follow = self.scroll_back == 0;
         let id = self.selected_id().unwrap_or("—").to_string();
         let title = if follow {
@@ -344,14 +394,16 @@ impl App {
             let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(Some("↑"))
                 .end_symbol(Some("↓"));
-            frame.render_stateful_widget(
-                bar,
-                area.inner(Margin {
-                    vertical: 1,
-                    horizontal: 0,
-                }),
-                &mut state,
-            );
+            let bar_area = area.inner(Margin {
+                vertical: 1,
+                horizontal: 0,
+            });
+            frame.render_stateful_widget(bar, bar_area, &mut state);
+            // Remember where it landed so mouse clicks/drags can target it.
+            self.scrollbar = Some(ScrollbarHit {
+                area: bar_area,
+                max_back,
+            });
         }
     }
 
