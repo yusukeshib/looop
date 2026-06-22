@@ -162,8 +162,8 @@ pub fn cmd_ask(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         ],
     );
 
-    // Block until answered. The pulse pokes the root agent when it senses this
-    // ask; the root agent answers via `looop _ answer <id>`.
+    // Block until answered. The root agent sees this ask via `looop _ wait`
+    // (the pulse keeps the world fresh) and replies via `looop _ answer <id>`.
     let poll = Duration::from_millis(
         std::env::var("LOOOP_ASK_POLL_MS")
             .ok()

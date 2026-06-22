@@ -234,7 +234,6 @@ pub struct Session {
     pub state: String,
     pub alive: bool,
     pub exit_code: Option<i64>,
-    pub note: Option<String>,
 }
 
 impl Session {
@@ -250,7 +249,6 @@ fn project(info: ::babysit::SessionInfo) -> Session {
         state: info.state,
         alive: info.alive,
         exit_code: info.exit_code.map(|c| c as i64),
-        note: info.note,
     }
 }
 
@@ -494,17 +492,16 @@ pub fn await_alive(paths: &Paths, session: &str, timeout: std::time::Duration) -
 mod tests {
     use super::*;
 
-    fn sess(id: &str, note: Option<&str>) -> Session {
+    fn sess(id: &str) -> Session {
         Session {
             id: id.to_string(),
-            note: note.map(str::to_string),
             ..Default::default()
         }
     }
 
     #[test]
     fn pulse_is_recognized() {
-        assert!(sess(PULSE_SESSION, None).is_pulse());
-        assert!(!sess("triage", None).is_pulse());
+        assert!(sess(PULSE_SESSION).is_pulse());
+        assert!(!sess("triage").is_pulse());
     }
 }
