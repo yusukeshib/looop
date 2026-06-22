@@ -14,7 +14,7 @@
 
 use crate::paths::Paths;
 use crate::util;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use std::fs;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -188,11 +188,26 @@ pub fn cmd_ask(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 /// which unblocks the worker's `_ ask`. Refuses an unknown ask id.
 pub fn cmd_answer(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     let Some((ask_id, rest)) = args.split_first() else {
-        eprintln!("usage: looop _ answer <ask_id> <text…>");
+        eprintln!(
+            "usage: looop _ answer <ask_id> <text…|->  (omit text or pass `-` to read stdin/heredoc)"
+        );
         return Ok(ExitCode::from(1));
     };
     safe(ask_id)?;
-    let text = rest.join(" ");
+    // Body resolution mirrors `_ goal/sensor/playbook write`: an inline body wins,
+    // otherwise (no body, or a lone `-`) read the whole answer from stdin so a
+    // multi-line design decision can be piped or passed via heredoc without the
+    // `-` (or the heredoc terminator) leaking into the saved answer.
+    let text = if rest.is_empty() || (rest.len() == 1 && rest[0] == "-") {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading answer from stdin")?;
+        buf.trim_end().to_string()
+    } else {
+        rest.join(" ")
+    };
     if text.trim().is_empty() {
         bail!("answer: empty text");
     }
@@ -200,17 +215,52 @@ pub fn cmd_answer(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         bail!("answer: no pending ask {ask_id:?}");
     }
     fs::create_dir_all(paths.answers_dir())?;
+    let answer_path = paths.answers_dir().join(format!("{ask_id}.json"));
+    if answer_path.is_file() {
+        eprintln!("looop _ answer: overwriting the existing answer for {ask_id}");
+    }
     let body = serde_json::json!({ "answer": text, "ts": util::now_unix() });
-    fs::write(
-        paths.answers_dir().join(format!("{ask_id}.json")),
-        serde_json::to_string_pretty(&body)?,
-    )?;
+    fs::write(&answer_path, serde_json::to_string_pretty(&body)?)?;
     util::event(
         util::Level::Ok,
         "answer",
         &format!("{ask_id}: {text}"),
         &[("ask_id", serde_json::json!(ask_id))],
     );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `looop _ asks [--json]` — the concierge's narrow view: ONLY the pending asks,
+/// not the full `_ state` dump (snapshots / journal / fleet). Plain output is a
+/// compact list; `--json` emits the array of ask objects. The concierge's main
+/// job is relaying asks, so this makes that a single cheap call.
+pub fn cmd_asks(paths: &Paths, args: &[String]) -> Result<ExitCode> {
+    let _ = crate::seed::ensure_dirs(paths);
+    let asks = pending(paths);
+    if args.iter().any(|a| a == "--json") {
+        let arr: Vec<serde_json::Value> = asks
+            .iter()
+            .map(|a| serde_json::to_value(a).unwrap_or_default())
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::Value::Array(arr))?
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+    if asks.is_empty() {
+        println!("no pending asks");
+        return Ok(ExitCode::SUCCESS);
+    }
+    for a in &asks {
+        println!("⚑ {} ({}): {}", a.id, a.worker, a.prompt);
+        if !a.reference.is_empty() {
+            println!("    ref: {}", a.reference);
+        }
+        if !a.options.is_empty() {
+            println!("    options: {}", a.options.join(", "));
+        }
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -254,5 +304,36 @@ mod tests {
         let p = Paths::temp();
         fs::create_dir_all(p.asks_dir()).unwrap();
         assert!(cmd_answer(&p, &["nope-9".into(), "x".into()]).is_err());
+    }
+
+    #[test]
+    fn answer_can_overwrite_a_prior_answer() {
+        let p = Paths::temp();
+        fs::create_dir_all(p.asks_dir()).unwrap();
+        fs::create_dir_all(p.answers_dir()).unwrap();
+        fs::write(
+            p.asks_dir().join("w-1.json"),
+            serde_json::json!({"id":"w-1","worker":"w","prompt":"ok?","ts":1}).to_string(),
+        )
+        .unwrap();
+        cmd_answer(&p, &["w-1".into(), "first".into()]).unwrap();
+        // A re-answer overwrites (lets the human recover from a bad answer).
+        cmd_answer(&p, &["w-1".into(), "second".into()]).unwrap();
+        assert_eq!(read_answer(&p, "w-1").as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn asks_lists_only_pending() {
+        let p = Paths::temp();
+        let _ = crate::seed::ensure_dirs(&p);
+        fs::write(
+            p.asks_dir().join("w-1.json"),
+            serde_json::json!({"id":"w-1","worker":"w","prompt":"ok?","ts":1}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(pending(&p).len(), 1);
+        // cmd_asks is a thin view over pending(); answering empties it.
+        cmd_answer(&p, &["w-1".into(), "yes".into()]).unwrap();
+        assert!(pending(&p).is_empty());
     }
 }

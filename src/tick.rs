@@ -530,34 +530,127 @@ pub fn state(paths: &Paths) -> serde_json::Value {
     })
 }
 
-/// Block until there is something to look at, then return. "Something" = a
-/// pending ask (return immediately) OR the world hash moving from its value when
-/// this call started. Pure read — never senses, so it can't race the pulse.
-fn wait_for_change(paths: &Paths) {
+/// Which kinds of change should make `_ wait` return. The diff is computed per
+/// category (see [`fingerprints`]) so a noisy snapshot-only move can be filtered
+/// out by a concierge that only cares about asks / journal progress.
+#[derive(Clone, Copy)]
+enum WaitFilter {
+    /// Wake on ANY category change (default — the historical behavior).
+    Any,
+    /// Wake only when the pending-asks set changes (`--only-asks`).
+    Asks,
+    /// Wake only on asks or journal changes (`--actionable`).
+    Actionable,
+}
+
+/// Per-category content fingerprints, so `_ wait` can report WHAT changed, not
+/// just that the world hash moved. Categories: asks (the pending mailbox),
+/// journal, playbook, goals, snapshots (sensors + the live worker fleet).
+fn fingerprints(paths: &Paths) -> std::collections::BTreeMap<&'static str, String> {
+    let mut m = std::collections::BTreeMap::new();
+
+    let asks: Vec<serde_json::Value> = mailbox::pending(paths)
+        .into_iter()
+        .map(|a| serde_json::to_value(a).unwrap_or_default())
+        .collect();
+    m.insert(
+        "asks",
+        util::content_hash(serde_json::Value::Array(asks).to_string().as_bytes()),
+    );
+    m.insert(
+        "journal",
+        util::content_hash(&fs::read(paths.journal()).unwrap_or_default()),
+    );
+    m.insert(
+        "playbook",
+        util::content_hash(&fs::read(paths.playbook()).unwrap_or_default()),
+    );
+
+    let mut goals = Vec::new();
+    for id in goal_ids(paths) {
+        goals.extend_from_slice(id.as_bytes());
+        goals.push(b'\n');
+        goals.extend_from_slice(
+            &fs::read(paths.goals_dir().join(format!("{id}.md"))).unwrap_or_default(),
+        );
+    }
+    m.insert("goals", util::content_hash(&goals));
+
+    // Snapshots: only the wake SIGNAL (matching world_hash) so volatile `.detail`
+    // never registers as a change. `snapshots()` returns sorted keys.
+    let mut snaps = Vec::new();
+    for (k, v) in snapshots(paths) {
+        snaps.extend_from_slice(k.as_bytes());
+        snaps.push(b'\n');
+        snaps.extend_from_slice(crate::worldhash::wake_signal(v).to_string().as_bytes());
+        snaps.push(b'\n');
+    }
+    m.insert("snapshots", util::content_hash(&snaps));
+
+    m
+}
+
+/// Categories whose fingerprint differs between two snapshots, sorted (BTreeMap).
+fn changed_categories(
+    base: &std::collections::BTreeMap<&'static str, String>,
+    cur: &std::collections::BTreeMap<&'static str, String>,
+) -> Vec<String> {
+    base.iter()
+        .filter(|(k, v)| cur.get(*k) != Some(*v))
+        .map(|(k, _)| k.to_string())
+        .collect()
+}
+
+/// Block until there is something to look at, then return the list of categories
+/// that changed. "Something" = a pending ask (return immediately) OR a category
+/// move that passes `filter`. Pure read — never senses, so it can't race the pulse.
+fn wait_for_change(paths: &Paths, filter: WaitFilter) -> Vec<String> {
     let poll = std::time::Duration::from_millis(
         std::env::var("LOOOP_WAIT_POLL_MS")
             .ok()
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(1000),
     );
-    let baseline = crate::worldhash::world_hash(paths);
+    // An ask already waiting is actionable for every filter: don't block.
+    if !mailbox::pending(paths).is_empty() {
+        return vec!["asks".to_string()];
+    }
+    let baseline = fingerprints(paths);
     loop {
-        if !mailbox::pending(paths).is_empty() {
-            return;
-        }
-        if crate::worldhash::world_hash(paths) != baseline {
-            return;
+        let changed = changed_categories(&baseline, &fingerprints(paths));
+        let hit = match filter {
+            WaitFilter::Any => !changed.is_empty(),
+            WaitFilter::Asks => changed.iter().any(|c| c == "asks"),
+            WaitFilter::Actionable => changed.iter().any(|c| c == "asks" || c == "journal"),
+        };
+        if hit {
+            return changed;
         }
         std::thread::sleep(poll);
     }
 }
 
 /// Print the current state. `--json` = full structured object; else a summary.
-fn print_state(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let s = state(paths);
+/// `changed` (set by `_ wait`) is surfaced as a `changed: […]` diff summary so a
+/// caller knows WHICH categories moved without re-diffing the whole state.
+fn print_state(paths: &Paths, args: &[String], changed: Option<&[String]>) -> Result<ExitCode> {
+    let mut s = state(paths);
+    if let (Some(ch), Some(obj)) = (changed, s.as_object_mut()) {
+        obj.insert("changed".to_string(), serde_json::json!(ch));
+    }
     if args.iter().any(|a| a == "--json") {
         println!("{}", serde_json::to_string_pretty(&s)?);
         return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(ch) = changed {
+        println!(
+            "changed: {}",
+            if ch.is_empty() {
+                "(none)".to_string()
+            } else {
+                ch.join(", ")
+            }
+        );
     }
     let asks = s["asks"].as_array().map(|a| a.len()).unwrap_or(0);
     let workers = s["workers"].as_array().map(|a| a.len()).unwrap_or(0);
@@ -578,16 +671,25 @@ fn print_state(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 /// sensing, no side effects (the autonomous pulse keeps snapshots fresh).
 pub fn cmd_state(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     let _ = crate::seed::ensure_dirs(paths);
-    print_state(paths, args)
+    print_state(paths, args, None)
 }
 
-/// `looop _ wait [--json]` — BLOCK until there is something to look at (a pending
-/// ask, or the world changed), then print the fresh state. A convenience for a
-/// human/helper watching the autonomous loop; looop itself does not need it.
+/// `looop _ wait [--json] [--only-asks|--actionable]` — BLOCK until there is
+/// something to look at, then print the fresh state plus a `changed: […]` diff
+/// summary. By default any category move (asks / journal / playbook / goals /
+/// snapshots) wakes it; `--actionable` narrows to asks+journal and `--only-asks`
+/// to asks alone, so a watching concierge can ignore noisy snapshot-only moves.
 pub fn cmd_wait(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     let _ = crate::seed::ensure_dirs(paths);
-    wait_for_change(paths);
-    print_state(paths, args)
+    let filter = if args.iter().any(|a| a == "--only-asks") {
+        WaitFilter::Asks
+    } else if args.iter().any(|a| a == "--actionable") {
+        WaitFilter::Actionable
+    } else {
+        WaitFilter::Any
+    };
+    let changed = wait_for_change(paths, filter);
+    print_state(paths, args, Some(&changed))
 }
 
 #[cfg(test)]
@@ -644,5 +746,51 @@ mod tests {
         assert!(goals.contains(&"triage".to_string()));
         assert_eq!(s["asks"].as_array().unwrap().len(), 1);
         assert_eq!(s["asks"][0]["id"], "triage-1");
+    }
+
+    #[test]
+    fn fingerprints_pin_each_category_independently() {
+        let p = Paths::temp();
+        let _ = crate::seed::ensure_dirs(&p);
+        let base = fingerprints(&p);
+
+        // A goal edit moves only the goals category.
+        fs::write(p.goals_dir().join("g.md"), b"do the thing\n").unwrap();
+        assert_eq!(changed_categories(&base, &fingerprints(&p)), vec!["goals"]);
+
+        // A new pending ask moves only the asks category.
+        let after_goal = fingerprints(&p);
+        fs::write(
+            p.asks_dir().join("w-1.json"),
+            serde_json::json!({"id":"w-1","worker":"w","prompt":"ok?","ts":1}).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            changed_categories(&after_goal, &fingerprints(&p)),
+            vec!["asks"]
+        );
+
+        // A journal append moves only the journal category.
+        let after_ask = fingerprints(&p);
+        fs::write(p.journal(), b"progress\n").unwrap();
+        assert_eq!(
+            changed_categories(&after_ask, &fingerprints(&p)),
+            vec!["journal"]
+        );
+    }
+
+    #[test]
+    fn wait_returns_immediately_when_an_ask_is_already_pending() {
+        let p = Paths::temp();
+        let _ = crate::seed::ensure_dirs(&p);
+        fs::write(
+            p.asks_dir().join("w-1.json"),
+            serde_json::json!({"id":"w-1","worker":"w","prompt":"ok?","ts":1}).to_string(),
+        )
+        .unwrap();
+        // No blocking: a waiting ask is actionable for every filter.
+        assert_eq!(wait_for_change(&p, WaitFilter::Asks), vec!["asks"]);
+        assert_eq!(wait_for_change(&p, WaitFilter::Actionable), vec!["asks"]);
+        assert_eq!(wait_for_change(&p, WaitFilter::Any), vec!["asks"]);
     }
 }

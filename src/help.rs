@@ -28,8 +28,9 @@ Usage:
   looop version | help           print version / show this help
 
   STEER (you, or a concierge acting for you — looop does NOT need these to act):
-  looop _ state [--json] | _ wait [--json]             read state (blocking with `_ wait`)
-  looop _ answer <ask_id> "<text>"           resolve a worker's pending ask
+  looop _ state [--json] | _ wait [--json] [--only-asks|--actionable]  read state
+  looop _ asks [--json]                      pending asks only (concierge's narrow view)
+  looop _ answer <ask_id> "<text>"|-          resolve a worker's ask (`-`/empty = stdin)
   looop _ goal write <id> [body|stdin] | _ goal archive <id>
   looop _ sensor write <name> [script|stdin]
   looop _ playbook write [body|stdin]

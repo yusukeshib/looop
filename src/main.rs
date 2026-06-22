@@ -91,6 +91,9 @@ fn main() -> ExitCode {
                 Some("wait") => {
                     deps::require_deps(&paths).and_then(|_| tick::cmd_wait(&paths, &rest[1..]))
                 }
+                Some("asks") => {
+                    deps::require_deps(&paths).and_then(|_| mailbox::cmd_asks(&paths, &rest[1..]))
+                }
                 Some("answer") => {
                     deps::require_deps(&paths).and_then(|_| mailbox::cmd_answer(&paths, &rest[1..]))
                 }
@@ -130,7 +133,7 @@ fn main() -> ExitCode {
                 Some("cost") => cost::cmd_cost_record(&paths, &rest[1..]),
                 other => {
                     eprintln!(
-                        "looop _: unknown internal verb {other:?} (root: state, wait, answer, goal, sensor, playbook, run, worker; worker: ask, kill, claim, unclaim, cost; pulse)"
+                        "looop _: unknown internal verb {other:?} (root: state, wait, asks, answer, goal, sensor, playbook, run, worker; worker: ask, kill, claim, unclaim, cost; pulse)"
                     );
                     Ok(ExitCode::from(1))
                 }

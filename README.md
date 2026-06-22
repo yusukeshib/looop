@@ -111,8 +111,12 @@ looop config zsh|bash          print shell integration (tab completions)
 looop version | help           (looop help = the full design manual)
 
 # STEER (you, or a concierge acting for you — looop does NOT need these to act)
-looop _ state [--json] | _ wait [--json]   read current world state
-looop _ answer <ask_id> "<text>"           resolve a worker's pending ask
+looop _ state [--json]                     read current world state
+looop _ wait [--json] [--only-asks|--actionable]   block until change; prints a
+                                           `changed: […]` diff (--actionable =
+                                           asks/journal only, --only-asks = asks)
+looop _ asks [--json]                      pending asks only (concierge's narrow view)
+looop _ answer <ask_id> "<text>"|-          resolve an ask (`-`/empty body = stdin/heredoc)
 looop _ goal write <id> [body|stdin] | _ goal archive <id>
 looop _ sensor write <name> [script|stdin] | _ playbook write [body|stdin]
 

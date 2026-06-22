@@ -56,17 +56,24 @@ pursues and answer what only you can:
     observes the change next beat and steers toward it. Do this with the verbs
     below (single-writer) or let the concierge do it for you.
   • Answer worker asks — a worker blocked on a human decision shows up as a
-    pending ask; resolve it with `looop _ answer <ask_id> "<text>"`.
+    pending ask; resolve it with `looop _ answer <ask_id> "<text>"` (or pass `-`
+    / omit the text to read a multi-line answer from stdin / a heredoc).
   • Watch — `looop watch` (live colored log + session selector) or
     `looop _ state --json` for a structured snapshot.
 
 VERBS (for you / the concierge — looop does NOT need these to act):
-  looop _ state [--json] | _ wait [--json]   read state (blocking with `_ wait`)
-  looop _ answer <ask_id> "<text>"   resolve a worker's pending ask
+  looop _ state [--json]                     read the full world state
+  looop _ wait [--json] [--only-asks|--actionable]   BLOCK until something changes,
+                                             then print state + a `changed: […]`
+                                             diff summary. --actionable wakes only
+                                             on asks/journal, --only-asks on asks.
+  looop _ asks [--json]                      pending asks only (concierge's narrow view)
+  looop _ answer <ask_id> "<text>"|-  resolve a worker's pending ask
   looop _ goal write <id> [body|stdin] | _ goal archive <id>
   looop _ sensor write <name> [script|stdin]
   looop _ playbook write [body|stdin]
-  (multi-line bodies: omit the inline body and pipe it on stdin / heredoc.)
+  (multi-line bodies — incl. `_ answer`: omit the inline body or pass `-`, then
+   pipe it on stdin / heredoc.)
 
 WORKER CONTRACT (auto-injected into every worker — for reference)
   A worker that needs a human decision runs ONE blocking call and waits:
