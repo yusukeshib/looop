@@ -166,6 +166,9 @@ struct App {
     /// Persistent vt100 replay of the selected session's log (fed incrementally
     /// across frames). `None` until a session with a log file is selected.
     log: Option<LogReplay>,
+    /// Geometry of the session list from the last draw, so a mouse click can be
+    /// mapped back to a row → session index. `None` when the list is empty.
+    selector: Option<SelectorHit>,
 }
 
 /// Persistent vt100 replay of one session's `output.log`. We keep the parser
@@ -184,6 +187,17 @@ struct LogReplay {
     prev_scrollback: usize,
     /// Total bytes ever fed — 0 means the file exists but is empty.
     seen: u64,
+}
+
+/// The session list's on-screen geometry, captured during `draw_selector` so a
+/// mouse click can be mapped back to the session under the cursor.
+#[derive(Clone, Copy)]
+struct SelectorHit {
+    /// Inner area the session rows are drawn into (inside the border).
+    area: Rect,
+    /// First visible session index (the list's scroll offset), so a click on
+    /// row `r` selects session `offset + (r - area.top())`.
+    offset: usize,
 }
 
 /// The scrollbar's on-screen track and the scrollback depth it represents,
@@ -217,6 +231,7 @@ impl App {
             hidden,
             scrollbar: None,
             log: None,
+            selector: None,
         }
     }
 
@@ -244,6 +259,28 @@ impl App {
         };
         // pos counts from the top (oldest); scroll_back counts from the tail.
         self.scroll_back = hit.max_scroll.saturating_sub(pos);
+        true
+    }
+
+    /// Select the session under a mouse click on the bottom list. Returns
+    /// `false` if the click wasn't inside the list (so the caller can ignore
+    /// it). Switching session re-follows the tail, mirroring `move_selection`.
+    fn select_at(&mut self, col: u16, row: u16) -> bool {
+        let Some(hit) = self.selector else {
+            return false;
+        };
+        let a = hit.area;
+        if col < a.left() || col >= a.right() || row < a.top() || row >= a.bottom() {
+            return false;
+        }
+        let idx = hit.offset + (row - a.top()) as usize;
+        if idx >= self.sessions.len() {
+            return false; // click landed on a blank row below the last session
+        }
+        if Some(idx) != self.list_state.selected() {
+            self.list_state.select(Some(idx));
+            self.scroll_back = 0;
+        }
         true
     }
 
@@ -411,9 +448,16 @@ impl App {
                         }
                         // Click or drag on the scrollbar jumps/scrubs the
                         // viewport to that position in the scrollback.
-                        MouseEventKind::Down(MouseButton::Left)
-                        | MouseEventKind::Drag(MouseButton::Left) => {
+                        // Drag scrubs the scrollbar; a plain click scrubs the
+                        // scrollbar OR, failing that, selects a session row.
+                        MouseEventKind::Drag(MouseButton::Left) => {
                             self.scrollbar_drag(m.column, m.row);
+                        }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            // Try the scrollbar first; if the click missed it,
+                            // fall through to selecting a session row.
+                            let _ = self.scrollbar_drag(m.column, m.row)
+                                || self.select_at(m.column, m.row);
                         }
                         _ => {}
                     },
@@ -597,6 +641,23 @@ impl App {
             .highlight_style(Style::default().bg(Color::White).fg(Color::Black))
             .highlight_symbol("> ");
         frame.render_stateful_widget(list, area, &mut self.list_state);
+
+        // Record the list geometry so a mouse click can hit-test a row. The
+        // rows render inside the border; read `offset()` AFTER the render so it
+        // reflects any scrolling the widget just applied.
+        self.selector = if self.sessions.is_empty() {
+            None
+        } else {
+            Some(SelectorHit {
+                area: Rect {
+                    x: area.x.saturating_add(1),
+                    y: area.y.saturating_add(1),
+                    width: area.width.saturating_sub(2),
+                    height: area.height.saturating_sub(2),
+                },
+                offset: self.list_state.offset(),
+            })
+        };
     }
 }
 
