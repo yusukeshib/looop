@@ -32,9 +32,9 @@ Usage:
   looop _ state [--json] | _ wait [--json] [--only-asks|--actionable]  read state
   looop _ asks [--json]                      pending asks only (a client's narrow view)
   looop _ answer <ask_id> "<text>"|- [--force]  resolve a worker's ask (`-`/empty = stdin; --force to re-answer)
-  looop _ goal write <id> [body|stdin] | _ goal archive <id>
-  looop _ sensor write <name> [script|stdin]
-  looop _ playbook write [body|stdin]
+  looop _ goal write <id> [body|-] | _ goal archive <id>   (`-`/omit = stdin/heredoc)
+  looop _ sensor write <name> [script|-]                   (`-`/omit = stdin/heredoc)
+  looop _ playbook write [body|-]                          (`-`/omit = stdin/heredoc)
   looop _ send <id> "<text>" [--no-newline]   type input into a worker's terminal
   looop _ screenshot <id> [--ansi|--json] [--no-trim]   capture a session's screen
 

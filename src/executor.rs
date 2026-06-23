@@ -394,10 +394,11 @@ pub fn run_action(paths: &Paths, action: &Action, journal: Option<&str>) -> Resu
 }
 
 /// Resolve an action body from positional args, falling back to stdin when none
-/// are given (so a human/client can heredoc a multi-line goal/PLAYBOOK body).
+/// are given OR a lone `-` is passed (so a human/client can heredoc a multi-line
+/// goal/PLAYBOOK body, matching the `_ answer` `-` convention).
 fn body_or_stdin(rest: &[String]) -> Result<String> {
-    if !rest.is_empty() {
-        return Ok(rest.join(" "));
+    if let Some(body) = inline_body(rest) {
+        return Ok(body);
     }
     use std::io::Read;
     let mut buf = String::new();
@@ -405,6 +406,20 @@ fn body_or_stdin(rest: &[String]) -> Result<String> {
         .read_to_string(&mut buf)
         .context("reading body from stdin")?;
     Ok(buf)
+}
+
+/// The positional-args half of [`body_or_stdin`]: `Some(body)` when an inline
+/// body is given, `None` when stdin should be read (no args, OR a lone `-`).
+/// The `-` sentinel mirrors `_ answer` so a multi-line body can be piped /
+/// passed via heredoc without the literal `-` leaking in as the body. (Without
+/// this, `looop _ playbook write -` wrote a one-char `-`, silently clobbering the
+/// whole PLAYBOOK.)
+fn inline_body(rest: &[String]) -> Option<String> {
+    if !rest.is_empty() && !(rest.len() == 1 && rest[0] == "-") {
+        Some(rest.join(" "))
+    } else {
+        None
+    }
 }
 
 /// Strip `--journal <text>` from args, returning (journal, remaining args).
@@ -427,13 +442,13 @@ fn ok(summary: String) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `looop _ goal write <id> [body…|stdin]` | `looop _ goal archive <id>`
+/// `looop _ goal write <id> [body…|-]` | `looop _ goal archive <id>`
 pub fn cmd_goal(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     let (journal, rest) = take_journal(args);
     match rest.first().map(String::as_str) {
         Some("write") => {
             let Some(id) = rest.get(1).cloned() else {
-                eprintln!("usage: looop _ goal write <id> [body…|stdin]");
+                eprintln!("usage: looop _ goal write <id> [body…|-]  (omit body or pass `-` to read stdin/heredoc)");
                 return Ok(ExitCode::from(1));
             };
             let body = body_or_stdin(&rest[2.min(rest.len())..])?;
@@ -461,15 +476,15 @@ pub fn cmd_goal(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     }
 }
 
-/// `looop _ sensor write <name> [script…|stdin]`
+/// `looop _ sensor write <name> [script…|-]`
 pub fn cmd_sensor(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     let (journal, rest) = take_journal(args);
     if rest.first().map(String::as_str) != Some("write") {
-        eprintln!("usage: looop _ sensor write <name> [script…|stdin]");
+        eprintln!("usage: looop _ sensor write <name> [script…|-]  (omit script or pass `-` to read stdin/heredoc)");
         return Ok(ExitCode::from(1));
     }
     let Some(name) = rest.get(1).cloned() else {
-        eprintln!("usage: looop _ sensor write <name> [script…|stdin]");
+        eprintln!("usage: looop _ sensor write <name> [script…|-]  (omit script or pass `-` to read stdin/heredoc)");
         return Ok(ExitCode::from(1));
     };
     let script = body_or_stdin(&rest[2.min(rest.len())..])?;
@@ -480,11 +495,11 @@ pub fn cmd_sensor(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     )?)
 }
 
-/// `looop _ playbook write [body…|stdin]`
+/// `looop _ playbook write [body…|-]`
 pub fn cmd_playbook(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     let (journal, rest) = take_journal(args);
     if rest.first().map(String::as_str) != Some("write") {
-        eprintln!("usage: looop _ playbook write [body…|stdin]");
+        eprintln!("usage: looop _ playbook write [body…|-]  (omit body or pass `-` to read stdin/heredoc)");
         return Ok(ExitCode::from(1));
     }
     let body = body_or_stdin(&rest[1.min(rest.len())..])?;
@@ -539,6 +554,26 @@ pub fn cmd_worker_start(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_body_resolves_args_and_stdin_sentinel() {
+        // No args → read stdin (None).
+        assert_eq!(inline_body(&[]), None);
+        // A lone `-` → read stdin (None), NOT a literal one-char body. This is the
+        // regression: `looop _ playbook write -` used to write "-" and clobber the
+        // whole PLAYBOOK.
+        assert_eq!(inline_body(&["-".to_string()]), None);
+        // An inline body wins, joined with spaces.
+        assert_eq!(
+            inline_body(&["hello".to_string(), "world".to_string()]),
+            Some("hello world".to_string())
+        );
+        // A `-` alongside real words is part of the body, not a sentinel.
+        assert_eq!(
+            inline_body(&["a".to_string(), "-".to_string()]),
+            Some("a -".to_string())
+        );
+    }
 
     #[test]
     fn safe_segment_blocks_traversal() {
