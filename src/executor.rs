@@ -448,7 +448,9 @@ pub fn cmd_goal(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     match rest.first().map(String::as_str) {
         Some("write") => {
             let Some(id) = rest.get(1).cloned() else {
-                eprintln!("usage: looop _ goal write <id> [body…|-]  (omit body or pass `-` to read stdin/heredoc)");
+                eprintln!(
+                    "usage: looop _ goal write <id> [body…|-]  (omit body or pass `-` to read stdin/heredoc)"
+                );
                 return Ok(ExitCode::from(1));
             };
             let body = body_or_stdin(&rest[2.min(rest.len())..])?;
@@ -480,11 +482,15 @@ pub fn cmd_goal(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 pub fn cmd_sensor(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     let (journal, rest) = take_journal(args);
     if rest.first().map(String::as_str) != Some("write") {
-        eprintln!("usage: looop _ sensor write <name> [script…|-]  (omit script or pass `-` to read stdin/heredoc)");
+        eprintln!(
+            "usage: looop _ sensor write <name> [script…|-]  (omit script or pass `-` to read stdin/heredoc)"
+        );
         return Ok(ExitCode::from(1));
     }
     let Some(name) = rest.get(1).cloned() else {
-        eprintln!("usage: looop _ sensor write <name> [script…|-]  (omit script or pass `-` to read stdin/heredoc)");
+        eprintln!(
+            "usage: looop _ sensor write <name> [script…|-]  (omit script or pass `-` to read stdin/heredoc)"
+        );
         return Ok(ExitCode::from(1));
     };
     let script = body_or_stdin(&rest[2.min(rest.len())..])?;
@@ -499,7 +505,9 @@ pub fn cmd_sensor(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 pub fn cmd_playbook(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     let (journal, rest) = take_journal(args);
     if rest.first().map(String::as_str) != Some("write") {
-        eprintln!("usage: looop _ playbook write [body…|-]  (omit body or pass `-` to read stdin/heredoc)");
+        eprintln!(
+            "usage: looop _ playbook write [body…|-]  (omit body or pass `-` to read stdin/heredoc)"
+        );
         return Ok(ExitCode::from(1));
     }
     let body = body_or_stdin(&rest[1.min(rest.len())..])?;
