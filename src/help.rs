@@ -21,8 +21,9 @@ Usage:
   looop watch [<id>] [--since <dur>] [--all]
                                 observer TUI: live colored log + session selector
                                 (read-only; <id> preselects, e.g. `looop watch pulse`)
-                                hides dead sessions idle > 1d; --since 12h/30m to
-                                widen, --all to show every session, `a` toggles live;
+                                shows only active sessions; --since 1d/12h/30m to
+                                also show recent dead, --all for every session,
+                                `a` cycles active/recent/all live;
                                 scroll up reaches the first line; shift+drag to copy
   looop cost                     report LLM spend by day (per-beat + workers)
   looop config zsh|bash          print shell integration (completions)

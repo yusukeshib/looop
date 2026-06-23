@@ -78,32 +78,44 @@ const PTY_COLS: u16 = render::DEFAULT_SCREENSHOT_SIZE.1;
 /// generous headroom to avoid silently dropping the oldest lines.
 const SCROLLBACK_ROWS: usize = 100_000;
 
-/// Default recency window: hide dead sessions idle longer than this. Alive
-/// sessions and the pulse are always shown regardless. Override with `--since`,
-/// disable with `--all`, or toggle live in the TUI with `a`.
+/// Recency window used by [`Filter::Recent`] when `--since` isn't given. Alive
+/// sessions and the pulse are always shown regardless of filter.
 const DEFAULT_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Which sessions the selector shows. Cycled live in the TUI with `a`
+/// (Active → Recent → All → Active).
+#[derive(Clone, Copy)]
+enum Filter {
+    /// Only live sessions (plus the pulse). The default — dead corpses hidden.
+    Active,
+    /// Live + pulse + dead sessions idle less than this window.
+    Recent(Duration),
+    /// Every session, no matter how stale.
+    All,
+}
 
 /// `looop watch [<id>] [--since <dur>] [--all]` — open the observer TUI.
 ///
 /// An optional id preselects a session (e.g. `looop watch pulse`); otherwise the
-/// most-recently-active one. `--since <dur>` sets the recency window for hiding
-/// stale corpses (e.g. `1d`, `12h`, `30m`, `90s`, or bare seconds); `--all`
-/// shows every session. The window defaults to [`DEFAULT_WINDOW`].
+/// most-recently-active one. By default only live sessions (plus the pulse) are
+/// shown. `--since <dur>` widens to also include dead sessions idle less than
+/// the window (e.g. `1d`, `12h`, `30m`, `90s`, or bare seconds); `--all` shows
+/// every session.
 pub fn cmd_watch(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     let mut initial: Option<String> = None;
-    let mut window: Option<Duration> = Some(DEFAULT_WINDOW);
+    let mut filter = Filter::Active;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--all" | "-a" => window = None,
+            "--all" | "-a" => filter = Filter::All,
             "--since" | "-s" => {
                 let v = iter.next().ok_or_else(|| {
                     anyhow::anyhow!("looop watch: --since needs a duration (e.g. 1d, 12h, 30m)")
                 })?;
-                window = Some(parse_duration(v)?);
+                filter = Filter::Recent(parse_duration(v)?);
             }
             other if other.starts_with("--since=") => {
-                window = Some(parse_duration(&other["--since=".len()..])?);
+                filter = Filter::Recent(parse_duration(&other["--since=".len()..])?);
             }
             other if other.starts_with('-') => {
                 anyhow::bail!("looop watch: unknown flag '{other}' (--since <dur>, --all)");
@@ -121,7 +133,7 @@ pub fn cmd_watch(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     // letting the terminal scroll its alternate screen out from under us (which
     // corrupts the rendered panes).
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
-    let res = App::new(paths, initial, window).run(&mut terminal, paths);
+    let res = App::new(paths, initial, filter).run(&mut terminal, paths);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res?;
@@ -151,13 +163,12 @@ struct App {
     list_state: ListState,
     /// Lines scrolled back from the bottom (0 = follow the tail live).
     scroll_back: usize,
-    /// Active recency window: dead sessions idle longer than this are hidden.
-    /// `None` shows everything. Toggled live with `a`.
-    window: Option<Duration>,
-    /// The window to restore when toggling filtering back on (from `--since`
-    /// or [`DEFAULT_WINDOW`]).
-    configured: Duration,
-    /// Sessions hidden by the window on the last refresh (footer hint).
+    /// Which sessions the selector shows. Cycled live with `a`.
+    filter: Filter,
+    /// The window used by [`Filter::Recent`] (from `--since` or
+    /// [`DEFAULT_WINDOW`]). Preserved across filter cycling.
+    recent_window: Duration,
+    /// Sessions hidden by the current filter on the last refresh (footer hint).
     hidden: usize,
     /// Geometry of the log scrollbar from the last draw, so mouse clicks/drags
     /// on it can be mapped back to a `scroll_back` position. `None` when the
@@ -211,9 +222,12 @@ struct ScrollbarHit {
 }
 
 impl App {
-    fn new(paths: &Paths, initial: Option<String>, window: Option<Duration>) -> Self {
-        let configured = window.unwrap_or(DEFAULT_WINDOW);
-        let (sessions, hidden) = list_filtered(paths, window);
+    fn new(paths: &Paths, initial: Option<String>, filter: Filter) -> Self {
+        let recent_window = match filter {
+            Filter::Recent(w) => w,
+            _ => DEFAULT_WINDOW,
+        };
+        let (sessions, hidden) = list_filtered(paths, filter);
         let mut list_state = ListState::default();
         let idx = initial
             .as_deref()
@@ -226,8 +240,8 @@ impl App {
             sessions,
             list_state,
             scroll_back: 0,
-            window,
-            configured,
+            filter,
+            recent_window,
             hidden,
             scrollbar: None,
             log: None,
@@ -295,7 +309,7 @@ impl App {
     /// re-sorted most-recently-active first, so the index drifts).
     fn refresh(&mut self, paths: &Paths) {
         let keep = self.selected_id().map(str::to_string);
-        let (sessions, hidden) = list_filtered(paths, self.window);
+        let (sessions, hidden) = list_filtered(paths, self.filter);
         self.sessions = sessions;
         self.hidden = hidden;
         if self.sessions.is_empty() {
@@ -418,10 +432,11 @@ impl App {
                             KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
                             KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
                             KeyCode::Char('a') => {
-                                // Toggle the recency filter: show all ↔ apply window.
-                                self.window = match self.window {
-                                    Some(_) => None,
-                                    None => Some(self.configured),
+                                // Cycle the filter: Active → Recent → All → Active.
+                                self.filter = match self.filter {
+                                    Filter::Active => Filter::Recent(self.recent_window),
+                                    Filter::Recent(_) => Filter::All,
+                                    Filter::All => Filter::Active,
                                 };
                                 self.refresh(paths);
                             }
@@ -600,15 +615,15 @@ impl App {
             self.sessions.iter().map(session_row).collect()
         };
 
-        let scope = match self.window {
-            Some(_) if self.hidden > 0 => format!(" ({} hidden)", self.hidden),
-            Some(_) => String::new(),
-            None => String::from(" (all)"),
+        let scope = match self.filter {
+            Filter::All => String::from(" (all)"),
+            _ if self.hidden > 0 => format!(" ({} hidden)", self.hidden),
+            _ => String::new(),
         };
-        let recency = if self.window.is_some() {
-            "a all"
-        } else {
-            "a recent"
+        let recency = match self.filter {
+            Filter::Active => "a recent",
+            Filter::Recent(_) => "a all",
+            Filter::All => "a active",
         };
         let title = format!(" sessions{scope}  ↑/↓ select · {recency} · shift+drag copy · q quit ");
         let list = List::new(items)
@@ -646,19 +661,22 @@ impl App {
     }
 }
 
-/// List sessions, hiding dead corpses idle longer than `window` (alive sessions
-/// and the pulse are always kept). Returns the visible list plus the count of
-/// hidden sessions. `window == None` keeps everything.
-fn list_filtered(paths: &Paths, window: Option<Duration>) -> (Vec<Session>, usize) {
+/// List sessions according to `filter`. Alive sessions and the pulse are always
+/// kept. Returns the visible list plus the count of hidden sessions.
+fn list_filtered(paths: &Paths, filter: Filter) -> (Vec<Session>, usize) {
     let all = session::list(paths);
-    let Some(window) = window else {
-        return (all, 0);
-    };
     let total = all.len();
-    let kept: Vec<Session> = all
-        .into_iter()
-        .filter(|s| s.alive || s.is_pulse() || s.idle_for().map(|d| d < window).unwrap_or(true))
-        .collect();
+    let kept: Vec<Session> = match filter {
+        Filter::All => return (all, 0),
+        Filter::Active => all
+            .into_iter()
+            .filter(|s| s.alive || s.is_pulse())
+            .collect(),
+        Filter::Recent(window) => all
+            .into_iter()
+            .filter(|s| s.alive || s.is_pulse() || s.idle_for().map(|d| d < window).unwrap_or(true))
+            .collect(),
+    };
     let hidden = total - kept.len();
     (kept, hidden)
 }
