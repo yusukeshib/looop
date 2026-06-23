@@ -101,32 +101,15 @@ enum Filter {
 /// shown. `--since <dur>` widens to also include dead sessions idle less than
 /// the window (e.g. `1d`, `12h`, `30m`, `90s`, or bare seconds); `--all` shows
 /// every session.
-pub fn cmd_watch(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let mut initial: Option<String> = None;
-    let mut filter = Filter::Active;
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--all" | "-a" => filter = Filter::All,
-            "--since" | "-s" => {
-                let v = iter.next().ok_or_else(|| {
-                    anyhow::anyhow!("looop watch: --since needs a duration (e.g. 1d, 12h, 30m)")
-                })?;
-                filter = Filter::Recent(parse_duration(v)?);
-            }
-            other if other.starts_with("--since=") => {
-                filter = Filter::Recent(parse_duration(&other["--since=".len()..])?);
-            }
-            other if other.starts_with('-') => {
-                anyhow::bail!("looop watch: unknown flag '{other}' (--since <dur>, --all)");
-            }
-            id => {
-                if initial.is_none() {
-                    initial = Some(id.to_string());
-                }
-            }
-        }
-    }
+pub fn cmd_watch(paths: &Paths, args: &crate::cli::WatchArgs) -> Result<ExitCode> {
+    let initial: Option<String> = args.id.clone();
+    let filter = if let Some(dur) = &args.since {
+        Filter::Recent(parse_duration(dur)?)
+    } else if args.all {
+        Filter::All
+    } else {
+        Filter::Active
+    };
 
     let mut terminal = ratatui::init();
     // Capture the mouse so wheel events reach us as `Event::Mouse` instead of

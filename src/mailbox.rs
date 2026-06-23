@@ -101,29 +101,16 @@ pub fn pending(paths: &Paths) -> Vec<Ask> {
 /// until the human replies (`looop _ answer`), printing the answer to stdout and
 /// exiting 0.
 /// `<worker>` defaults to `$LOOOP_SESSION_ID` when omitted.
-pub fn cmd_ask(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let mut worker = String::new();
-    let mut prompt = String::new();
-    let mut reference = String::new();
-    let mut options: Vec<String> = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        match a.as_str() {
-            "--prompt" => prompt = it.next().cloned().unwrap_or_default(),
-            "--ref" => reference = it.next().cloned().unwrap_or_default(),
-            "--options" => {
-                options = it
-                    .next()
-                    .map(|s| s.split(',').map(|x| x.trim().to_string()).collect())
-                    .unwrap_or_default()
-            }
-            other if !other.starts_with("--") && worker.is_empty() => worker = other.to_string(),
-            _ => {}
-        }
-    }
-    if worker.is_empty() {
-        worker = std::env::var("LOOOP_SESSION_ID").unwrap_or_default();
-    }
+pub fn cmd_ask(paths: &Paths, args: &crate::cli::AskArgs) -> Result<ExitCode> {
+    // worker defaults to $LOOOP_SESSION_ID (a worker self-callback omits it).
+    let worker = match &args.worker {
+        Some(w) if !w.is_empty() => w.clone(),
+        _ => std::env::var("LOOOP_SESSION_ID").unwrap_or_default(),
+    };
+    let reference = args.reference.clone().unwrap_or_default();
+    // clap already split `--options a,b` on commas; trim each entry.
+    let options: Vec<String> = args.options.iter().map(|s| s.trim().to_string()).collect();
+    let prompt = args.prompt.clone();
     if worker.is_empty() {
         eprintln!("usage: looop _ ask <worker> --prompt \"…\" [--ref PATH] [--options a,b]");
         return Ok(ExitCode::from(1));
@@ -176,22 +163,16 @@ pub fn cmd_ask(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 ///
 /// Root-agent callback: resolve a pending ask. Writes `answers/<ask_id>.json`,
 /// which unblocks the worker's `_ ask`. Refuses an unknown ask id.
-pub fn cmd_answer(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    // `--force` may sit anywhere in the args; pull it out before positional
-    // parsing so it never leaks into the answer body.
-    let force = args.iter().any(|a| a == "--force");
-    let positional: Vec<String> = args.iter().filter(|a| *a != "--force").cloned().collect();
-    let Some((ask_id, rest)) = positional.split_first() else {
-        eprintln!(
-            "usage: looop _ answer <ask_id> <text…|-> [--force]  (omit text or pass `-` to read stdin/heredoc)"
-        );
-        return Ok(ExitCode::from(1));
-    };
+pub fn cmd_answer(paths: &Paths, args: &crate::cli::AnswerArgs) -> Result<ExitCode> {
+    let ask_id = &args.ask_id;
+    let force = args.force;
     safe(ask_id)?;
-    // Body resolution mirrors `_ goal/sensor/playbook write`: an inline body wins,
+    // Body resolution mirrors `_ goal/sensor/playbook write`: inline words win,
     // otherwise (no body, or a lone `-`) read the whole answer from stdin so a
     // multi-line design decision can be piped or passed via heredoc without the
-    // `-` (or the heredoc terminator) leaking into the saved answer.
+    // `-` (or the heredoc terminator) leaking into the saved answer. clap pulls
+    // `--force` out from anywhere, so it never leaks into the body.
+    let rest = &args.body;
     let text = if rest.is_empty() || (rest.len() == 1 && rest[0] == "-") {
         use std::io::Read;
         let mut buf = String::new();
@@ -233,10 +214,10 @@ pub fn cmd_answer(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 /// not the full `_ state` dump (snapshots / journal / fleet). Plain output is a
 /// compact list; `--json` emits the array of ask objects. A client's main job is
 /// relaying asks, so this makes that a single cheap call.
-pub fn cmd_asks(paths: &Paths, args: &[String]) -> Result<ExitCode> {
+pub fn cmd_asks(paths: &Paths, json: bool) -> Result<ExitCode> {
     let _ = crate::seed::ensure_dirs(paths);
     let asks = pending(paths);
-    if args.iter().any(|a| a == "--json") {
+    if json {
         let arr: Vec<serde_json::Value> = asks
             .iter()
             .map(|a| serde_json::to_value(a).unwrap_or_default())
@@ -268,6 +249,16 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Build an `AnswerArgs` the way clap would after parsing
+    /// `_ answer <id> <text…> [--force]`.
+    fn ans(id: &str, text: &str, force: bool) -> crate::cli::AnswerArgs {
+        crate::cli::AnswerArgs {
+            ask_id: id.into(),
+            body: vec![text.into()],
+            force,
+        }
+    }
+
     #[test]
     fn ask_ids_increment_and_pending_excludes_answered() {
         let p = Paths::temp();
@@ -294,7 +285,7 @@ mod tests {
         assert_eq!(pending(&p).len(), 1, "unanswered ask is pending");
 
         // Answering it removes it from pending but keeps the id reserved.
-        cmd_answer(&p, &["triage-1".into(), "yes".into()]).unwrap();
+        cmd_answer(&p, &ans("triage-1", "yes", false)).unwrap();
         assert!(pending(&p).is_empty(), "answered ask is not pending");
         assert_eq!(read_answer(&store, "triage-1").as_deref(), Some("yes"));
         assert_eq!(next_ask_id(&store, "triage"), "triage-2");
@@ -304,7 +295,7 @@ mod tests {
     fn answer_refuses_unknown_ask() {
         let p = Paths::temp();
         fs::create_dir_all(p.asks_dir()).unwrap();
-        assert!(cmd_answer(&p, &["nope-9".into(), "x".into()]).is_err());
+        assert!(cmd_answer(&p, &ans("nope-9", "x", false)).is_err());
     }
 
     #[test]
@@ -317,15 +308,15 @@ mod tests {
             serde_json::json!({"id":"w-1","worker":"w","prompt":"ok?","ts":1}).to_string(),
         )
         .unwrap();
-        cmd_answer(&p, &["w-1".into(), "first".into()]).unwrap();
+        cmd_answer(&p, &ans("w-1", "first", false)).unwrap();
         // A bare re-answer is refused (a stray re-answer is almost always a misfire).
-        assert!(cmd_answer(&p, &["w-1".into(), "second".into()]).is_err());
+        assert!(cmd_answer(&p, &ans("w-1", "second", false)).is_err());
         assert_eq!(
             read_answer(&FileStore::new(&p), "w-1").as_deref(),
             Some("first")
         );
         // `--force` lets the human deliberately recover from a bad answer.
-        cmd_answer(&p, &["w-1".into(), "second".into(), "--force".into()]).unwrap();
+        cmd_answer(&p, &ans("w-1", "second", true)).unwrap();
         assert_eq!(
             read_answer(&FileStore::new(&p), "w-1").as_deref(),
             Some("second")
@@ -343,7 +334,7 @@ mod tests {
         .unwrap();
         assert_eq!(pending(&p).len(), 1);
         // cmd_asks is a thin view over pending(); answering empties it.
-        cmd_answer(&p, &["w-1".into(), "yes".into()]).unwrap();
+        cmd_answer(&p, &ans("w-1", "yes", false)).unwrap();
         assert!(pending(&p).is_empty());
     }
 }

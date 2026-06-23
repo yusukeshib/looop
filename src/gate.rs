@@ -40,30 +40,11 @@ fn claim_holder(store: &impl StateStore, key: &Key) -> String {
 
 /// The session that should own a claim: explicit `--session <id>`, else the
 /// worker's exported `$LOOOP_SESSION_ID`. Empty when neither is set.
-fn claim_session(args: &[String]) -> String {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--session" {
-            return it.next().cloned().unwrap_or_default();
-        }
+fn claim_session(args: &crate::cli::ClaimArgs) -> String {
+    match &args.session {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => std::env::var("LOOOP_SESSION_ID").unwrap_or_default(),
     }
-    std::env::var("LOOOP_SESSION_ID").unwrap_or_default()
-}
-
-/// The first positional argument (the claim name), skipping `--session <val>`
-/// and any other `--flag` so a flag value is never mistaken for the name.
-fn claim_positional(args: &[String]) -> String {
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--session" {
-            it.next(); // skip its value
-            continue;
-        }
-        if !a.starts_with("--") {
-            return a.clone();
-        }
-    }
-    String::new()
 }
 
 /// `looop _ claim <name> [--session <id>]` — atomically acquire the lease for
@@ -71,8 +52,8 @@ fn claim_positional(args: &[String]) -> String {
 /// session holds it. The acquire is O_EXCL so two racers can't both win; a lease
 /// held by a DEAD session is reclaimed. The claim body is `{session,name}`,
 /// matching what `sys_claims` surfaces and `reap_stale_claims` reaps.
-pub fn cmd_claim(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let name = claim_positional(args);
+pub fn cmd_claim(paths: &Paths, args: &crate::cli::ClaimArgs) -> Result<ExitCode> {
+    let name = args.name.clone();
     safe_name(&name)?;
     let session = claim_session(args);
     let store = FileStore::new(paths);
@@ -105,8 +86,8 @@ pub fn cmd_claim(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 /// `looop _ unclaim <name> [--session <id>]` — release a lease we own. Removes
 /// `claims/<name>.json` when it is unowned, owned by us, or held by a DEAD
 /// session; refuses (exit 1) only when a DIFFERENT live session holds it.
-pub fn cmd_unclaim(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let name = claim_positional(args);
+pub fn cmd_unclaim(paths: &Paths, args: &crate::cli::ClaimArgs) -> Result<ExitCode> {
+    let name = args.name.clone();
     safe_name(&name)?;
     let session = claim_session(args);
     let store = FileStore::new(paths);
@@ -164,8 +145,11 @@ mod tests {
     use super::*;
     use std::fs;
 
-    fn args(name: &str, sess: &str) -> Vec<String> {
-        vec![name.into(), "--session".into(), sess.into()]
+    fn args(name: &str, sess: &str) -> crate::cli::ClaimArgs {
+        crate::cli::ClaimArgs {
+            name: name.into(),
+            session: Some(sess.into()),
+        }
     }
 
     #[test]
@@ -227,9 +211,9 @@ mod tests {
     #[test]
     fn claim_name_after_session_flag_is_not_the_flag_value() {
         let p = Paths::temp();
-        // `claim --session w1 repo-q` must claim repo-q, not "w1".
-        let a = vec!["--session".into(), "w1".into(), "repo-q".into()];
-        assert_eq!(cmd_claim(&p, &a).unwrap(), ExitCode::SUCCESS);
+        // `claim --session w1 repo-q` must claim repo-q, not "w1" (clap binds the
+        // positional `name` distinctly from the `--session` value).
+        assert_eq!(cmd_claim(&p, &args("repo-q", "w1")).unwrap(), ExitCode::SUCCESS);
         assert!(p.claims_dir().join("repo-q.json").is_file());
         assert!(!p.claims_dir().join("w1.json").exists());
     }

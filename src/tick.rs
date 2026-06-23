@@ -671,12 +671,12 @@ fn one_line(s: &str, max: usize) -> String {
 /// (with age), the live worker fleet, each sensor's wake signal, and the last
 /// few journal lines — so a client woken by `_ wait` never has to follow up
 /// with `tail journal.md` / `_ state --json | jq` to see what actually moved.
-fn print_state(paths: &Paths, args: &[String], changed: Option<&[String]>) -> Result<ExitCode> {
+fn print_state(paths: &Paths, json: bool, changed: Option<&[String]>) -> Result<ExitCode> {
     let mut s = state(paths);
     if let (Some(ch), Some(obj)) = (changed, s.as_object_mut()) {
         obj.insert("changed".to_string(), serde_json::json!(ch));
     }
-    if args.iter().any(|a| a == "--json") {
+    if json {
         println!("{}", serde_json::to_string_pretty(&s)?);
         return Ok(ExitCode::SUCCESS);
     }
@@ -771,9 +771,9 @@ fn print_state(paths: &Paths, args: &[String], changed: Option<&[String]>) -> Re
 
 /// `looop _ state [--json]` — read the current world state. Pure read: no
 /// sensing, no side effects (the autonomous pulse keeps snapshots fresh).
-pub fn cmd_state(paths: &Paths, args: &[String]) -> Result<ExitCode> {
+pub fn cmd_state(paths: &Paths, json: bool) -> Result<ExitCode> {
     let _ = crate::seed::ensure_dirs(paths);
-    print_state(paths, args, None)
+    print_state(paths, json, None)
 }
 
 /// `looop _ wait [--json] [--only-asks|--actionable]` — BLOCK until there is
@@ -781,17 +781,17 @@ pub fn cmd_state(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 /// summary. By default any category move (asks / journal / playbook / goals /
 /// snapshots) wakes it; `--actionable` narrows to asks+journal and `--only-asks`
 /// to asks alone, so a watching client can ignore noisy snapshot-only moves.
-pub fn cmd_wait(paths: &Paths, args: &[String]) -> Result<ExitCode> {
+pub fn cmd_wait(paths: &Paths, args: &crate::cli::WaitArgs) -> Result<ExitCode> {
     let _ = crate::seed::ensure_dirs(paths);
-    let filter = if args.iter().any(|a| a == "--only-asks") {
+    let filter = if args.only_asks {
         WaitFilter::Asks
-    } else if args.iter().any(|a| a == "--actionable") {
+    } else if args.actionable {
         WaitFilter::Actionable
     } else {
         WaitFilter::Any
     };
     let changed = wait_for_change(paths, filter);
-    print_state(paths, args, Some(&changed))
+    print_state(paths, args.json, Some(&changed))
 }
 
 #[cfg(test)]

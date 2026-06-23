@@ -143,16 +143,6 @@ pub fn record_cost(paths: &Paths, kind: &str, id: &str, runner: &str, cost: &str
     }
 }
 
-/// `looop _ cost <kind> <id> <runner> <usd>` — a worker self-reporting its spend.
-pub fn cmd_cost_record(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let kind = args.first().map(String::as_str).unwrap_or("");
-    let id = args.get(1).map(String::as_str).unwrap_or("");
-    let runner = args.get(2).map(String::as_str).unwrap_or("");
-    let cost = args.get(3).map(String::as_str).unwrap_or("");
-    record_cost(paths, kind, id, runner, cost);
-    Ok(ExitCode::SUCCESS)
-}
-
 /// Accumulates LLM spend from a runner's NDJSON stream.
 ///
 /// With no `spec`, the meter understands the two BUILT-IN runner shapes and
@@ -398,7 +388,7 @@ fn table(
     out
 }
 
-pub fn cmd_cost(paths: &Paths, _args: &[String]) -> Result<ExitCode> {
+pub fn cmd_cost(paths: &Paths) -> Result<ExitCode> {
     let ledger = paths.cost_ledger();
 
     if !ledger.is_file() {

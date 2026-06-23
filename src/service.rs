@@ -16,18 +16,7 @@ use std::time::Duration;
 /// `looop up [--json]` — start the autonomous pulse (idempotent). looop runs
 /// itself from there; steer by editing goals/PLAYBOOK or run a client to watch
 /// and relay (`looop watch`, or a pi/claude session pointed at `looop _ state`).
-pub fn cmd_up(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let mut json = false;
-    for a in args {
-        match a.as_str() {
-            "--json" => json = true,
-            other => {
-                eprintln!("looop up: unknown option '{other}' (the only flag is --json)");
-                return Ok(ExitCode::from(1));
-            }
-        }
-    }
-
+pub fn cmd_up(paths: &Paths, json: bool) -> Result<ExitCode> {
     if session::is_alive(paths, PULSE_SESSION) {
         println!("looop: pulse already running");
     } else {

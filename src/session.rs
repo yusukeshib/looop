@@ -185,11 +185,7 @@ fn reject_pulse(session: &str, verb: &str) -> bool {
 
 /// `looop _ kill <id>` — terminate a worker session (in-process). Internal
 /// worker self-control callback (CONTRACT), not a human-facing verb.
-pub fn cmd_kill(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let Some(id) = args.first() else {
-        eprintln!("usage: looop _ kill <id>");
-        return Ok(ExitCode::from(1));
-    };
+pub fn cmd_kill(paths: &Paths, id: &str) -> Result<ExitCode> {
     let session = full_session(id);
     if reject_pulse(&session, "kill") {
         return Ok(ExitCode::from(1));
@@ -204,32 +200,17 @@ pub fn cmd_kill(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 /// default a trailing Enter is sent (the common "answer the prompt" case);
 /// `--no-newline` suppresses it (e.g. partial input). Refuses the pulse — the
 /// control loop is driven by goals/PLAYBOOK + asks, never raw keystrokes.
-pub fn cmd_send(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let mut newline = true;
-    let mut rest: Vec<&String> = Vec::new();
-    for a in args {
-        match a.as_str() {
-            "--no-newline" | "-n" => newline = false,
-            _ => rest.push(a),
-        }
-    }
-    let Some((id, words)) = rest.split_first() else {
-        eprintln!("usage: looop _ send <id> <text…> [--no-newline]");
-        return Ok(ExitCode::from(1));
-    };
-    if words.is_empty() {
+pub fn cmd_send(paths: &Paths, args: &crate::cli::SendArgs) -> Result<ExitCode> {
+    let newline = !args.no_newline;
+    if args.text.is_empty() {
         eprintln!("usage: looop _ send <id> <text…> [--no-newline]");
         return Ok(ExitCode::from(1));
     }
-    let session = full_session(id);
+    let session = full_session(&args.id);
     if reject_pulse(&session, "send") {
         return Ok(ExitCode::from(1));
     }
-    let text = words
-        .iter()
-        .map(|s| s.as_str())
-        .collect::<Vec<_>>()
-        .join(" ");
+    let text = args.text.join(" ");
     rt().block_on(
         paths
             .sessions()
@@ -246,22 +227,17 @@ pub fn cmd_send(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 /// attaching. Falls back to the on-disk log render if the session isn't live.
 /// Defaults to plain text (cheapest for an LLM to read) with trailing blank
 /// rows trimmed.
-pub fn cmd_screenshot(paths: &Paths, args: &[String]) -> Result<ExitCode> {
+pub fn cmd_screenshot(paths: &Paths, args: &crate::cli::ScreenshotArgs) -> Result<ExitCode> {
     use ::babysit::cli::ShotFormat;
-    let mut format = ShotFormat::Plain;
-    let mut trim = true;
-    let mut id = None;
-    for a in args {
-        match a.as_str() {
-            "--ansi" => format = ShotFormat::Ansi,
-            "--json" => format = ShotFormat::Json,
-            "--plain" => format = ShotFormat::Plain,
-            "--no-trim" => trim = false,
-            _ if id.is_none() => id = Some(a),
-            _ => {}
-        }
-    }
-    let Some(id) = id else {
+    let format = if args.ansi {
+        ShotFormat::Ansi
+    } else if args.json {
+        ShotFormat::Json
+    } else {
+        ShotFormat::Plain
+    };
+    let trim = !args.no_trim;
+    let Some(id) = args.id.as_deref() else {
         eprintln!("usage: looop _ screenshot <id> [--ansi|--json] [--no-trim]");
         return Ok(ExitCode::from(1));
     };

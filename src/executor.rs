@@ -380,70 +380,23 @@ pub fn run_action(paths: &Paths, action: &Action, journal: Option<&str>) -> Resu
     Ok(summary)
 }
 
-/// Resolve an action body from positional args, falling back to stdin when none
-/// are given OR a lone `-` is passed (so a human/client can heredoc a multi-line
-/// goal/PLAYBOOK body, matching the `_ answer` `-` convention).
-fn body_or_stdin(rest: &[String]) -> Result<String> {
-    reject_flaglike_body(rest)?;
-    if let Some(body) = inline_body(rest) {
-        return Ok(body);
+/// Resolve an action body from the parsed positional words, falling back to
+/// stdin when none are given OR a lone `-` is passed (so a human/client can
+/// heredoc a multi-line goal/PLAYBOOK body, matching the `_ answer` convention).
+/// clap already rejects mistyped flags (`_ playbook write --help` prints help
+/// instead of writing the literal text), so this no longer has to guard against
+/// flag-like bodies — a body that genuinely starts with `--` arrives here only
+/// via the `--` end-of-options separator or stdin.
+fn resolve_body(words: &[String]) -> Result<String> {
+    if words.is_empty() || (words.len() == 1 && words[0] == "-") {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .context("reading body from stdin")?;
+        return Ok(buf);
     }
-    use std::io::Read;
-    let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
-        .context("reading body from stdin")?;
-    Ok(buf)
-}
-
-/// Refuse a lone flag-like argument (`--help`, `--force`, `--anything`) as the
-/// *entire* body. With no clap layer, `rest` is joined verbatim, so a mistyped
-/// flag is silently written as content — this is exactly how `_ playbook write
-/// --help` clobbered the PLAYBOOK down to 7 bytes (the literal text `--help`).
-/// PR #48 closed the lone-`-` case; this closes the lone-`--flag` case for every
-/// write verb (goal/sensor/playbook/worker start) that funnels through
-/// [`body_or_stdin`]. A body that genuinely begins with `--` can still be piped
-/// via the `-`/heredoc path, which never goes through this guard.
-fn reject_flaglike_body(rest: &[String]) -> Result<()> {
-    if rest.len() == 1 && rest[0].starts_with("--") {
-        anyhow::bail!(
-            "refusing to write {:?} as a body — that looks like a CLI flag, not content. \
-             To write text that starts with `--`, pipe it via stdin instead, e.g. \
-             `… write - <<'EOF'`.",
-            rest[0]
-        );
-    }
-    Ok(())
-}
-
-/// The positional-args half of [`body_or_stdin`]: `Some(body)` when an inline
-/// body is given, `None` when stdin should be read (no args, OR a lone `-`).
-/// The `-` sentinel mirrors `_ answer` so a multi-line body can be piped /
-/// passed via heredoc without the literal `-` leaking in as the body. (Without
-/// this, `looop _ playbook write -` wrote a one-char `-`, silently clobbering the
-/// whole PLAYBOOK.)
-fn inline_body(rest: &[String]) -> Option<String> {
-    let read_stdin = rest.is_empty() || (rest.len() == 1 && rest[0] == "-");
-    if read_stdin {
-        None
-    } else {
-        Some(rest.join(" "))
-    }
-}
-
-/// Strip `--journal <text>` from args, returning (journal, remaining args).
-fn take_journal(args: &[String]) -> (Option<String>, Vec<String>) {
-    let mut journal = None;
-    let mut rest = Vec::new();
-    let mut it = args.iter();
-    while let Some(a) = it.next() {
-        if a == "--journal" {
-            journal = it.next().cloned();
-        } else {
-            rest.push(a.clone());
-        }
-    }
-    (journal, rest)
+    Ok(words.join(" "))
 }
 
 fn ok(summary: String) -> Result<ExitCode> {
@@ -451,120 +404,95 @@ fn ok(summary: String) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `looop _ goal write <id> [body…|-]` | `looop _ goal archive <id>`
-pub fn cmd_goal(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let (journal, rest) = take_journal(args);
-    match rest.first().map(String::as_str) {
-        Some("write") => {
-            let Some(id) = rest.get(1).cloned() else {
-                eprintln!(
-                    "usage: looop _ goal write <id> [body…|-]  (omit body or pass `-` to read stdin/heredoc)"
-                );
-                return Ok(ExitCode::from(1));
-            };
-            let body = body_or_stdin(&rest[2.min(rest.len())..])?;
-            ok(run_action(
-                paths,
-                &Action::WriteGoal { id, body },
-                journal.as_deref(),
-            )?)
-        }
-        Some("archive") => {
-            let Some(id) = rest.get(1).cloned() else {
-                eprintln!("usage: looop _ goal archive <id>");
-                return Ok(ExitCode::from(1));
-            };
-            ok(run_action(
-                paths,
-                &Action::ArchiveGoal { id },
-                journal.as_deref(),
-            )?)
-        }
-        _ => {
-            eprintln!("usage: looop _ goal write <id> [body…] | looop _ goal archive <id>");
-            Ok(ExitCode::from(1))
-        }
-    }
+/// `looop _ goal write <id> [body…|-]`
+pub fn write_goal(
+    paths: &Paths,
+    id: &str,
+    body: &[String],
+    journal: Option<&str>,
+) -> Result<ExitCode> {
+    let body = resolve_body(body)?;
+    ok(run_action(
+        paths,
+        &Action::WriteGoal {
+            id: id.to_string(),
+            body,
+        },
+        journal,
+    )?)
+}
+
+/// `looop _ goal archive <id>`
+pub fn archive_goal(paths: &Paths, id: &str, journal: Option<&str>) -> Result<ExitCode> {
+    ok(run_action(
+        paths,
+        &Action::ArchiveGoal { id: id.to_string() },
+        journal,
+    )?)
 }
 
 /// `looop _ sensor write <name> [script…|-]`
-pub fn cmd_sensor(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let (journal, rest) = take_journal(args);
-    if rest.first().map(String::as_str) != Some("write") {
-        eprintln!(
-            "usage: looop _ sensor write <name> [script…|-]  (omit script or pass `-` to read stdin/heredoc)"
-        );
-        return Ok(ExitCode::from(1));
-    }
-    let Some(name) = rest.get(1).cloned() else {
-        eprintln!(
-            "usage: looop _ sensor write <name> [script…|-]  (omit script or pass `-` to read stdin/heredoc)"
-        );
-        return Ok(ExitCode::from(1));
-    };
-    let script = body_or_stdin(&rest[2.min(rest.len())..])?;
+pub fn write_sensor(
+    paths: &Paths,
+    name: &str,
+    script: &[String],
+    journal: Option<&str>,
+) -> Result<ExitCode> {
+    let script = resolve_body(script)?;
     ok(run_action(
         paths,
-        &Action::WriteSensor { name, script },
-        journal.as_deref(),
+        &Action::WriteSensor {
+            name: name.to_string(),
+            script,
+        },
+        journal,
     )?)
 }
 
 /// `looop _ playbook write [body…|-]`
-pub fn cmd_playbook(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let (journal, rest) = take_journal(args);
-    if rest.first().map(String::as_str) != Some("write") {
-        eprintln!(
-            "usage: looop _ playbook write [body…|-]  (omit body or pass `-` to read stdin/heredoc)"
-        );
-        return Ok(ExitCode::from(1));
-    }
-    let body = body_or_stdin(&rest[1.min(rest.len())..])?;
-    ok(run_action(
-        paths,
-        &Action::WritePlaybook { body },
-        journal.as_deref(),
-    )?)
+pub fn write_playbook(paths: &Paths, body: &[String], journal: Option<&str>) -> Result<ExitCode> {
+    let body = resolve_body(body)?;
+    ok(run_action(paths, &Action::WritePlaybook { body }, journal)?)
 }
 
-/// `looop _ run <cmd…> [--reason TEXT]` — one ad-hoc, REVERSIBLE shell command.
-pub fn cmd_run(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let (journal, mut rest) = take_journal(args);
-    let mut reason = String::new();
-    if let Some(i) = rest.iter().position(|a| a == "--reason") {
-        rest.remove(i);
-        if i < rest.len() {
-            reason = rest.remove(i);
-        }
-    }
-    let cmd = rest.join(" ");
+/// `looop _ run [--reason TEXT] <cmd…>` — one ad-hoc, REVERSIBLE shell command.
+/// The command is captured verbatim (its own `--flags` pass through), so
+/// `--reason`/`--journal` must precede it.
+pub fn cmd_run(paths: &Paths, args: &crate::cli::RunArgs) -> Result<ExitCode> {
+    let cmd = args.cmd.join(" ");
     if cmd.trim().is_empty() {
-        eprintln!("usage: looop _ run <cmd…> [--reason TEXT]");
+        eprintln!("usage: looop _ run [--reason TEXT] <cmd…>");
         return Ok(ExitCode::from(1));
     }
     ok(run_action(
         paths,
-        &Action::RunShell { cmd, reason },
-        journal.as_deref(),
+        &Action::RunShell {
+            cmd,
+            reason: args.reason.clone().unwrap_or_default(),
+        },
+        args.journal.journal.as_deref(),
     )?)
 }
 
-/// `looop _ worker start <id> <prompt…>` — spawn a worker session (journaled).
-pub fn cmd_worker_start(paths: &Paths, args: &[String]) -> Result<ExitCode> {
-    let (journal, rest) = take_journal(args);
-    let Some(id) = rest.first().cloned() else {
-        eprintln!("usage: looop _ worker start <id> <prompt…>");
-        return Ok(ExitCode::from(1));
-    };
-    let prompt = body_or_stdin(&rest[1.min(rest.len())..])?;
+/// `looop _ worker start <id> <prompt…|->` — spawn a worker session (journaled).
+pub fn start_worker(
+    paths: &Paths,
+    id: &str,
+    prompt: &[String],
+    journal: Option<&str>,
+) -> Result<ExitCode> {
+    let prompt = resolve_body(prompt)?;
     if prompt.trim().is_empty() {
-        eprintln!("usage: looop _ worker start <id> <prompt…>");
+        eprintln!("usage: looop _ worker start <id> <prompt…|->");
         return Ok(ExitCode::from(1));
     }
     ok(run_action(
         paths,
-        &Action::StartWorker { id, prompt },
-        journal.as_deref(),
+        &Action::StartWorker {
+            id: id.to_string(),
+            prompt,
+        },
+        journal,
     )?)
 }
 
@@ -573,42 +501,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inline_body_resolves_args_and_stdin_sentinel() {
-        // No args → read stdin (None).
-        assert_eq!(inline_body(&[]), None);
-        // A lone `-` → read stdin (None), NOT a literal one-char body. This is the
-        // regression: `looop _ playbook write -` used to write "-" and clobber the
-        // whole PLAYBOOK.
-        assert_eq!(inline_body(&["-".to_string()]), None);
-        // An inline body wins, joined with spaces.
+    fn resolve_body_joins_words_and_keeps_inner_dash() {
+        // Inline words join with spaces.
         assert_eq!(
-            inline_body(&["hello".to_string(), "world".to_string()]),
-            Some("hello world".to_string())
+            resolve_body(&["hello".to_string(), "world".to_string()]).unwrap(),
+            "hello world"
         );
-        // A `-` alongside real words is part of the body, not a sentinel.
+        // A `-` alongside real words is content, not the stdin sentinel (only a
+        // LONE `-`, or no words at all, falls through to stdin — not unit-tested
+        // here since it blocks on a real stdin read). clap rejects mistyped flags
+        // (`--help` prints help) before they ever reach here, so the old
+        // flag-like-body guard is gone; a literal `--word` body arrives only via
+        // the `--` separator.
         assert_eq!(
-            inline_body(&["a".to_string(), "-".to_string()]),
-            Some("a -".to_string())
+            resolve_body(&["a".to_string(), "-".to_string(), "b".to_string()]).unwrap(),
+            "a - b"
         );
-    }
-
-    #[test]
-    fn reject_flaglike_body_blocks_lone_flags() {
-        // A lone `--flag` is a mistyped CLI flag, not content. Refuse it so it
-        // never gets written verbatim (this is how `_ playbook write --help`
-        // shrank the PLAYBOOK to the literal 6-char text `--help`).
-        assert!(reject_flaglike_body(&["--help".to_string()]).is_err());
-        assert!(reject_flaglike_body(&["--force".to_string()]).is_err());
-        // The stdin sentinel `-` and a real (empty/multi-word) body are fine.
-        assert!(reject_flaglike_body(&[]).is_ok());
-        assert!(reject_flaglike_body(&["-".to_string()]).is_ok());
-        assert!(reject_flaglike_body(&["hello".to_string(), "world".to_string()]).is_ok());
-        // A `--`-prefixed token alongside real words is part of a body, not a
-        // lone flag — the join keeps it (e.g. a markdown `--- frontmatter` line).
-        assert!(reject_flaglike_body(&["--note".to_string(), "text".to_string()]).is_ok());
-        // A lone single-dash word (e.g. `-x`) is not `--`-prefixed: left to
-        // `inline_body`, which only treats the bare `-` as the stdin sentinel.
-        assert!(reject_flaglike_body(&["-x".to_string()]).is_ok());
     }
 
     #[test]

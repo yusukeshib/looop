@@ -10,6 +10,7 @@
 //! supervises both kinds of detached session: a worker (cmd is the agent) and
 //! the pulse (cmd is `looop _ pulse`, the reconcile-loop body).
 
+mod cli;
 mod config;
 mod cost;
 mod deps;
@@ -43,134 +44,38 @@ fn main() -> ExitCode {
     util::init_format();
     util::init_color();
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    // A bare `looop` is no longer a command: the loop runs as the `looop up`
-    // service (the autonomous pulse). With no verb, show the manual.
-    let Some(cmd) = args.first().map(String::as_str) else {
-        help::print(&paths);
-        return ExitCode::SUCCESS;
-    };
-    let rest = &args[1..];
+    let raw: Vec<String> = std::env::args().skip(1).collect();
 
-    let result: Result<ExitCode> = match cmd {
-        "help" | "-h" | "--help" => {
-            help::print(&paths);
-            Ok(ExitCode::SUCCESS)
-        }
-        "version" | "--version" | "-V" => {
-            println!("looop {}", env!("CARGO_PKG_VERSION"));
-            Ok(ExitCode::SUCCESS)
-        }
-        // Hidden: babysit's detacher re-execs us as the headless session
-        // supervisor (`looop run --detached-id <id> -- <cmd>`), for BOTH workers
-        // and the pulse. babysit hard-codes the `run` verb. Route straight to
-        // the supervisor; no deps check, no pulse.
-        "run" if rest.first().map(String::as_str) == Some("--detached-id") => {
-            session::run_detached_worker(rest).map(|c| ExitCode::from(c.clamp(0, 255) as u8))
-        }
-        // Service control: bring the autonomous pulse up / tear it (and workers)
-        // down. looop decides on its own; you steer via goals/PLAYBOOK + asks.
-        "up" => deps::require_deps(&paths).and_then(|_| service::cmd_up(&paths, rest)),
-        "down" => deps::require_deps(&paths).and_then(|_| service::cmd_down(&paths)),
-        // Read-only observer TUI: tail the colored log of any running session
-        // (pulse or worker) with a live selector. No deps gate — it only reads
-        // logs + lists sessions, never launches an agent.
-        "watch" => watch::cmd_watch(&paths, rest),
-        // Machine-facing verbs, grouped under `_`. Two audiences: STEER verbs
-        // (state/wait/answer/goal/sensor/playbook) the human or any client
-        // uses to inspect + steer + answer asks, and the WORKER self-callbacks
-        // (ask/kill/claim/unclaim/cost). `_ pulse` is looop's own detached spawn.
-        "_" => {
-            match rest.first().map(String::as_str) {
-                Some("pulse") => {
-                    deps::require_deps(&paths).and_then(|_| service::cmd_pulse(&paths))
-                }
-                // Root agent: read state (now / blocking) + drive the world.
-                Some("state") => {
-                    deps::require_deps(&paths).and_then(|_| tick::cmd_state(&paths, &rest[1..]))
-                }
-                Some("wait") => {
-                    deps::require_deps(&paths).and_then(|_| tick::cmd_wait(&paths, &rest[1..]))
-                }
-                Some("asks") => {
-                    deps::require_deps(&paths).and_then(|_| mailbox::cmd_asks(&paths, &rest[1..]))
-                }
-                Some("answer") => {
-                    deps::require_deps(&paths).and_then(|_| mailbox::cmd_answer(&paths, &rest[1..]))
-                }
-                Some("goal") => {
-                    deps::require_deps(&paths).and_then(|_| executor::cmd_goal(&paths, &rest[1..]))
-                }
-                Some("sensor") => deps::require_deps(&paths)
-                    .and_then(|_| executor::cmd_sensor(&paths, &rest[1..])),
-                Some("playbook") => deps::require_deps(&paths)
-                    .and_then(|_| executor::cmd_playbook(&paths, &rest[1..])),
-                Some("run") => {
-                    deps::require_deps(&paths).and_then(|_| executor::cmd_run(&paths, &rest[1..]))
-                }
-                Some("worker") => match rest.get(1).map(String::as_str) {
-                    Some("start") => deps::require_deps(&paths)
-                        .and_then(|_| executor::cmd_worker_start(&paths, &rest[2..])),
-                    Some("kill") => deps::require_deps(&paths)
-                        .and_then(|_| session::cmd_kill(&paths, &rest[2..])),
-                    other => {
-                        eprintln!("looop _ worker: unknown subverb {other:?} (start, kill)");
-                        Ok(ExitCode::from(1))
-                    }
-                },
-                // Worker self-callbacks (auto-injected CONTRACT).
-                Some("ask") => {
-                    deps::require_deps(&paths).and_then(|_| mailbox::cmd_ask(&paths, &rest[1..]))
-                }
-                Some("kill") => {
-                    deps::require_deps(&paths).and_then(|_| session::cmd_kill(&paths, &rest[1..]))
-                }
-                // STEER: nudge an interactive worker (type input) / peek at its
-                // current screen. send refuses the pulse; screenshot is read-only.
-                Some("send") => {
-                    deps::require_deps(&paths).and_then(|_| session::cmd_send(&paths, &rest[1..]))
-                }
-                Some("screenshot") => deps::require_deps(&paths)
-                    .and_then(|_| session::cmd_screenshot(&paths, &rest[1..])),
-                Some("claim") => {
-                    deps::require_deps(&paths).and_then(|_| gate::cmd_claim(&paths, &rest[1..]))
-                }
-                Some("unclaim") => {
-                    deps::require_deps(&paths).and_then(|_| gate::cmd_unclaim(&paths, &rest[1..]))
-                }
-                Some("cost") => cost::cmd_cost_record(&paths, &rest[1..]),
-                other => {
-                    eprintln!(
-                        "looop _: unknown internal verb {other:?} (root: state, wait, asks, answer, goal, sensor, playbook, run, worker, send, screenshot; worker: ask, kill, claim, unclaim, cost; pulse)"
-                    );
-                    Ok(ExitCode::from(1))
-                }
+    // PRE-CLAP shortcut (the ONE path that bypasses clap): babysit's detacher
+    // re-execs us as the headless session supervisor (`looop run --detached-id
+    // <id> … -- <cmd>`), for BOTH workers and the pulse. babysit hard-codes the
+    // `run` verb and may pass flags THIS version doesn't know; that argv must
+    // tolerate unknown flags (forward-compat), the opposite of clap's strict
+    // rejection — so it never reaches clap. No deps check, no pulse.
+    if raw.first().map(String::as_str) == Some("run")
+        && raw.get(1).map(String::as_str) == Some("--detached-id")
+    {
+        return match session::run_detached_worker(&raw[1..]) {
+            Ok(c) => ExitCode::from(c.clamp(0, 255) as u8),
+            Err(e) => {
+                eprintln!("{e}");
+                ExitCode::from(1)
             }
-        }
-        "config" => match rest.first().map(String::as_str) {
-            Some("zsh") => {
-                print!("{}", include_str!("completions/looop.zsh"));
-                Ok(ExitCode::SUCCESS)
-            }
-            Some("bash") => {
-                print!("{}", include_str!("completions/looop.bash"));
-                Ok(ExitCode::SUCCESS)
-            }
-            _ => {
-                eprintln!("looop config: specify a shell — zsh or bash");
-                eprintln!("  zsh:  eval \"$(looop config zsh)\"");
-                eprintln!("  bash: eval \"$(looop config bash)\"");
-                Ok(ExitCode::from(1))
-            }
-        },
-        "cost" => cost::cmd_cost(&paths, rest),
-        other => {
-            eprintln!(
-                "looop: unknown command '{other}' (up, down, watch, cost, config, version, help)"
-            );
-            Ok(ExitCode::from(1))
+        };
+    }
+
+    use clap::Parser;
+    let cli = match cli::Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            // Remap clap's exit codes to looop's convention: usage/parse errors
+            // exit 1 (not clap's default 2); `--help`/`--version` still exit 0.
+            let _ = e.print();
+            return ExitCode::from(if e.use_stderr() { 1 } else { 0 });
         }
     };
+
+    let result: Result<ExitCode> = dispatch(&paths, cli.cmd);
 
     match result {
         Ok(code) => code,
@@ -178,6 +83,89 @@ fn main() -> ExitCode {
             eprintln!("{e}");
             ExitCode::from(1)
         }
+    }
+}
+
+/// Route a parsed command to its handler. The deps gate wraps every verb that
+/// actually touches the loop's tools; read-only/meta verbs (watch, cost, config,
+/// help, version, cost-record) skip it, matching the pre-clap wiring.
+fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
+    use cli::{Cmd, CostRecordOp, GoalOp, PlaybookOp, SensorOp, Shell, Verb, WorkerOp};
+
+    // A bare `looop` is not a command (the loop runs as the `looop up` service);
+    // with no verb, show the manual.
+    let Some(cmd) = cmd else {
+        help::print(paths);
+        return Ok(ExitCode::SUCCESS);
+    };
+
+    let gated = |f: &dyn Fn() -> Result<ExitCode>| deps::require_deps(paths).and_then(|_| f());
+
+    match cmd {
+        Cmd::Help => {
+            help::print(paths);
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Version => {
+            println!("looop {}", env!("CARGO_PKG_VERSION"));
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Up(a) => gated(&|| service::cmd_up(paths, a.json)),
+        Cmd::Down => gated(&|| service::cmd_down(paths)),
+        // Read-only observer TUI — no deps gate (only reads logs + lists
+        // sessions, never launches an agent).
+        Cmd::Watch(a) => watch::cmd_watch(paths, &a),
+        Cmd::Cost => cost::cmd_cost(paths),
+        Cmd::Config(a) => {
+            match a.shell {
+                Shell::Zsh => print!("{}", include_str!("completions/looop.zsh")),
+                Shell::Bash => print!("{}", include_str!("completions/looop.bash")),
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Cmd::Underscore { verb } => match verb {
+            Verb::Pulse => gated(&|| service::cmd_pulse(paths)),
+            Verb::State(a) => gated(&|| tick::cmd_state(paths, a.json)),
+            Verb::Wait(a) => gated(&|| tick::cmd_wait(paths, &a)),
+            Verb::Asks(a) => gated(&|| mailbox::cmd_asks(paths, a.json)),
+            Verb::Answer(a) => gated(&|| mailbox::cmd_answer(paths, &a)),
+            Verb::Goal(a) => gated(&|| match &a.op {
+                GoalOp::Write { id, body, journal } => {
+                    executor::write_goal(paths, id, body, journal.journal.as_deref())
+                }
+                GoalOp::Archive { id, journal } => {
+                    executor::archive_goal(paths, id, journal.journal.as_deref())
+                }
+            }),
+            Verb::Sensor(a) => gated(&|| {
+                let SensorOp::Write { name, script, journal } = &a.op;
+                executor::write_sensor(paths, name, script, journal.journal.as_deref())
+            }),
+            Verb::Playbook(a) => gated(&|| {
+                let PlaybookOp::Write { body, journal } = &a.op;
+                executor::write_playbook(paths, body, journal.journal.as_deref())
+            }),
+            Verb::Run(a) => gated(&|| executor::cmd_run(paths, &a)),
+            Verb::Worker(a) => gated(&|| match &a.op {
+                WorkerOp::Start { id, prompt, journal } => {
+                    executor::start_worker(paths, id, prompt, journal.journal.as_deref())
+                }
+                WorkerOp::Kill { id } => session::cmd_kill(paths, id),
+            }),
+            Verb::Ask(a) => gated(&|| mailbox::cmd_ask(paths, &a)),
+            Verb::Kill(a) => gated(&|| session::cmd_kill(paths, &a.id)),
+            Verb::Send(a) => gated(&|| session::cmd_send(paths, &a)),
+            Verb::Screenshot(a) => gated(&|| session::cmd_screenshot(paths, &a)),
+            Verb::Claim(a) => gated(&|| gate::cmd_claim(paths, &a)),
+            Verb::Unclaim(a) => gated(&|| gate::cmd_unclaim(paths, &a)),
+            // Cost recording skips the deps gate (matches the pre-clap wiring:
+            // a worker records spend even if the env is degraded).
+            Verb::Cost(a) => {
+                let CostRecordOp::Session { id, runner, usd } = &a.op;
+                cost::record_cost(paths, "session", id, runner, usd);
+                Ok(ExitCode::SUCCESS)
+            }
+        },
     }
 }
 
