@@ -64,6 +64,16 @@ fn main() -> ExitCode {
         };
     }
 
+    // PRE-CLAP shortcut: a TOP-LEVEL `-h`/`--help` (like a bare `looop` or the
+    // `help` verb) shows our hand-written manual, NOT clap's terse auto-help —
+    // `looop --help` is the front door and must stay the full manual. Only the
+    // top-level flag is intercepted: `looop <verb> --help` still falls through
+    // to clap so every subcommand keeps its own (non-destructive) help.
+    if matches!(raw.first().map(String::as_str), Some("-h") | Some("--help")) {
+        help::print(&paths);
+        return ExitCode::SUCCESS;
+    }
+
     use clap::Parser;
     let cli = match cli::Cli::try_parse() {
         Ok(c) => c,
