@@ -25,22 +25,21 @@ pub fn is_json() -> bool {
     *JSON.get().unwrap_or(&false)
 }
 
-/// Decide once whether to emit ANSI, mirroring the bash gate:
-/// `$LOOOP_COLOR` wins; else a tty on stdout with no `$NO_COLOR`.
-/// JSON mode forces color OFF so the machine stream stays free of escapes.
+/// Decide once whether to emit ANSI: a tty on stdout with no `$NO_COLOR`, and
+/// never in JSON mode (the machine stream stays free of escapes).
+///
+/// Each looop process decides from its OWN stdout — there is NO inherited
+/// override. looop re-execs itself (the detached pulse supervisor, worker
+/// self-callbacks), and a previous design exported the computed decision so the
+/// tree shared one choice. That backfired: the detached supervisor runs with
+/// stdout=/dev/null, so it computed "no color" and pushed that down onto the
+/// PTY-backed pulse below it, leaving the pulse log uncolored. Self-detection
+/// fixes it structurally — the pulse sees its real PTY and colors correctly;
+/// sensors write JSON to files (never colored); workers are pi/claude under
+/// their own PTY (they self-color). `NO_COLOR` is the one honored opt-out.
 pub fn init_color() {
-    let enabled = if is_json() {
-        false
-    } else {
-        match std::env::var("LOOOP_COLOR") {
-            Ok(v) if v == "1" => true,
-            Ok(v) if v == "0" => false,
-            _ => is_stdout_tty() && std::env::var_os("NO_COLOR").is_none(),
-        }
-    };
+    let enabled = !is_json() && is_stdout_tty() && std::env::var_os("NO_COLOR").is_none();
     let _ = COLOR.set(enabled);
-    // Export so children (the tick runner, sensors, workers) inherit the decision.
-    unsafe { std::env::set_var("LOOOP_COLOR", if enabled { "1" } else { "0" }) };
 }
 
 fn color_on() -> bool {

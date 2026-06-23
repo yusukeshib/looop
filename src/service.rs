@@ -36,15 +36,6 @@ pub fn cmd_up(paths: &Paths, args: &[String]) -> Result<ExitCode> {
         }
         if json {
             unsafe { std::env::set_var("LOOOP_LOG_FORMAT", "json") };
-        } else if std::env::var_os("NO_COLOR").is_none() {
-            // The pulse ALWAYS runs under a PTY and its transcript is meant to be
-            // viewed colored via `looop watch` (vt100 replay). But the detached
-            // supervisor babysit re-execs is spawned with stdout=/dev/null, so its
-            // own `init_color` would compute "no color" and export LOOOP_COLOR=0
-            // down the chain to the PTY-backed pulse, leaving the log uncolored.
-            // Pin color ON here (std::process::Command inherits env, so the whole
-            // detached chain sees it); the universal NO_COLOR opt-out still wins.
-            unsafe { std::env::set_var("LOOOP_COLOR", "1") };
         }
         let bin = paths.bin.to_string_lossy().to_string();
         session::spawn_detached(
