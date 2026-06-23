@@ -384,6 +384,7 @@ pub fn run_action(paths: &Paths, action: &Action, journal: Option<&str>) -> Resu
 /// are given OR a lone `-` is passed (so a human/client can heredoc a multi-line
 /// goal/PLAYBOOK body, matching the `_ answer` `-` convention).
 fn body_or_stdin(rest: &[String]) -> Result<String> {
+    reject_flaglike_body(rest)?;
     if let Some(body) = inline_body(rest) {
         return Ok(body);
     }
@@ -393,6 +394,26 @@ fn body_or_stdin(rest: &[String]) -> Result<String> {
         .read_to_string(&mut buf)
         .context("reading body from stdin")?;
     Ok(buf)
+}
+
+/// Refuse a lone flag-like argument (`--help`, `--force`, `--anything`) as the
+/// *entire* body. With no clap layer, `rest` is joined verbatim, so a mistyped
+/// flag is silently written as content — this is exactly how `_ playbook write
+/// --help` clobbered the PLAYBOOK down to 7 bytes (the literal text `--help`).
+/// PR #48 closed the lone-`-` case; this closes the lone-`--flag` case for every
+/// write verb (goal/sensor/playbook/worker start) that funnels through
+/// [`body_or_stdin`]. A body that genuinely begins with `--` can still be piped
+/// via the `-`/heredoc path, which never goes through this guard.
+fn reject_flaglike_body(rest: &[String]) -> Result<()> {
+    if rest.len() == 1 && rest[0].starts_with("--") {
+        anyhow::bail!(
+            "refusing to write {:?} as a body — that looks like a CLI flag, not content. \
+             To write text that starts with `--`, pipe it via stdin instead, e.g. \
+             `… write - <<'EOF'`.",
+            rest[0]
+        );
+    }
+    Ok(())
 }
 
 /// The positional-args half of [`body_or_stdin`]: `Some(body)` when an inline
@@ -569,6 +590,25 @@ mod tests {
             inline_body(&["a".to_string(), "-".to_string()]),
             Some("a -".to_string())
         );
+    }
+
+    #[test]
+    fn reject_flaglike_body_blocks_lone_flags() {
+        // A lone `--flag` is a mistyped CLI flag, not content. Refuse it so it
+        // never gets written verbatim (this is how `_ playbook write --help`
+        // shrank the PLAYBOOK to the literal 6-char text `--help`).
+        assert!(reject_flaglike_body(&["--help".to_string()]).is_err());
+        assert!(reject_flaglike_body(&["--force".to_string()]).is_err());
+        // The stdin sentinel `-` and a real (empty/multi-word) body are fine.
+        assert!(reject_flaglike_body(&[]).is_ok());
+        assert!(reject_flaglike_body(&["-".to_string()]).is_ok());
+        assert!(reject_flaglike_body(&["hello".to_string(), "world".to_string()]).is_ok());
+        // A `--`-prefixed token alongside real words is part of a body, not a
+        // lone flag — the join keeps it (e.g. a markdown `--- frontmatter` line).
+        assert!(reject_flaglike_body(&["--note".to_string(), "text".to_string()]).is_ok());
+        // A lone single-dash word (e.g. `-x`) is not `--`-prefixed: left to
+        // `inline_body`, which only treats the bare `-` as the stdin sentinel.
+        assert!(reject_flaglike_body(&["-x".to_string()]).is_ok());
     }
 
     #[test]
