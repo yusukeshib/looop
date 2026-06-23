@@ -415,10 +415,11 @@ fn body_or_stdin(rest: &[String]) -> Result<String> {
 /// this, `looop _ playbook write -` wrote a one-char `-`, silently clobbering the
 /// whole PLAYBOOK.)
 fn inline_body(rest: &[String]) -> Option<String> {
-    if !rest.is_empty() && !(rest.len() == 1 && rest[0] == "-") {
-        Some(rest.join(" "))
-    } else {
+    let read_stdin = rest.is_empty() || (rest.len() == 1 && rest[0] == "-");
+    if read_stdin {
         None
+    } else {
+        Some(rest.join(" "))
     }
 }
 
