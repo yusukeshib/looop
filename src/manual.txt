@@ -33,7 +33,10 @@ THREE LAYERS
             State is held in a file-based backend today; that is an
             implementation detail you never address directly.
   contract  the `looop _ …` verbs. The ONE supported surface to read + steer
-            core. This — not the backend layout — is the stable boundary.
+            core. This — not the backend layout — is the stable boundary. The
+            `_ ` prefix marks the plumbing surface (the contract a client drives);
+            the bare commands (`up` / `down` / `watch` / `cost`) are the porcelain
+            a human runs by hand.
   client    anything that drives the contract for a human. The human reaches
             core ONLY through the contract; a bare terminal is the thinnest
             client, an agent/notify client does the same calls on your behalf.
