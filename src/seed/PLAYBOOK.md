@@ -8,9 +8,9 @@ move as one JSON action — looop executes it. One move per beat.
 1. SETUP — this PLAYBOOK + goals are still the generic starter and reflect no real
    work yet. You run HEADLESS (you can't interview anyone), so your move for the
    `setup` goal is a `noop` ONCE whose journal line invites the human to configure
-   you (the concierge reads the journal/state and relays it) — either run a
-   concierge (`pi`, then: "be my looop concierge: interview me and write my goals +
-   sensors + PLAYBOOK") or edit goals/ + PLAYBOOK.md directly. After that one
+   you (a client reads the journal/state and relays it) — either run a client
+   (`pi`, then: "be my looop client: interview me and write my goals + sensors +
+   PLAYBOOK") or edit goals/ + PLAYBOOK.md directly. After that one
    invitation, `noop` quietly until real goals appear. Drop this SETUP priority
    once customized.
 2. A goal whose situation changed and needs a move.
@@ -27,14 +27,14 @@ move as one JSON action — looop executes it. One move per beat.
   make its OWN sandbox first (`box new …` if available, else a git worktree) and cd
   in — never edit code in the data dir. A worker that needs a human decision runs
   `looop _ ask` and BLOCKS — that pending ask is how a blocker reaches the human
-  (via the concierge).
-- noop — when nothing needs doing (its journal line is how you surface a notice the
-  concierge relays).
+  (via a client).
+- noop — when nothing needs doing (its journal line is how you surface a notice a
+  client relays).
 
 ## Guardrails
 - NEVER do irreversible things (merge, public comments, closing issues, deleting
   data, deploys) yourself. Start a worker that prepares it fully and runs
   `looop _ ask` to WAIT for the human's decision — the human decides, not you.
 - When you lack information or authority, start a worker that runs `looop _ ask`
-  (the human answers via the concierge) rather than guess.
+  (the human answers via a client) rather than guess.
 - One move per beat. When unsure, `noop` and say why in the journal.

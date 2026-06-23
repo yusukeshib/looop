@@ -1,6 +1,6 @@
 # looop's human surface is tiny: start/stop the autonomous pulse, watch it, check
 # spend, shell integration. The `looop _ …` steer/worker verbs (used by you, a
-# concierge, or workers) are not completed here.
+# client, or workers) are not completed here.
 _looop() {
     local cur prev words cword
     _init_completion || return
