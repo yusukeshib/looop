@@ -27,7 +27,9 @@ use crate::paths::Paths;
 use crate::session::{self, Session};
 use anyhow::Result;
 use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use ansi_to_tui::IntoText;
@@ -40,7 +42,7 @@ use ratatui::crossterm::event::{
 use ratatui::crossterm::execute;
 use ratatui::prelude::*;
 use ratatui::widgets::{
-    Block, Borders, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
+    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Scrollbar, ScrollbarOrientation,
     ScrollbarState,
 };
 
@@ -153,6 +155,12 @@ struct App {
     recent_window: Duration,
     /// Sessions hidden by the current filter on the last refresh (footer hint).
     hidden: usize,
+    /// `true` while the floating session picker is open (ESC). The log is the
+    /// main buffer; the list is hidden until summoned, and ENTER/ESC closes it.
+    picking: bool,
+    /// Height (rows) of the log pane on the last draw, so `Ctrl-D`/`Ctrl-U`
+    /// (half page) and `Ctrl-F`/`Ctrl-B` (full page) scroll by the viewport.
+    log_rows: usize,
     /// Geometry of the log scrollbar from the last draw, so mouse clicks/drags
     /// on it can be mapped back to a `scroll_back` position. `None` when the
     /// pane isn't scrollable (no scrollbar rendered).
@@ -160,9 +168,38 @@ struct App {
     /// Persistent vt100 replay of the selected session's log (fed incrementally
     /// across frames). `None` until a session with a log file is selected.
     log: Option<LogReplay>,
+    /// Cached output of the (expensive) vt100→ANSI→ratatui render in `draw_log`,
+    /// reused on frames where none of its inputs changed.
+    log_cache: Option<LogCache>,
     /// Geometry of the session list from the last draw, so a mouse click can be
     /// mapped back to a row → session index. `None` when the list is empty.
     selector: Option<SelectorHit>,
+    /// Background vt100-replay worker. Replaying a multi-MB log can take ~1s in
+    /// debug builds, so the initial (re)parse on a session switch runs off the
+    /// UI thread; the live tail is then fed incrementally on the UI thread
+    /// (cheap). `loading` names the session currently being parsed (drawn as a
+    /// hint), and `parse_gen` discards results from superseded requests.
+    parse_tx: Sender<ParseRequest>,
+    parse_rx: Receiver<ParseResult>,
+    parse_gen: u64,
+    loading: Option<String>,
+    /// `true` while the left mouse button is held after grabbing the scrollbar,
+    /// so drags keep scrubbing even when the cursor drifts off the thin column.
+    dragging_scrollbar: bool,
+}
+
+/// A request to the replay worker: parse `path` for session `id`. `gen` lets
+/// the UI ignore a result whose session is no longer selected.
+struct ParseRequest {
+    generation: u64,
+    id: String,
+    path: PathBuf,
+}
+
+/// A completed replay handed back from the worker, ready to install as `log`.
+struct ParseResult {
+    generation: u64,
+    replay: LogReplay,
 }
 
 /// Persistent vt100 replay of one session's `output.log`. We keep the parser
@@ -181,6 +218,25 @@ struct LogReplay {
     prev_scrollback: usize,
     /// Total bytes ever fed — 0 means the file exists but is empty.
     seen: u64,
+}
+
+/// Cached result of the expensive vt100→ANSI→ratatui render done by `draw_log`.
+/// That path renders the whole screen to ANSI and re-parses it with
+/// `ansi-to-tui` for each tile — far too costly to repeat on every frame. We
+/// keep the last result and only rebuild it when an input that affects the
+/// rendered lines changes: the selected session, the log content (`seen`), the
+/// scroll position, or the pane size. Idle frames and unrelated input events
+/// (e.g. a filter toggle that doesn't touch the log) reuse the cached lines.
+struct LogCache {
+    id: String,
+    /// Log content version — total bytes fed to the parser.
+    seen: u64,
+    /// Clamped scroll position the cached frame was rendered at.
+    scroll_back: usize,
+    pane_w: u16,
+    pane_h: u16,
+    lines: Vec<Line<'static>>,
+    max_scroll: usize,
 }
 
 /// The session list's on-screen geometry, captured during `draw_selector` so a
@@ -219,6 +275,7 @@ impl App {
         if !sessions.is_empty() {
             list_state.select(Some(idx));
         }
+        let (parse_tx, parse_rx) = spawn_replay_worker();
         App {
             sessions,
             list_state,
@@ -228,15 +285,24 @@ impl App {
             hidden,
             scrollbar: None,
             log: None,
+            log_cache: None,
             selector: None,
+            picking: false,
+            log_rows: 0,
+            parse_tx,
+            parse_rx,
+            parse_gen: 0,
+            loading: None,
+            dragging_scrollbar: false,
         }
     }
 
-    /// Map a mouse position on the log scrollbar to a `scroll_back` value.
-    /// Returns `false` if the click/drag wasn't on the scrollbar (so the
-    /// caller can ignore it). The track is mapped linearly top→bottom:
-    /// top (↑) = oldest scrollback, bottom (↓) = live tail.
-    fn scrollbar_drag(&mut self, col: u16, row: u16) -> bool {
+    /// Begin a scrollbar drag. Returns `true` if `(col, row)` landed on the
+    /// bar's column (within the track), scrubbing the viewport to that row. The
+    /// caller then holds the grab and feeds later moves to `scrollbar_scrub`
+    /// (row only) until mouse-up, so the cursor can wander off the thin column
+    /// without the grab snapping loose.
+    fn scrollbar_grab(&mut self, col: u16, row: u16) -> bool {
         let Some(hit) = self.scrollbar else {
             return false;
         };
@@ -247,16 +313,29 @@ impl App {
         if col + 1 < a.right() || col > a.right() || row < a.top() || row >= a.bottom() {
             return false;
         }
+        self.scrollbar_scrub(row);
+        true
+    }
+
+    /// Scrub the viewport to `row` on the scrollbar track, ignoring the column
+    /// (used while a grab is held). The row is clamped into the track, so
+    /// dragging past the top/bottom pins to the oldest/newest line. The track
+    /// maps linearly top→bottom: top (↑) = oldest scrollback, bottom (↓) = tail.
+    fn scrollbar_scrub(&mut self, row: u16) {
+        let Some(hit) = self.scrollbar else {
+            return;
+        };
+        let a = hit.area;
         let span = a.height.saturating_sub(1);
+        let clamped = row.clamp(a.top(), a.bottom().saturating_sub(1));
         let pos = if span == 0 {
             0
         } else {
-            let frac = (row - a.top()) as f64 / span as f64;
+            let frac = (clamped - a.top()) as f64 / span as f64;
             (frac * hit.max_scroll as f64).round() as usize
         };
         // pos counts from the top (oldest); scroll_back counts from the tail.
         self.scroll_back = hit.max_scroll.saturating_sub(pos);
-        true
     }
 
     /// Select the session under a mouse click on the bottom list. Returns
@@ -322,13 +401,25 @@ impl App {
     /// file, then feed any newly-appended bytes. Keeps a paused viewport
     /// anchored by nudging `scroll_back` when the tail grows.
     fn sync_log(&mut self, paths: &Paths) {
+        // Install any finished background replay that still matches the current
+        // selection (stale ones — from sessions navigated past — are dropped).
+        while let Ok(res) = self.parse_rx.try_recv() {
+            if res.generation == self.parse_gen {
+                self.log = Some(res.replay);
+                self.loading = None;
+                self.log_cache = None; // fresh buffer → drop the render cache
+            }
+        }
+
         let Some(id) = self.selected_id().map(str::to_string) else {
             self.log = None;
+            self.loading = None;
             return;
         };
         let path = paths.sessions().output_log_path(&id);
         let Ok(meta) = std::fs::metadata(&path) else {
             self.log = None; // no log file yet
+            self.loading = None;
             return;
         };
         let len = meta.len();
@@ -340,31 +431,24 @@ impl App {
         };
 
         if reset {
-            // Replay the WHOLE file so scrollback reaches the first line; only a
-            // pathologically huge log falls back to the last MAX_REPLAY_BYTES
-            // (live tail kept, oldest lines dropped). From here we only ever feed
-            // the freshly-appended tail.
-            let mut parser = vt100::Parser::new(PTY_ROWS, PTY_COLS, SCROLLBACK_ROWS);
-            // `0` for any log within the cap (first line reachable); only an
-            // over-cap log starts mid-stream at the last MAX_REPLAY_BYTES.
-            let start = len.saturating_sub(MAX_REPLAY_BYTES);
-            if len > 0
-                && let Ok(b) = read_from(&path, start)
-            {
-                parser.process(&b);
+            // The full replay can take ~1s in debug builds, so hand it to the
+            // background worker instead of freezing the UI. Only fire a fresh
+            // request when we're not already parsing this exact session; until
+            // the parser lands, `draw_log` shows a "loading…" hint.
+            if self.loading.as_deref() != Some(id.as_str()) {
+                self.parse_gen += 1;
+                self.loading = Some(id.clone());
+                self.log = None;
+                let _ = self.parse_tx.send(ParseRequest {
+                    generation: self.parse_gen,
+                    id,
+                    path,
+                });
             }
-            let prev_scrollback = scrollback_len(&mut parser);
-            self.log = Some(LogReplay {
-                id,
-                parser,
-                offset: len,
-                prev_scrollback,
-                seen: len - start,
-            });
             return;
         }
 
-        // Feed only what was appended since the last frame.
+        // Feed only what was appended since the last frame (cheap, UI thread).
         let Some(l) = self.log.as_mut() else { return };
         if len <= l.offset {
             return;
@@ -409,34 +493,82 @@ impl App {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
                         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-                        match key.code {
-                            KeyCode::Char('q') | KeyCode::Esc => break,
-                            KeyCode::Char('c') if ctrl => break,
-                            KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-                            KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-                            KeyCode::Char('a') => {
-                                // Cycle the filter: Active → Recent → All → Active.
-                                self.filter = match self.filter {
-                                    Filter::Active => Filter::Recent(self.recent_window),
-                                    Filter::Recent(_) => Filter::All,
-                                    Filter::All => Filter::Active,
-                                };
-                                self.refresh(paths);
+                        if ctrl && matches!(key.code, KeyCode::Char('c')) {
+                            break;
+                        }
+                        if self.picking {
+                            // Floating picker: navigate sessions, ENTER/ESC closes
+                            // it and hands focus back to the log.
+                            match key.code {
+                                KeyCode::Enter | KeyCode::Esc => self.picking = false,
+                                KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+                                KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
+                                KeyCode::Char('a') => {
+                                    // Cycle the filter: Active → Recent → All → Active.
+                                    self.filter = match self.filter {
+                                        Filter::Active => Filter::Recent(self.recent_window),
+                                        Filter::Recent(_) => Filter::All,
+                                        Filter::All => Filter::Active,
+                                    };
+                                    self.refresh(paths);
+                                }
+                                _ => {}
                             }
-                            KeyCode::PageUp => {
-                                self.scroll_back = self.scroll_back.saturating_add(10)
+                        } else {
+                            // Main buffer (log): scroll, or ESC to open the picker.
+                            // `scroll_back` counts rows from the live tail, so
+                            // scrolling UP (into history) ADDS and DOWN subtracts.
+                            let half = (self.log_rows / 2).max(1);
+                            let page = self.log_rows.max(1);
+                            match key.code {
+                                KeyCode::Char('q') => break,
+                                KeyCode::Esc => self.picking = true,
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    self.scroll_back = self.scroll_back.saturating_sub(1)
+                                }
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    self.scroll_back = self.scroll_back.saturating_add(1)
+                                }
+                                // Half page: Ctrl-D down, Ctrl-U up (vim/less).
+                                KeyCode::Char('d') if ctrl => {
+                                    self.scroll_back = self.scroll_back.saturating_sub(half)
+                                }
+                                KeyCode::Char('u') if ctrl => {
+                                    self.scroll_back = self.scroll_back.saturating_add(half)
+                                }
+                                // Full page: Ctrl-F / PageDown down, Ctrl-B / PageUp up.
+                                KeyCode::Char('f') if ctrl => {
+                                    self.scroll_back = self.scroll_back.saturating_sub(page)
+                                }
+                                KeyCode::Char('b') if ctrl => {
+                                    self.scroll_back = self.scroll_back.saturating_add(page)
+                                }
+                                KeyCode::PageDown => {
+                                    self.scroll_back = self.scroll_back.saturating_sub(page)
+                                }
+                                KeyCode::PageUp => {
+                                    self.scroll_back = self.scroll_back.saturating_add(page)
+                                }
+                                // Jump to ends: g/Home oldest, G/End live tail.
+                                KeyCode::Char('g') | KeyCode::Home => self.scroll_back = usize::MAX,
+                                KeyCode::Char('G') | KeyCode::End => self.scroll_back = 0,
+                                _ => {}
                             }
-                            KeyCode::PageDown => {
-                                self.scroll_back = self.scroll_back.saturating_sub(10)
-                            }
-                            KeyCode::Home => self.scroll_back = usize::MAX, // jump to oldest
-                            KeyCode::End => self.scroll_back = 0,           // back to live tail
-                            _ => {}
                         }
                     }
-                    // Mouse wheel scrolls the log pane (3 lines per notch, the
-                    // usual terminal step). Capturing it ourselves is what keeps
-                    // the alternate screen from being scrolled and corrupted.
+                    // The floating picker, when open, is modal: it captures the
+                    // wheel (to move the selection) and clicks (to pick a row).
+                    // Otherwise the mouse drives the log: wheel scrolls and the
+                    // scrollbar can be clicked/dragged. Capturing the wheel
+                    // ourselves keeps the alternate screen from being corrupted.
+                    Event::Mouse(m) if self.picking => match m.kind {
+                        MouseEventKind::ScrollUp => self.move_selection(-1),
+                        MouseEventKind::ScrollDown => self.move_selection(1),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            let _ = self.select_at(m.column, m.row);
+                        }
+                        _ => {}
+                    },
                     Event::Mouse(m) => match m.kind {
                         MouseEventKind::ScrollUp => {
                             self.scroll_back = self.scroll_back.saturating_add(3)
@@ -444,18 +576,17 @@ impl App {
                         MouseEventKind::ScrollDown => {
                             self.scroll_back = self.scroll_back.saturating_sub(3)
                         }
-                        // Click or drag on the scrollbar jumps/scrubs the
-                        // viewport to that position in the scrollback.
-                        // Drag scrubs the scrollbar; a plain click scrubs the
-                        // scrollbar OR, failing that, selects a session row.
-                        MouseEventKind::Drag(MouseButton::Left) => {
-                            self.scrollbar_drag(m.column, m.row);
-                        }
+                        // Grab the scrollbar on press; once grabbed, keep
+                        // scrubbing on every drag (row only) until release, so
+                        // the cursor can leave the column without dropping it.
                         MouseEventKind::Down(MouseButton::Left) => {
-                            // Try the scrollbar first; if the click missed it,
-                            // fall through to selecting a session row.
-                            let _ = self.scrollbar_drag(m.column, m.row)
-                                || self.select_at(m.column, m.row);
+                            self.dragging_scrollbar = self.scrollbar_grab(m.column, m.row);
+                        }
+                        MouseEventKind::Drag(MouseButton::Left) if self.dragging_scrollbar => {
+                            self.scrollbar_scrub(m.row);
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            self.dragging_scrollbar = false;
                         }
                         _ => {}
                     },
@@ -467,13 +598,56 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        // Selector grows with the fleet but is capped so the log keeps the room.
-        let rows = self.sessions.len().clamp(1, 8) as u16;
-        let chunks = Layout::vertical([Constraint::Min(3), Constraint::Length(rows + 2)])
-            .split(frame.area());
+        // The log is the main buffer and owns the whole screen, save a one-row
+        // footer for the dim help/legend line.
+        let chunks =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(frame.area());
+        let log_area = chunks[0];
+        self.draw_log(frame, log_area);
+        self.draw_footer(frame, chunks[1]);
 
-        self.draw_log(frame, chunks[0]);
-        self.draw_selector(frame, chunks[1]);
+        if self.picking {
+            // Floating session picker, overlaid on the bottom of the log. Capped
+            // so it never swallows the whole pane; `Clear` wipes the log rows
+            // underneath so the list reads cleanly on top.
+            let rows = self.sessions.len().clamp(1, 8) as u16;
+            let h = (rows + 2).min(log_area.height);
+            let float = Rect {
+                x: log_area.x,
+                y: log_area.bottom().saturating_sub(h),
+                width: log_area.width,
+                height: h,
+            };
+            frame.render_widget(Clear, float);
+            self.draw_selector(frame, float);
+        } else {
+            // No list on screen → nothing for a mouse click to hit-test.
+            self.selector = None;
+        }
+    }
+
+    /// The dim help/legend line along the very bottom of the screen. Adapts to
+    /// the focus: scroll/quit hints for the log, navigate/filter hints (with
+    /// the active filter + hidden count) while the picker is open.
+    fn draw_footer(&mut self, frame: &mut Frame, area: Rect) {
+        let help = if self.picking {
+            let name = match self.filter {
+                Filter::Active => "active",
+                Filter::Recent(_) => "recent",
+                Filter::All => "all",
+            };
+            let hidden = if self.hidden > 0 {
+                format!(" ({} hidden)", self.hidden)
+            } else {
+                String::new()
+            };
+            format!(" {name}{hidden}  ↑/↓ move · a filter · enter select · esc cancel ")
+        } else {
+            let id = self.selected_id().unwrap_or("—").to_string();
+            format!(" {id}  ↑/↓ scroll · esc sessions · q quit ")
+        };
+        let style = Style::default().bg(Color::White).fg(Color::Black);
+        frame.render_widget(Paragraph::new(Span::styled(help, style)).style(style), area);
     }
 
     fn draw_log(&mut self, frame: &mut Frame, area: Rect) {
@@ -490,6 +664,9 @@ impl App {
         // No log file, or a file that exists but is empty: a dim hint; the view
         // can't be scrolled.
         let hint = match &self.log {
+            None if self.loading.as_deref() == Some(id.as_str()) => {
+                Some(format!("(loading '{id}'…)"))
+            }
             None => Some(format!("(no log for '{id}')")),
             Some(l) if l.seen == 0 => Some("(no output yet)".to_string()),
             Some(_) => None,
@@ -501,7 +678,27 @@ impl App {
             return;
         }
 
-        let pane_h = body.height.max(1) as usize;
+        let pane_h_u16 = body.height.max(1);
+        let pane_h = pane_h_u16 as usize;
+        self.log_rows = pane_h; // for half/full-page scroll keys
+
+        // Cache fast path: if the selected session, log content, scroll position
+        // and pane size all match the last render, reuse those lines instead of
+        // replaying the vt100 screen + re-parsing ANSI for every tile again.
+        let seen = self.log.as_ref().map(|l| l.seen).unwrap_or(0);
+        if let Some(c) = &self.log_cache
+            && c.id == id
+            && c.seen == seen
+            && c.scroll_back == self.scroll_back
+            && c.pane_w == body.width
+            && c.pane_h == pane_h_u16
+        {
+            let max_scroll = c.max_scroll;
+            let lines = c.lines.clone();
+            self.render_log_lines(frame, body, lines, max_scroll, self.scroll_back);
+            return;
+        }
+
         let log = self.log.as_mut().expect("log present: None handled above");
         let rows = log.parser.screen().size().0 as usize; // recorded grid height
 
@@ -571,20 +768,68 @@ impl App {
                 .map(|k| window[k].take().unwrap_or_else(|| Line::from("")))
                 .collect()
         };
+        // Stash the computed frame so unchanged subsequent frames skip the
+        // whole vt100 replay above, then draw it.
+        self.log_cache = Some(LogCache {
+            id,
+            seen,
+            scroll_back: back,
+            pane_w: body.width,
+            pane_h: pane_h_u16,
+            lines: lines.clone(),
+            max_scroll,
+        });
+        self.render_log_lines(frame, body, lines, max_scroll, back);
+    }
+
+    /// Paint the (possibly cached) log lines plus the scrollbar, and record the
+    /// scrollbar geometry for the mouse handler. Shared by the compute path and
+    /// the cache fast path in `draw_log`.
+    fn render_log_lines(
+        &mut self,
+        frame: &mut Frame,
+        body: Rect,
+        lines: Vec<Line<'static>>,
+        max_scroll: usize,
+        back: usize,
+    ) {
         frame.render_widget(Paragraph::new(Text::from(lines)), body);
 
         // Scrollbar at the body's right edge, reflecting position in the range.
-        if max_scroll > 0 {
-            let mut state = ScrollbarState::new(max_scroll).position(max_scroll - back);
+        // Hidden while the picker is open — it owns the input then, and a stray
+        // bar behind the floating box is just noise.
+        if max_scroll > 0 && !self.picking {
+            // ratatui sizes the thumb as `viewport * track / (content + viewport)`,
+            // so a deep scrollback collapses it to a single hard-to-grab row.
+            // Inflate the viewport length until the thumb is at least
+            // `MIN_THUMB` rows (it only affects the thumb's *size*, not the
+            // position mapping, which our `scrollbar_drag` computes itself).
+            const MIN_THUMB: usize = 4;
+            let track = body.height as usize;
+            let viewport = if track > MIN_THUMB {
+                let need = (MIN_THUMB * max_scroll.saturating_sub(1)).div_ceil(track - MIN_THUMB);
+                need.max(track)
+            } else {
+                track
+            };
+            let mut state = ScrollbarState::new(max_scroll)
+                .position(max_scroll - back)
+                .viewport_content_length(viewport);
             let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .begin_symbol(Some("↑"))
-                .end_symbol(Some("↓"));
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_symbol("┃")
+                .thumb_style(Style::default().fg(Color::Gray))
+                .track_symbol(Some("│"))
+                .track_style(Style::default().fg(Color::DarkGray));
             frame.render_stateful_widget(bar, body, &mut state);
             // Remember where it landed so mouse clicks/drags can target it.
             self.scrollbar = Some(ScrollbarHit {
                 area: body,
                 max_scroll,
             });
+        } else {
+            self.scrollbar = None;
         }
     }
 
@@ -598,31 +843,14 @@ impl App {
             self.sessions.iter().map(session_row).collect()
         };
 
-        let scope = match self.filter {
-            Filter::All => String::from(" (all)"),
-            _ if self.hidden > 0 => format!(" ({} hidden)", self.hidden),
-            _ => String::new(),
-        };
-        let recency = match self.filter {
-            Filter::Active => "a recent",
-            Filter::Recent(_) => "a all",
-            Filter::All => "a active",
-        };
-        let title = format!(" sessions{scope}  ↑/↓ select · {recency} · shift+drag copy · q quit ");
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(title)
-                    .title_style(Style::default().add_modifier(Modifier::BOLD)),
-            )
+            .block(Block::default().borders(Borders::ALL))
             // Uniform white background on the selected row. REVERSED would
             // flip each span's fg into its bg (green dot → green block, gray
             // detail → gray block), which reads as a messy multicolored bar;
             // forcing bg=white + fg=black patches over the per-span colors for
             // one clean highlight.
-            .highlight_style(Style::default().bg(Color::White).fg(Color::Black))
-            .highlight_symbol("> ");
+            .highlight_style(Style::default().bg(Color::White).fg(Color::Black));
         frame.render_stateful_widget(list, area, &mut self.list_state);
 
         // Record the list geometry so a mouse click can hit-test a row. The
@@ -678,9 +906,15 @@ fn session_row(s: &Session) -> ListItem<'static> {
     } else {
         s.id.clone()
     };
-    let detail = match s.exit_code {
-        Some(code) if !s.alive => format!("{} (exit {code})", s.state),
-        _ => s.state.clone(),
+    // The status dot already conveys "running" for alive sessions, so only
+    // show a textual detail once the session has finished.
+    let detail = if s.alive {
+        String::new()
+    } else {
+        match s.exit_code {
+            Some(code) => format!("{} (exit {code})", s.state),
+            None => s.state.clone(),
+        }
     };
     ListItem::new(Line::from(vec![
         Span::styled(format!("{dot} "), Style::default().fg(color)),
@@ -714,6 +948,52 @@ fn scrollback_len(parser: &mut vt100::Parser) -> usize {
     parser.screen().scrollback()
 }
 
+/// Replay a session's `output.log` into a fresh vt100 parser. This is the
+/// expensive step (a multi-MB tail can take ~1s in debug builds), so it runs
+/// on the background worker rather than the UI thread.
+fn build_replay(id: String, path: &Path) -> LogReplay {
+    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let mut parser = vt100::Parser::new(PTY_ROWS, PTY_COLS, SCROLLBACK_ROWS);
+    // `0` for any log within the cap (first line reachable); only an over-cap
+    // log starts mid-stream at the last MAX_REPLAY_BYTES.
+    let start = len.saturating_sub(MAX_REPLAY_BYTES);
+    if len > 0
+        && let Ok(b) = read_from(path, start)
+    {
+        parser.process(&b);
+    }
+    let prev_scrollback = scrollback_len(&mut parser);
+    LogReplay {
+        id,
+        parser,
+        offset: len,
+        prev_scrollback,
+        seen: len.saturating_sub(start),
+    }
+}
+
+/// Spawn the background replay worker. It owns the heavy `build_replay`, so a
+/// session switch never blocks the UI. When several requests pile up (fast
+/// picker navigation), it skips straight to the newest so it doesn't replay
+/// every session passed over.
+fn spawn_replay_worker() -> (Sender<ParseRequest>, Receiver<ParseResult>) {
+    let (req_tx, req_rx) = std::sync::mpsc::channel::<ParseRequest>();
+    let (res_tx, res_rx) = std::sync::mpsc::channel::<ParseResult>();
+    std::thread::spawn(move || {
+        while let Ok(mut req) = req_rx.recv() {
+            while let Ok(newer) = req_rx.try_recv() {
+                req = newer; // collapse a backlog to the latest request
+            }
+            let generation = req.generation;
+            let replay = build_replay(req.id, &req.path);
+            if res_tx.send(ParseResult { generation, replay }).is_err() {
+                break; // UI gone
+            }
+        }
+    });
+    (req_tx, res_rx)
+}
+
 /// Read `path` from byte `start` to EOF — the bytes appended since the last
 /// frame, fed incrementally into the persistent parser.
 fn read_from(path: &std::path::Path, start: u64) -> std::io::Result<Vec<u8>> {
@@ -737,6 +1017,40 @@ mod tests {
         let mut f = std::fs::File::create(&p).unwrap();
         f.write_all(contents).unwrap();
         p
+    }
+
+    #[test]
+    #[ignore] // perf probe: set LOOOP_BENCH_LOG=/path/to/output.log
+    fn bench_replay() {
+        let Ok(p) = std::env::var("LOOOP_BENCH_LOG") else {
+            eprintln!("set LOOOP_BENCH_LOG to a real output.log to run this probe");
+            return;
+        };
+        let path = std::path::Path::new(&p);
+        let len = std::fs::metadata(path).unwrap().len();
+        for cap in [1u64, 2, 4, 8, 16].map(|m| m * 1024 * 1024) {
+            let start = len.saturating_sub(cap);
+            let bytes = read_from(path, start).unwrap();
+            let t0 = Instant::now();
+            let mut parser = vt100::Parser::new(PTY_ROWS, PTY_COLS, SCROLLBACK_ROWS);
+            parser.process(&bytes);
+            let process = t0.elapsed();
+            let t1 = Instant::now();
+            parser.screen_mut().set_scrollback(usize::MAX);
+            let sb = parser.screen().scrollback();
+            let scrollback = t1.elapsed();
+            let t2 = Instant::now();
+            let _ = render::render_screen(parser.screen(), ShotFormat::Ansi, false);
+            let render = t2.elapsed();
+            println!(
+                "cap={:>2}MiB bytes={:>9} process={:>8.1?} scrollback_len={sb} ({:?}) render_screen={:?}",
+                cap / 1024 / 1024,
+                bytes.len(),
+                process,
+                scrollback,
+                render
+            );
+        }
     }
 
     #[test]
