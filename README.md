@@ -56,7 +56,6 @@ convention, not a dependency of looop itself.
 looop up            # start the autonomous pulse (detached)
 looop watch         # live log + running-session selector
 looop down          # stop the pulse and all workers
-looop cost          # report LLM spend
 ```
 
 On first run, looop seeds a starter PLAYBOOK and a `setup` goal. Replace it with
