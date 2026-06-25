@@ -202,69 +202,19 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
             return TickOutcome::idle();
         }
     };
-    let runner_name = cfg.default_runner().unwrap_or_default();
-    let Some(tick_cmd) = cfg.runner_cmd(&runner_name, "tick") else {
+    let runner_name = cfg.runner_label();
+    let Some(tick_cmd) = cfg.runner_cmd("tick") else {
         util::event(
             Level::Error,
             "tick.error",
-            &format!("no tick command for runner '{runner_name}' (config a `tick` command)"),
+            "no `tick` command configured",
             &[("runner", serde_json::json!(runner_name))],
         );
         return TickOutcome::idle();
     };
 
-    // The runner+spec signature for fail-closed unmetered tracking: a change to
-    // either (switching runners, adding a cost spec) resets the breaker.
-    let cost_sig = format!(
-        "{runner_name}|{}",
-        cfg.runner_cost_spec(&runner_name).is_some()
-    );
-
-    // 3b. budget circuit breaker (H2): once today's ledger total reaches the
-    // configured ceiling, skip the AI entirely so a runaway loop can't bill past
-    // the cap. Off by default; clears at local midnight.
-    if let Some(max) = crate::cost::daily_budget(&cfg) {
-        let spent = crate::cost::spent_today(paths);
-        if spent >= max {
-            util::event(
-                Level::Warn,
-                "tick.budget",
-                &format!(
-                    "daily budget reached (${spent:.2} ≥ ${max:.2}) — skipping AI until local midnight"
-                ),
-                &[
-                    ("spent_usd", serde_json::json!(spent)),
-                    ("max_daily_usd", serde_json::json!(max)),
-                ],
-            );
-            events::emit(
-                paths,
-                "budget_exceeded",
-                serde_json::json!({ "spent_usd": spent, "max_daily_usd": max }),
-            );
-            return TickOutcome::idle();
-        }
-        if crate::cost::unmetered_blocked(paths, &cost_sig) {
-            util::event(
-                Level::Warn,
-                "tick.budget_unmetered",
-                &format!(
-                    "runner '{runner_name}' produced no cost for {n} consecutive runs and a budget is set — skipping AI (declare a runner `cost` spec, or use pi/claude)",
-                    n = crate::cost::UNMETERED_LIMIT
-                ),
-                &[("runner", serde_json::json!(runner_name))],
-            );
-            events::emit(
-                paths,
-                "budget_unmetered",
-                serde_json::json!({ "runner": runner_name }),
-            );
-            return TickOutcome::idle();
-        }
-    }
-
-    let cost_id = format!("tick-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
-    let run_dir = paths.runs_dir().join(&cost_id);
+    let run_id = format!("tick-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+    let run_dir = paths.runs_dir().join(&run_id);
     let _ = fs::create_dir_all(&run_dir);
     let prompt_file = run_dir.join("prompt.md");
     let snap = paths.snapshots_dir();
@@ -277,13 +227,13 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
         &format!("{runner_name} is deciding the one move"),
         &[
             ("runner", serde_json::json!(runner_name)),
-            ("run_id", serde_json::json!(cost_id)),
+            ("run_id", serde_json::json!(run_id)),
         ],
     );
     events::emit(
         paths,
         "decide_start",
-        serde_json::json!({ "runner": runner_name, "run_id": cost_id }),
+        serde_json::json!({ "runner": runner_name, "run_id": run_id }),
     );
 
     // The runner's free-form chatter is archived to the tee files (replay from
@@ -297,15 +247,7 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
         // Dropped right after the run, which erases the spinner line so the
         // following structured outcome event prints clean.
         let _spin = util::Spinner::start(&format!("{runner_name} is deciding"));
-        runner::run_streamed(
-            paths,
-            &tick_cmd,
-            &prompt_file,
-            "tick",
-            &cost_id,
-            &runner_name,
-            &tee,
-        )
+        runner::run_streamed(paths, &tick_cmd, &prompt_file, &tee)
     };
     let secs = t0.elapsed().as_secs();
     let outcome = if runner_ok {
@@ -313,32 +255,6 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
     } else {
         None
     };
-
-    // Fail-closed accounting: a budget can only be enforced if runs are metered.
-    if runner_ok && crate::cost::daily_budget(&cfg).is_some() {
-        if tick_cost(paths, &cost_id).is_none() {
-            let n = crate::cost::record_unmetered(paths, &cost_sig);
-            let limit = crate::cost::UNMETERED_LIMIT;
-            let tail = if n >= limit {
-                "breaker now open".to_string()
-            } else {
-                format!("{n}/{limit} before the breaker opens")
-            };
-            util::event(
-                Level::Warn,
-                "tick.unmetered",
-                &format!(
-                    "max_daily_usd is set but runner '{runner_name}' produced no cost row ({tail}) — declare a runner `cost` spec, or use pi/claude"
-                ),
-                &[
-                    ("runner", serde_json::json!(runner_name)),
-                    ("count", serde_json::json!(n)),
-                ],
-            );
-        } else {
-            crate::cost::clear_unmetered(paths);
-        }
-    }
 
     // A beat SUCCEEDS only when a usable decision was produced: commit the world
     // hash, clear backoff, journal the move. Every other outcome arms backoff and
@@ -348,25 +264,22 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
             let _ = fs::write(paths.data_dir.join(".last-tick-hash"), format!("{hash}\n"));
             clear_backoff(paths);
             let next_interval_s = d.next_interval_s;
-            let cost = tick_cost(paths, &cost_id);
-            let cost_str = cost.map(|c| format!(" · ${c:.4}")).unwrap_or_default();
             util::event(
                 Level::Ok,
                 "tick.decided",
-                &format!("{} · {} · {secs}s{cost_str}", d.kind, d.journal),
+                &format!("{} · {} · {secs}s", d.kind, d.journal),
                 &[
                     ("action", serde_json::json!(d.kind)),
                     ("summary", serde_json::json!(d.summary)),
                     ("journal", serde_json::json!(d.journal)),
                     ("secs", serde_json::json!(secs)),
-                    ("cost_usd", serde_json::json!(cost)),
-                    ("run_id", serde_json::json!(cost_id)),
+                    ("run_id", serde_json::json!(run_id)),
                 ],
             );
             events::emit(
                 paths,
                 "decided",
-                serde_json::json!({ "run_id": cost_id, "action": d.kind, "journal": d.journal }),
+                serde_json::json!({ "run_id": run_id, "action": d.kind, "journal": d.journal }),
             );
             // noop is a real decision (the world is fine) — it does not count as
             // "acted" for cadence, but it DID commit the hash above.
@@ -377,7 +290,7 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
             let replay = run_dir.display().to_string();
             let mut fields = vec![
                 ("secs", serde_json::json!(secs)),
-                ("run_id", serde_json::json!(cost_id)),
+                ("run_id", serde_json::json!(run_id)),
                 ("fails", serde_json::json!(fails)),
             ];
             let (level, code, msg) = match failure {
@@ -411,7 +324,7 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
             events::emit(
                 paths,
                 "tick_failed",
-                serde_json::json!({ "run_id": cost_id, "fails": fails }),
+                serde_json::json!({ "run_id": run_id, "fails": fails }),
             );
             (false, None)
         }
@@ -422,18 +335,6 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
         acted,
         next_interval_s,
     }
-}
-
-/// Best-effort: this tick's recorded spend, read back from the cost ledger
-/// (`run_streamed` writes the row before it returns). `None` when the runner
-/// emitted no usage data or nothing was recorded.
-fn tick_cost(paths: &Paths, cost_id: &str) -> Option<f64> {
-    let text = fs::read_to_string(paths.cost_ledger()).ok()?;
-    text.lines()
-        .rev()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .find(|r| r.get("id").and_then(|x| x.as_str()) == Some(cost_id))
-        .and_then(|r| r.get("cost_usd").and_then(|c| c.as_f64()))
 }
 
 /// Keep the newest LOOOP_RUNS_KEEP run dirs (default 50; 0 = keep all).

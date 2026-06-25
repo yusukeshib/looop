@@ -31,7 +31,6 @@ answers/
 .goal-activity.json
 tick.log
 events.jsonl
-cost.jsonl
 # worker scratch that can land in the data dir
 .ruff_cache/
 .pytest_cache/

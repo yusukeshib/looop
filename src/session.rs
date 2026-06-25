@@ -57,12 +57,6 @@ const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
     • if `box` is available:  box new __SESSION__ --repo <repo> && cd "$(box switch __SESSION__)"
     • otherwise (git):         git -C <local-clone> worktree add /tmp/__SESSION__ -b looop/__SESSION__ && cd /tmp/__SESSION__
   (the PLAYBOOK names the repos and which to prefer.)
-- COST: when you end your session (right before `looop _ kill`), record this
-  session's total LLM spend so the human can see it in `looop cost`. If you can
-  determine your own USD cost for this run, log it:
-    "$LOOOP_BIN" _ cost session __ID__ __RUNNER__ <usd>
-  (e.g. "$LOOOP_BIN" _ cost session __ID__ __RUNNER__ 0.42). Skip only if you truly
-  cannot determine the amount.
 - DELIVERABLES: write any report / artifact a human will read into the data dir's
   reports/ folder (e.g. reports/<id>.md). That dir PERSISTS across ticks. NEVER
   write deliverables to snapshots/ — the pulse wipes snapshots/ on EVERY beat, so
@@ -77,7 +71,7 @@ pub fn cmd_start_session(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     seed::ensure_dirs(paths)?;
 
     let Some(id) = args.first() else {
-        eprintln!("usage: looop start-session <id> <prompt> [runner]");
+        eprintln!("usage: looop start-session <id> <prompt>");
         return Ok(ExitCode::from(1));
     };
     let Some(prompt) = args.get(1) else {
@@ -86,14 +80,9 @@ pub fn cmd_start_session(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     };
 
     let cfg = Config::load(paths)?;
-    let runner = args
-        .get(2)
-        .cloned()
-        .or_else(|| cfg.default_runner())
-        .unwrap_or_default();
-
-    let Some(tmpl) = cfg.runner_cmd(&runner, "interactive") else {
-        eprintln!("start-session: unknown runner '{runner}'");
+    let runner = cfg.runner_label();
+    let Some(tmpl) = cfg.runner_cmd("interactive") else {
+        eprintln!("start-session: no `interactive` command configured");
         return Ok(ExitCode::from(1));
     };
 
@@ -119,8 +108,7 @@ pub fn cmd_start_session(paths: &Paths, args: &[String]) -> Result<ExitCode> {
     let prompt_file = paths.prompts_dir().join(format!("{session}.md"));
     let contract = CONTRACT
         .replace("__SESSION__", &session)
-        .replace("__ID__", id)
-        .replace("__RUNNER__", &runner);
+        .replace("__ID__", id);
     fs::write(&prompt_file, format!("{contract}{prompt}\n"))?;
 
     let cmd = tmpl.replace("{{prompt_file}}", &prompt_file.to_string_lossy());

@@ -137,7 +137,7 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     };
 
-    let runner_name = cfg.default_runner().unwrap_or_else(|| "?".into());
+    let runner_name = cfg.runner_label();
     util::event(
         Level::Ok,
         "pulse.start",

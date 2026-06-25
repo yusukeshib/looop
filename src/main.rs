@@ -12,10 +12,10 @@
 
 mod cli;
 mod config;
-mod cost;
 mod deps;
 mod events;
 mod executor;
+mod fmt;
 mod gate;
 mod help;
 mod mailbox;
@@ -97,10 +97,10 @@ fn main() -> ExitCode {
 }
 
 /// Route a parsed command to its handler. The deps gate wraps every verb that
-/// actually touches the loop's tools; read-only/meta verbs (watch, cost, config,
-/// help, version, cost-record) skip it, matching the pre-clap wiring.
+/// actually touches the loop's tools; read-only/meta verbs (watch, help,
+/// version) skip it, matching the pre-clap wiring.
 fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
-    use cli::{Cmd, CostRecordOp, GoalOp, PlaybookOp, SensorOp, Shell, Verb, WorkerOp};
+    use cli::{Cmd, GoalOp, PlaybookOp, SensorOp, Verb, WorkerOp};
 
     // A bare `looop` is not a command (the loop runs as the `looop up` service);
     // with no verb, show the manual.
@@ -125,14 +125,6 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
         // Read-only observer TUI — no deps gate (only reads logs + lists
         // sessions, never launches an agent).
         Cmd::Watch(a) => watch::cmd_watch(paths, &a),
-        Cmd::Cost => cost::cmd_cost(paths),
-        Cmd::Config(a) => {
-            match a.shell {
-                Shell::Zsh => print!("{}", include_str!("completions/looop.zsh")),
-                Shell::Bash => print!("{}", include_str!("completions/looop.bash")),
-            }
-            Ok(ExitCode::SUCCESS)
-        }
         Cmd::Underscore { verb } => match verb {
             Verb::Pulse => gated(&|| service::cmd_pulse(paths)),
             Verb::State(a) => gated(&|| tick::cmd_state(paths, a.json)),
@@ -174,13 +166,6 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
             Verb::Screenshot(a) => gated(&|| session::cmd_screenshot(paths, &a)),
             Verb::Claim(a) => gated(&|| gate::cmd_claim(paths, &a)),
             Verb::Unclaim(a) => gated(&|| gate::cmd_unclaim(paths, &a)),
-            // Cost recording skips the deps gate (matches the pre-clap wiring:
-            // a worker records spend even if the env is degraded).
-            Verb::Cost(a) => {
-                let CostRecordOp::Session { id, runner, usd } = &a.op;
-                cost::record_cost(paths, "session", id, runner, usd);
-                Ok(ExitCode::SUCCESS)
-            }
         },
     }
 }
@@ -209,7 +194,7 @@ fn export_env(paths: &Paths) {
     set("LOOOP_BIN", paths.bin.as_os_str());
     set("LOOOP_DATA_DIR", paths.data_dir.as_os_str());
     // All looop-owned env lives under the LOOOP_ namespace (M1): bare CONFIG /
-    // CLAIMS_DIR / REPORTS_DIR / COST_LEDGER collided with whatever the child
+    // CLAIMS_DIR / REPORTS_DIR collided with whatever the child
     // (sensors, workers, the runner pipeline) already had in scope. Exporting
     // LOOOP_CONFIG also keeps children pinned to the same resolved wiring as the
     // parent (Paths::resolve reads it as the override), so a worker that re-invokes
@@ -217,37 +202,7 @@ fn export_env(paths: &Paths) {
     set("LOOOP_CONFIG", paths.config.as_os_str());
     set("LOOOP_CLAIMS_DIR", paths.claims_dir().as_os_str());
     set("LOOOP_REPORTS_DIR", paths.reports_dir().as_os_str());
-    set("LOOOP_COST_LEDGER", paths.cost_ledger().as_os_str());
     // NB: no $BABYSIT_DIR. looop never configures the babysit library through the
     // environment — it passes an explicit context (`paths.sessions()`) to every
     // call, and the detached worker receives its root via `--root`.
-}
-
-#[cfg(test)]
-mod tests {
-    /// `looop config zsh` must emit a script that registers the completion
-    /// (the `#compdef` autoload tag plus the live `compdef` call), so a bare
-    /// `eval "$(looop config zsh)"` actually wires up completion.
-    #[test]
-    fn zsh_completion_registers_itself() {
-        let s = include_str!("completions/looop.zsh");
-        assert!(s.contains("#compdef looop"), "missing #compdef tag");
-        assert!(s.contains("compdef _looop looop"), "missing compdef call");
-        assert!(s.contains("'watch:"), "watch missing from zsh command list");
-    }
-
-    /// `looop config bash` must emit a script that registers the completion via
-    /// `complete -F`, so `eval "$(looop config bash)"` wires it up.
-    #[test]
-    fn bash_completion_registers_itself() {
-        let s = include_str!("completions/looop.bash");
-        assert!(
-            s.contains("complete -F _looop looop"),
-            "missing complete -F registration"
-        );
-        assert!(
-            s.contains("up down watch"),
-            "watch missing from bash subcommand list"
-        );
-    }
 }

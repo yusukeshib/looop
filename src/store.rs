@@ -21,7 +21,7 @@
 //!   * SensorRuntime — executing `sensors/*.sh` and the snapshots they emit. A
 //!     sensor's CONTENT is state (here), but RUNNING it needs a real file to
 //!     exec; that path stays on [`Paths`].
-//!   * scratch / coordination — runs, prompts, the `.lock`, the cost ledger,
+//!   * scratch / coordination — runs, prompts, the `.lock`,
 //!     reports: regenerated / append-only / locking, different lifecycle.
 
 use crate::paths::Paths;
