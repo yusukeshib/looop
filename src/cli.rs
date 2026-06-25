@@ -1,8 +1,8 @@
 //! The single clap-derived front door for the whole CLI.
 //!
-//! Every verb — the human/client surface (`up`, `down`, `watch`, `cost`,
-//! `config`) and the machine-facing `_` plumbing (steer verbs + worker
-//! self-callbacks) — is declared here as typed args. clap owns parsing, so we
+//! Every verb — the human/client surface (`up`, `down`, `watch`) and the
+//! machine-facing `_` plumbing (steer verbs + worker self-callbacks) — is
+//! declared here as typed args. clap owns parsing, so we
 //! get, uniformly and for free across every verb:
 //!   • `--help`/`-h` on every subcommand (and it is NON-destructive: `_ playbook
 //!     write --help` prints help instead of writing the literal text `--help`,
@@ -10,9 +10,7 @@
 //!   • rejection of unknown/mistyped flags (exit 1) instead of silently writing
 //!     or ignoring them;
 //!   • the `--` end-of-options convention, so a body that genuinely starts with
-//!     `--` is still expressible (`… write -- --literal`);
-//!   • generated shell completions (`clap_complete`) instead of hand-maintained
-//!     files.
+//!     `--` is still expressible (`… write -- --literal`).
 //!
 //! Free-form bodies (goal/sensor/playbook/answer/worker-prompt) are modeled as a
 //! variadic positional `Vec<String>`; the `-`/heredoc → stdin convention is
@@ -25,7 +23,7 @@
 //! not know; it MUST tolerate unknown flags (forward-compat), which is the
 //! opposite of clap's strict rejection. main.rs shortcuts it BEFORE clap parses.
 
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -53,10 +51,6 @@ pub enum Cmd {
     Down,
     /// Read-only observer TUI over a running session's log.
     Watch(WatchArgs),
-    /// LLM spend, by day.
-    Cost,
-    /// Emit a shell completion script (eval it in your shell rc).
-    Config(ConfigArgs),
     /// Machine-facing plumbing verbs (the contract a client drives).
     #[command(name = "_")]
     Underscore {
@@ -82,19 +76,6 @@ pub struct WatchArgs {
     /// Only sessions newer than a duration (e.g. 1d, 12h, 30m).
     #[arg(long, short = 's')]
     pub since: Option<String>,
-}
-
-#[derive(Args, Debug)]
-pub struct ConfigArgs {
-    /// Which shell to emit completions for.
-    #[arg(value_enum)]
-    pub shell: Shell,
-}
-
-#[derive(Copy, Clone, Debug, ValueEnum)]
-pub enum Shell {
-    Zsh,
-    Bash,
 }
 
 /// The `_` plumbing: STEER verbs a human/client uses + WORKER self-callbacks.
@@ -132,8 +113,6 @@ pub enum Verb {
     Claim(ClaimArgs),
     /// Release a named lease.
     Unclaim(ClaimArgs),
-    /// Record LLM spend.
-    Cost(CostRecordArgs),
 }
 
 /// Shared by every action verb that funnels through `run_action`: a one-line
@@ -326,20 +305,4 @@ pub struct ClaimArgs {
     /// Holding session id. Defaults to $LOOOP_SESSION_ID.
     #[arg(long)]
     pub session: Option<String>,
-}
-
-#[derive(Args, Debug)]
-pub struct CostRecordArgs {
-    #[command(subcommand)]
-    pub op: CostRecordOp,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum CostRecordOp {
-    /// Record a session's spend: `_ cost session <id> <runner> <usd>`.
-    Session {
-        id: String,
-        runner: String,
-        usd: String,
-    },
 }

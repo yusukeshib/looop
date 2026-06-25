@@ -35,7 +35,7 @@ THREE LAYERS
   contract  the `looop _ …` verbs. The ONE supported surface to read + steer
             core. This — not the backend layout — is the stable boundary. The
             `_ ` prefix marks the plumbing surface (the contract a client drives);
-            the bare commands (`up` / `down` / `watch` / `cost`) are the porcelain
+            the bare commands (`up` / `down` / `watch`) are the porcelain
             a human runs by hand.
   client    anything that drives the contract for a human. The human reaches
             core ONLY through the contract; a bare terminal is the thinnest
@@ -60,8 +60,7 @@ ONE BEAT (sense → decide → act)
   readings + pending asks to the configured `tick` runner, which emits ONE typed
   action; looop executes it (and gates risky ones). It is the SOLE senser +
   decider (single-instance flock), so beats never race. Cadence is one interval
-  (config `interval`, default 60s); a move may nudge the next beat sooner. A
-  daily budget breaker (`max_daily_usd`) caps spend.
+  (config `interval`, default 60s); a move may nudge the next beat sooner.
 
 ============================================================================
 CLIENT CONTRACT  (read this to BECOME a looop client)
@@ -122,8 +121,8 @@ WORKER CONTRACT (auto-injected into every worker — for reference)
      answer=$("$LOOOP_BIN" _ ask "$LOOOP_SESSION_ID" --prompt "…" [--ref P] [--options a,b])
   It needs no terminal/attach — `ask` returns when answered (a client replies via
   `looop _ answer`). Workers write only to claims/, reports/ and their own code
-  sandbox; they end themselves with `_ kill`, lease shared resources with
-  `_ claim`/`_ unclaim`, and self-report spend with `_ cost`.
+  sandbox; they end themselves with `_ kill`, and lease shared resources with
+  `_ claim`/`_ unclaim`.
 
 CODE / CONFIG / DATA are cleanly separated (all overridable by env)
   EXEC    this one binary                          the program (portable)
@@ -132,7 +131,7 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
             A runner needs TWO commands — `tick` (run one disposable decide move,
             prompt on stdin) and `interactive` (launch a worker session;
             `{{prompt_file}}` is its brief). Optional: `interval` (cadence),
-            `max_daily_usd` (budget breaker), `session_ttl` (corpse retention).
+            `session_ttl` (corpse retention).
   DATA    ${XDG_STATE_HOME:-~/.local/state}/looop/  the file-based backend
           └ override with $LOOOP_DATA_DIR
             PLAYBOOK.md  goals/  journal.md  sensors/*.sh   <- durable memory

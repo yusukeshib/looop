@@ -25,8 +25,6 @@ Usage:
                                 also show recent dead, --all for every session,
                                 `a` cycles active/recent/all live;
                                 scroll up reaches the first line; shift+drag to copy
-  looop cost                     report LLM spend by day (per-beat + workers)
-  looop config zsh|bash          print shell integration (completions)
   looop version | help           print version / show this help
 
   STEER (the contract — driven by you or any client; looop does NOT need these to act):
@@ -41,7 +39,7 @@ Usage:
 
   WORKER self-callbacks (auto-injected CONTRACT — not for humans):
   looop _ ask <id> --prompt "…" [--ref P] [--options a,b]   ask + block for answer
-  looop _ kill <id> | _ claim <name> | _ unclaim <name> | _ cost <…>
+  looop _ kill <id> | _ claim <name> | _ unclaim <name>
 
 Paths (override via env LOOOP_CONFIG / LOOOP_DATA_DIR):
   config    {config}
@@ -52,7 +50,7 @@ looop is a single self-contained binary: session management (babysit) is linked
 as a LIBRARY and driven entirely in-process — no `babysit` executable required.
 looop decides autonomously each beat and drives itself through the typed actions;
 the `_ …` verbs above are the contract YOU (or any client) drive to steer +
-answer asks; the worker self-callbacks (ask / kill / claim / unclaim / cost) are
+answer asks; the worker self-callbacks (ask / kill / claim / unclaim) are
 auto-injected.
 
 looop launches each worker in the data dir; a worker that touches code provisions

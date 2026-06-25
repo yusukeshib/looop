@@ -122,9 +122,6 @@ impl Paths {
     pub fn answers_dir(&self) -> PathBuf {
         self.data_dir.join("answers")
     }
-    pub fn cost_ledger(&self) -> PathBuf {
-        self.data_dir.join("cost.jsonl")
-    }
     pub fn prompts_dir(&self) -> PathBuf {
         self.data_dir.join("prompts")
     }

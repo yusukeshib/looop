@@ -1,32 +1,28 @@
 //! Runner-wiring config — the only thing that needs "installing".
 //!
-//! Written to $LOOOP_CONFIG on first run if absent. `tick` = how to run one
+//! Written to $LOOOP_CONFIG on first run if absent. It wires up ONE runner with
+//! three commands at the top level (no profiles): `tick` = how to run one
 //! disposable AI move (stdin = the tick prompt). `interactive` = how to launch
 //! a worker agent; {{prompt_file}} is substituted with the worker's prompt file.
+//! `resume` = how to re-attach a worker session. The default wires `pi`; switch
+//! to claude (or anything) by editing these three commands.
 //!
-//! TICK COST ACCOUNTING (H3): `runner::run_streamed` meters every tick IN-PROCESS
-//! off the runner's NDJSON stdout. pi emits per-message usage (the meter sums it);
-//! claude emits a single cumulative `total_cost_usd` in its stream-json `result`
-//! event (the meter takes it as-is). Both runners therefore need their structured
-//! stream enabled in the tick command (pi: `--mode json`, claude:
-//! `--output-format stream-json --verbose`), but NEITHER pipes through an external
-//! formatter — there is no `| _ fmt` seam anymore. (Worker sessions self-report
-//! via `looop _ cost`, independent of the tick meter.)
+//! TICK OUTPUT (H3): `runner::run_streamed` renders every tick IN-PROCESS off the
+//! runner's NDJSON stdout. Both runners therefore need their structured stream
+//! enabled in the tick command (pi: `--mode json`, claude: `--output-format
+//! stream-json --verbose`), but NEITHER pipes through an external formatter —
+//! there is no `| _ fmt` seam anymore.
 //!
 //! BACK-COMPAT: a stored config written before this change may still end
 //! its tick command with `| "$LOOOP_BIN" _ fmt`. `runner_cmd` strips that trailing
 //! seam on load (see `strip_fmt_seam`), so old configs keep working unchanged.
 //!
-//! MODEL ALLOCATION (M4): the tick is the highest-leverage call — it picks the
-//! single move that steers everything — so it must NOT run on a weaker model than
-//! the workers it directs. This is enforced per runner:
-//!   * `pi` pins both tick and worker to the same strong model (claude-opus-4-8);
-//!     the tick runs at `--thinking low` (one tiny decision) while the heavier
-//!     `medium` budget is reserved for the worker's multi-step execution.
-//!   * `claude` pins no model on either command, so both inherit the CLI default
-//!     — equal, which still satisfies "tick not weaker than worker".
+//! MODEL ALLOCATION (M4): the tick is one tiny decision (pick the single next
+//! move), so the default `pi` wiring runs it on a fast model at low thinking
+//! (claude-sonnet-4-5, `--thinking low`); workers do the heavy multi-step
+//! execution on the stronger model (claude-opus-4-8, `--thinking medium`).
 //!
-//! Cost stays bounded because the world-hash gate skips the AI entirely when
+//! Spend stays bounded because the world-hash gate skips the AI entirely when
 //! nothing changed, and the tick emits only one tiny decision. Operators who want
 //! to trade decision quality for cost can drop the tick model in this file.
 
@@ -36,44 +32,14 @@ use std::fs;
 
 /// The inline default config. Originally a copy of the bash `default_config`,
 /// it now diverges deliberately: the tick commands no longer carry the
-/// `| "$LOOOP_BIN" _ fmt` seam, since formatting + cost metering run in-process
+/// `| "$LOOOP_BIN" _ fmt` seam, since output formatting runs in-process
 /// (see `runner::run_streamed`).
 pub const DEFAULT_CONFIG: &str = r#"{
-  "default": "pi",
-  "runners": {
-    "claude": {
-      "tick": "claude -p --output-format stream-json --verbose --dangerously-skip-permissions",
-      "interactive": "claude \"$(cat {{prompt_file}})\"",
-      "resume": "claude --resume"
-    },
-    "pi": {
-      "tick": "pi -p --mode json -ne --model claude-opus-4-8 --thinking low 'Execute the looop tick instructions provided on stdin.'",
-      "interactive": "pi --model claude-opus-4-8 --thinking medium @{{prompt_file}}",
-      "resume": "pi --session"
-    }
-  }
+  "tick": "pi -p --mode json -ne --model claude-sonnet-4-5 --thinking low 'Execute the looop tick instructions provided on stdin.'",
+  "interactive": "pi --model claude-opus-4-8 --thinking medium @{{prompt_file}}",
+  "resume": "pi --session"
 }
 "#;
-
-/// How a runner reports spend on its NDJSON stream. Built-in shapes (pi/claude)
-/// need no spec; a CUSTOM runner declares one so the budget breaker (H2) can
-/// actually meter it instead of silently failing open. Config shape:
-///   "cost": { "type": "<ndjson .type>", "pointer": "/json/pointer",
-///             "mode": "sum" | "total" }
-/// `sum` adds the value from every matching event (per-message usage); `total`
-/// takes the last value verbatim (a cumulative run total).
-#[derive(Debug, Clone, PartialEq)]
-pub struct CostSpec {
-    pub type_tag: String,
-    pub pointer: String,
-    pub mode: CostMode,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum CostMode {
-    Sum,
-    Total,
-}
 
 /// The parsed config — kept as a generic JSON value so the runner table stays
 /// open-ended (mirrors the bash `jq` lookups rather than a rigid schema).
@@ -96,50 +62,28 @@ impl Config {
         Ok(Config { root })
     }
 
-    /// The active runner name (`.default`).
-    pub fn default_runner(&self) -> Option<String> {
-        self.root
-            .get("default")
-            .and_then(|v| v.as_str())
-            .map(str::to_owned)
+    /// A short label for the configured runner — the first token of the `tick`
+    /// command (e.g. `pi`, `claude`). For log lines only.
+    pub fn runner_label(&self) -> String {
+        self.runner_cmd("tick")
+            .or_else(|| self.runner_cmd("interactive"))
+            .and_then(|c| c.split_whitespace().next().map(str::to_owned))
+            .unwrap_or_else(|| "runner".into())
     }
 
-    /// `.runners[<name>].<key>` — e.g. the `tick` / `interactive` command.
+    /// `.<key>` — e.g. the `tick` / `interactive` / `resume` command.
     ///
     /// Any trailing `| "$LOOOP_BIN" _ fmt` seam from a pre-in-process-metering
     /// config is stripped here (`strip_fmt_seam`), so stored configs written
     /// before the formatter moved in-process keep working without re-seeding.
-    pub fn runner_cmd(&self, name: &str, key: &str) -> Option<String> {
-        self.root
-            .get("runners")?
-            .get(name)?
-            .get(key)?
-            .as_str()
-            .map(strip_fmt_seam)
-    }
-
-    /// `.runners[<name>].cost` — a custom runner's cost-extraction spec, if any.
-    /// `None` means "use the built-in pi/claude shapes" (the default). A spec is
-    /// only honored when both `type` and `pointer` are present strings.
-    pub fn runner_cost_spec(&self, name: &str) -> Option<CostSpec> {
-        let c = self.root.get("runners")?.get(name)?.get("cost")?;
-        let type_tag = c.get("type")?.as_str()?.to_string();
-        let pointer = c.get("pointer")?.as_str()?.to_string();
-        let mode = match c.get("mode").and_then(|m| m.as_str()).unwrap_or("sum") {
-            "total" => CostMode::Total,
-            _ => CostMode::Sum,
-        };
-        Some(CostSpec {
-            type_tag,
-            pointer,
-            mode,
-        })
+    pub fn runner_cmd(&self, key: &str) -> Option<String> {
+        self.root.get(key)?.as_str().map(strip_fmt_seam)
     }
 }
 
 /// Strip a trailing `| <bin> _ fmt` (or `_fmt`) seam from a runner command.
 ///
-/// Tick formatting + cost metering moved in-process (`runner::run_streamed`), so
+/// Tick output formatting moved in-process (`runner::run_streamed`), so
 /// the old external pipe is dead. Older configs still carry it; rather
 /// than force a re-seed (which would clobber user edits) we drop the seam on load.
 /// Only the LAST pipe segment is inspected, and only when it is recognisably the

@@ -54,8 +54,7 @@ pub fn require_deps(paths: &Paths) -> Result<()> {
     // prereq. Resolve from $LOOOP_CONFIG when present, else the inline default,
     // and check its first token.
     if let Ok(cfg) = Config::load(paths)
-        && let Some(name) = cfg.default_runner()
-        && let Some(cmd) = cfg.runner_cmd(&name, "interactive")
+        && let Some(cmd) = cfg.runner_cmd("interactive")
         && let Some(bin) = cmd.split_whitespace().next()
         && !bin.is_empty()
         && !on_path(bin)
