@@ -154,7 +154,7 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
         util::event(
             Level::Info,
             "tick.forced",
-            "world unchanged but re-deciding (cadence override from last beat)",
+            "world unchanged but re-deciding (forced: pulse start or a cadence nudge)",
             &[],
         );
     }
@@ -203,7 +203,7 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
         }
     };
     let runner_name = cfg.runner_label();
-    let Some(tick_cmd) = cfg.runner_cmd("tick") else {
+    let Some(tick_cmd) = cfg.runner_cmd("tick_command") else {
         util::event(
             Level::Error,
             "tick.error",

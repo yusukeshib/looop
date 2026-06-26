@@ -45,6 +45,8 @@ pub enum Cmd {
     Help,
     /// Print the version.
     Version,
+    /// Interactive setup: choose the agent runner and write its wiring.
+    Init,
     /// Bring the autonomous pulse up.
     Up(UpArgs),
     /// Tear the pulse (and workers) down.

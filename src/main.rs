@@ -18,6 +18,7 @@ mod executor;
 mod fmt;
 mod gate;
 mod help;
+mod init;
 mod mailbox;
 mod paths;
 mod prompt;
@@ -102,10 +103,14 @@ fn main() -> ExitCode {
 fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
     use cli::{Cmd, GoalOp, PlaybookOp, SensorOp, Verb, WorkerOp};
 
-    // A bare `looop` is not a command (the loop runs as the `looop up` service);
-    // with no verb, show the manual.
+    // A bare `looop` is not a command (the loop runs as the `looop up` service).
+    // With no verb, show clap's auto-generated SHORT command summary — the long
+    // hand-written manual is reserved for the explicit `looop help` / `--help`
+    // front door. (clap derives this from cli.rs, so it never drifts.)
     let Some(cmd) = cmd else {
-        help::print(paths);
+        use clap::CommandFactory;
+        let _ = cli::Cli::command().print_help();
+        println!();
         return Ok(ExitCode::SUCCESS);
     };
 
@@ -120,7 +125,13 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
             println!("looop {}", env!("CARGO_PKG_VERSION"));
             Ok(ExitCode::SUCCESS)
         }
-        Cmd::Up(a) => gated(&|| service::cmd_up(paths, a.json)),
+        // Not gated: `looop init` configures the runner BEFORE its CLI need be
+        // installed, so we must not preflight the runner binary here.
+        Cmd::Init => init::cmd_init(paths),
+        // Not gated here: cmd_up checks `init` FIRST (so an uninitialized user is
+        // told to run `looop init`, not nagged about a missing runner they may
+        // not even want), then runs the deps preflight itself.
+        Cmd::Up(a) => service::cmd_up(paths, a.json),
         Cmd::Down => gated(&|| service::cmd_down(paths)),
         // Read-only observer TUI — no deps gate (only reads logs + lists
         // sessions, never launches an agent).

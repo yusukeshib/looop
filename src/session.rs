@@ -81,8 +81,8 @@ pub fn cmd_start_session(paths: &Paths, args: &[String]) -> Result<ExitCode> {
 
     let cfg = Config::load(paths)?;
     let runner = cfg.runner_label();
-    let Some(tmpl) = cfg.runner_cmd("interactive") else {
-        eprintln!("start-session: no `interactive` command configured");
+    let Some(tmpl) = cfg.runner_cmd("worker_command") else {
+        eprintln!("start-session: no `worker_command` configured");
         return Ok(ExitCode::from(1));
     };
 

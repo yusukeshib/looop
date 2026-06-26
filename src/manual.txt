@@ -128,10 +128,10 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
   EXEC    this one binary                          the program (portable)
   CONFIG  <DATA>/config.json                       one file: runner wiring
           └ override with $LOOOP_CONFIG            (seeded inline if absent)
-            A runner needs TWO commands — `tick` (run one disposable decide move,
-            prompt on stdin) and `interactive` (launch a worker session;
-            `{{prompt_file}}` is its brief). Optional: `interval` (cadence),
-            `session_ttl` (corpse retention).
+            A runner needs TWO commands — `tick_command` (run one disposable
+            decide move, prompt on stdin) and `worker_command` (launch a worker
+            session; `{{prompt_file}}` is its brief). Optional: `interval`
+            (cadence), `session_ttl` (corpse retention).
   DATA    ${XDG_STATE_HOME:-~/.local/state}/looop/  the file-based backend
           └ override with $LOOOP_DATA_DIR
             PLAYBOOK.md  goals/  journal.md  sensors/*.sh   <- durable memory
@@ -144,15 +144,19 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
           a public interface. Steer with the verbs, not by writing these files.
 
 BOOTSTRAP
-  A fresh data dir is seeded once with a starter PLAYBOOK + goals/setup.md +
+  Run `looop init` once: it lets you edit the three command strings of the wiring
+  (tick_command/worker_command), prefilled with the claude default (paste another
+  runner's wiring from the README to switch). `looop up` requires this. A fresh
+  data dir is also seeded once with a starter PLAYBOOK + goals/setup.md +
   goals/playbook-daily.md + sensors/today.sh, all embedded in this binary. The
   starter goal's top priority is for looop to invite you (via a journal note a
   client surfaces) to configure it, then rewrite the seed into your real goals +
   PLAYBOOK.
 
 DEPENDENCIES
-  Just the configured agent CLI (claude or pi) — used BOTH for looop's per-beat
-  decide (`tick`) and to launch workers (and, if you run one, an agent client).
+  Just the configured agent CLI (claude/codex/opencode/pi, chosen via `looop
+  init`; claude by default) — used BOTH for looop's per-beat decide (`tick`) and
+  to launch workers (and, if you run one, an agent client).
   Session management (babysit) is LINKED IN as a library and runs in-process; no
   babysit binary is required. A worker that touches code makes its own sandbox
   (box if available, else git worktree).

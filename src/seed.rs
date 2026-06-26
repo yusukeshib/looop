@@ -1,12 +1,11 @@
 //! First-run seeding + directory layout.
 //!
-//! Config is seeded inline (config.rs); data (memory) starts empty except for an
-//! embedded starter PLAYBOOK + goals + heartbeat sensor, written ONCE. Setup is
-//! then just a goal: the starter PLAYBOOK's top priority is an interactive setup
-//! session that rewrites the seed into the user's real config. The program makes
-//! no decisions — it only lays down bytes.
+//! Config (the runner wiring) is written separately by `looop init`; this module
+//! only lays down the DATA dir: an embedded starter PLAYBOOK + goals + heartbeat
+//! sensor, written ONCE. Setup is then just a goal: the starter PLAYBOOK's top
+//! priority is an interactive setup session that rewrites the seed into the
+//! user's real config. The program makes no decisions — it only lays down bytes.
 
-use crate::config;
 use crate::paths::Paths;
 use crate::store::{FileStore, Key, StateStore};
 use anyhow::{Context, Result};
@@ -60,7 +59,9 @@ pub fn ensure_dirs(paths: &Paths) -> Result<()> {
         fs::create_dir_all(&d).with_context(|| format!("mkdir -p {}", d.display()))?;
     }
 
-    config::ensure_config(paths)?;
+    // Config is NOT written here: `looop init` writes the runner wiring, and an
+    // absent config is the "not initialized" signal. Until then the loop runs on
+    // the inline DEFAULT_CONFIG (config::Config::load falls back to it).
 
     // Fresh data dir (no PLAYBOOK yet) -> lay down the embedded starter seed.
     if !paths.playbook().is_file() {
