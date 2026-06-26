@@ -155,7 +155,7 @@ struct App {
     recent_window: Duration,
     /// Sessions hidden by the current filter on the last refresh (footer hint).
     hidden: usize,
-    /// `true` while the floating session picker is open (ESC). The log is the
+    /// `true` while the floating session picker is open (ENTER). The log is the
     /// main buffer; the list is hidden until summoned, and ENTER/ESC closes it.
     picking: bool,
     /// Height (rows) of the log pane on the last draw, so `Ctrl-D`/`Ctrl-U`
@@ -516,14 +516,14 @@ impl App {
                                 _ => {}
                             }
                         } else {
-                            // Main buffer (log): scroll, or ESC to open the picker.
+                            // Main buffer (log): scroll, or ENTER to open the picker.
                             // `scroll_back` counts rows from the live tail, so
                             // scrolling UP (into history) ADDS and DOWN subtracts.
                             let half = (self.log_rows / 2).max(1);
                             let page = self.log_rows.max(1);
                             match key.code {
                                 KeyCode::Char('q') => break,
-                                KeyCode::Esc => self.picking = true,
+                                KeyCode::Enter => self.picking = true,
                                 KeyCode::Down | KeyCode::Char('j') => {
                                     self.scroll_back = self.scroll_back.saturating_sub(1)
                                 }
@@ -645,7 +645,7 @@ impl App {
             format!(" {name}{hidden}  ↑/↓ move · a filter · enter select · esc cancel · q quit ")
         } else {
             let id = self.selected_id().unwrap_or("—").to_string();
-            format!(" {id}  ↑/↓ scroll · esc sessions · q quit ")
+            format!(" {id}  ↑/↓ scroll · enter sessions · q quit ")
         };
         let style = Style::default().bg(Color::Rgb(40, 40, 40)).fg(Color::White);
         frame.render_widget(Paragraph::new(Span::styled(help, style)).style(style), area);
