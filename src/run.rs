@@ -162,11 +162,16 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
         );
     }
 
-    // Decide forever. `force` makes the next beat re-decide even if the world is
-    // unchanged — armed when a beat emits a `next_interval_s` nudge (a goal
-    // scheduling a time-based follow-up). Reset every beat; only a fresh nudge
-    // re-arms it.
-    let mut force = false;
+    // Decide forever. `force` makes a beat re-decide even if the world hash is
+    // unchanged. It starts TRUE so the FIRST beat of every pulse process always
+    // takes a move: `looop up` should act immediately, not sit idle for a full
+    // interval because the world happens to match a `.last-tick-hash` left by a
+    // previous run in this data dir. After that it is reset every beat and only
+    // re-armed by a `next_interval_s` cadence nudge (a goal scheduling a
+    // time-based follow-up). Steady-state beats stay gated by the world hash, so
+    // a quiet loop is still nearly free. (Failure backoff still applies on the
+    // forced beat, so a crash-restart loop can't burn unbounded AI calls.)
+    let mut force = true;
     loop {
         let outcome = tick::tick(paths, force);
         force = false;

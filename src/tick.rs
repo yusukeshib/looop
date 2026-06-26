@@ -154,7 +154,7 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
         util::event(
             Level::Info,
             "tick.forced",
-            "world unchanged but re-deciding (cadence override from last beat)",
+            "world unchanged but re-deciding (forced: pulse start or a cadence nudge)",
             &[],
         );
     }
