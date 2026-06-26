@@ -81,7 +81,8 @@ pub fn cmd_init(paths: &Paths) -> Result<ExitCode> {
     else {
         return aborted();
     };
-    let Some(worker) = prompt_value("Worker model (heavy execution)", spec.worker_model, tty) else {
+    let Some(worker) = prompt_value("Worker model (heavy execution)", spec.worker_model, tty)
+    else {
         return aborted();
     };
 
@@ -154,11 +155,7 @@ fn prompt_choice(choices: &[&str], default: &str, tty: bool) -> Option<String> {
     loop {
         match editable("Runner: ", &seed) {
             Edit::Line(s) => {
-                let s = if s.is_empty() {
-                    default.to_string()
-                } else {
-                    s
-                };
+                let s = if s.is_empty() { default.to_string() } else { s };
                 if choices.contains(&s.as_str()) {
                     return Some(s);
                 }
