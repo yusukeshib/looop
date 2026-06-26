@@ -5,8 +5,9 @@
 //! Rust port needs neither `jq` (JSON is handled in-process by serde_json) nor
 //! the `babysit` binary (babysit is linked as a library and the whole worker
 //! fleet — spawn / list / attach / kill / prune — runs in-process). The
-//! single hard prerequisite is the configured runner (pi/claude) used for looop's
-//! per-beat decide (`tick`) and to launch worker sessions.
+//! single hard prerequisite is the configured runner (claude/codex/opencode/pi,
+//! chosen via `looop init`) used for looop's per-beat decide (`tick`) and to
+//! launch worker sessions.
 
 use crate::config::Config;
 use crate::paths::Paths;
@@ -14,8 +15,10 @@ use anyhow::{Result, bail};
 
 fn dep_hint(cmd: &str) -> &'static str {
     match cmd {
-        "pi" => "see https://github.com/earendil-works/pi  (the default runner)",
-        "claude" => "see https://docs.claude.com/claude-code",
+        "claude" => "see https://docs.claude.com/claude-code  (the default runner)",
+        "codex" => "see https://developers.openai.com/codex/cli",
+        "opencode" => "see https://opencode.ai/docs",
+        "pi" => "see https://github.com/earendil-works/pi",
         _ => "see the tool's docs",
     }
 }
@@ -70,6 +73,7 @@ pub fn require_deps(paths: &Paths) -> Result<()> {
     for (cmd, hint) in &missing {
         msg.push_str(&format!("  {:<8} install:  {}\n", cmd, hint));
     }
-    msg.push_str("\nInstall the above, then re-run looop.");
+    msg.push_str("\nInstall the above, then re-run looop.\n");
+    msg.push_str("Or run `looop init` to choose a different runner.");
     bail!(msg);
 }

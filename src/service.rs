@@ -6,6 +6,7 @@
 //! through a client — e.g. a pi/claude session you point at looop to watch + relay).
 //! `looop down` stops the pulse and every live worker.
 
+use crate::config;
 use crate::paths::Paths;
 use crate::run;
 use crate::session::{self, PULSE_SESSION};
@@ -17,6 +18,10 @@ use std::time::Duration;
 /// itself from there; steer by editing goals/PLAYBOOK or run a client to watch
 /// and relay (`looop watch`, or a pi/claude session pointed at `looop _ state`).
 pub fn cmd_up(paths: &Paths, json: bool) -> Result<ExitCode> {
+    if !config::is_initialized(paths) {
+        println!("looop: not initialized — running on built-in claude defaults.");
+        println!("       run `looop init` to choose your runner (claude/codex/opencode/pi).");
+    }
     if session::is_alive(paths, PULSE_SESSION) {
         println!("looop: pulse already running");
     } else {

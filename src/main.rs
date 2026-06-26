@@ -18,6 +18,7 @@ mod executor;
 mod fmt;
 mod gate;
 mod help;
+mod init;
 mod mailbox;
 mod paths;
 mod prompt;
@@ -120,6 +121,9 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
             println!("looop {}", env!("CARGO_PKG_VERSION"));
             Ok(ExitCode::SUCCESS)
         }
+        // Not gated: `looop init` configures the runner BEFORE its CLI need be
+        // installed, so we must not preflight the runner binary here.
+        Cmd::Init => init::cmd_init(paths),
         Cmd::Up(a) => gated(&|| service::cmd_up(paths, a.json)),
         Cmd::Down => gated(&|| service::cmd_down(paths)),
         // Read-only observer TUI — no deps gate (only reads logs + lists

@@ -144,15 +144,18 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
           a public interface. Steer with the verbs, not by writing these files.
 
 BOOTSTRAP
-  A fresh data dir is seeded once with a starter PLAYBOOK + goals/setup.md +
-  goals/playbook-daily.md + sensors/today.sh, all embedded in this binary. The
-  starter goal's top priority is for looop to invite you (via a journal note a
+  Run `looop init` once to choose the agent runner (claude/codex/opencode/pi) and
+  write its wiring; claude is the default and the loop will run on it even before
+  you init. A fresh data dir is seeded once with a starter PLAYBOOK + goals/setup
+  .md + goals/playbook-daily.md + sensors/today.sh, all embedded in this binary.
+  The starter goal's top priority is for looop to invite you (via a journal note a
   client surfaces) to configure it, then rewrite the seed into your real goals +
   PLAYBOOK.
 
 DEPENDENCIES
-  Just the configured agent CLI (claude or pi) — used BOTH for looop's per-beat
-  decide (`tick`) and to launch workers (and, if you run one, an agent client).
+  Just the configured agent CLI (claude/codex/opencode/pi, chosen via `looop
+  init`; claude by default) — used BOTH for looop's per-beat decide (`tick`) and
+  to launch workers (and, if you run one, an agent client).
   Session management (babysit) is LINKED IN as a library and runs in-process; no
   babysit binary is required. A worker that touches code makes its own sandbox
   (box if available, else git worktree).
