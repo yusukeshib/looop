@@ -202,7 +202,10 @@ fn editable(prompt: &str, initial: &str) -> Edit {
         if execute!(out, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine)).is_err() {
             break Edit::Unsupported;
         }
-        let _ = write!(out, "{prompt}{line}");
+        // The label is dimmed (gray); the editable value renders normal. The
+        // ANSI codes are zero-width, so `prompt_cols` (plain char count) stays
+        // the correct cursor column.
+        let _ = write!(out, "{}{prompt}{}{line}", dim(), rst());
         let _ = execute!(out, cursor::MoveToColumn(prompt_cols + pos as u16));
         let _ = out.flush();
 
