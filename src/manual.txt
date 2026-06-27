@@ -75,7 +75,9 @@ embedded DB, or anything else. A client does FOUR things:
        looop _ wait --only-asks      wake only on a new pending ask
        looop _ wait [--json]         wake on any category change
      `_ wait` prints state + a `changed: […]` diff, so ONE call tells you WHAT
-     moved — no follow-up `tail` / `jq` needed.
+     moved — no follow-up `tail` / `jq` needed. If the pulse is DOWN it wakes
+     immediately with `changed: [pulse-down]` (and state shows `pulse: DOWN`)
+     instead of blocking forever on a loop that will never move the files.
 
   2. READ — inspect without blocking:
        looop _ state [--json]        full world: goals, snapshots, fleet, asks

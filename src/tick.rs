@@ -424,6 +424,10 @@ pub fn state(paths: &Paths) -> serde_json::Value {
 
     serde_json::json!({
         "world_hash": hash,
+        // Is the autonomous loop actually running? Without it the snapshots/fleet
+        // below are frozen at the last beat, so a client must know the pulse is
+        // down before trusting (or waiting on) this state.
+        "pulse_alive": crate::run::pulse_running(paths),
         "snapshots": snapshots(paths),
         "asks": asks,
         "workers": workers,
@@ -520,6 +524,13 @@ pub(crate) fn wait_for_change(paths: &Paths, filter: WaitFilter) -> Vec<String> 
     }
     let baseline = fingerprints(paths);
     loop {
+        // The pulse is the only thing that drives autonomous change; if it isn't
+        // running, these files will never move, so don't block forever — wake the
+        // caller with a distinct `pulse-down` signal (filter-independent: a dead
+        // loop is critical no matter what a client narrowed its wait to).
+        if !crate::run::pulse_running(paths) {
+            return vec!["pulse-down".to_string()];
+        }
         let changed = changed_categories(&baseline, &fingerprints(paths));
         let hit = match filter {
             WaitFilter::Any => !changed.is_empty(),
@@ -601,11 +612,18 @@ pub(crate) fn render_state(s: &serde_json::Value, json: bool) -> Result<ExitCode
         .iter()
         .filter(|w| w["alive"].as_bool().unwrap_or(false))
         .count();
+    let pulse_alive = s["pulse_alive"].as_bool().unwrap_or(false);
     println!(
-        "asks: {}  ·  workers: {live} live / {}  ·  goals: {goals}",
+        "pulse: {}  ·  asks: {}  ·  workers: {live} live / {}  ·  goals: {goals}",
+        if pulse_alive { "live" } else { "DOWN" },
         asks.len(),
         workers.len()
     );
+    if !pulse_alive {
+        println!(
+            "  ⚠ the autonomous loop is not running — run `looop up` (no beats, snapshots are stale)"
+        );
+    }
 
     // Pending asks, each with WHICH worker + HOW LONG it has been waiting, so the
     // freshness of a blocked decision is obvious at a glance.
@@ -686,6 +704,10 @@ pub fn cmd_state(paths: &Paths, json: bool) -> Result<ExitCode> {
 /// summary. By default any category move (asks / journal / playbook / goals /
 /// snapshots) wakes it; `--actionable` narrows to asks+journal and `--only-asks`
 /// to asks alone, so a watching client can ignore noisy snapshot-only moves.
+///
+/// It also wakes — regardless of filter — with `changed: [pulse-down]` if the
+/// autonomous loop isn't running, so a blocked client is never left hanging on a
+/// dead pulse (nothing would ever change the files to wake it otherwise).
 pub fn cmd_wait(paths: &Paths, args: &crate::cli::WaitArgs) -> Result<ExitCode> {
     let _ = crate::seed::ensure_dirs(paths);
     use crate::contract::Contract;
@@ -800,5 +822,27 @@ mod tests {
         assert_eq!(wait_for_change(&p, WaitFilter::Asks), vec!["asks"]);
         assert_eq!(wait_for_change(&p, WaitFilter::Actionable), vec!["asks"]);
         assert_eq!(wait_for_change(&p, WaitFilter::Any), vec!["asks"]);
+    }
+
+    #[test]
+    fn state_reports_pulse_down_when_nothing_holds_the_lock() {
+        let p = Paths::temp();
+        let _ = crate::seed::ensure_dirs(&p);
+        // No pulse has ever acquired the flock in a fresh temp dir.
+        assert_eq!(state(&p)["pulse_alive"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn wait_wakes_with_pulse_down_instead_of_blocking_when_the_loop_is_dead() {
+        let p = Paths::temp();
+        let _ = crate::seed::ensure_dirs(&p);
+        // No ask pending and no pulse running: every filter must wake (not hang)
+        // with the distinct pulse-down signal.
+        assert_eq!(wait_for_change(&p, WaitFilter::Any), vec!["pulse-down"]);
+        assert_eq!(wait_for_change(&p, WaitFilter::Asks), vec!["pulse-down"]);
+        assert_eq!(
+            wait_for_change(&p, WaitFilter::Actionable),
+            vec!["pulse-down"]
+        );
     }
 }

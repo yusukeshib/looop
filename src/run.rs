@@ -79,7 +79,6 @@ fn try_flock(_f: &std::fs::File) -> bool {
 /// authoritative "is the loop actually running" probe (a babysit session can be
 /// alive while its inner loop has crashed): open the lock file read-only and try
 /// to take the flock; if we CAN, nobody holds it. Exercised by the lock tests.
-#[allow(dead_code)]
 pub(crate) fn pulse_running(paths: &Paths) -> bool {
     let Ok(f) = std::fs::File::open(paths.lock().join("lock")) else {
         return false;
