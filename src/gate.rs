@@ -40,9 +40,9 @@ fn claim_holder(store: &impl StateStore, key: &Key) -> String {
 
 /// The session that should own a claim: explicit `--session <id>`, else the
 /// worker's exported `$LOOOP_SESSION_ID`. Empty when neither is set.
-fn claim_session(args: &crate::cli::ClaimArgs) -> String {
-    match &args.session {
-        Some(s) if !s.is_empty() => s.clone(),
+fn session_or_env(session: Option<&str>) -> String {
+    match session {
+        Some(s) if !s.is_empty() => s.to_string(),
         _ => std::env::var("LOOOP_SESSION_ID").unwrap_or_default(),
     }
 }
@@ -53,11 +53,35 @@ fn claim_session(args: &crate::cli::ClaimArgs) -> String {
 /// held by a DEAD session is reclaimed. The claim body is `{session,name}`,
 /// matching what `sys_claims` surfaces and `reap_stale_claims` reaps.
 pub fn cmd_claim(paths: &Paths, args: &crate::cli::ClaimArgs) -> Result<ExitCode> {
-    let name = args.name.clone();
-    safe_name(&name)?;
-    let session = claim_session(args);
+    use crate::contract::{ClaimOutcome, Contract};
+    let name = &args.name;
+    match crate::contract::LocalContract::new(paths).claim(name, args.session.as_deref())? {
+        ClaimOutcome::Won => {
+            println!("claimed {name}");
+            Ok(ExitCode::SUCCESS)
+        }
+        ClaimOutcome::AlreadyOwned => Ok(ExitCode::SUCCESS), // idempotent
+        ClaimOutcome::HeldByLive(holder) => {
+            eprintln!("claim {name}: held by live session '{holder}'");
+            Ok(ExitCode::from(1))
+        }
+    }
+}
+
+/// CONTRACT core for `_ claim`: an atomic, liveness-aware test-and-set on the
+/// named lease. Transport-agnostic — returns a typed [`ClaimOutcome`] the
+/// presenter maps to an exit code. `session` is the explicit owner, else the
+/// worker's exported `$LOOOP_SESSION_ID`.
+pub(crate) fn claim(
+    paths: &Paths,
+    name: &str,
+    session: Option<&str>,
+) -> Result<crate::contract::ClaimOutcome> {
+    use crate::contract::ClaimOutcome;
+    safe_name(name)?;
+    let session = session_or_env(session);
     let store = FileStore::new(paths);
-    let key = Key::Claim(name.clone());
+    let key = Key::Claim(name.to_string());
     let body = serde_json::json!({ "session": session, "name": name }).to_string();
 
     // Retry a bounded number of times: each iteration is one atomic create-if-absent
@@ -65,17 +89,15 @@ pub fn cmd_claim(paths: &Paths, args: &crate::cli::ClaimArgs) -> Result<ExitCode
     // loop only re-runs when we reclaimed a dead holder, so it terminates).
     for _ in 0..8 {
         if store.create_exclusive(&key, &body)? {
-            println!("claimed {name}");
-            return Ok(ExitCode::SUCCESS);
+            return Ok(ClaimOutcome::Won);
         }
         // Already held: inspect the holder to decide own / live / reclaim.
         let holder = claim_holder(&store, &key);
         if !holder.is_empty() && holder == session {
-            return Ok(ExitCode::SUCCESS); // idempotent: we already own it
+            return Ok(ClaimOutcome::AlreadyOwned);
         }
         if !holder.is_empty() && session::is_alive(paths, &holder) {
-            eprintln!("claim {name}: held by live session '{holder}'");
-            return Ok(ExitCode::from(1));
+            return Ok(ClaimOutcome::HeldByLive(holder));
         }
         // Stale (holder empty or dead): reclaim and retry the atomic create.
         let _ = store.remove(&key);
@@ -87,21 +109,33 @@ pub fn cmd_claim(paths: &Paths, args: &crate::cli::ClaimArgs) -> Result<ExitCode
 /// `claims/<name>.json` when it is unowned, owned by us, or held by a DEAD
 /// session; refuses (exit 1) only when a DIFFERENT live session holds it.
 pub fn cmd_unclaim(paths: &Paths, args: &crate::cli::ClaimArgs) -> Result<ExitCode> {
-    let name = args.name.clone();
-    safe_name(&name)?;
-    let session = claim_session(args);
+    use crate::contract::Contract;
+    let name = &args.name;
+    if crate::contract::LocalContract::new(paths).unclaim(name, args.session.as_deref())? {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        eprintln!("unclaim {name}: held by another live session");
+        Ok(ExitCode::from(1))
+    }
+}
+
+/// CONTRACT core for `_ unclaim`: release a lease we may own. `Ok(true)` when the
+/// lease is now gone (unowned, ours, or a dead holder — all idempotent);
+/// `Ok(false)` when a DIFFERENT live session holds it. Transport-agnostic.
+pub(crate) fn unclaim(paths: &Paths, name: &str, session: Option<&str>) -> Result<bool> {
+    safe_name(name)?;
+    let session = session_or_env(session);
     let store = FileStore::new(paths);
-    let key = Key::Claim(name.clone());
+    let key = Key::Claim(name.to_string());
     if !store.exists(&key) {
-        return Ok(ExitCode::SUCCESS); // already released (idempotent)
+        return Ok(true); // already released (idempotent)
     }
     let holder = claim_holder(&store, &key);
     if holder.is_empty() || holder == session || !session::is_alive(paths, &holder) {
         store.remove(&key)?;
-        return Ok(ExitCode::SUCCESS);
+        return Ok(true);
     }
-    eprintln!("unclaim {name}: held by another live session '{holder}'");
-    Ok(ExitCode::from(1))
+    Ok(false)
 }
 
 /// Reap claims/<name>.json whose `.session` is no longer alive. Never interprets

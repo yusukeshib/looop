@@ -411,24 +411,15 @@ pub fn write_goal(
     body: &[String],
     journal: Option<&str>,
 ) -> Result<ExitCode> {
+    use crate::contract::Contract;
     let body = resolve_body(body)?;
-    ok(run_action(
-        paths,
-        &Action::WriteGoal {
-            id: id.to_string(),
-            body,
-        },
-        journal,
-    )?)
+    ok(crate::contract::LocalContract::new(paths).goal_write(id, &body, journal)?)
 }
 
 /// `looop _ goal archive <id>`
 pub fn archive_goal(paths: &Paths, id: &str, journal: Option<&str>) -> Result<ExitCode> {
-    ok(run_action(
-        paths,
-        &Action::ArchiveGoal { id: id.to_string() },
-        journal,
-    )?)
+    use crate::contract::Contract;
+    ok(crate::contract::LocalContract::new(paths).goal_archive(id, journal)?)
 }
 
 /// `looop _ sensor write <name> [script…|-]`
@@ -438,38 +429,32 @@ pub fn write_sensor(
     script: &[String],
     journal: Option<&str>,
 ) -> Result<ExitCode> {
+    use crate::contract::Contract;
     let script = resolve_body(script)?;
-    ok(run_action(
-        paths,
-        &Action::WriteSensor {
-            name: name.to_string(),
-            script,
-        },
-        journal,
-    )?)
+    ok(crate::contract::LocalContract::new(paths).sensor_write(name, &script, journal)?)
 }
 
 /// `looop _ playbook write [body…|-]`
 pub fn write_playbook(paths: &Paths, body: &[String], journal: Option<&str>) -> Result<ExitCode> {
+    use crate::contract::Contract;
     let body = resolve_body(body)?;
-    ok(run_action(paths, &Action::WritePlaybook { body }, journal)?)
+    ok(crate::contract::LocalContract::new(paths).playbook_write(&body, journal)?)
 }
 
 /// `looop _ run [--reason TEXT] <cmd…>` — one ad-hoc, REVERSIBLE shell command.
 /// The command is captured verbatim (its own `--flags` pass through), so
 /// `--reason`/`--journal` must precede it.
 pub fn cmd_run(paths: &Paths, args: &crate::cli::RunArgs) -> Result<ExitCode> {
+    use crate::contract::Contract;
     let cmd = args.cmd.join(" ");
     if cmd.trim().is_empty() {
         eprintln!("usage: looop _ run [--reason TEXT] <cmd…>");
         return Ok(ExitCode::from(1));
     }
-    ok(run_action(
-        paths,
-        &Action::RunShell {
-            cmd,
-            reason: args.reason.clone().unwrap_or_default(),
-        },
+    let reason = args.reason.clone().unwrap_or_default();
+    ok(crate::contract::LocalContract::new(paths).run(
+        &cmd,
+        &reason,
         args.journal.journal.as_deref(),
     )?)
 }
@@ -481,19 +466,13 @@ pub fn start_worker(
     prompt: &[String],
     journal: Option<&str>,
 ) -> Result<ExitCode> {
+    use crate::contract::Contract;
     let prompt = resolve_body(prompt)?;
     if prompt.trim().is_empty() {
         eprintln!("usage: looop _ worker start <id> <prompt…|->");
         return Ok(ExitCode::from(1));
     }
-    ok(run_action(
-        paths,
-        &Action::StartWorker {
-            id: id.to_string(),
-            prompt,
-        },
-        journal,
-    )?)
+    ok(crate::contract::LocalContract::new(paths).worker_start(id, &prompt, journal)?)
 }
 
 #[cfg(test)]

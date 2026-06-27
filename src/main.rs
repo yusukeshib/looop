@@ -12,6 +12,7 @@
 
 mod cli;
 mod config;
+mod contract;
 mod deps;
 mod events;
 mod executor;

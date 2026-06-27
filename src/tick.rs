@@ -437,7 +437,7 @@ pub fn state(paths: &Paths) -> serde_json::Value {
 /// category (see [`fingerprints`]) so a noisy snapshot-only move can be filtered
 /// out by a client that only cares about asks / journal progress.
 #[derive(Clone, Copy)]
-enum WaitFilter {
+pub(crate) enum WaitFilter {
     /// Wake on ANY category change (default — the historical behavior).
     Any,
     /// Wake only when the pending-asks set changes (`--only-asks`).
@@ -507,7 +507,7 @@ fn changed_categories(
 /// Block until there is something to look at, then return the list of categories
 /// that changed. "Something" = a pending ask (return immediately) OR a category
 /// move that passes `filter`. Pure read — never senses, so it can't race the pulse.
-fn wait_for_change(paths: &Paths, filter: WaitFilter) -> Vec<String> {
+pub(crate) fn wait_for_change(paths: &Paths, filter: WaitFilter) -> Vec<String> {
     let poll = std::time::Duration::from_millis(
         std::env::var("LOOOP_WAIT_POLL_MS")
             .ok()
@@ -572,22 +572,25 @@ fn one_line(s: &str, max: usize) -> String {
 /// (with age), the live worker fleet, each sensor's wake signal, and the last
 /// few journal lines — so a client woken by `_ wait` never has to follow up
 /// with `tail journal.md` / `_ state --json | jq` to see what actually moved.
-fn print_state(paths: &Paths, json: bool, changed: Option<&[String]>) -> Result<ExitCode> {
-    let mut s = state(paths);
-    if let (Some(ch), Some(obj)) = (changed, s.as_object_mut()) {
-        obj.insert("changed".to_string(), serde_json::json!(ch));
-    }
+/// Render a state value (from [`crate::contract::Contract::state`] / `wait`) to
+/// stdout. A `"changed"` array on the value (present only for `wait`) prints the
+/// `changed:` diff line; absent (plain `state`) skips it. PRESENTATION ONLY — the
+/// data assembly lives behind the contract, so this is the CLI transport's job.
+pub(crate) fn render_state(s: &serde_json::Value, json: bool) -> Result<ExitCode> {
     if json {
-        println!("{}", serde_json::to_string_pretty(&s)?);
+        println!("{}", serde_json::to_string_pretty(s)?);
         return Ok(ExitCode::SUCCESS);
     }
-    if let Some(ch) = changed {
+    if let Some(ch) = s.get("changed").and_then(|c| c.as_array()) {
         println!(
             "changed: {}",
             if ch.is_empty() {
                 "(none)".to_string()
             } else {
-                ch.join(", ")
+                ch.iter()
+                    .filter_map(|c| c.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             }
         );
     }
@@ -673,8 +676,9 @@ fn print_state(paths: &Paths, json: bool, changed: Option<&[String]>) -> Result<
 /// `looop _ state [--json]` — read the current world state. Pure read: no
 /// sensing, no side effects (the autonomous pulse keeps snapshots fresh).
 pub fn cmd_state(paths: &Paths, json: bool) -> Result<ExitCode> {
-    let _ = crate::seed::ensure_dirs(paths);
-    print_state(paths, json, None)
+    use crate::contract::Contract;
+    let s = crate::contract::LocalContract::new(paths).state()?;
+    render_state(&s, json)
 }
 
 /// `looop _ wait [--json] [--only-asks|--actionable]` — BLOCK until there is
@@ -684,6 +688,7 @@ pub fn cmd_state(paths: &Paths, json: bool) -> Result<ExitCode> {
 /// to asks alone, so a watching client can ignore noisy snapshot-only moves.
 pub fn cmd_wait(paths: &Paths, args: &crate::cli::WaitArgs) -> Result<ExitCode> {
     let _ = crate::seed::ensure_dirs(paths);
+    use crate::contract::Contract;
     let filter = if args.only_asks {
         WaitFilter::Asks
     } else if args.actionable {
@@ -691,8 +696,8 @@ pub fn cmd_wait(paths: &Paths, args: &crate::cli::WaitArgs) -> Result<ExitCode> 
     } else {
         WaitFilter::Any
     };
-    let changed = wait_for_change(paths, filter);
-    print_state(paths, args.json, Some(&changed))
+    let s = crate::contract::LocalContract::new(paths).wait(filter)?;
+    render_state(&s, args.json)
 }
 
 #[cfg(test)]

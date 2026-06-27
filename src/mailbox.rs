@@ -102,32 +102,51 @@ pub fn pending(paths: &Paths) -> Vec<Ask> {
 /// exiting 0.
 /// `<worker>` defaults to `$LOOOP_SESSION_ID` when omitted.
 pub fn cmd_ask(paths: &Paths, args: &crate::cli::AskArgs) -> Result<ExitCode> {
+    use crate::contract::Contract;
     // worker defaults to $LOOOP_SESSION_ID (a worker self-callback omits it).
     let worker = match &args.worker {
         Some(w) if !w.is_empty() => w.clone(),
         _ => std::env::var("LOOOP_SESSION_ID").unwrap_or_default(),
     };
-    let reference = args.reference.clone().unwrap_or_default();
-    // clap already split `--options a,b` on commas; trim each entry.
-    let options: Vec<String> = args.options.iter().map(|s| s.trim().to_string()).collect();
-    let prompt = args.prompt.clone();
     if worker.is_empty() {
         eprintln!("usage: looop _ ask <worker> --prompt \"…\" [--ref PATH] [--options a,b]");
         return Ok(ExitCode::from(1));
     }
-    safe(&worker)?;
+    let reference = args.reference.clone().unwrap_or_default();
+    // clap already split `--options a,b` on commas; trim each entry.
+    let options: Vec<String> = args.options.iter().map(|s| s.trim().to_string()).collect();
+    let answer = crate::contract::LocalContract::new(paths).ask(
+        &worker,
+        &args.prompt,
+        &reference,
+        &options,
+    )?;
+    println!("{answer}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// CONTRACT core for `_ ask`: write the durable ask, then BLOCK polling answers/
+/// until the human replies, returning the answer text. Transport-agnostic (no
+/// stdout): the CLI presenter prints it; a remote backend would long-poll.
+pub(crate) fn ask(
+    paths: &Paths,
+    worker: &str,
+    prompt: &str,
+    reference: &str,
+    options: &[String],
+) -> Result<String> {
+    safe(worker)?;
     if prompt.trim().is_empty() {
         bail!("ask: empty --prompt");
     }
-
     let store = FileStore::new(paths);
-    let id = next_ask_id(&store, &worker);
+    let id = next_ask_id(&store, worker);
     let ask = Ask {
         id: id.clone(),
-        worker: worker.clone(),
-        prompt: prompt.clone(),
-        reference,
-        options,
+        worker: worker.to_string(),
+        prompt: prompt.to_string(),
+        reference: reference.to_string(),
+        options: options.to_vec(),
         ts: util::now_unix(),
     };
     store.write_atomic(&Key::Ask(id.clone()), &serde_json::to_string_pretty(&ask)?)?;
@@ -142,8 +161,7 @@ pub fn cmd_ask(paths: &Paths, args: &crate::cli::AskArgs) -> Result<ExitCode> {
     );
 
     // Block until answered. The human sees this ask (via `looop watch` / a
-    // client / `looop _ state`) and replies with `looop _ answer`.
-    // (the pulse keeps the world fresh) and replies via `looop _ answer <id>`.
+    // client / `looop _ state`) and replies with `looop _ answer <id>`.
     let poll = Duration::from_millis(
         std::env::var("LOOOP_ASK_POLL_MS")
             .ok()
@@ -152,8 +170,7 @@ pub fn cmd_ask(paths: &Paths, args: &crate::cli::AskArgs) -> Result<ExitCode> {
     );
     loop {
         if let Some(answer) = read_answer(&store, &id) {
-            println!("{answer}");
-            return Ok(ExitCode::SUCCESS);
+            return Ok(answer);
         }
         std::thread::sleep(poll);
     }
@@ -164,14 +181,13 @@ pub fn cmd_ask(paths: &Paths, args: &crate::cli::AskArgs) -> Result<ExitCode> {
 /// Root-agent callback: resolve a pending ask. Writes `answers/<ask_id>.json`,
 /// which unblocks the worker's `_ ask`. Refuses an unknown ask id.
 pub fn cmd_answer(paths: &Paths, args: &crate::cli::AnswerArgs) -> Result<ExitCode> {
-    let ask_id = &args.ask_id;
-    let force = args.force;
-    safe(ask_id)?;
+    use crate::contract::Contract;
     // Body resolution mirrors `_ goal/sensor/playbook write`: inline words win,
     // otherwise (no body, or a lone `-`) read the whole answer from stdin so a
     // multi-line design decision can be piped or passed via heredoc without the
     // `-` (or the heredoc terminator) leaking into the saved answer. clap pulls
-    // `--force` out from anywhere, so it never leaks into the body.
+    // `--force` out from anywhere, so it never leaks into the body. Stdin
+    // resolution is a CLI-transport concern, so it stays in the presenter.
     let rest = &args.body;
     let text = if rest.is_empty() || (rest.len() == 1 && rest[0] == "-") {
         use std::io::Read;
@@ -183,22 +199,31 @@ pub fn cmd_answer(paths: &Paths, args: &crate::cli::AnswerArgs) -> Result<ExitCo
     } else {
         rest.join(" ")
     };
+    crate::contract::LocalContract::new(paths).answer(&args.ask_id, &text, args.force)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// CONTRACT core for `_ answer`: durably resolve a pending ask. Refuses an
+/// unknown ask id, and (without `force`) an already-answered one. Transport-
+/// agnostic: no stdin, no stdout.
+pub(crate) fn answer(paths: &Paths, ask_id: &str, text: &str, force: bool) -> Result<()> {
+    safe(ask_id)?;
     if text.trim().is_empty() {
         bail!("answer: empty text");
     }
     let store = FileStore::new(paths);
-    if !store.exists(&Key::Ask(ask_id.clone())) {
+    if !store.exists(&Key::Ask(ask_id.to_string())) {
         bail!("answer: no pending ask {ask_id:?}");
     }
     // Answers are durable: refuse to clobber one already given unless `--force`.
     // A worker that has already read its answer has moved on, so a stray re-answer
     // is almost always a misfire — fail loudly instead of silently overwriting.
-    if store.exists(&Key::Answer(ask_id.clone())) && !force {
+    if store.exists(&Key::Answer(ask_id.to_string())) && !force {
         bail!("answer: {ask_id:?} is already answered (pass --force to overwrite)");
     }
     let body = serde_json::json!({ "answer": text, "ts": util::now_unix() });
     store.write_atomic(
-        &Key::Answer(ask_id.clone()),
+        &Key::Answer(ask_id.to_string()),
         &serde_json::to_string_pretty(&body)?,
     )?;
     util::event(
@@ -207,7 +232,7 @@ pub fn cmd_answer(paths: &Paths, args: &crate::cli::AnswerArgs) -> Result<ExitCo
         &format!("{ask_id}: {text}"),
         &[("ask_id", serde_json::json!(ask_id))],
     );
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
 /// `looop _ asks [--json]` — a client's narrow view: ONLY the pending asks,
@@ -215,8 +240,8 @@ pub fn cmd_answer(paths: &Paths, args: &crate::cli::AnswerArgs) -> Result<ExitCo
 /// compact list; `--json` emits the array of ask objects. A client's main job is
 /// relaying asks, so this makes that a single cheap call.
 pub fn cmd_asks(paths: &Paths, json: bool) -> Result<ExitCode> {
-    let _ = crate::seed::ensure_dirs(paths);
-    let asks = pending(paths);
+    use crate::contract::Contract;
+    let asks = crate::contract::LocalContract::new(paths).asks()?;
     if json {
         let arr: Vec<serde_json::Value> = asks
             .iter()
