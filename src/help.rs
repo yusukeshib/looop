@@ -21,7 +21,7 @@ pub fn print(paths: &Paths) {
 Usage:
   HUMAN (looop runs itself — this is nearly all you touch):
   looop init                     interactive setup: choose the agent runner
-                                (claude/codex/opencode/pi) and write its wiring
+                                (claude/codex/opencode/pi/custom) and write wiring
   looop up [--json]              start the pulse: the autonomous loop (sense +
                                 decide + run workers), detached. --json logs NDJSON.
   looop down                     stop the pulse and all workers

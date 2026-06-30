@@ -3,7 +3,7 @@
 //! `looop up` starts the PULSE: looop's detached, AUTONOMOUS loop — it senses,
 //! decides ONE move per changed beat, and runs the worker fleet. That is looop.
 //! You steer it by editing goals/PLAYBOOK and answering worker asks (optionally
-//! through a client — e.g. a pi/claude session you point at looop to watch + relay).
+//! through a client — e.g. an agent session you point at looop to watch + relay).
 //! `looop down` stops the pulse and every live worker.
 
 use crate::config;
@@ -16,7 +16,7 @@ use std::time::Duration;
 
 /// `looop up [--json]` — start the autonomous pulse (idempotent). looop runs
 /// itself from there; steer by editing goals/PLAYBOOK or run a client to watch
-/// and relay (`looop watch`, or a pi/claude session pointed at `looop _ state`).
+/// and relay (`looop watch`, or an agent session pointed at `looop _ state`).
 pub fn cmd_up(paths: &Paths, json: bool) -> Result<ExitCode> {
     // Hard gate: refuse to start the pulse until the operator has run `looop
     // init`. The runner wiring is a deliberate choice (which agent CLI drives
@@ -24,7 +24,9 @@ pub fn cmd_up(paths: &Paths, json: bool) -> Result<ExitCode> {
     // on a default the user never picked.
     if !config::is_initialized(paths) {
         eprintln!("looop: not initialized — run `looop init` first.");
-        eprintln!("       it picks your runner (claude/codex/opencode/pi) and writes the wiring.");
+        eprintln!(
+            "       it picks your runner (claude/codex/opencode/pi/custom) and writes wiring."
+        );
         return Ok(ExitCode::from(1));
     }
     // Initialized — now preflight the configured runner before spawning the pulse

@@ -13,7 +13,7 @@
 //!
 //! Read-only: it tails files and lists sessions, never sends input. The pulse
 //! and workers are PTY-backed, so their `output.log` is a RAW PTY transcript —
-//! an interactive agent (pi/claude) redraws in place (cursor moves, line/screen
+//! an interactive agent redraws in place (cursor moves, line/screen
 //! clears, carriage returns), so the raw bytes are NOT a clean line log. We
 //! replay the WHOLE log through a `vt100` virtual terminal and render the
 //! resulting SCREEN plus its scrollback, instead of dumping every redraw frame

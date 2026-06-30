@@ -36,8 +36,8 @@ pub fn is_json() -> bool {
 /// stdout=/dev/null, so it computed "no color" and pushed that down onto the
 /// PTY-backed pulse below it, leaving the pulse log uncolored. Self-detection
 /// fixes it structurally — the pulse sees its real PTY and colors correctly;
-/// sensors write JSON to files (never colored); workers are pi/claude under
-/// their own PTY (they self-color). `NO_COLOR` is the one honored opt-out.
+/// sensors write JSON to files (never colored); workers are agents under their
+/// own PTY (they self-color). `NO_COLOR` is the one honored opt-out.
 pub fn init_color() {
     let enabled = !is_json() && is_stdout_tty() && std::env::var_os("NO_COLOR").is_none();
     let _ = COLOR.set(enabled);

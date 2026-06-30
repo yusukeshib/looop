@@ -13,10 +13,10 @@
 
         # The Rust binary. babysit is linked as a library and the whole worker
         # fleet runs in-process — no `babysit` binary needed at runtime. The
-        # configured LLM runner (pi/claude) is the user's to provide.
+        # configured LLM runner is the user's to provide.
         looop = pkgs.rustPlatform.buildRustPackage {
           pname = "looop";
-          version = "0.36.1";
+          version = "0.37.0";
           src = ./.;
 
           cargoLock.lockFile = ./Cargo.lock;

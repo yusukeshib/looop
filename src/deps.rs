@@ -5,7 +5,7 @@
 //! Rust port needs neither `jq` (JSON is handled in-process by serde_json) nor
 //! the `babysit` binary (babysit is linked as a library and the whole worker
 //! fleet — spawn / list / attach / kill / prune — runs in-process). The
-//! single hard prerequisite is the configured runner (claude/codex/opencode/pi,
+//! single hard prerequisite is the configured runner (claude/codex/opencode/pi/custom,
 //! chosen via `looop init`) used for looop's per-beat decide (`tick`) and to
 //! launch worker sessions.
 

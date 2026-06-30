@@ -45,8 +45,8 @@ answers are a durable file mailbox reached through one backend-agnostic contract
 — it just needs an answer *eventually*, from whatever channel reaches you:
 
 - a **bare terminal** — you typing the verbs yourself (the thinnest client);
-- an **agent concierge** — a `claude`/`pi` session that relays asks in plain
-  language and answers on your behalf;
+- an **agent concierge** — a `claude`/`codex`/`opencode`/`pi` session that relays
+  asks in plain language and answers on your behalf;
 - a **notify script** — a loop that pushes asks to Slack/SMS and relays your reply.
 
 A client is an *interface*, never a decision-maker. looop decides; the client
@@ -120,10 +120,10 @@ or let a client drive them for you.
 ### First run
 
 looop runs headless, so it can't interview you. A fresh data dir is seeded with a
-starter PLAYBOOK and a `setup` goal whose top priority is exactly that: on the
-first changed beat, looop journals an invitation to configure it. The simplest
-way to answer is an **agent client** ("concierge") — a `claude`/`pi`/`codex`
-session you talk to in plain language:
+starter PLAYBOOK, a `setup` goal, and a real pending `setup` ask so a client
+waiting on asks wakes immediately. The simplest way to answer is an **agent
+client** ("concierge") — a `claude`/`codex`/`opencode`/`pi` session you talk to in
+plain language:
 
 ```sh
 claude   # then say:
@@ -131,9 +131,10 @@ claude   # then say:
 #  me to write my goals, sensors, and PLAYBOOK."
 ```
 
-The concierge runs `looop up`, surfaces pending asks, and edits your
+The concierge runs `looop up`, surfaces the pending setup ask, and edits your
 goals/PLAYBOOK via the write verbs — speaking plain language while driving the
-contract. Once customized, archive the `setup` goal and looop runs from there.
+contract. Once customized, answer the starter ask and archive the `setup` goal;
+looop runs from there.
 
 You can skip the concierge entirely and steer by hand. See `looop help` for the
 full command reference and design manual.
@@ -141,15 +142,15 @@ full command reference and design manual.
 ## Configuration
 
 The config (`$LOOOP_CONFIG`, default `~/.config/looop/config.json`) is just **two
-shell commands** — looop is glue and knows nothing about any specific runner:
+shell commands**. `looop init` lets you pick `claude`, `codex`, `opencode`, `pi`,
+or `custom`; after that looop treats the result as plain runner wiring:
 
 | Key              | Role                                                                                     |
 | ---------------- | ---------------------------------------------------------------------------------------- |
 | `tick_command`   | run ONE disposable decision. The prompt is passed via the `{{prompt_file}}` placeholder (substituted with the prompt file path — read it with `$(cat {{prompt_file}})` or `@{{prompt_file}}`). If you omit the placeholder the prompt is piped in on **stdin** instead. Must run unattended (no permission prompts — the detached pulse can't answer them) and emit a structured event stream looop can render. |
 | `worker_command` | launch a worker agent. Same `{{prompt_file}}` placeholder, substituted with the worker's prompt file path. (A worker can't use the stdin fallback — stdin is its live attach TTY.) |
 
-`looop init` just lets you edit these two strings. The built-in default is
-`claude`; paste one of the wirings below (or your own) to switch runner.
+The built-in presets are:
 
 **claude** (default)
 

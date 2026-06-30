@@ -13,8 +13,8 @@ THE IDEA
   (looop observes them next beat); a worker that hits a decision only a human can
   make asks you and waits. You reach looop through a CLIENT — anything that
   drives the contract verbs below on your behalf: a bare terminal (you, typing
-  `looop _ …`), an AGENT client (a pi/claude session you talk to in plain
-  language, which reads state, relays asks, and edits goals for you), or a NOTIFY
+  `looop _ …`), an AGENT client (claude/codex/opencode/pi/custom) you talk to in
+  plain language, which reads state, relays asks, and edits goals for you), or a NOTIFY
   client (a script that pushes pending asks to Slack/SMS/desktop and relays your
   reply back). A client is an INTERFACE, not a decision-maker: looop decides,
   the client just talks. core knows nothing about any particular client.
@@ -44,11 +44,12 @@ THREE LAYERS
 HOW IT RUNS
   1. `looop up` — start the pulse: a detached, autonomous loop that senses,
      decides ONE move per changed beat, and runs the worker fleet. That is looop.
-  2. (optional) run a client to watch + steer:
-        pi      # then: "be my looop client — read `looop --help`, show me
-                #        `looop _ state`, relay pending asks and let me answer in
-                #        plain language, help me edit goals/PLAYBOOK. looop itself
-                #        decides; you never decide for it."
+  2. (optional) run an agent client to watch + steer:
+        claude  # or codex/opencode/pi/custom, then say: "be my looop client —
+                #        read `looop --help`, show me `looop _ state`, relay
+                #        pending asks and let me answer in plain language, help
+                #        me edit goals/PLAYBOOK. looop itself decides; you never
+                #        decide for it."
   3. `looop down` — stop the pulse and every live worker.
   You can skip a long-running client entirely and drive the contract by hand:
   `looop _ state`, `looop _ answer`, `looop _ goal write`.
@@ -114,7 +115,7 @@ embedded DB, or anything else. A client does FOUR things:
      Push once per ask; escalate on age. Route by urgency: desktop/digest for
      low, chat for normal, SMS/voice for irreversible.
 
-  BUILD AN AGENT CLIENT (a "concierge") — a pi/claude session pointed at looop:
+  BUILD AN AGENT CLIENT (a "concierge") — any agent session pointed at looop:
   have it `_ wait`, relay pending asks to you in plain language, `_ answer` your
   reply, and edit goals/PLAYBOOK via the write verbs. It interfaces; looop decides.
 
@@ -146,18 +147,16 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
           a public interface. Steer with the verbs, not by writing these files.
 
 BOOTSTRAP
-  Run `looop init` once: it lets you edit the three command strings of the wiring
-  (tick_command/worker_command), prefilled with the claude default (paste another
-  runner's wiring from the README to switch). `looop up` requires this. A fresh
+  Run `looop init` once: choose claude, codex, opencode, pi, or custom wiring
+  (tick_command/worker_command). `looop up` requires this. A fresh
   data dir is also seeded once with a starter PLAYBOOK + goals/setup.md +
-  goals/playbook-daily.md + sensors/today.sh, all embedded in this binary. The
-  starter goal's top priority is for looop to invite you (via a journal note a
-  client surfaces) to configure it, then rewrite the seed into your real goals +
-  PLAYBOOK.
+  goals/playbook-daily.md + sensors/today.sh + a real pending setup ask, all
+  embedded in this binary. The ask wakes a client/concierge waiting on asks so it
+  can interview you, then rewrite the seed into your real goals + PLAYBOOK.
 
 DEPENDENCIES
-  Just the configured agent CLI (claude/codex/opencode/pi, chosen via `looop
-  init`; claude by default) — used BOTH for looop's per-beat decide (`tick`) and
+  Just the configured agent CLI (claude/codex/opencode/pi/custom, chosen via
+  `looop init`; claude by default) — used BOTH for looop's per-beat decide (`tick`) and
   to launch workers (and, if you run one, an agent client).
   Session management (babysit) is LINKED IN as a library and runs in-process; no
   babysit binary is required. A worker that touches code makes its own sandbox
