@@ -11,17 +11,13 @@
 //! worker is done in-process via babysit, so there is no `resume` command.)
 //!
 //! NOT INITIALIZED = no config file. `looop up` REFUSES to start the pulse in
-//! that state and tells the operator to run `looop init`, which lets you EDIT the
-//! two command strings (prefilled with the current values, or the claude
-//! default on first run) and writes the wiring. The inline `DEFAULT_CONFIG`
-//! (claude) is the only wiring this code knows about; it is both the first-run
-//! default and the safety net for `Config::load` (e.g. a `_` verb that runs
-//! without a file).
+//! that state and tells the operator to run `looop init`, which writes the runner
+//! wiring. The inline `DEFAULT_CONFIG` (claude) is both the first-run default and
+//! the safety net for `Config::load` (e.g. a `_` verb that runs without a file).
 //!
-//! looop is deliberately a GLUE layer: it does NOT bake in per-runner command
-//! knowledge (codex/opencode/pi flags, model ids, …). The only runner literal in
-//! code is the single claude default below; ready-to-paste wirings for other
-//! runners live in the README, and `looop init` just lets you edit the strings.
+//! looop is deliberately a GLUE layer: after init, runtime config is just these
+//! two command strings. Preset knowledge (codex/opencode/pi flags, model ids,
+//! etc.) lives at the init UI boundary, not in the pulse/worker runtime.
 //!
 //! TICK OUTPUT (H3): `runner::run_streamed` renders every tick IN-PROCESS off the
 //! runner's NDJSON stdout. Both runners therefore need their structured stream
@@ -53,10 +49,6 @@ pub const DEFAULT_CONFIG: &str = r#"{
   "worker_command": "claude --dangerously-skip-permissions --model opus \"$(cat {{prompt_file}})\""
 }
 "#;
-
-/// The wiring keys `looop init` prompts for, in order. Editing-only metadata:
-/// `looop` itself reads them via [`Config::runner_cmd`].
-pub const KEYS: [&str; 2] = ["tick_command", "worker_command"];
 
 /// Assemble the wiring JSON from the two command strings the user supplied to
 /// `looop init`. Pure serialization — NO per-runner knowledge lives here; the
@@ -222,8 +214,6 @@ mod tests {
             cfg.runner_cmd("worker_command").unwrap(),
             "W {{prompt_file}}"
         );
-        // Keys match the documented edit order.
-        assert_eq!(super::KEYS, ["tick_command", "worker_command"]);
     }
 
     #[test]

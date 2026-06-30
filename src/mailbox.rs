@@ -4,7 +4,7 @@
 //! --prompt "…"`, which writes a durable question file under `asks/` and then
 //! BLOCKS until a matching `answers/` file appears, printing the answer to stdout.
 //! The human answers with `looop _ answer <ask_id> "…"` — directly, or through any
-//! client (a pi/claude session, a notify script, …) that surfaces pending asks and
+//! client (an agent concierge, a notify script, …) that surfaces pending asks and
 //! relays the reply. looop's own decide loop sees pending asks but does NOT answer
 //! them: they
 //! are the human's call.
@@ -338,7 +338,8 @@ mod tests {
     #[test]
     fn asks_lists_only_pending() {
         let p = Paths::temp();
-        let _ = crate::seed::ensure_dirs(&p);
+        fs::create_dir_all(p.asks_dir()).unwrap();
+        fs::create_dir_all(p.answers_dir()).unwrap();
         fs::write(
             p.asks_dir().join("w-1.json"),
             serde_json::json!({"id":"w-1","worker":"w","prompt":"ok?","ts":1}).to_string(),

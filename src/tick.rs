@@ -768,8 +768,10 @@ mod tests {
             .map(|v| v.as_str().unwrap().to_string())
             .collect();
         assert!(goals.contains(&"triage".to_string()));
-        assert_eq!(s["asks"].as_array().unwrap().len(), 1);
-        assert_eq!(s["asks"][0]["id"], "triage-1");
+        let asks = s["asks"].as_array().unwrap();
+        assert_eq!(asks.len(), 2);
+        assert!(asks.iter().any(|a| a["id"] == "setup-1"));
+        assert!(asks.iter().any(|a| a["id"] == "triage-1"));
     }
 
     #[test]
@@ -830,6 +832,7 @@ mod tests {
     fn wait_wakes_with_pulse_down_instead_of_blocking_when_the_loop_is_dead() {
         let p = Paths::temp();
         let _ = crate::seed::ensure_dirs(&p);
+        crate::mailbox::answer(&p, "setup-1", "handled", false).unwrap();
         // No ask pending and no pulse running: every filter must wake (not hang)
         // with the distinct pulse-down signal.
         assert_eq!(wait_for_change(&p, WaitFilter::Any), vec!["pulse-down"]);

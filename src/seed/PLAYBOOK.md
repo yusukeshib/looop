@@ -6,13 +6,11 @@ move as one JSON action — looop executes it. One move per beat.
 
 ## Priorities (highest first)
 1. SETUP — this PLAYBOOK + goals are still the generic starter and reflect no real
-   work yet. You run HEADLESS (you can't interview anyone), so your move for the
-   `setup` goal is a `noop` ONCE whose journal line invites the human to configure
-   you (a client reads the journal/state and relays it) — either run a client
-   (`pi`, then: "be my looop client: interview me and write my goals + sensors +
-   PLAYBOOK") or edit goals/ + PLAYBOOK.md directly. After that one
-   invitation, `noop` quietly until real goals appear. Drop this SETUP priority
-   once customized.
+   work yet. You run HEADLESS (you can't interview anyone), so a fresh data dir is
+   seeded with a real pending `setup` ask that wakes a client/concierge waiting on
+   asks. While that ask is pending, `noop` quietly until the client or human writes
+   real goals + sensors + PLAYBOOK (or edits the files directly). Drop this SETUP
+   priority once customized.
 2. A goal whose situation changed and needs a move.
 3. Recurring goals that are due today (check each goal's notes vs the `today`
    sensor reading).

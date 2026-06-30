@@ -2,10 +2,12 @@
 //!
 //! Config (the runner wiring) is written separately by `looop init`; this module
 //! only lays down the DATA dir: an embedded starter PLAYBOOK + goals + heartbeat
-//! sensor, written ONCE. Setup is then just a goal: the starter PLAYBOOK's top
-//! priority is an interactive setup session that rewrites the seed into the
-//! user's real config. The program makes no decisions — it only lays down bytes.
+//! sensor, written ONCE. Setup is surfaced as a real pending Ask so a first-run
+//! concierge waiting on `looop _ wait --only-asks` wakes immediately and can start
+//! the interview that rewrites the seed into the user's real config. The program
+//! makes no decisions — it only lays down bytes.
 
+use crate::mailbox::Ask;
 use crate::paths::Paths;
 use crate::store::{FileStore, Key, StateStore};
 use anyhow::{Context, Result};
@@ -16,6 +18,9 @@ const SEED_PLAYBOOK: &str = include_str!("seed/PLAYBOOK.md");
 const SEED_GOAL_SETUP: &str = include_str!("seed/setup.md");
 const SEED_GOAL_PLAYBOOK_DAILY: &str = include_str!("seed/playbook-daily.md");
 const SEED_SENSOR_TODAY: &str = include_str!("seed/today.sh");
+
+const SEED_SETUP_ASK_ID: &str = "setup-1";
+const SEED_SETUP_ASK_PROMPT: &str = "First-run setup: looop is unconfigured. Please have your concierge interview you about goals, sensors, irreversible actions, repos/workspaces, and recurring cadences, then write the real PLAYBOOK/goals/sensors and archive the setup goal.";
 
 const GITIGNORE: &str = "\
 snapshots/
@@ -88,5 +93,44 @@ fn seed_data(paths: &Paths) -> Result<()> {
     )?;
     // write_atomic sets the sensor's exec bit (it's a script the runtime runs).
     store.write_atomic(&Key::Sensor("today".into()), SEED_SENSOR_TODAY)?;
+    seed_setup_ask(&store)?;
     Ok(())
+}
+
+fn seed_setup_ask(store: &impl StateStore) -> Result<()> {
+    // A fresh loop must be visible to the thinnest concierge, which normally
+    // blocks on `looop _ wait --only-asks`. Journal-only setup notices are too
+    // easy to miss, so seed a real mailbox item. It is intentionally from the
+    // synthetic `setup` worker: no worker is blocked on the answer; the concierge
+    // uses the pending ask as the human-facing trigger for the setup interview.
+    let ask = Ask {
+        id: SEED_SETUP_ASK_ID.to_string(),
+        worker: "setup".to_string(),
+        prompt: SEED_SETUP_ASK_PROMPT.to_string(),
+        reference: "goals/setup.md".to_string(),
+        options: vec![],
+        ts: crate::util::now_unix(),
+    };
+    store.write_atomic(
+        &Key::Ask(SEED_SETUP_ASK_ID.to_string()),
+        &serde_json::to_string_pretty(&ask)?,
+    )?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fresh_seed_contains_pending_setup_ask() {
+        let p = Paths::temp();
+        ensure_dirs(&p).unwrap();
+
+        let asks = crate::mailbox::pending(&p);
+        assert_eq!(asks.len(), 1);
+        assert_eq!(asks[0].id, SEED_SETUP_ASK_ID);
+        assert_eq!(asks[0].worker, "setup");
+        assert_eq!(asks[0].reference, "goals/setup.md");
+    }
 }
