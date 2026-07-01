@@ -132,7 +132,8 @@ const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
 - WORKSPACE: you start in the loop data dir (read-only context for you, save the
   meta exception above). If your task touches a code repo, provision your OWN
   sandbox FIRST and cd into it — never edit code in the data dir:
-    • if `box` is available:  box new __SESSION__ --repo <repo> && cd "$(box switch __SESSION__)"
+    • if `box` is available:  box workspace add __SESSION__ --repo <source> && cd "$(box workspace switch __SESSION__)"
+                              (box v0.3+; aliases box ws add / box ws sw. <source> is a registered source name — `box source list`.)
     • otherwise (git):         git -C <local-clone> worktree add /tmp/__SESSION__ -b looop/__SESSION__ && cd /tmp/__SESSION__
   (the PLAYBOOK names the repos and which to prefer.)
 - DELIVERABLES: write any report / artifact a human will read into the data dir's
