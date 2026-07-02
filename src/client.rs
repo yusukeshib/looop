@@ -87,11 +87,18 @@ impl App {
     fn refresh(&mut self, paths: &Paths) {
         self.asks = mailbox::pending(paths);
         self.pulse_alive = run::pulse_running(paths);
-        self.workers_alive = session::list_workers(paths).iter().filter(|s| s.alive).count();
+        self.workers_alive = session::list_workers(paths)
+            .iter()
+            .filter(|s| s.alive)
+            .count();
         if self.asks.is_empty() {
             self.list_state.select(None);
         } else {
-            let sel = self.list_state.selected().unwrap_or(0).min(self.asks.len() - 1);
+            let sel = self
+                .list_state
+                .selected()
+                .unwrap_or(0)
+                .min(self.asks.len() - 1);
             self.list_state.select(Some(sel));
         }
     }
@@ -106,7 +113,8 @@ impl App {
         }
         let cur = self.list_state.selected().unwrap_or(0) as isize;
         let last = self.asks.len() as isize - 1;
-        self.list_state.select(Some(cur.saturating_add(delta).clamp(0, last) as usize));
+        self.list_state
+            .select(Some(cur.saturating_add(delta).clamp(0, last) as usize));
     }
 
     /// Durably resolve the selected ask with the typed text. On success drop
@@ -134,7 +142,9 @@ impl App {
     }
 
     fn run(&mut self, terminal: &mut ratatui::DefaultTerminal, paths: &Paths) -> Result<()> {
-        let mut last_refresh = Instant::now().checked_sub(TICK).unwrap_or_else(Instant::now);
+        let mut last_refresh = Instant::now()
+            .checked_sub(TICK)
+            .unwrap_or_else(Instant::now);
         loop {
             if last_refresh.elapsed() >= TICK {
                 self.refresh(paths);
@@ -193,7 +203,8 @@ impl App {
         .split(frame.area());
         self.draw_header(frame, chunks[0]);
 
-        let body = Layout::horizontal([Constraint::Length(26), Constraint::Min(20)]).split(chunks[1]);
+        let body =
+            Layout::horizontal([Constraint::Length(26), Constraint::Min(20)]).split(chunks[1]);
         self.draw_asks(frame, body[0]);
         self.draw_detail(frame, body[1]);
         self.draw_footer(frame, chunks[2]);
@@ -210,7 +221,10 @@ impl App {
             ("DOWN — run `looop up`", Style::default().fg(Color::Red))
         };
         let line = Line::from(vec![
-            Span::styled(" looop client ", Style::default().fg(Color::Black).bg(Color::White)),
+            Span::styled(
+                " looop client ",
+                Style::default().fg(Color::Black).bg(Color::White),
+            ),
             Span::raw("  pulse: "),
             Span::styled(pulse, pstyle),
             Span::raw(format!(
@@ -304,7 +318,12 @@ impl App {
                 v
             }
         };
-        frame.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .wrap(Wrap { trim: false }),
+            area,
+        );
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
