@@ -1,8 +1,9 @@
 //! `looop client` — a minimal, non-agent TUI for answering worker asks.
 //!
 //! looop's steering surface is the `looop _ …` CONTRACT. The RECOMMENDED client
-//! is an AGENT ("concierge", see the /looop skill) that watches for asks, relays
-//! them to the human in plain language with a recommendation, and drives the
+//! is an AGENT concierge — start any coding agent and tell it to "work as a
+//! concierge for the `looop` command" — that watches for asks, relays them to
+//! the human in plain language with a recommendation, and drives the
 //! `_ answer` / `_ goal` / `_ playbook` verbs. This command is the humble,
 //! hand-driven alternative: a TUI where the pending ask list is ALWAYS on
 //! screen and the human answers each ask themselves.
@@ -314,11 +315,11 @@ impl App {
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(Span::styled(
-                    "here for you to answer. (An agent concierge does this better;",
+                    "here for you to answer. (An agent concierge does this better:",
                     Style::default().fg(Color::DarkGray),
                 )),
                 Line::from(Span::styled(
-                    "see the /looop skill.)",
+                    "tell any coding agent to work as a concierge for `looop`.)",
                     Style::default().fg(Color::DarkGray),
                 )),
             ],
