@@ -14,21 +14,21 @@
 //! thing it defers to a human is a worker's blocking ask, and this window is
 //! that human ⇄ mailbox channel, laid bare.
 //!
-//! The ask list owns the whole screen; opening an ask (ENTER) floats a
-//! scrollable DETAIL modal OVER it, and ESC closes it back to the list —
-//! mirroring `looop watch`, where the log fills the screen and the session
-//! picker floats on top:
+//! The ask list is a full-width TABLE (id · age · worker state · options ·
+//! prompt preview). Opening an ask (ENTER/click) floats a scrollable DETAIL
+//! pane over the right; ESC closes it back to the list — mirroring `looop
+//! watch`, where the log fills the screen and the picker floats on top:
 //!
 //! ```text
-//!   ⚑ worker-1-1       ┌─ triage-2 ───────────────┐
-//! > ⚑ triage-2         │ worker: triage          ┃
-//!   ⚑ deploy-3         │ <the worker's question> │
-//!                       │ ref: reports/triage.md  │
-//!                       │ options: ship, hold     │
-//!                       ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
-//!                       │ › ship█                  │
-//!                       └────────────────────────┘
-//!    type answer · enter send · ↑/↓ scroll · esc close  (footer)
+//!   ID          AGE  STATE    PROMPT        ┌─ triage-2 ─────────────┐
+//! > triage-2    2m   running  flaky test…   │ worker: triage       ┃ │
+//!   deploy-3    0s   running  dep upgrade…  │                      ┃ │
+//!                                           │ <the question>       │ │
+//!                                           │ options: ship, hold  │ │
+//!                                           ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
+//!                                           │ › ship█              │ │
+//!                                           └──────────────────────┘
+//!    type answer · enter send · ↑/↓ scroll · esc close    (footer)
 //! ```
 //!
 //! The list is borderless (like watch's log) so the bordered detail pane reads
@@ -286,11 +286,17 @@ impl App {
         self.select_index(idx);
     }
 
-    /// Point the selection at row `idx`, resetting the detail scroll (a
-    /// different ask reads from the top). Shared by keyboard + mouse selection.
+    /// Point the selection at row `idx`. When it actually CHANGES the target
+    /// ask, reset the detail scroll and clear any half-typed answer — so a
+    /// pending answer can never be submitted against a different ask than the
+    /// one it was typed for. Shared by keyboard + mouse selection.
     fn select_index(&mut self, idx: usize) {
-        self.selected_id = Some(self.asks[idx].id.clone());
-        self.detail_scroll = 0;
+        let id = self.asks[idx].id.clone();
+        if self.selected_id.as_deref() != Some(id.as_str()) {
+            self.detail_scroll = 0;
+            self.input.clear();
+        }
+        self.selected_id = Some(id);
         self.ensure_visible(idx);
     }
 
