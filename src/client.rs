@@ -15,32 +15,39 @@
 //! that human ⇄ mailbox channel, laid bare.
 //!
 //! The ask list is a full-width TABLE (id · age · worker state · options ·
-//! prompt preview). Opening an ask (ENTER/click) floats a scrollable DETAIL
-//! pane over the right; ESC closes it back to the list — mirroring `looop
-//! watch`, where the log fills the screen and the picker floats on top:
+//! prompt preview). Opening an ask (ENTER/click) floats a DETAIL pane over the
+//! right that shows the WORKER'S LIVE BUFFER — a scrollable `looop watch`-style
+//! vt100 replay of the worker's `output.log`, with the ask itself pinned at the
+//! very BOTTOM. So you read the worker's own transcript, scroll back through its
+//! history, and answer the question right where it sits, at the end of the
+//! buffer. ESC closes it back to the list:
 //!
 //! ```text
-//!   ID          AGE  STATE    PROMPT        ┌─ triage-2 ─────────────┐
-//! > triage-2    2m   running  flaky test…   │ worker: triage       ┃ │
-//!   deploy-3    0s   running  dep upgrade…  │                      ┃ │
+//!   ID          AGE  STATE    PROMPT        ┌──────────────────────┐
+//! > triage-2    2m   running  flaky test…   │ …worker output…      ┃ │
+//!   deploy-3    0s   running  dep upgrade…  │ running tests…       ┃ │
+//!                                           │ ── ask ──             │ │
 //!                                           │ <the question>       │ │
 //!                                           │ options: ship, hold  │ │
 //!                                           ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
 //!                                           │ › ship█              │ │
 //!                                           └──────────────────────┘
-//!    type answer · enter send · ↑/↓ scroll · esc close    (footer)
+//!    type answer · enter send · ↑/↓ move · pgup/pgdn scroll · esc close
 //! ```
 //!
-//! The list is borderless (like watch's log) so the bordered detail pane reads
-//! as floating on top; wheel + click + scrollbar-drag all work. The input is
-//! pinned along the pane's bottom and focused the moment the pane opens — no
-//! extra keystroke to "reveal" it.
+//! The buffer replay + scroll model + scrollbar all live in [`crate::logview`],
+//! shared with `looop watch` (which shows the same buffer with no pinned ask) —
+//! so the client can eventually REPLACE watch. The list is borderless (like
+//! watch's log) so the bordered detail pane reads as floating on top; wheel +
+//! click + scrollbar-drag all work. The input is pinned along the pane's bottom
+//! and focused the moment the pane opens — no extra keystroke to "reveal" it.
 //!
 //! Read + one narrow write: it lists pending asks (`mailbox::pending`) and, on
 //! submit, durably resolves the selected one (`mailbox::answer`). It never
 //! spawns a worker or edits policy — for that, use the agent concierge or the
 //! raw `_` verbs.
 
+use crate::logview::{self, LogView};
 use crate::mailbox::{self, Ask};
 use crate::paths::Paths;
 use crate::run;
@@ -58,7 +65,7 @@ use ratatui::crossterm::execute;
 use ratatui::prelude::*;
 use ratatui::widgets::{
     Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
-    Table, TableState, Wrap,
+    Table, TableState,
 };
 
 /// Re-list asks / re-check the pulse this often, and the input-poll timeout.
@@ -135,6 +142,72 @@ fn render_vscrollbar(frame: &mut Frame, area: Rect, max_scroll: usize, pos: usiz
     frame.render_stateful_widget(bar, area, &mut state);
 }
 
+/// Group a run of styled chars into a `Line`, coalescing adjacent chars that
+/// share a style into one `Span` (keeps the widget's span list compact).
+fn chars_to_line(chars: &[(char, Style)], base: Style) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut cur_style: Option<Style> = None;
+    for &(c, st) in chars {
+        if cur_style != Some(st) {
+            if let Some(prev) = cur_style.take() {
+                spans.push(Span::styled(std::mem::take(&mut buf), prev));
+            }
+            cur_style = Some(st);
+        }
+        buf.push(c);
+    }
+    if let Some(st) = cur_style {
+        spans.push(Span::styled(buf, st));
+    }
+    Line::from(spans).style(base)
+}
+
+/// Word-wrap styled `lines` to `width` columns, preserving each span's style.
+/// Breaks at the last space that fits; a word longer than the whole width is
+/// hard-split. Width is counted in `char`s (good enough for the ask block; CJK
+/// double-width isn't special-cased). The `LogView` paints its `tail` verbatim
+/// against a fixed-width log grid, so the ask block must be pre-wrapped here to
+/// stay readable in a narrow detail pane.
+fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    if width == 0 {
+        return lines;
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for line in lines {
+        let base = line.style;
+        // Flatten the line to a styled-char sequence, then greedily re-emit.
+        let chars: Vec<(char, Style)> = line
+            .spans
+            .iter()
+            .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
+            .collect();
+        if chars.is_empty() {
+            out.push(Line::from("").style(base));
+            continue;
+        }
+        let mut start = 0usize;
+        while start < chars.len() {
+            let mut end = (start + width).min(chars.len());
+            if end < chars.len() {
+                // Prefer breaking at the last space in the window (dropped).
+                if let Some(sp) = (start..end).rev().find(|&i| chars[i].0 == ' ')
+                    && sp > start
+                {
+                    end = sp;
+                }
+            }
+            out.push(chars_to_line(&chars[start..end], base));
+            start = end;
+            // Swallow a single break space so it doesn't lead the next row.
+            if start < chars.len() && chars[start].0 == ' ' {
+                start += 1;
+            }
+        }
+    }
+    out
+}
+
 /// `looop client` — bring up the ask-answering TUI.
 pub fn cmd_client(paths: &Paths) -> Result<ExitCode> {
     let mut terminal = ratatui::init();
@@ -173,15 +246,6 @@ struct AsksHit {
     offset: usize,
 }
 
-/// The detail scrollbar's on-screen track + the scroll depth it represents,
-/// captured during `draw_detail` for the mouse handler (mirrors watch's
-/// `ScrollbarHit`). Top-anchored: track top = offset 0, bottom = `max_scroll`.
-#[derive(Clone, Copy)]
-struct ScrollbarHit {
-    area: Rect,
-    max_scroll: usize,
-}
-
 struct App {
     asks: Vec<Ask>,
     /// Top visible row (viewport scroll). The WHEEL scrolls this directly and
@@ -203,12 +267,13 @@ struct App {
     input: String,
     /// Last outcome to show in the footer (an error, or an "answered X" note).
     status: Option<String>,
-    /// Top-anchored scroll offset (in wrapped lines) of the detail modal.
-    /// Reset to 0 whenever the selection changes or the modal is (re)opened.
-    detail_scroll: usize,
-    /// Inner height of the detail modal from the last draw, so page-scroll keys
-    /// (`PgUp`/`PgDn`, `Ctrl-U`/`Ctrl-D`) know the viewport size.
-    detail_rows: usize,
+    /// The worker's live buffer shown in the detail pane: a scrollable vt100
+    /// replay of the selected ask's worker `output.log`, with the ask itself
+    /// pinned at the very bottom as the LogView's `tail`. Answering thus happens
+    /// "at the end of the buffer" — mirroring (and, eventually, replacing)
+    /// `looop watch`. Owns its own scroll model, background parse, and
+    /// scrollbar.
+    log: LogView,
     pulse_alive: bool,
     /// Count of alive worker sessions (pulse excluded) — header context.
     worker_count: usize,
@@ -217,12 +282,6 @@ struct App {
     worker_state: HashMap<String, (bool, String)>,
     /// Geometry of the ask list from the last draw, for click→row hit-testing.
     asks_hit: Option<AsksHit>,
-    /// Geometry of the detail scrollbar from the last draw, for click/drag
-    /// scrubbing. `None` when the modal isn't scrollable (no bar rendered).
-    detail_bar: Option<ScrollbarHit>,
-    /// `true` while the left button is held after grabbing the scrollbar, so
-    /// drags keep scrubbing even when the cursor drifts off the thin column.
-    dragging_scrollbar: bool,
 }
 
 impl App {
@@ -235,14 +294,11 @@ impl App {
             mode: Mode::List,
             input: String::new(),
             status: None,
-            detail_scroll: 0,
-            detail_rows: 0,
+            log: LogView::new(),
             pulse_alive: false,
             worker_count: 0,
             worker_state: HashMap::new(),
             asks_hit: None,
-            detail_bar: None,
-            dragging_scrollbar: false,
         }
     }
 
@@ -306,7 +362,10 @@ impl App {
     fn select_index(&mut self, idx: usize) {
         let id = self.asks[idx].id.clone();
         if self.selected_id.as_deref() != Some(id.as_str()) {
-            self.detail_scroll = 0;
+            // New target ask: follow its worker buffer's tail and drop any
+            // half-typed answer so it can't land on the wrong worker. The
+            // LogView re-points to the new worker's log on the next `sync`.
+            self.log.follow_tail();
             self.input.clear();
         }
         self.selected_id = Some(id);
@@ -324,12 +383,13 @@ impl App {
         }
     }
 
-    /// Open the detail pane on the current selection: read area at the top,
-    /// answer input pinned at the bottom (focused), scrolled to the top.
+    /// Open the detail pane on the current selection: the worker's live buffer
+    /// fills the read area (following the tail, so the newest output and the ask
+    /// at the bottom are in view), with the answer input pinned below (focused).
     fn open_detail(&mut self) {
         self.input.clear();
         self.status = None;
-        self.detail_scroll = 0;
+        self.log.follow_tail();
         self.mode = Mode::Detail;
     }
 
@@ -343,49 +403,6 @@ impl App {
         }
         let idx = hit.offset + (row - a.top()) as usize;
         (idx < self.asks.len()).then_some(idx)
-    }
-
-    /// Begin a scrollbar drag. Returns `true` if `(col, row)` landed on the
-    /// bar's column within the track, scrubbing the detail to that row; the
-    /// caller then holds the grab and feeds later moves to `scrollbar_scrub`.
-    fn scrollbar_grab(&mut self, col: u16, row: u16) -> bool {
-        let Some(hit) = self.detail_bar else {
-            return false;
-        };
-        let a = hit.area;
-        // The bar occupies the rightmost column of its area; also accept the
-        // border cell just right of it. Only rows within the track count.
-        let bar_col = a.right().saturating_sub(1);
-        let on_bar = col == bar_col || col == bar_col + 1;
-        if !on_bar || row < a.top() || row >= a.bottom() {
-            return false;
-        }
-        self.scrollbar_scrub(row);
-        true
-    }
-
-    /// Scrub the detail viewport to `row` on the track (column ignored, used
-    /// while a grab is held). Top-anchored: the track maps linearly top→bottom
-    /// onto `0..=max_scroll`, so dragging past an edge pins to first/last line.
-    fn scrollbar_scrub(&mut self, row: u16) {
-        let Some(hit) = self.detail_bar else {
-            return;
-        };
-        let a = hit.area;
-        let span = a.height.saturating_sub(1);
-        let clamped = row.clamp(a.top(), a.bottom().saturating_sub(1));
-        self.detail_scroll = if span == 0 {
-            0
-        } else {
-            let frac = (clamped - a.top()) as f64 / span as f64;
-            (frac * hit.max_scroll as f64).round() as usize
-        };
-    }
-
-    /// Scroll the detail read area by `delta` wrapped lines. Clamped at 0
-    /// here; the clamp to the real `max_scroll` happens in `draw_detail`.
-    fn scroll_detail(&mut self, delta: isize) {
-        self.detail_scroll = self.detail_scroll.saturating_add_signed(delta);
     }
 
     /// Route a mouse event by focus — wheel + click on the list (List) or the
@@ -410,22 +427,29 @@ impl App {
                 }
                 _ => {}
             },
+            // The detail pane shows the worker's scrollable buffer: the wheel
+            // and scrollbar scroll it (up = into history, toward the tail =
+            // down); a click on a still-visible list row switches the buffer to
+            // that ask's worker.
             Mode::Detail => match m.kind {
-                MouseEventKind::ScrollUp => self.scroll_detail(-(WHEEL_STEP as isize)),
-                MouseEventKind::ScrollDown => self.scroll_detail(WHEEL_STEP as isize),
+                MouseEventKind::ScrollUp => self.log.scroll(WHEEL_STEP as isize),
+                MouseEventKind::ScrollDown => self.log.scroll(-(WHEEL_STEP as isize)),
                 MouseEventKind::Down(MouseButton::Left) => {
                     // Prefer the scrollbar; otherwise a click on a still-visible
-                    // list row switches the modal to that ask.
-                    if self.scrollbar_grab(m.column, m.row) {
-                        self.dragging_scrollbar = true;
-                    } else if let Some(idx) = self.ask_at(m.column, m.row) {
+                    // list row switches the buffer to that ask. Always (re)assign
+                    // the grab result so a non-scrollbar click clears any stuck
+                    // drag state (e.g. a missed mouse-up).
+                    self.log.dragging_scrollbar = self.log.scrollbar_grab(m.column, m.row);
+                    if !self.log.dragging_scrollbar
+                        && let Some(idx) = self.ask_at(m.column, m.row)
+                    {
                         self.select_index(idx);
                     }
                 }
-                MouseEventKind::Drag(MouseButton::Left) if self.dragging_scrollbar => {
-                    self.scrollbar_scrub(m.row);
+                MouseEventKind::Drag(MouseButton::Left) if self.log.dragging_scrollbar => {
+                    self.log.scrollbar_scrub(m.row);
                 }
-                MouseEventKind::Up(MouseButton::Left) => self.dragging_scrollbar = false,
+                MouseEventKind::Up(MouseButton::Left) => self.log.dragging_scrollbar = false,
                 _ => {}
             },
         }
@@ -466,6 +490,15 @@ impl App {
                 self.refresh(paths);
                 last_refresh = Instant::now();
             }
+
+            // Keep the buffer pointed at the selected ask's worker in BOTH
+            // modes so the detail pane opens instantly (no re-parse flash) and
+            // feed any newly-appended bytes. The heavy initial parse runs on the
+            // LogView's background worker; the incremental tail feed is cheap.
+            self.log
+                .set_target(self.selected().map(|a| a.worker.clone()));
+            self.log.sync(paths);
+
             terminal.draw(|f| self.draw(f))?;
 
             // Block up to a tick for the first event, then DRAIN every event
@@ -517,7 +550,9 @@ impl App {
             // Note there is no `q`-to-quit here: `q` is a legal answer
             // character. Quit with ESC then `q`, or Ctrl-C anywhere.
             Mode::Detail => {
-                let page = self.detail_rows.max(1) as isize;
+                // The buffer scrolls up into history and down toward the tail
+                // (where the ask sits); `Home`/`End` jump to oldest/live.
+                let page = self.log.rows().max(1) as isize;
                 match key.code {
                     KeyCode::Esc => self.mode = Mode::List,
                     KeyCode::Enter => self.submit(paths),
@@ -526,13 +561,12 @@ impl App {
                     }
                     KeyCode::Down => self.move_selection(1),
                     KeyCode::Up => self.move_selection(-1),
-                    KeyCode::PageDown => self.scroll_detail(page),
-                    KeyCode::PageUp => self.scroll_detail(-page),
-                    KeyCode::Char('d') if ctrl => self.scroll_detail(page / 2),
-                    KeyCode::Char('u') if ctrl => self.scroll_detail(-(page / 2)),
-                    KeyCode::Home => self.detail_scroll = 0,
-                    // Clamped down to the real max in `draw_detail`.
-                    KeyCode::End => self.detail_scroll = usize::MAX,
+                    KeyCode::PageDown => self.log.scroll(-page),
+                    KeyCode::PageUp => self.log.scroll(page),
+                    KeyCode::Char('d') if ctrl => self.log.scroll(-(page / 2)),
+                    KeyCode::Char('u') if ctrl => self.log.scroll(page / 2),
+                    KeyCode::End => self.log.follow_tail(),
+                    KeyCode::Home => self.log.jump_oldest(),
                     // Everything else printable is answer text.
                     KeyCode::Char(c) if !ctrl => self.input.push(c),
                     _ => {}
@@ -713,9 +747,11 @@ impl App {
     }
 
     /// The floating DETAIL pane — overlaid on the list's right while
-    /// `Mode::Detail`. A scrollable read area (with a `looop watch`-style
-    /// scrollbar when the ask overflows) sits on top; the answer input is
-    /// pinned along the BOTTOM and is always focused.
+    /// `Mode::Detail`. It shows the selected ask's WORKER BUFFER: a scrollable
+    /// `looop watch`-style vt100 replay of the worker's `output.log`, with the
+    /// ask itself (worker · prompt · ref · options) pinned at the very BOTTOM
+    /// as the buffer's tail. The answer input is pinned below that and always
+    /// focused — so answering happens at the end of the buffer.
     fn draw_detail(&mut self, frame: &mut Frame, area: Rect) {
         // Floats where the right pane used to sit: anchored to the right, full
         // height, starting just past the ask-list column so that column stays
@@ -733,7 +769,7 @@ impl App {
         frame.render_widget(Clear, float);
         frame.render_widget(block, float);
 
-        // Split the inner area: the read area fills the top; the input takes a
+        // Split the inner area: the buffer fills the top; the input takes a
         // separator row + one text row pinned along the bottom.
         let input_h = 2u16.min(inner.height);
         let content = Rect {
@@ -746,31 +782,33 @@ impl App {
             ..inner
         };
 
-        // Keep the selected ask alive for the whole function so the Markdown
-        // `Text` (which borrows `a.prompt`) can be spliced into `lines`.
-        let selected = self.selected().cloned();
-        let lines: Vec<Line> = match &selected {
+        // Build the ask block pinned at the bottom of the buffer. A dim rule
+        // separates the worker's own output above from the structured ask.
+        let tail: Vec<Line<'static>> = match self.selected().cloned() {
             // The ask vanished (answered elsewhere, worker exited) while open.
             None => vec![Line::from(Span::styled(
                 "this ask is no longer pending — esc to close.",
                 dim(),
             ))],
             Some(a) => {
-                let mut v = vec![
+                let mut v: Vec<Line<'static>> = vec![
+                    Line::from(Span::styled("── ask ──", dim())),
                     Line::from(vec![
                         Span::styled("worker: ", dim()),
-                        Span::raw(a.worker.as_str()),
+                        Span::raw(a.worker.clone()),
                     ]),
-                    Line::raw(""),
+                    Line::from(""),
                 ];
-                // Render the ask prompt as Markdown: headings/bold/lists/code
-                // become styled lines instead of a single raw block.
-                v.extend(tui_markdown::from_str(&a.prompt).lines);
+                // Render the ask prompt as Markdown, lifting the borrowed lines
+                // to owned so the LogView can cache them.
+                for line in tui_markdown::from_str(&a.prompt).lines {
+                    v.push(logview::static_line(&line));
+                }
                 if !a.reference.is_empty() {
-                    v.push(Line::raw(""));
+                    v.push(Line::from(""));
                     v.push(Line::from(vec![
                         Span::styled("ref: ", dim()),
-                        Span::raw(a.reference.as_str()),
+                        Span::raw(a.reference.clone()),
                     ]));
                 }
                 if !a.options.is_empty() {
@@ -782,33 +820,11 @@ impl App {
                 v
             }
         };
+        // The LogView paints tail lines verbatim (the log grid is fixed-width),
+        // so word-wrap the ask to the pane first — long prompts stay readable.
+        let tail = wrap_lines(tail, content.width as usize);
 
-        // Measure the wrapped content against the READ-AREA width to clamp the
-        // scroll offset and size the scrollbar. `line_count` wraps exactly as
-        // the rendered borderless `Paragraph` will (same width + Wrap).
-        let visible_h = content.height as usize;
-        let content_h = Paragraph::new(lines.clone())
-            .wrap(Wrap { trim: false })
-            .line_count(content.width);
-        let max_scroll = content_h.saturating_sub(visible_h);
-        self.detail_scroll = self.detail_scroll.min(max_scroll);
-        self.detail_rows = visible_h;
-
-        frame.render_widget(
-            Paragraph::new(lines)
-                .wrap(Wrap { trim: false })
-                .scroll((self.detail_scroll.min(u16::MAX as usize) as u16, 0)),
-            content,
-        );
-
-        // Scrollbar over the read area's right column (same helper as the list).
-        render_vscrollbar(frame, content, max_scroll, self.detail_scroll);
-        // Remember where it landed so mouse clicks/drags can target it.
-        self.detail_bar = (max_scroll > 0).then_some(ScrollbarHit {
-            area: content,
-            max_scroll,
-        });
-
+        self.log.render(frame, content, &tail, true);
         self.draw_input(frame, input_area);
     }
 
@@ -857,5 +873,56 @@ impl App {
             },
         };
         frame.render_widget(Paragraph::new(Span::styled(help, style)).style(style), area);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn wrap_breaks_at_spaces_and_preserves_text() {
+        let lines = vec![Line::from("the quick brown fox jumps")];
+        let out = wrap_lines(lines, 10);
+        // Each wrapped row fits the width and no word is split at a space break.
+        assert!(out.iter().all(|l| plain(l).chars().count() <= 10));
+        let joined: String = out.iter().map(plain).collect::<Vec<_>>().join(" ");
+        assert_eq!(joined, "the quick brown fox jumps");
+    }
+
+    #[test]
+    fn wrap_hard_splits_overlong_word() {
+        let lines = vec![Line::from("abcdefghijklmnop")];
+        let out = wrap_lines(lines, 5);
+        assert_eq!(out.len(), 4); // 16 chars / 5
+        assert!(out.iter().all(|l| plain(l).chars().count() <= 5));
+        let joined: String = out.iter().map(|l| plain(l)).collect();
+        assert_eq!(joined, "abcdefghijklmnop");
+    }
+
+    #[test]
+    fn wrap_preserves_span_styles() {
+        let styled = Line::from(vec![
+            Span::styled("aaa", Style::default().fg(Color::Red)),
+            Span::styled(" bbb", Style::default().fg(Color::Green)),
+        ]);
+        let out = wrap_lines(vec![styled], 3);
+        // "aaa" then "bbb" on separate rows, keeping their colors.
+        assert_eq!(plain(&out[0]), "aaa");
+        assert_eq!(out[0].spans[0].style.fg, Some(Color::Red));
+        assert_eq!(plain(&out[1]), "bbb");
+        assert_eq!(out[1].spans.last().unwrap().style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn wrap_zero_width_is_identity() {
+        let lines = vec![Line::from("anything")];
+        let out = wrap_lines(lines.clone(), 0);
+        assert_eq!(out.len(), 1);
+        assert_eq!(plain(&out[0]), "anything");
     }
 }
