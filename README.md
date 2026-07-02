@@ -114,8 +114,8 @@ looop down     # stop the pulse and all workers
 
 The pulse refuses to start until `looop init` writes the runner wiring, so the
 agent CLI driving every tick and worker is always an explicit choice. Read and
-steer core with the `looop _ …` verbs (`_ state`, `_ wait`, `_ answer`, `_ goal
-write`), by hand or through a client.
+steer core with the `looop _ …` verbs (`_ state`, `_ wait`, `_ answer`,
+`_ goal write`), by hand or through a client.
 
 ### First run
 

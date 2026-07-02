@@ -842,7 +842,10 @@ impl App {
             Some(msg) => format!(" {msg} "),
             None => match self.mode {
                 Mode::List => " ↑/↓ move · enter open · q quit ".to_string(),
-                Mode::Detail => " type answer · enter send · ↑/↓ move · pgup/pgdn scroll · esc close ".to_string(),
+                Mode::Detail => {
+                    " type answer · enter send · ↑/↓ move · pgup/pgdn scroll · esc close "
+                        .to_string()
+                }
             },
         };
         frame.render_widget(Paragraph::new(Span::styled(help, style)).style(style), area);
