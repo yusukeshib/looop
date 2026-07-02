@@ -61,7 +61,7 @@ answer asks; the worker self-callbacks (ask / kill / claim / unclaim) are
 auto-injected.
 
 looop launches each worker in the data dir; a worker that touches code provisions
-its OWN sandbox (box if available, else git worktree). looop itself has no notion
+its OWN sandbox (a git worktree). looop itself has no notion
 of repos. Steer it by editing goals / the PLAYBOOK (`looop _ goal write` /
 `_ playbook write`) — it takes effect next beat. (looop does not version the data
 dir; `git init` it yourself for history.)"#,

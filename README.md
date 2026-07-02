@@ -99,8 +99,8 @@ cargo install looop
 
 **Only hard dependency:** an LLM runner. `claude` is the default; `codex`,
 `opencode`, and `pi` also work — pick one with `looop init`. (Workers that touch
-code isolate their own sandbox via `git worktree`, or `box` if available — a
-worker convention, not a looop dependency.)
+code isolate their own sandbox via `git worktree` — a worker convention, not a
+looop dependency.)
 
 ## Usage
 

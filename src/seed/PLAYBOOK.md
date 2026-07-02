@@ -22,7 +22,7 @@ move as one JSON action — looop executes it. One move per beat.
 - start_worker — hands-on / multi-step work; <id> matches the goal file name (for
   a RECURRING goal use a date-stamped id like name-YYYYMMDD so a finished run never
   blocks the next one). The worker starts in the data dir; if it edits CODE it must
-  make its OWN sandbox first (`box new …` if available, else a git worktree) and cd
+  make its OWN sandbox first (a git worktree) and cd
   in — never edit code in the data dir. A worker that needs a human decision runs
   `looop _ ask` and BLOCKS — that pending ask is how a blocker reaches the human
   (via a client).

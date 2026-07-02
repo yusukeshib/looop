@@ -83,7 +83,7 @@ Pick exactly ONE `action` and fill its fields:
   {"action":"start_worker","id":"<goal-name>","prompt":"<detailed worker brief>"}
      Spawn an agent for hands-on, multi-step work. <id> matches the goal file.
      The worker starts in the data dir; if its task edits CODE, tell it to make
-     its OWN sandbox first (box if available, else git worktree) and cd in —
+     its OWN sandbox first (a git worktree) and cd in —
      never edit code in the data dir. A worker that needs a human decision runs
      `looop _ ask <id> --prompt "…"` and BLOCKS until the human answers — prefer
      one worker per goal over spawning a second for the same goal.
