@@ -1,6 +1,6 @@
 [package]
 name = "looop"
-version = "0.40.1"
+version = "0.41.0"
 edition = "2024"
 description = "A tiny, portable, Kubernetes-shaped control loop for your work"
 license = "MIT"
@@ -31,7 +31,9 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io
 # through `ratatui::crossterm` and don't pin crossterm separately. ansi-to-tui
 # parses the PTY log's ANSI/SGR escapes into styled ratatui lines so the log
 # pane stays colored.
-ratatui = "0.30"
+# `unstable-rendered-line-info` exposes `Paragraph::line_count`, which the client
+# detail modal uses to measure wrapped content height and clamp its scrollbar.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 ansi-to-tui = "8"
 # `looop watch` replays the raw PTY `output.log` through a virtual terminal so
 # an interactive agent's in-place redraws (cursor moves, line clears) render as
