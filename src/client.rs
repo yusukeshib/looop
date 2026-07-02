@@ -746,7 +746,10 @@ impl App {
             ..inner
         };
 
-        let lines: Vec<Line> = match self.selected().cloned() {
+        // Keep the selected ask alive for the whole function so the Markdown
+        // `Text` (which borrows `a.prompt`) can be spliced into `lines`.
+        let selected = self.selected().cloned();
+        let lines: Vec<Line> = match &selected {
             // The ask vanished (answered elsewhere, worker exited) while open.
             None => vec![Line::from(Span::styled(
                 "this ask is no longer pending — esc to close.",
@@ -754,15 +757,20 @@ impl App {
             ))],
             Some(a) => {
                 let mut v = vec![
-                    Line::from(vec![Span::styled("worker: ", dim()), Span::raw(a.worker)]),
+                    Line::from(vec![
+                        Span::styled("worker: ", dim()),
+                        Span::raw(a.worker.as_str()),
+                    ]),
                     Line::raw(""),
-                    Line::raw(a.prompt),
                 ];
+                // Render the ask prompt as Markdown: headings/bold/lists/code
+                // become styled lines instead of a single raw block.
+                v.extend(tui_markdown::from_str(&a.prompt).lines);
                 if !a.reference.is_empty() {
                     v.push(Line::raw(""));
                     v.push(Line::from(vec![
                         Span::styled("ref: ", dim()),
-                        Span::raw(a.reference),
+                        Span::raw(a.reference.as_str()),
                     ]));
                 }
                 if !a.options.is_empty() {

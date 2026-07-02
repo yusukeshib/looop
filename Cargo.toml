@@ -1,6 +1,6 @@
 [package]
 name = "looop"
-version = "0.41.4"
+version = "0.42.0"
 edition = "2024"
 description = "A tiny, portable, Kubernetes-shaped control loop for your work"
 license = "MIT"
@@ -35,6 +35,12 @@ tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io
 # detail modal uses to measure wrapped content height and clamp its scrollbar.
 ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 ansi-to-tui = "8"
+# `looop client`'s detail pane renders the worker's ask PROMPT as Markdown so
+# headings/bold/lists/code render as styled ratatui lines instead of raw text.
+# default-features = false drops the `highlight-code` feature (syntect), keeping
+# that heavy syntax-highlighting stack out — code blocks still render, just
+# without per-language coloring.
+tui-markdown = { version = "0.3", default-features = false }
 # `looop watch` replays the raw PTY `output.log` through a virtual terminal so
 # an interactive agent's in-place redraws (cursor moves, line clears) render as
 # the actual SCREEN instead of a garbled append of every frame. babysit already
