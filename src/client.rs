@@ -67,6 +67,11 @@ const TICK: Duration = Duration::from_millis(250);
 /// Rows scrolled per mouse-wheel notch (list and detail alike).
 const WHEEL_STEP: usize = 3;
 
+/// The shared dark-surface background (same as `looop watch`): the selected
+/// row's highlight and the footer bar. Dark enough that per-span colors
+/// (green/red state, dim gray) stay legible without overriding fg.
+const SURFACE: Color = Color::Rgb(40, 40, 40);
+
 /// The dim gray style shared by all secondary text in this TUI.
 fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
@@ -639,7 +644,7 @@ impl App {
                 // Highlight the selected row via its own style (the widget runs
                 // with `selected = None` + a manual offset — see below).
                 if Some(a.id.as_str()) == self.selected_id.as_deref() {
-                    row.style(Style::default().bg(Color::Rgb(40, 40, 40)))
+                    row.style(Style::default().bg(SURFACE))
                 } else {
                     row
                 }
@@ -837,7 +842,7 @@ impl App {
     }
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
-        let style = Style::default().bg(Color::Rgb(40, 40, 40)).fg(Color::White);
+        let style = Style::default().bg(SURFACE).fg(Color::White);
         let help = match &self.status {
             Some(msg) => format!(" {msg} "),
             None => match self.mode {
