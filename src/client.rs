@@ -60,6 +60,12 @@ enum Mode {
 struct App {
     asks: Vec<Ask>,
     list_state: ListState,
+    /// The selected ask, tracked by its STABLE id — not by list index.
+    /// `mailbox::pending` re-sorts every tick and asks come and go, so an
+    /// index would silently point at a different ask (and, mid-answer, drift
+    /// the answer onto the wrong worker). The id is the source of truth; the
+    /// list index is derived from it each refresh.
+    selected_id: Option<String>,
     mode: Mode,
     /// The answer being typed (in `Mode::Answer`).
     input: String,
@@ -75,6 +81,7 @@ impl App {
         Self {
             asks: Vec::new(),
             list_state: ListState::default(),
+            selected_id: None,
             mode: Mode::Browse,
             input: String::new(),
             status: None,
@@ -83,7 +90,11 @@ impl App {
         }
     }
 
-    /// Re-read the pending asks + pulse liveness, keeping the selection valid.
+    /// Re-read the pending asks + pulse liveness, reconciling the selection by
+    /// id. If the selected id is still present its row index is refreshed; if
+    /// it vanished we fall back to the first ask WHILE BROWSING, but while
+    /// answering we keep the (now-missing) id pinned so `submit` can report it
+    /// instead of silently retargeting a different ask.
     fn refresh(&mut self, paths: &Paths) {
         self.asks = mailbox::pending(paths);
         self.pulse_alive = run::pulse_running(paths);
@@ -92,36 +103,54 @@ impl App {
             .filter(|s| s.alive)
             .count();
         if self.asks.is_empty() {
+            self.selected_id = None;
             self.list_state.select(None);
-        } else {
-            let sel = self
-                .list_state
-                .selected()
-                .unwrap_or(0)
-                .min(self.asks.len() - 1);
-            self.list_state.select(Some(sel));
+            return;
+        }
+        match self.selected_index() {
+            Some(pos) => self.list_state.select(Some(pos)),
+            // Selected id gone (or none yet).
+            None if matches!(self.mode, Mode::Answer) => {
+                // Keep the pinned id so `submit` surfaces "it vanished"; just
+                // drop the row highlight (the ask is no longer in the list).
+                self.list_state.select(None);
+            }
+            None => {
+                self.selected_id = Some(self.asks[0].id.clone());
+                self.list_state.select(Some(0));
+            }
         }
     }
 
+    /// Row index of the currently-selected ask id, if it is still pending.
+    fn selected_index(&self) -> Option<usize> {
+        let id = self.selected_id.as_deref()?;
+        self.asks.iter().position(|a| a.id == id)
+    }
+
     fn selected(&self) -> Option<&Ask> {
-        self.list_state.selected().and_then(|i| self.asks.get(i))
+        self.selected_index().map(|i| &self.asks[i])
     }
 
     fn move_selection(&mut self, delta: isize) {
         if self.asks.is_empty() {
             return;
         }
-        let cur = self.list_state.selected().unwrap_or(0) as isize;
+        let cur = self.selected_index().unwrap_or(0) as isize;
         let last = self.asks.len() as isize - 1;
-        self.list_state
-            .select(Some(cur.saturating_add(delta).clamp(0, last) as usize));
+        let idx = cur.saturating_add(delta).clamp(0, last) as usize;
+        self.list_state.select(Some(idx));
+        self.selected_id = Some(self.asks[idx].id.clone());
     }
 
     /// Durably resolve the selected ask with the typed text. On success drop
-    /// back to Browse and refresh (the answered ask leaves the pending list);
-    /// on failure stay in Answer so the human can fix + retry.
+    /// back to Browse and refresh (the answered ask leaves the pending list).
+    /// On failure — including the ask having vanished (another client answered
+    /// it, the worker exited) — STAY in Answer with the typed text intact and
+    /// surface the reason, so the human can copy/edit before cancelling.
     fn submit(&mut self, paths: &Paths) {
-        let Some(ask) = self.selected() else {
+        let Some(id) = self.selected_id.clone() else {
+            self.status = Some("no ask selected".into());
             self.mode = Mode::Browse;
             return;
         };
@@ -129,7 +158,6 @@ impl App {
             self.status = Some("answer: empty text (esc to cancel)".into());
             return;
         }
-        let id = ask.id.clone();
         match mailbox::answer(paths, &id, &self.input, false) {
             Ok(()) => {
                 self.status = Some(format!("answered {id}"));
@@ -180,6 +208,7 @@ impl App {
                 Mode::Answer => match key.code {
                     KeyCode::Esc => {
                         self.input.clear();
+                        self.status = None;
                         self.mode = Mode::Browse;
                     }
                     KeyCode::Enter => self.submit(paths),
@@ -348,7 +377,9 @@ impl App {
             height: h,
         };
         frame.render_widget(Clear, float);
-        let id = self.selected().map(|a| a.id.as_str()).unwrap_or("—");
+        // The pinned id (not the live row) so the title still names the ask
+        // even if it just vanished from the pending list mid-answer.
+        let id = self.selected_id.as_deref().unwrap_or("—");
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" answer {id} "))
