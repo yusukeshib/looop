@@ -889,8 +889,9 @@ impl App {
 
     /// The floating ask pane: while the input is focused and the selected
     /// session has a pending ask, its prompt (rendered as Markdown), reference
-    /// and options float just above the input — you answer with the question
-    /// and the worker's log both in view. Scrolls via PgUp/PgDn / the wheel.
+    /// and options float along the TOP of the log — the question stays put
+    /// while the worker's log and the input line below remain in view. Scrolls
+    /// via PgUp/PgDn / the wheel.
     fn draw_ask_float(&mut self, frame: &mut Frame, area: Rect) {
         let Some(ask) = self.selected_ask().cloned() else {
             return;
@@ -898,7 +899,7 @@ impl App {
         let h = (area.height * 2 / 5).clamp(5.min(area.height), area.height);
         let float = Rect {
             x: area.x,
-            y: area.bottom().saturating_sub(h),
+            y: area.y,
             width: area.width,
             height: h,
         };
