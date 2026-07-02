@@ -64,6 +64,14 @@ use ratatui::widgets::{
 /// Re-list asks / re-check the pulse this often, and the input-poll timeout.
 const TICK: Duration = Duration::from_millis(250);
 
+/// Rows scrolled per mouse-wheel notch (list and detail alike).
+const WHEEL_STEP: usize = 3;
+
+/// The dim gray style shared by all secondary text in this TUI.
+fn dim() -> Style {
+    Style::default().fg(Color::DarkGray)
+}
+
 /// Compact relative age of a unix timestamp: `5s` / `3m` / `2h` / `4d`. Shown
 /// dim next to each ask so the list conveys how long it has been waiting.
 fn fmt_age(ts: u64) -> String {
@@ -186,7 +194,7 @@ struct App {
     /// list index is derived from it each refresh.
     selected_id: Option<String>,
     mode: Mode,
-    /// The answer being typed (in `Mode::Answer`).
+    /// The answer being typed in the detail pane's pinned input.
     input: String,
     /// Last outcome to show in the footer (an error, or an "answered X" note).
     status: Option<String>,
@@ -340,9 +348,11 @@ impl App {
             return false;
         };
         let a = hit.area;
-        // The vertical bar lives in the rightmost column of its area; accept
-        // that column (and the border just right of it) within the track rows.
-        if col + 1 < a.right() || col > a.right() || row < a.top() || row >= a.bottom() {
+        // The bar occupies the rightmost column of its area; also accept the
+        // border cell just right of it. Only rows within the track count.
+        let bar_col = a.right().saturating_sub(1);
+        let on_bar = col == bar_col || col == bar_col + 1;
+        if !on_bar || row < a.top() || row >= a.bottom() {
             return false;
         }
         self.scrollbar_scrub(row);
@@ -367,6 +377,12 @@ impl App {
         };
     }
 
+    /// Scroll the detail read area by `delta` wrapped lines. Clamped at 0
+    /// here; the clamp to the real `max_scroll` happens in `draw_detail`.
+    fn scroll_detail(&mut self, delta: isize) {
+        self.detail_scroll = self.detail_scroll.saturating_add_signed(delta);
+    }
+
     /// Route a mouse event by focus — wheel + click on the list (List) or the
     /// detail modal + its scrollbar (Detail). Mirrors watch's mouse model.
     fn on_mouse(&mut self, m: MouseEvent) {
@@ -375,10 +391,10 @@ impl App {
                 // The wheel scrolls the VIEW, not the selection (the highlight
                 // stays on its ask); clamped to range in `draw_asks`.
                 MouseEventKind::ScrollUp => {
-                    self.list_offset = self.list_offset.saturating_sub(3);
+                    self.list_offset = self.list_offset.saturating_sub(WHEEL_STEP);
                 }
                 MouseEventKind::ScrollDown => {
-                    self.list_offset = self.list_offset.saturating_add(3);
+                    self.list_offset = self.list_offset.saturating_add(WHEEL_STEP);
                 }
                 // Click a row: select it AND open its detail pane.
                 MouseEventKind::Down(MouseButton::Left) => {
@@ -390,12 +406,8 @@ impl App {
                 _ => {}
             },
             Mode::Detail => match m.kind {
-                MouseEventKind::ScrollUp => {
-                    self.detail_scroll = self.detail_scroll.saturating_sub(3);
-                }
-                MouseEventKind::ScrollDown => {
-                    self.detail_scroll = self.detail_scroll.saturating_add(3);
-                }
+                MouseEventKind::ScrollUp => self.scroll_detail(-(WHEEL_STEP as isize)),
+                MouseEventKind::ScrollDown => self.scroll_detail(WHEEL_STEP as isize),
                 MouseEventKind::Down(MouseButton::Left) => {
                     // Prefer the scrollbar; otherwise a click on a still-visible
                     // list row switches the modal to that ask.
@@ -499,31 +511,19 @@ impl App {
             // Note there is no `q`-to-quit here: `q` is a legal answer
             // character. Quit with ESC then `q`, or Ctrl-C anywhere.
             Mode::Detail => {
-                let page = self.detail_rows.max(1);
+                let page = self.detail_rows.max(1) as isize;
                 match key.code {
                     KeyCode::Esc => self.mode = Mode::List,
                     KeyCode::Enter => self.submit(paths),
                     KeyCode::Backspace => {
                         self.input.pop();
                     }
-                    KeyCode::Down => {
-                        self.detail_scroll = self.detail_scroll.saturating_add(1);
-                    }
-                    KeyCode::Up => {
-                        self.detail_scroll = self.detail_scroll.saturating_sub(1);
-                    }
-                    KeyCode::PageDown => {
-                        self.detail_scroll = self.detail_scroll.saturating_add(page);
-                    }
-                    KeyCode::PageUp => {
-                        self.detail_scroll = self.detail_scroll.saturating_sub(page);
-                    }
-                    KeyCode::Char('d') if ctrl => {
-                        self.detail_scroll = self.detail_scroll.saturating_add(page / 2);
-                    }
-                    KeyCode::Char('u') if ctrl => {
-                        self.detail_scroll = self.detail_scroll.saturating_sub(page / 2);
-                    }
+                    KeyCode::Down => self.scroll_detail(1),
+                    KeyCode::Up => self.scroll_detail(-1),
+                    KeyCode::PageDown => self.scroll_detail(page),
+                    KeyCode::PageUp => self.scroll_detail(-page),
+                    KeyCode::Char('d') if ctrl => self.scroll_detail(page / 2),
+                    KeyCode::Char('u') if ctrl => self.scroll_detail(-(page / 2)),
                     KeyCode::Home => self.detail_scroll = 0,
                     // Clamped down to the real max in `draw_detail`.
                     KeyCode::End => self.detail_scroll = usize::MAX,
@@ -588,7 +588,7 @@ impl App {
         } else {
             area.width
         };
-        let dim = Style::default().fg(Color::DarkGray);
+        let dim = dim();
 
         if self.asks.is_empty() {
             self.asks_hit = None;
@@ -627,21 +627,7 @@ impl App {
             .asks
             .iter()
             .map(|a| {
-                // STATE column: the asking worker's session state as plain
-                // text — running / exited / killed, or `gone` when it's not in
-                // the session list at all.
-                let (state, color) = match self.worker_state.get(&a.worker) {
-                    Some((true, _)) => ("running".to_string(), Color::Green),
-                    Some((false, st)) => (
-                        st.clone(),
-                        if st == "killed" {
-                            Color::Red
-                        } else {
-                            Color::DarkGray
-                        },
-                    ),
-                    None => ("gone".to_string(), Color::DarkGray),
-                };
+                let (state, color) = self.state_cell(&a.worker);
                 let prompt = a.prompt.split_whitespace().collect::<Vec<_>>().join(" ");
                 let row = Row::new(vec![
                     Cell::from(a.id.clone()),
@@ -708,6 +694,18 @@ impl App {
         });
     }
 
+    /// The STATE cell for the worker behind an ask: `running` (green), the
+    /// recorded exit state (`exited` dim / `killed` red), or `gone` (dim)
+    /// when the session isn't in the session list at all.
+    fn state_cell(&self, worker: &str) -> (String, Color) {
+        match self.worker_state.get(worker) {
+            Some((true, _)) => ("running".into(), Color::Green),
+            Some((false, st)) if st == "killed" => (st.clone(), Color::Red),
+            Some((false, st)) => (st.clone(), Color::DarkGray),
+            None => ("gone".into(), Color::DarkGray),
+        }
+    }
+
     /// The floating DETAIL pane — overlaid on the list's right while
     /// `Mode::Detail`. A scrollable read area (with a `looop watch`-style
     /// scrollbar when the ask overflows) sits on top; the answer input is
@@ -726,11 +724,11 @@ impl App {
 
         // The pinned id (not the live row) titles the pane, so it still names
         // the ask even if that ask just left the pending list under us.
-        let id = self.selected_id.as_deref().unwrap_or("—").to_string();
+        let id = self.selected_id.as_deref().unwrap_or("—");
         let block = Block::default()
             .borders(Borders::ALL)
             .title(format!(" {id} "))
-            .border_style(Style::default().fg(Color::DarkGray));
+            .border_style(dim());
         let inner = block.inner(float);
         frame.render_widget(Clear, float);
         frame.render_widget(block, float);
@@ -752,27 +750,24 @@ impl App {
             // The ask vanished (answered elsewhere, worker exited) while open.
             None => vec![Line::from(Span::styled(
                 "this ask is no longer pending — esc to close.",
-                Style::default().fg(Color::DarkGray),
+                dim(),
             ))],
             Some(a) => {
                 let mut v = vec![
-                    Line::from(vec![
-                        Span::styled("worker: ", Style::default().fg(Color::DarkGray)),
-                        Span::raw(a.worker),
-                    ]),
+                    Line::from(vec![Span::styled("worker: ", dim()), Span::raw(a.worker)]),
                     Line::raw(""),
                     Line::raw(a.prompt),
                 ];
                 if !a.reference.is_empty() {
                     v.push(Line::raw(""));
                     v.push(Line::from(vec![
-                        Span::styled("ref: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("ref: ", dim()),
                         Span::raw(a.reference),
                     ]));
                 }
                 if !a.options.is_empty() {
                     v.push(Line::from(vec![
-                        Span::styled("options: ", Style::default().fg(Color::DarkGray)),
+                        Span::styled("options: ", dim()),
                         Span::raw(a.options.join(", ")),
                     ]));
                 }
@@ -812,9 +807,7 @@ impl App {
     /// The always-focused answer editor pinned along the bottom of the detail
     /// pane: a `┈` separator row above a single `› …` input line.
     fn draw_input(&self, frame: &mut Frame, area: Rect) {
-        let sep = Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(Color::DarkGray));
+        let sep = Block::default().borders(Borders::TOP).border_style(dim());
         let field = sep.inner(area);
         frame.render_widget(sep, area);
         if field.height == 0 {
@@ -830,15 +823,12 @@ impl App {
         } else {
             self.input.clone()
         };
-        let mut spans = vec![Span::styled("› ", Style::default().fg(Color::DarkGray))];
+        let mut spans = vec![Span::styled("› ", dim())];
         if self.input.is_empty() {
             // Block cursor first, then a dim placeholder so the field reads as
             // focused and self-explanatory before anything is typed.
             spans.push(Span::styled(" ", Style::default().bg(Color::White)));
-            spans.push(Span::styled(
-                " type answer · enter to send",
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled(" type answer · enter to send", dim()));
         } else {
             spans.push(Span::raw(shown));
             spans.push(Span::styled(" ", Style::default().bg(Color::White)));
