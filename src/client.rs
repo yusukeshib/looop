@@ -1006,12 +1006,13 @@ impl App {
                 },
             ),
         };
-        // The border is the affordance: dim while idle, WHITE (bold) once the
-        // input is activated — so "where do I type" is answered at a glance.
+        // The border is the affordance: a mid gray while idle (bright enough to
+        // stand off the log), WHITE (bold) once the input is activated — so
+        // "where do I type" is answered at a glance.
         let border_style = if focused {
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
         } else {
-            dim()
+            Style::default().fg(Color::Gray)
         };
         let block = Block::default()
             .borders(Borders::ALL)
