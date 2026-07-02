@@ -832,7 +832,14 @@ impl App {
         if self.focus == Focus::Input && !self.picking {
             self.draw_ask_float(frame, log_area);
         }
-        self.draw_input(frame, chunks[1]);
+        if self.picking {
+            // The picker owns the input then; leave the pinned line blank so its
+            // placeholder isn't stray noise under the float.
+            frame.render_widget(Clear, chunks[1]);
+            self.input_hit = None;
+        } else {
+            self.draw_input(frame, chunks[1]);
+        }
         self.draw_footer(frame, chunks[2]);
 
         if self.picking {
