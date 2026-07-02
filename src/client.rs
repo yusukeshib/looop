@@ -436,10 +436,13 @@ impl App {
                 MouseEventKind::ScrollDown => self.log.scroll(-(WHEEL_STEP as isize)),
                 MouseEventKind::Down(MouseButton::Left) => {
                     // Prefer the scrollbar; otherwise a click on a still-visible
-                    // list row switches the buffer to that ask.
-                    if self.log.scrollbar_grab(m.column, m.row) {
-                        self.log.dragging_scrollbar = true;
-                    } else if let Some(idx) = self.ask_at(m.column, m.row) {
+                    // list row switches the buffer to that ask. Always (re)assign
+                    // the grab result so a non-scrollbar click clears any stuck
+                    // drag state (e.g. a missed mouse-up).
+                    self.log.dragging_scrollbar = self.log.scrollbar_grab(m.column, m.row);
+                    if !self.log.dragging_scrollbar
+                        && let Some(idx) = self.ask_at(m.column, m.row)
+                    {
                         self.select_index(idx);
                     }
                 }
