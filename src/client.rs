@@ -639,7 +639,7 @@ impl App {
                     Cell::from(fmt_age(a.ts)).style(dim),
                     Cell::from(state).style(Style::default().fg(color)),
                     Cell::from(a.options.join("/")).style(dim),
-                    Cell::from(prompt).style(dim),
+                    Cell::from(prompt),
                 ]);
                 // Highlight the selected row via its own style (the widget runs
                 // with `selected = None` + a manual offset — see below).

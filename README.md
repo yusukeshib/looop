@@ -112,19 +112,26 @@ looop client   # non-agent TUI: pending asks always on screen, answer by hand
 looop down     # stop the pulse and all workers
 ```
 
-`looop init` is **required before `looop up`**: the pulse refuses to start until
-the runner wiring exists, so the agent CLI driving every tick and worker is an
-explicit choice, never a silent default. To read and steer core, drive the
-`looop _ …` verbs by hand (`looop _ state`, `_ wait`, `_ answer`, `_ goal write`)
-or let a client drive them for you.
+The pulse refuses to start until `looop init` writes the runner wiring, so the
+agent CLI driving every tick and worker is always an explicit choice. Read and
+steer core with the `looop _ …` verbs (`_ state`, `_ wait`, `_ answer`, `_ goal
+write`), by hand or through a client.
 
 ### First run
 
 looop runs headless, so it can't interview you. A fresh data dir is seeded with a
 starter PLAYBOOK, a `setup` goal, and a real pending `setup` ask so a client
-waiting on asks wakes immediately. The simplest way to answer is an **agent
-client** ("concierge") — a `claude`/`codex`/`opencode`/`pi` session you talk to in
-plain language:
+waiting on asks wakes immediately.
+
+Start with `looop up` then `looop client`: the TUI keeps the pending ask list on
+screen and lets you answer by hand — no extra tooling, just looop. Answer the
+starter `setup` ask, edit your goals/PLAYBOOK with the `looop _ …` verbs, archive
+the `setup` goal, and looop runs from there.
+
+**Even easier: an agent concierge.** Point a `claude`/`codex`/`opencode`/`pi`
+session at looop and talk to it in plain language — it relays asks with
+recommendations, drives the write verbs for you, and interviews you to shape your
+goals, sensors, and PLAYBOOK:
 
 ```sh
 claude   # then say:
@@ -132,18 +139,7 @@ claude   # then say:
 #  me to write my goals, sensors, and PLAYBOOK."
 ```
 
-The concierge runs `looop up`, surfaces the pending setup ask, and edits your
-goals/PLAYBOOK via the write verbs — speaking plain language while driving the
-contract. Once customized, answer the starter ask and archive the `setup` goal;
-looop runs from there.
-
-You can skip the concierge entirely and steer by hand — either the raw `looop _
-…` verbs, or `looop client`, a minimal TUI that keeps the pending ask list on
-screen and lets you answer each one yourself. It is intentionally more spartan
-than an agent concierge (no plain-language framing, no recommendations, no
-steering) — its value is making looop's design legible: the loop drives itself,
-and the one thing it defers to a human is a worker's blocking ask. See `looop
-help` for the full command reference and design manual.
+See `looop help` for the full command reference and design manual.
 
 ## Configuration
 
