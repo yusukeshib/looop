@@ -108,6 +108,7 @@ looop dependency.)
 looop init     # interactive setup — required before `up`; pick the runner wiring
 looop up       # start the autonomous pulse (detached)
 looop watch    # live log + running-session selector (read-only)
+looop client   # non-agent TUI: pending asks always on screen, answer by hand
 looop down     # stop the pulse and all workers
 ```
 
@@ -136,8 +137,13 @@ goals/PLAYBOOK via the write verbs — speaking plain language while driving the
 contract. Once customized, answer the starter ask and archive the `setup` goal;
 looop runs from there.
 
-You can skip the concierge entirely and steer by hand. See `looop help` for the
-full command reference and design manual.
+You can skip the concierge entirely and steer by hand — either the raw `looop _
+…` verbs, or `looop client`, a minimal TUI that keeps the pending ask list on
+screen and lets you answer each one yourself. It is intentionally more spartan
+than an agent concierge (no plain-language framing, no recommendations, no
+steering) — its value is making looop's design legible: the loop drives itself,
+and the one thing it defers to a human is a worker's blocking ask. See `looop
+help` for the full command reference and design manual.
 
 ## Configuration
 

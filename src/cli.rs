@@ -53,6 +53,8 @@ pub enum Cmd {
     Down,
     /// Read-only observer TUI over a running session's log.
     Watch(WatchArgs),
+    /// Non-agent TUI: see pending worker asks and answer them by hand.
+    Client,
     /// Machine-facing plumbing verbs (the contract a client drives).
     #[command(name = "_")]
     Underscore {
