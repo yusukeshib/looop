@@ -440,6 +440,16 @@ impl App {
         self.picking || (self.focus == Focus::Input && self.selected_ask().is_some())
     }
 
+    /// Can the input line send anything for the current selection? A pending
+    /// ask (⇒ answer) OR a live worker PTY (⇒ send) makes it usable; the pulse
+    /// with no ask is READ-ONLY (nothing to send), so focusing it is pointless.
+    fn input_enabled(&self) -> bool {
+        match self.selected_id() {
+            None => false,
+            Some(id) => id != session::PULSE_SESSION || self.selected_ask().is_some(),
+        }
+    }
+
     /// `a` (log focus): jump to a pending ask. If the selected session already
     /// has one, just focus the input; otherwise select the oldest ask's worker
     /// (so the log context matches the question) and focus the input there.
@@ -717,10 +727,13 @@ impl App {
                             match key.code {
                                 KeyCode::Char('q') => break,
                                 KeyCode::Enter => self.picking = true,
-                                KeyCode::Char('i') | KeyCode::Tab => {
+                                KeyCode::Char('i') | KeyCode::Tab if self.input_enabled() => {
                                     self.status = None;
                                     self.ask_scroll = 0;
                                     self.focus = Focus::Input;
+                                }
+                                KeyCode::Char('i') | KeyCode::Tab => {
+                                    self.status = Some("read-only — nothing to send here".into());
                                 }
                                 KeyCode::Char('a') => self.jump_to_ask(),
                                 KeyCode::Down | KeyCode::Char('j') => {
@@ -791,7 +804,7 @@ impl App {
                             let on_input = self
                                 .input_hit
                                 .is_some_and(|a| m.row >= a.top() && m.row < a.bottom());
-                            if on_input {
+                            if on_input && self.input_enabled() {
                                 self.status = None;
                                 self.focus = Focus::Input;
                             } else {
@@ -1026,10 +1039,12 @@ impl App {
                 }
             }
             Focus::Log => {
-                if self.input.is_empty() {
-                    spans.push(Span::styled("i to type", dim()));
-                } else {
+                if !self.input.is_empty() {
                     spans.push(Span::styled(shown, dim()));
+                } else if is_pulse {
+                    // Read-only: nothing to type, so no `i` hint.
+                } else {
+                    spans.push(Span::styled("i to type", dim()));
                 }
             }
         }
@@ -1063,7 +1078,8 @@ impl App {
             } else {
                 format!(" · ⚑{} a answer", self.asks.len())
             };
-            format!(" {id}  ↑/↓ scroll · i type{asks} · enter sessions · q quit ")
+            let type_hint = if self.input_enabled() { " · i type" } else { "" };
+            format!(" {id}  ↑/↓ scroll{type_hint}{asks} · enter sessions · q quit ")
         };
         frame.render_widget(Paragraph::new(Span::styled(help, style)).style(style), area);
     }
