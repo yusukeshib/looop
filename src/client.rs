@@ -843,14 +843,14 @@ impl App {
         self.draw_footer(frame, chunks[2]);
 
         if self.picking {
-            // Floating session picker, overlaid on the bottom of the log. Capped
+            // Floating session picker, overlaid on the TOP of the log. Capped
             // so it never swallows the whole pane; `Clear` wipes the log rows
             // underneath so the list reads cleanly on top.
             let rows = self.sessions.len().clamp(1, 8) as u16;
             let h = (rows + 2).min(log_area.height);
             let float = Rect {
                 x: log_area.x,
-                y: log_area.bottom().saturating_sub(h),
+                y: log_area.y,
                 width: log_area.width,
                 height: h,
             };
