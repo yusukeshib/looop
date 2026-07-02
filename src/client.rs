@@ -831,10 +831,10 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         // The log is the main buffer and owns the whole screen, save the pinned
-        // input line (separator + text row) and a one-row footer.
+        // input BOX (a 3-row bordered field) and a one-row footer.
         let chunks = Layout::vertical([
             Constraint::Min(3),
-            Constraint::Length(2),
+            Constraint::Length(3),
             Constraint::Length(1),
         ])
         .split(frame.area());
@@ -975,49 +975,60 @@ impl App {
         render_vscrollbar(frame, inner, max_scroll, self.ask_scroll);
     }
 
-    /// The pinned input line above the footer: a `┈` separator row and one
-    /// `label › text█` row. The label announces the channel: `answer <ask-id>`
-    /// (yellow) when the selected session has a pending ask, `send <id>`
-    /// otherwise, or a read-only note for the pulse.
+    /// The pinned input BOX above the footer. The bordered box's TITLE
+    /// announces the channel — `⚑ answer <ask-id>` (yellow) when the selected
+    /// session has a pending ask, else `send <id>`. The border is the focus
+    /// affordance: dim while idle (placeholder: `press i to type`), WHITE+bold
+    /// once activated. A read-only selection (the pulse, no ask) draws nothing.
     fn draw_input(&mut self, frame: &mut Frame, area: Rect) {
-        // Read-only selection (the pulse, no ask): nothing to send, so the line
-        // is pure noise — leave it blank rather than show `pulse (read-only) ›`.
+        // Read-only selection (the pulse, no ask): nothing to send, so the box
+        // is pure noise — leave it blank rather than frame an inert field.
         if !self.input_enabled() {
             frame.render_widget(Clear, area);
             self.input_hit = None;
             return;
         }
         self.input_hit = Some(area);
-        let sep = Block::default().borders(Borders::TOP).border_style(dim());
-        let field = sep.inner(area);
-        frame.render_widget(sep, area);
-        if field.height == 0 {
+
+        let focused = self.focus == Focus::Input;
+        // Channel the input drives: a pending ask ⇒ answer, else ⇒ send.
+        let (title, title_style) = match self.selected_ask() {
+            Some(a) => (
+                format!(" ⚑ answer {} ", a.id),
+                Style::default().fg(Color::Yellow),
+            ),
+            None => (
+                format!(" send {} ", self.selected_id().unwrap_or("")),
+                if focused {
+                    Style::default().fg(Color::White)
+                } else {
+                    dim()
+                },
+            ),
+        };
+        // The border is the affordance: dim while idle, WHITE (bold) once the
+        // input is activated — so "where do I type" is answered at a glance.
+        let border_style = if focused {
+            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+        } else {
+            dim()
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(border_style)
+            .title(Span::styled(title, title_style));
+        let field = block.inner(area);
+        frame.render_widget(Clear, area);
+        frame.render_widget(block, area);
+        if field.height == 0 || field.width == 0 {
             return;
         }
 
-        let Some(sid) = self.selected_id().map(str::to_string) else {
-            frame.render_widget(
-                Paragraph::new(Span::styled("no session selected", dim())),
-                field,
-            );
-            return;
-        };
-        // Past the read-only guard above, the selection can always send: a
-        // pending ask ⇒ answer, otherwise a live worker ⇒ send.
-        let ask_id = self.selected_ask().map(|a| a.id.clone());
-        let (label, lstyle) = match &ask_id {
-            Some(id) => (
-                format!("answer {id} › "),
-                Style::default().fg(Color::Yellow),
-            ),
-            None => (format!("send {sid} › "), dim()),
-        };
-
-        // Single non-wrapping line: label + text + block cursor (1 col). If the
-        // text overflows, show its TAIL (chars, not bytes) so the caret stays
-        // visible — horizontal scroll rather than run-off.
+        // Content row: the typed text (tail-scrolled so the caret stays in view)
+        // plus a block cursor when focused, or a guiding placeholder when idle.
+        let prompt = "› ";
         let avail = (field.width as usize)
-            .saturating_sub(label.chars().count())
+            .saturating_sub(prompt.chars().count())
             .saturating_sub(1);
         let chars: Vec<char> = self.input.chars().collect();
         let shown: String = if chars.len() > avail {
@@ -1026,31 +1037,20 @@ impl App {
             self.input.clone()
         };
 
-        let mut spans = vec![Span::styled(label, lstyle)];
-        match self.focus {
-            Focus::Input => {
-                if self.input.is_empty() {
-                    // Block cursor first, then a dim placeholder so the field
-                    // reads as focused and self-explanatory before any typing.
-                    spans.push(Span::styled(" ", Style::default().bg(Color::White)));
-                    let hint = if ask_id.is_some() {
-                        " type answer · enter to send"
-                    } else {
-                        " type · enter to send"
-                    };
-                    spans.push(Span::styled(hint, dim()));
-                } else {
-                    spans.push(Span::raw(shown));
-                    spans.push(Span::styled(" ", Style::default().bg(Color::White)));
-                }
+        let mut spans = vec![Span::styled(prompt, dim())];
+        if focused {
+            if self.input.is_empty() {
+                spans.push(Span::styled(" ", Style::default().bg(Color::White)));
+                spans.push(Span::styled(" type · enter to send · esc to leave", dim()));
+            } else {
+                spans.push(Span::raw(shown));
+                spans.push(Span::styled(" ", Style::default().bg(Color::White)));
             }
-            Focus::Log => {
-                if self.input.is_empty() {
-                    spans.push(Span::styled("i to type", dim()));
-                } else {
-                    spans.push(Span::styled(shown, dim()));
-                }
-            }
+        } else if self.input.is_empty() {
+            spans.push(Span::styled("press i to type", dim()));
+        } else {
+            // A half-typed draft, waiting to be resumed.
+            spans.push(Span::styled(shown, dim()));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), field);
     }
