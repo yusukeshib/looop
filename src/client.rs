@@ -991,21 +991,6 @@ impl App {
         self.input_hit = Some(area);
 
         let focused = self.focus == Focus::Input;
-        // Channel the input drives: a pending ask ⇒ answer, else ⇒ send.
-        let (title, title_style) = match self.selected_ask() {
-            Some(a) => (
-                format!(" ⚑ answer {} ", a.id),
-                Style::default().fg(Color::Yellow),
-            ),
-            None => (
-                format!(" send {} ", self.selected_id().unwrap_or("")),
-                if focused {
-                    Style::default().fg(Color::White)
-                } else {
-                    dim()
-                },
-            ),
-        };
         // The border is the affordance: a mid gray while idle (bright enough to
         // stand off the log), WHITE (bold) once the input is activated — so
         // "where do I type" is answered at a glance.
@@ -1014,10 +999,18 @@ impl App {
         } else {
             Style::default().fg(Color::Gray)
         };
-        let block = Block::default()
+        let mut block = Block::default()
             .borders(Borders::ALL)
-            .border_style(border_style)
-            .title(Span::styled(title, title_style));
+            .border_style(border_style);
+        // Only the ANSWER channel needs a title (which ask is being answered);
+        // for SEND the target session id is already in the footer, so a title
+        // would just be redundant chrome on the border.
+        if let Some(a) = self.selected_ask() {
+            block = block.title(Span::styled(
+                format!(" ⚑ answer {} ", a.id),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
         let field = block.inner(area);
         frame.render_widget(Clear, area);
         frame.render_widget(block, area);
