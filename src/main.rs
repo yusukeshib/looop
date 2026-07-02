@@ -21,6 +21,7 @@ mod fmt;
 mod gate;
 mod help;
 mod init;
+mod logview;
 mod mailbox;
 mod paths;
 mod prompt;
