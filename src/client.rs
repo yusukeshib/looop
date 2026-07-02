@@ -980,6 +980,13 @@ impl App {
     /// (yellow) when the selected session has a pending ask, `send <id>`
     /// otherwise, or a read-only note for the pulse.
     fn draw_input(&mut self, frame: &mut Frame, area: Rect) {
+        // Read-only selection (the pulse, no ask): nothing to send, so the line
+        // is pure noise — leave it blank rather than show `pulse (read-only) ›`.
+        if !self.input_enabled() {
+            frame.render_widget(Clear, area);
+            self.input_hit = None;
+            return;
+        }
         self.input_hit = Some(area);
         let sep = Block::default().borders(Borders::TOP).border_style(dim());
         let field = sep.inner(area);
@@ -995,15 +1002,14 @@ impl App {
             );
             return;
         };
+        // Past the read-only guard above, the selection can always send: a
+        // pending ask ⇒ answer, otherwise a live worker ⇒ send.
         let ask_id = self.selected_ask().map(|a| a.id.clone());
-        let is_pulse = sid == session::PULSE_SESSION && ask_id.is_none();
-
         let (label, lstyle) = match &ask_id {
             Some(id) => (
                 format!("answer {id} › "),
                 Style::default().fg(Color::Yellow),
             ),
-            None if is_pulse => ("pulse (read-only) › ".to_string(), dim()),
             None => (format!("send {sid} › "), dim()),
         };
 
@@ -1039,12 +1045,10 @@ impl App {
                 }
             }
             Focus::Log => {
-                if !self.input.is_empty() {
-                    spans.push(Span::styled(shown, dim()));
-                } else if is_pulse {
-                    // Read-only: nothing to type, so no `i` hint.
-                } else {
+                if self.input.is_empty() {
                     spans.push(Span::styled("i to type", dim()));
+                } else {
+                    spans.push(Span::styled(shown, dim()));
                 }
             }
         }
