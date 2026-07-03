@@ -455,6 +455,9 @@ impl App {
     /// pending answer can never be submitted against a different agent than the
     /// one it was typed for. Shared by keyboard + mouse selection.
     fn select_index(&mut self, idx: usize) {
+        // Navigating away dismisses any lingering action status (e.g. a stale
+        // "no pending ask to answer") so the footer doesn't sit stuck on it.
+        self.status = None;
         let id = self.rows[idx].id.clone();
         if self.selected_id.as_deref() != Some(id.as_str()) {
             // New target agent: follow its buffer's tail and drop any half-typed
