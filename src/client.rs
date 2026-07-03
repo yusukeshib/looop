@@ -226,22 +226,6 @@ pub fn cmd_client(paths: &Paths) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The list is the main view (always full-width). Opening an agent (ENTER/click)
-/// floats the DETAIL pane over the right — a scrollable read area on top. When
-/// the selected agent has a pending ask, the answer input is pinned along its
-/// BOTTOM and focused, so there is no second "reveal the input" step; for a
-/// read-only agent (the pulse, an idle worker) the pane is a pure transcript
-/// viewer with no input row. ESC closes it back to the list. Mirrors
-/// `looop watch`, where the log owns the screen and the picker floats on top.
-enum Mode {
-    /// Focus on the ask list.
-    List,
-    /// The detail pane is open: arrows/wheel/scrollbar scroll the read area.
-    /// When the selected agent has a pending ask, typing goes straight into
-    /// the pinned answer input; a read-only pane just scrolls and closes.
-    Detail,
-}
-
 /// The list's on-screen geometry, captured during `draw_asks` so a mouse
 /// click can be mapped back to the agent row under the cursor (mirrors watch's
 /// `SelectorHit`).
@@ -296,8 +280,8 @@ struct App {
     /// the answer onto the wrong worker). The id is the source of truth; the
     /// list index is derived from it each refresh.
     selected_id: Option<String>,
-    mode: Mode,
-    /// The answer being typed in the detail pane's pinned input.
+    /// The answer being typed in the pinned input (active whenever the selected
+    /// agent has a pending ask).
     input: String,
     /// Last outcome to show in the footer (an error, or an "answered X" note).
     status: Option<String>,
@@ -324,7 +308,6 @@ impl App {
             list_offset: 0,
             list_rows: 0,
             selected_id: None,
-            mode: Mode::List,
             input: String::new(),
             status: None,
             log: LogView::new(),
@@ -335,11 +318,10 @@ impl App {
     }
 
     /// Rebuild the live fleet (pulse + workers, each with its pending ask) and
-    /// re-check the pulse, reconciling the selection by id. If the selected id
-    /// is still present its row index is refreshed; if it vanished we fall back
-    /// to the first row WHILE BROWSING, but while answering we keep the
-    /// (now-missing) id pinned so `submit` can surface that it went away instead
-    /// of silently retargeting a different agent.
+    /// re-check the pulse, reconciling the selection by id. There is ALWAYS one
+    /// row selected: if the selected id is still present its row index is
+    /// refreshed; if it vanished (or nothing was selected yet) we fall back to
+    /// the top row (the pulse).
     fn refresh(&mut self, paths: &Paths) {
         self.pulse_alive = run::pulse_running(paths);
 
@@ -359,9 +341,7 @@ impl App {
             is_pulse: true,
             alive: self.pulse_alive,
             state: if self.pulse_alive { "live" } else { "down" }.to_string(),
-            // The pulse has no meaningful age — use the same "—" placeholder the
-            // OPTS/PROMPT columns use for non-applicable cells.
-            age: "—".to_string(),
+            age: String::new(),
             ask: None,
         }];
 
@@ -413,15 +393,19 @@ impl App {
         self.rows = rows;
 
         match self.selected_index() {
-            Some(pos) => self.ensure_visible(pos),
-            // Selected id gone while a pane is open: keep the pinned id so the
-            // open pane/`submit` can surface "it vanished"; the highlight just
-            // won't show (it left the list).
-            None if matches!(self.mode, Mode::Detail) => {}
-            // Browsing with no live selection — the list opens (and stays) with
-            // NOTHING selected until the human arrows/clicks a row. No
-            // auto-focus on row 0.
-            None => {}
+            // Still listed: leave the viewport ALONE. The wheel/scrollbar scroll
+            // the list freely and the highlight may scroll out of view (like the
+            // buffer); snapping it back into view every tick would fight the
+            // user's scroll. `ensure_visible` runs only on explicit selection
+            // moves (arrows/click), and `draw_asks` clamps the offset to range.
+            Some(_) => {}
+            // ALWAYS keep one row selected — default to the top row (the
+            // pulse). There is no "nothing selected" state: launch, and every
+            // refresh, leaves exactly one row highlighted (buffer shown).
+            None => {
+                self.selected_id = self.rows.first().map(|r| r.id.clone());
+                self.list_offset = 0;
+            }
         }
     }
 
@@ -481,16 +465,6 @@ impl App {
         }
     }
 
-    /// Open the detail pane on the current selection: the worker's live buffer
-    /// fills the read area (following the tail, so the newest output and the ask
-    /// at the bottom are in view), with the answer input pinned below (focused).
-    fn open_detail(&mut self) {
-        self.input.clear();
-        self.status = None;
-        self.log.follow_tail();
-        self.mode = Mode::Detail;
-    }
-
     /// Row index of the agent under a click at `(col, row)`, if it landed on a
     /// real row of the list (mirrors watch's `select_at` hit-test).
     fn ask_at(&self, col: u16, row: u16) -> Option<usize> {
@@ -504,8 +478,7 @@ impl App {
     }
 
     /// Whether `row` falls in the bottom list strip (its column-header row plus
-    /// the data rows) — used to route the wheel to the list vs. the buffer in
-    /// Detail mode.
+    /// the data rows) — used to route the wheel to the list vs. the buffer.
     fn in_list_region(&self, row: u16) -> bool {
         self.asks_hit.is_some_and(|hit| {
             // The header sits one row above the data area.
@@ -551,86 +524,64 @@ impl App {
         };
     }
 
-    /// Route a mouse event by focus — wheel + click on the list (List) or the
-    /// detail modal + its scrollbar (Detail). Mirrors watch's mouse model.
+    /// Route a mouse event. The buffer (top) and the bottom list strip scroll
+    /// independently — the wheel targets whichever the cursor is over; the
+    /// buffer and list each have a draggable scrollbar; a click on a list row
+    /// switches the selected agent (and thus the buffer).
     fn on_mouse(&mut self, m: MouseEvent) {
-        match self.mode {
-            Mode::List => match m.kind {
-                // The wheel scrolls the VIEW, not the selection (the highlight
-                // stays on its ask); clamped to range in `draw_asks`.
-                MouseEventKind::ScrollUp => {
+        match m.kind {
+            // The wheel scrolls whichever pane the cursor is over: the
+            // bottom list strip scrolls its view, the buffer above scrolls
+            // into history (up) / toward the tail (down).
+            MouseEventKind::ScrollUp => {
+                if self.in_list_region(m.row) {
                     self.list_offset = self.list_offset.saturating_sub(WHEEL_STEP);
+                } else {
+                    self.log.scroll(WHEEL_STEP as isize);
                 }
-                MouseEventKind::ScrollDown => {
+            }
+            MouseEventKind::ScrollDown => {
+                if self.in_list_region(m.row) {
                     self.list_offset = self.list_offset.saturating_add(WHEEL_STEP);
+                } else {
+                    self.log.scroll(-(WHEEL_STEP as isize));
                 }
-                // Click a row: select it AND open its detail pane.
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(idx) = self.ask_at(m.column, m.row) {
-                        self.select_index(idx);
-                        self.open_detail();
-                    }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                // Prefer a scrollbar grab (list strip or buffer); otherwise a
+                // click on a still-visible list row switches the buffer to
+                // that ask. Always (re)assign grab results so a plain click
+                // clears any stuck drag state (e.g. a missed mouse-up).
+                self.dragging_list_sb = self.list_scrollbar_grab(m.column, m.row);
+                self.log.dragging_scrollbar =
+                    !self.dragging_list_sb && self.log.scrollbar_grab(m.column, m.row);
+                if !self.dragging_list_sb
+                    && !self.log.dragging_scrollbar
+                    && let Some(idx) = self.ask_at(m.column, m.row)
+                {
+                    self.select_index(idx);
                 }
-                _ => {}
-            },
-            // The detail pane shows the worker's scrollable buffer: the wheel
-            // and scrollbar scroll it (up = into history, toward the tail =
-            // down); a click on a still-visible list row switches the buffer to
-            // that ask's worker.
-            Mode::Detail => match m.kind {
-                // The wheel scrolls whichever pane the cursor is over: the
-                // bottom list strip scrolls its view, the buffer above scrolls
-                // into history (up) / toward the tail (down).
-                MouseEventKind::ScrollUp => {
-                    if self.in_list_region(m.row) {
-                        self.list_offset = self.list_offset.saturating_sub(WHEEL_STEP);
-                    } else {
-                        self.log.scroll(WHEEL_STEP as isize);
-                    }
-                }
-                MouseEventKind::ScrollDown => {
-                    if self.in_list_region(m.row) {
-                        self.list_offset = self.list_offset.saturating_add(WHEEL_STEP);
-                    } else {
-                        self.log.scroll(-(WHEEL_STEP as isize));
-                    }
-                }
-                MouseEventKind::Down(MouseButton::Left) => {
-                    // Prefer a scrollbar grab (list strip or buffer); otherwise a
-                    // click on a still-visible list row switches the buffer to
-                    // that ask. Always (re)assign grab results so a plain click
-                    // clears any stuck drag state (e.g. a missed mouse-up).
-                    self.dragging_list_sb = self.list_scrollbar_grab(m.column, m.row);
-                    self.log.dragging_scrollbar =
-                        !self.dragging_list_sb && self.log.scrollbar_grab(m.column, m.row);
-                    if !self.dragging_list_sb
-                        && !self.log.dragging_scrollbar
-                        && let Some(idx) = self.ask_at(m.column, m.row)
-                    {
-                        self.select_index(idx);
-                    }
-                }
-                MouseEventKind::Drag(MouseButton::Left) if self.dragging_list_sb => {
-                    self.list_scrollbar_scrub(m.row);
-                }
-                MouseEventKind::Drag(MouseButton::Left) if self.log.dragging_scrollbar => {
-                    self.log.scrollbar_scrub(m.row);
-                }
-                MouseEventKind::Up(MouseButton::Left) => {
-                    self.log.dragging_scrollbar = false;
-                    self.dragging_list_sb = false;
-                }
-                _ => {}
-            },
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_list_sb => {
+                self.list_scrollbar_scrub(m.row);
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.log.dragging_scrollbar => {
+                self.log.scrollbar_scrub(m.row);
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                self.log.dragging_scrollbar = false;
+                self.dragging_list_sb = false;
+            }
+            _ => {}
         }
     }
 
     /// Durably resolve the selected agent's pending ask with the typed text. On
-    /// success close the pane back to the list and refresh (the answered ask
-    /// leaves the pending list). On failure — including the ask having vanished
-    /// (another client answered it, the worker exited) or the selected agent
-    /// having none — STAY in the open pane with the typed text intact and
-    /// surface the reason, so the human can copy/edit.
+    /// success clear the input and refresh (the answered ask leaves the pending
+    /// list; the buffer stays on the same agent). On failure — including the ask
+    /// having vanished (another client answered it, the worker exited) or the
+    /// selected agent having none — keep the typed text intact and surface the
+    /// reason, so the human can copy/edit.
     fn submit(&mut self, paths: &Paths) {
         let Some(id) = self
             .selected()
@@ -645,14 +596,13 @@ impl App {
             return;
         };
         if self.input.trim().is_empty() {
-            self.status = Some("answer: empty text (esc to cancel)".into());
+            self.status = Some("answer: type some text first".into());
             return;
         }
         match mailbox::answer(paths, &id, &self.input, false) {
             Ok(()) => {
                 self.status = Some(format!("answered {id}"));
                 self.input.clear();
-                self.mode = Mode::List;
                 self.refresh(paths);
             }
             Err(e) => self.status = Some(format!("{id}: {e}")),
@@ -704,62 +654,37 @@ impl App {
     }
 
     /// Handle one key press. Returns `true` when the app should quit.
+    ///
+    /// There is a single unified view: the selected agent's buffer with the
+    /// answer input always focused (when it has a pending ask). PRINTABLE keys
+    /// type the answer; Enter submits. Up/Down switch the selected agent (the
+    /// buffer follows); the buffer scrolls via page keys, Ctrl-d/u, the wheel,
+    /// and the scrollbar. Quit is Ctrl-C ONLY — so `q`/`j`/`k`/Esc are all
+    /// legal answer characters, never control keys.
     fn on_key(&mut self, key: KeyEvent, paths: &Paths) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         if ctrl && matches!(key.code, KeyCode::Char('c')) {
             return true;
         }
-        match self.mode {
-            // Focus on the list: navigate rows, open the detail pane.
-            Mode::List => match key.code {
-                KeyCode::Char('q') => return true,
-                KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-                KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-                KeyCode::Enter if self.selected().is_some() => self.open_detail(),
-                _ => {}
-            },
-            // The detail pane is open. The bottom input is always focused, so
-            // PRINTABLE keys type the answer and Enter submits it. Up/Down keep
-            // navigating the LIST even with the pane focused (the pane follows
-            // the selection); the read area scrolls via page keys, Ctrl-d/u,
-            // the wheel, and the scrollbar. ESC closes back to the list.
-            //
-            // Note there is no `q`-to-quit here: `q` is a legal answer
-            // character. Quit with ESC then `q`, or Ctrl-C anywhere.
-            Mode::Detail => {
-                // The buffer scrolls up into history and down toward the tail
-                // (where the ask sits); `Home`/`End` jump to oldest/live.
-                let page = self.log.rows().max(1) as isize;
-                // The answer input only exists when the selected agent has a
-                // pending ask (see `draw_detail`); for a read-only pane (the
-                // pulse, an idle worker) the answer keys do nothing — the pane
-                // just scrolls and closes.
-                let answerable = self.selected().is_some_and(|r| r.alive && r.ask.is_some());
-                match key.code {
-                    // Close the pane AND clear the selection — back to the
-                    // full-height list with nothing selected.
-                    KeyCode::Esc => {
-                        self.mode = Mode::List;
-                        self.selected_id = None;
-                    }
-                    KeyCode::Enter if answerable => self.submit(paths),
-                    KeyCode::Backspace if answerable => {
-                        self.input.pop();
-                    }
-                    KeyCode::Down => self.move_selection(1),
-                    KeyCode::Up => self.move_selection(-1),
-                    KeyCode::PageDown => self.log.scroll(-page),
-                    KeyCode::PageUp => self.log.scroll(page),
-                    KeyCode::Char('d') if ctrl => self.log.scroll(-(page / 2)),
-                    KeyCode::Char('u') if ctrl => self.log.scroll(page / 2),
-                    KeyCode::End => self.log.follow_tail(),
-                    KeyCode::Home => self.log.jump_oldest(),
-                    // Everything else printable is answer text — but only when
-                    // the pane is answerable (a read-only pane has no input).
-                    KeyCode::Char(c) if !ctrl && answerable => self.input.push(c),
-                    _ => {}
-                }
+        // The buffer scrolls up into history and down toward the tail (where the
+        // ask sits); `Home`/`End` jump to oldest/live.
+        let page = self.log.rows().max(1) as isize;
+        match key.code {
+            KeyCode::Enter => self.submit(paths),
+            KeyCode::Backspace => {
+                self.input.pop();
             }
+            KeyCode::Down => self.move_selection(1),
+            KeyCode::Up => self.move_selection(-1),
+            KeyCode::PageDown => self.log.scroll(-page),
+            KeyCode::PageUp => self.log.scroll(page),
+            KeyCode::Char('d') if ctrl => self.log.scroll(-(page / 2)),
+            KeyCode::Char('u') if ctrl => self.log.scroll(page / 2),
+            KeyCode::End => self.log.follow_tail(),
+            KeyCode::Home => self.log.jump_oldest(),
+            // Everything else printable is answer text.
+            KeyCode::Char(c) if !ctrl => self.input.push(c),
+            _ => {}
         }
         false
     }
@@ -771,19 +696,20 @@ impl App {
         ])
         .split(frame.area());
 
-        // Flex layout. Browsing (List): the list owns the whole body. Viewing
-        // (Detail): the selected agent's buffer takes the TOP (flex), and the
-        // list shrinks to a scrollable strip of at most 5 rows pinned at the
-        // BOTTOM — both panes scroll independently (wheel + scrollbar).
+        // Flex layout, driven by the SELECTION (not a separate mode): with a
+        // row selected — which is always the case — the agent's buffer takes
+        // the TOP (flex) and the list shrinks to a scrollable strip of at most
+        // 5 rows pinned at the BOTTOM. With nothing selected (only before the
+        // first refresh) the list owns the whole body.
         let body = chunks[0];
-        if matches!(self.mode, Mode::Detail) {
-            // +1 for the table's column-header row; keep ≥4 rows for the buffer
-            // (border + ≥2 content) so a tall list can't crowd it out.
+        if self.selected().is_some() {
+            // List height = up to 5 data rows + 1 column-header row + 2 border
+            // rows; keep ≥3 rows for the (borderless) buffer above.
             let data_rows = self.rows.len().clamp(1, 5) as u16;
-            let want = data_rows + 1;
-            let list_h = want.min(body.height.saturating_sub(4)).max(2);
+            let want = data_rows + 3;
+            let list_h = want.min(body.height.saturating_sub(3)).max(3);
             let parts =
-                Layout::vertical([Constraint::Min(4), Constraint::Length(list_h)]).split(body);
+                Layout::vertical([Constraint::Min(3), Constraint::Length(list_h)]).split(body);
             self.draw_detail(frame, parts[0]);
             self.draw_asks(frame, parts[1]);
         } else {
@@ -793,11 +719,16 @@ impl App {
     }
 
     fn draw_asks(&mut self, frame: &mut Frame, area: Rect) {
-        // Borderless — like watch's log. The list owns the full width of
-        // whatever area it's handed: the whole body while browsing, or the
-        // bottom strip while a detail buffer is open above it.
-        let col_w = area.width;
+        // The list pane is BORDERED (the buffer above is borderless), so the
+        // agent strip reads as a distinct panel. All geometry below — table,
+        // scrollbar, hit-testing — is relative to the block's INNER area.
         let dim = dim();
+        let block = Block::default().borders(Borders::ALL).border_style(dim);
+        let inner = block.inner(area);
+        frame.render_widget(Clear, area);
+        frame.render_widget(block, area);
+        let area = inner;
+        let col_w = area.width;
 
         if self.rows.is_empty() {
             self.asks_hit = None;
@@ -914,10 +845,11 @@ impl App {
         });
     }
 
-    /// The STATE cell for an agent row: the pulse reads `live` (green) /
-    /// `down` (red); a worker reads `running` (green), its recorded exit state
-    /// (`killed` red, others dim), or `gone` (dim) when reaped out from under a
-    /// lingering ask.
+    /// The STATE cell for an agent row: an agent with a pending ask reads
+    /// `pending` (bold yellow) so the row awaiting a human answer stands out.
+    /// Otherwise the pulse reads `live` (green) / `down` (red); a worker reads
+    /// `running` (green), its recorded exit state (`killed` red, others dim),
+    /// or `gone` (dim) when reaped out from under a lingering ask.
     fn state_cell(&self, row: &AgentRow) -> (String, Style) {
         // A pending ask is what a human must act on — surface it as its own
         // attention state (bold yellow), overriding the underlying liveness.
@@ -939,19 +871,19 @@ impl App {
         (row.state.clone(), Style::default().fg(color))
     }
 
-    /// The DETAIL pane — the TOP flex region while `Mode::Detail` (the list
-    /// sits below it). It shows the selected AGENT'S BUFFER: a scrollable
-    /// `looop watch`-style vt100 replay of the agent's `output.log`. When the
-    /// agent has a pending ask, that ask (worker · prompt · ref · options) is
-    /// pinned at the very BOTTOM as the buffer's tail, with the answer input
-    /// pinned below that and focused — so answering happens at the end of the
-    /// buffer. For a read-only agent (the pulse, an idle worker) the buffer
-    /// fills the whole pane with no ask tail and no input row.
+    /// The DETAIL pane — the TOP flex region (the list sits below it) shown
+    /// whenever a row is selected. It shows the selected ask's WORKER BUFFER: a scrollable
+    /// `looop watch`-style vt100 replay of the worker's `output.log`, with the
+    /// ask itself (worker · prompt · ref · options) pinned at the very BOTTOM
+    /// as the buffer's tail. The answer input is pinned below that and focused
+    /// — so answering happens at the end of the buffer — but ONLY when the
+    /// selected agent has a pending ask; for a read-only agent (the pulse, an
+    /// idle worker) the buffer fills the whole pane with no input row.
     fn draw_detail(&mut self, frame: &mut Frame, area: Rect) {
-        let block = Block::default().borders(Borders::ALL).border_style(dim());
-        let inner = block.inner(area);
+        // Borderless — like `looop watch`'s log, the buffer owns its area edge
+        // to edge; the bordered list below provides the visual seam.
+        let inner = area;
         frame.render_widget(Clear, area);
-        frame.render_widget(block, area);
 
         // The answer input only exists when the selected agent has a pending
         // ask — a read-only agent (pulse / idle worker) has nothing to answer,
@@ -1063,16 +995,12 @@ impl App {
         let style = Style::default().bg(SURFACE).fg(Color::White);
         let help = match &self.status {
             Some(msg) => format!(" {msg} "),
-            None => match self.mode {
-                Mode::List => " ↑/↓ move · enter open · q quit ".to_string(),
-                // The answer keys only apply when the selected agent has an ask;
-                // a read-only pane (pulse / idle worker) just scrolls + closes.
-                Mode::Detail if self.selected().is_some_and(|r| r.ask.is_some()) => {
-                    " type answer · enter send · ↑/↓ move · pgup/pgdn scroll · esc close "
-                        .to_string()
-                }
-                Mode::Detail => " ↑/↓ move · pgup/pgdn scroll · esc close ".to_string(),
-            },
+            // The answer keys only apply when the selected agent has a pending
+            // ask; a read-only agent (pulse / idle worker) just scrolls.
+            None if self.selected().is_some_and(|r| r.alive && r.ask.is_some()) => {
+                " type answer · enter send · ↑/↓ switch · pgup/pgdn scroll · ^c quit ".to_string()
+            }
+            None => " ↑/↓ switch · pgup/pgdn scroll · ^c quit ".to_string(),
         };
         frame.render_widget(Paragraph::new(Span::styled(help, style)).style(style), area);
     }
