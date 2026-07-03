@@ -140,7 +140,7 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
         // sessions, never launches an agent).
         Cmd::Watch(a) => watch::cmd_watch(paths, &a),
         // Non-agent client TUI — gated (it resolves asks, a contract write).
-        Cmd::Client => gated(&|| client::cmd_client(paths)),
+        Cmd::Client(a) => gated(&|| client::cmd_client(paths, &a)),
         Cmd::Underscore { verb } => match verb {
             Verb::Pulse => gated(&|| service::cmd_pulse(paths)),
             Verb::State(a) => gated(&|| tick::cmd_state(paths, a.json)),

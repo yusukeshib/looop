@@ -213,13 +213,55 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
     out
 }
 
+/// Recency window used by [`Filter::Recent`] when `--since` isn't given, and
+/// the window the `Tab`-cycled `recent` filter uses.
+const DEFAULT_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Which dead workers the fleet list includes (alive workers, the pulse, and
+/// any worker holding a pending ask are ALWAYS shown). Cycled live with `Tab`
+/// (Active → Recent → All → Active).
+#[derive(Clone, Copy)]
+enum Filter {
+    /// Only the live fleet — finished/dead workers hidden. The default.
+    Active,
+    /// Live fleet + dead workers idle less than this window.
+    Recent(Duration),
+    /// Every worker, no matter how stale.
+    All,
+}
+
+/// Parse a human duration: bare seconds (`90`) or a single unit suffix
+/// `s`/`m`/`h`/`d` (`30m`, `12h`, `1d`).
+fn parse_duration(s: &str) -> Result<Duration> {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last() {
+        Some('s') => (&s[..s.len() - 1], 1),
+        Some('m') => (&s[..s.len() - 1], 60),
+        Some('h') => (&s[..s.len() - 1], 60 * 60),
+        Some('d') => (&s[..s.len() - 1], 24 * 60 * 60),
+        _ => (s, 1),
+    };
+    let n: u64 = num
+        .trim()
+        .parse()
+        .map_err(|_| anyhow::anyhow!("looop client: bad duration '{s}' (try 1d, 12h, 30m, 90s)"))?;
+    Ok(Duration::from_secs(n * mult))
+}
+
 /// `looop client` — bring up the ask-answering TUI.
-pub fn cmd_client(paths: &Paths) -> Result<ExitCode> {
+pub fn cmd_client(paths: &Paths, args: &crate::cli::ClientArgs) -> Result<ExitCode> {
+    let filter = if let Some(dur) = &args.since {
+        Filter::Recent(parse_duration(dur)?)
+    } else if args.all {
+        Filter::All
+    } else {
+        Filter::Active
+    };
     let mut terminal = ratatui::init();
     // Capture the mouse so wheel/click/drag reach us as `Event::Mouse` instead
     // of letting the terminal scroll its alternate screen (mirrors `watch`).
     let _ = execute!(std::io::stdout(), EnableMouseCapture);
-    let res = App::new().run(&mut terminal, paths);
+    let res = App::new(args.id.clone(), filter).run(&mut terminal, paths);
     let _ = execute!(std::io::stdout(), DisableMouseCapture);
     ratatui::restore();
     res?;
@@ -296,13 +338,27 @@ struct App {
     pulse_alive: bool,
     /// Geometry of the list from the last draw, for click→row hit-testing.
     asks_hit: Option<AsksHit>,
-    /// Whether a drag on the bottom list's scrollbar is in progress (Detail
-    /// mode) — mirrors `LogView::dragging_scrollbar` for the main buffer.
+    /// Whether a drag on the bottom list's scrollbar is in progress — mirrors
+    /// `LogView::dragging_scrollbar` for the main buffer.
     dragging_list_sb: bool,
+    /// Which dead workers the list includes. Cycled live with `Tab`.
+    filter: Filter,
+    /// The window `Filter::Recent` uses when cycled to with `Tab`.
+    recent_window: Duration,
+    /// Count of workers hidden by the current filter — shown in the footer.
+    hidden: usize,
+    /// A `--id`/`looop client <id>` preselect to honor once the row appears.
+    pending_select: Option<String>,
 }
 
 impl App {
-    fn new() -> Self {
+    fn new(initial: Option<String>, filter: Filter) -> Self {
+        // A `--since` window carries its own duration; otherwise the `Tab`-
+        // cycled `recent` filter uses the default window.
+        let recent_window = match filter {
+            Filter::Recent(w) => w,
+            _ => DEFAULT_WINDOW,
+        };
         Self {
             rows: Vec::new(),
             list_offset: 0,
@@ -314,6 +370,10 @@ impl App {
             pulse_alive: false,
             asks_hit: None,
             dragging_list_sb: false,
+            filter,
+            recent_window,
+            hidden: 0,
+            pending_select: initial,
         }
     }
 
@@ -345,13 +405,23 @@ impl App {
             ask: None,
         }];
 
-        // Worker agents: every alive worker, plus any worker still holding a
-        // pending ask (blocked → answerable) even if its liveness dropped.
+        // Worker agents. A pending ask (answerable) or a live worker is ALWAYS
+        // shown; a dead worker with nothing waiting is subject to the filter
+        // (Active hides it, Recent keeps it within the window, All keeps it).
         let mut wrows: Vec<AgentRow> = Vec::new();
+        let mut hidden = 0usize;
         for s in workers {
             let ask = ask_by_worker.remove(&s.id);
-            if !s.alive && ask.is_none() {
-                continue; // dead corpse with nothing waiting — not a live agent
+            let keep = ask.is_some()
+                || s.alive
+                || match self.filter {
+                    Filter::All => true,
+                    Filter::Active => false,
+                    Filter::Recent(w) => s.idle_for().map(|d| d < w).unwrap_or(true),
+                };
+            if !keep {
+                hidden += 1;
+                continue;
             }
             let age = match &ask {
                 Some(a) => fmt_age(a.ts),
@@ -391,6 +461,15 @@ impl App {
         });
         rows.extend(wrows);
         self.rows = rows;
+        self.hidden = hidden;
+
+        // Honor a `looop client <id>` preselect once that row shows up.
+        if let Some(want) = self.pending_select.clone()
+            && self.rows.iter().any(|r| r.id == want)
+        {
+            self.selected_id = Some(want);
+            self.pending_select = None;
+        }
 
         match self.selected_index() {
             // Still listed: leave the viewport ALONE. The wheel/scrollbar scroll
@@ -676,6 +755,16 @@ impl App {
             }
             KeyCode::Down => self.move_selection(1),
             KeyCode::Up => self.move_selection(-1),
+            // Tab cycles which dead workers the list includes. It's not a
+            // printable answer char, so it can't collide with typing an answer.
+            KeyCode::Tab => {
+                self.filter = match self.filter {
+                    Filter::Active => Filter::Recent(self.recent_window),
+                    Filter::Recent(_) => Filter::All,
+                    Filter::All => Filter::Active,
+                };
+                self.refresh(paths);
+            }
             KeyCode::PageDown => self.log.scroll(-page),
             KeyCode::PageUp => self.log.scroll(page),
             KeyCode::Char('d') if ctrl => self.log.scroll(-(page / 2)),
@@ -993,14 +1082,28 @@ impl App {
 
     fn draw_footer(&self, frame: &mut Frame, area: Rect) {
         let style = Style::default().bg(SURFACE).fg(Color::White);
+        // The filter badge (with any hidden-worker count) leads the hint line,
+        // mirroring `looop watch`'s selector footer.
+        let fname = match self.filter {
+            Filter::Active => "active",
+            Filter::Recent(_) => "recent",
+            Filter::All => "all",
+        };
+        let hidden = if self.hidden > 0 {
+            format!(" ({} hidden)", self.hidden)
+        } else {
+            String::new()
+        };
         let help = match &self.status {
             Some(msg) => format!(" {msg} "),
             // The answer keys only apply when the selected agent has a pending
             // ask; a read-only agent (pulse / idle worker) just scrolls.
-            None if self.selected().is_some_and(|r| r.alive && r.ask.is_some()) => {
-                " type answer · enter send · ↑/↓ switch · pgup/pgdn scroll · ^c quit ".to_string()
+            None if self.selected().is_some_and(|r| r.alive && r.ask.is_some()) => format!(
+                " {fname}{hidden}  type answer · enter send · ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
+            ),
+            None => {
+                format!(" {fname}{hidden}  ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit ")
             }
-            None => " ↑/↓ switch · pgup/pgdn scroll · ^c quit ".to_string(),
         };
         frame.render_widget(Paragraph::new(Span::styled(help, style)).style(style), area);
     }
@@ -1054,5 +1157,19 @@ mod tests {
         let out = wrap_lines(lines.clone(), 0);
         assert_eq!(out.len(), 1);
         assert_eq!(plain(&out[0]), "anything");
+    }
+
+    #[test]
+    fn parse_duration_units_and_bare_seconds() {
+        assert_eq!(parse_duration("90").unwrap(), Duration::from_secs(90));
+        assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));
+        assert_eq!(parse_duration("12h").unwrap(), Duration::from_secs(43200));
+        assert_eq!(parse_duration("1d").unwrap(), Duration::from_secs(86400));
+    }
+
+    #[test]
+    fn parse_duration_rejects_garbage() {
+        assert!(parse_duration("soon").is_err());
+        assert!(parse_duration("").is_err());
     }
 }

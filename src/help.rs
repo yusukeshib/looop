@@ -32,10 +32,13 @@ Usage:
                                 also show recent dead, --all for every session,
                                 `a` cycles active/recent/all live;
                                 scroll up reaches the first line; shift+drag to copy
-  looop client                   non-agent TUI: pending asks always on screen,
-                                answer each by hand (the humble alternative to an
-                                agent concierge: tell any coding agent to work as
-                                a concierge for `looop`)
+  looop client [<id>] [--since <dur>] [--all]
+                                non-agent TUI: the whole live fleet on screen,
+                                each agent's buffer + pending ask, answer by hand.
+                                <id> preselects; --since 1d/12h/30m or --all also
+                                show finished workers, `tab` cycles active/recent/all.
+                                (the humble alternative to an agent concierge:
+                                tell any coding agent to work as a concierge for `looop`)
   looop version | help           print version / show this help
 
   STEER (the contract — driven by you or any client; looop does NOT need these to act):

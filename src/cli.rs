@@ -54,7 +54,7 @@ pub enum Cmd {
     /// Read-only observer TUI over a running session's log.
     Watch(WatchArgs),
     /// Non-agent TUI: see pending worker asks and answer them by hand.
-    Client,
+    Client(ClientArgs),
     /// Machine-facing plumbing verbs (the contract a client drives).
     #[command(name = "_")]
     Underscore {
@@ -78,6 +78,18 @@ pub struct WatchArgs {
     #[arg(long, short = 'a')]
     pub all: bool,
     /// Only sessions newer than a duration (e.g. 1d, 12h, 30m).
+    #[arg(long, short = 's')]
+    pub since: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ClientArgs {
+    /// Agent id to select initially (e.g. `looop client pulse`).
+    pub id: Option<String>,
+    /// Also show finished/dead workers, not just the live fleet.
+    #[arg(long, short = 'a')]
+    pub all: bool,
+    /// Also show dead workers idle less than a duration (e.g. 1d, 12h, 30m).
     #[arg(long, short = 's')]
     pub since: Option<String>,
 }
