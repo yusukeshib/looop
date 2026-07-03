@@ -51,9 +51,7 @@ pub enum Cmd {
     Up(UpArgs),
     /// Tear the pulse (and workers) down.
     Down,
-    /// Read-only observer TUI over a running session's log.
-    Watch(WatchArgs),
-    /// Non-agent TUI: see pending worker asks and answer them by hand.
+    /// Non-agent TUI: watch any session's log and answer pending asks by hand.
     Client(ClientArgs),
     /// Machine-facing plumbing verbs (the contract a client drives).
     #[command(name = "_")]
@@ -68,18 +66,6 @@ pub struct UpArgs {
     /// Emit pulse logs as JSON.
     #[arg(long)]
     pub json: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct WatchArgs {
-    /// Session id to focus initially.
-    pub id: Option<String>,
-    /// Show all sessions, not just active ones.
-    #[arg(long, short = 'a')]
-    pub all: bool,
-    /// Only sessions newer than a duration (e.g. 1d, 12h, 30m).
-    #[arg(long, short = 's')]
-    pub since: Option<String>,
 }
 
 #[derive(Args, Debug)]
