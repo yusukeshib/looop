@@ -1,12 +1,14 @@
-//! `looop client` — a minimal, non-agent TUI for answering worker asks.
+//! `looop client` — a minimal, non-agent TUI for watching the fleet and
+//! answering worker asks.
 //!
 //! looop's steering surface is the `looop _ …` CONTRACT. The RECOMMENDED client
 //! is an AGENT concierge — start any coding agent and tell it to "work as a
 //! concierge for the `looop` command" — that watches for asks, relays them to
 //! the human in plain language with a recommendation, and drives the
 //! `_ answer` / `_ goal` / `_ playbook` verbs. This command is the humble,
-//! hand-driven alternative: a TUI where the pending ask list is ALWAYS on
-//! screen and the human answers each ask themselves.
+//! hand-driven alternative: a TUI where the WHOLE live fleet — the pulse plus
+//! every running worker — is ALWAYS on screen, waiting agents float to the top,
+//! and the human answers each ask themselves.
 //!
 //! It is deliberately less capable than the concierge (no plain-language
 //! framing, no recommendation, no steering) — that's the point. Its job is to
@@ -14,20 +16,23 @@
 //! thing it defers to a human is a worker's blocking ask, and this window is
 //! that human ⇄ mailbox channel, laid bare.
 //!
-//! The ask list is a full-width TABLE (id · age · worker state · options ·
-//! prompt preview). Opening an ask (ENTER/click) floats a DETAIL pane over the
-//! right that shows the WORKER'S LIVE BUFFER — a scrollable `looop watch`-style
-//! vt100 replay of the worker's `output.log`, with the ask itself pinned at the
-//! very BOTTOM. So you read the worker's own transcript, scroll back through its
-//! history, and answer the question right where it sits, at the end of the
-//! buffer. ESC closes it back to the list:
+//! The fleet list is a full-width TABLE (id · age · state · options · prompt
+//! preview). Every agent is a row: the pulse first, then the workers, with any
+//! worker blocked on a pending ask sorted to the top so it's what you see. A
+//! row with no ask (the pulse, an idle worker) reads dim. Opening a row
+//! (ENTER/click) floats a DETAIL pane over the right that shows THAT AGENT'S
+//! LIVE BUFFER — a scrollable `looop watch`-style vt100 replay of its
+//! `output.log`, with the pending ask (if any) pinned at the very BOTTOM. So
+//! you read the agent's own transcript, scroll back through its history, and
+//! answer the question right where it sits, at the end of the buffer. ESC
+//! closes it back to the list:
 //!
 //! ```text
 //!   ID          AGE  STATE    PROMPT        ┌──────────────────────┐
 //! > triage-2    2m   running  flaky test…   │ …worker output…      ┃ │
 //!   deploy-3    0s   running  dep upgrade…  │ running tests…       ┃ │
-//!                                           │ ── ask ──             │ │
-//!                                           │ <the question>       │ │
+//!   pulse       —    live     control loop  │ ── ask ──             │ │
+//!   builder-1   5m   running  —             │ <the question>       │ │
 //!                                           │ options: ship, hold  │ │
 //!                                           ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
 //!                                           │ › ship█              │ │
@@ -42,10 +47,11 @@
 //! click + scrollbar-drag all work. The input is pinned along the pane's bottom
 //! and focused the moment the pane opens — no extra keystroke to "reveal" it.
 //!
-//! Read + one narrow write: it lists pending asks (`mailbox::pending`) and, on
-//! submit, durably resolves the selected one (`mailbox::answer`). It never
-//! spawns a worker or edits policy — for that, use the agent concierge or the
-//! raw `_` verbs.
+//! Read + one narrow write: it lists the fleet (`session::list_workers` +
+//! `run::pulse_running`) with pending asks merged on (`mailbox::pending`) and,
+//! on submit, durably resolves the selected agent's ask (`mailbox::answer`). It
+//! never spawns a worker or edits policy — for that, use the agent concierge or
+//! the raw `_` verbs.
 
 use crate::logview::{self, LogView};
 use crate::mailbox::{self, Ask};
@@ -84,16 +90,20 @@ fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
 }
 
-/// Compact relative age of a unix timestamp: `5s` / `3m` / `2h` / `4d`. Shown
-/// dim next to each ask so the list conveys how long it has been waiting.
-fn fmt_age(ts: u64) -> String {
-    let secs = crate::util::now_unix().saturating_sub(ts);
+/// Compact relative age from a second count: `5s` / `3m` / `2h` / `4d`.
+fn fmt_secs(secs: u64) -> String {
     match secs {
         s if s < 60 => format!("{s}s"),
         s if s < 3600 => format!("{}m", s / 60),
         s if s < 86_400 => format!("{}h", s / 3600),
         s => format!("{}d", s / 86_400),
     }
+}
+
+/// Compact relative age of a unix timestamp. Shown dim next to each row so the
+/// list conveys how long an ask has been waiting (or an agent has been idle).
+fn fmt_age(ts: u64) -> String {
+    fmt_secs(crate::util::now_unix().saturating_sub(ts))
 }
 
 /// Width of the left ask-list column while the detail pane is open. The detail
@@ -234,20 +244,43 @@ enum Mode {
     Detail,
 }
 
-/// The ask list's on-screen geometry, captured during `draw_asks` so a mouse
-/// click can be mapped back to the ask under the cursor (mirrors watch's
+/// The list's on-screen geometry, captured during `draw_asks` so a mouse
+/// click can be mapped back to the agent row under the cursor (mirrors watch's
 /// `SelectorHit`).
 #[derive(Clone, Copy)]
 struct AsksHit {
     /// Inner area the rows render into (inside the border).
     area: Rect,
     /// First visible row index (the list's scroll offset), so a click on row
-    /// `r` selects ask `offset + (r - area.top())`.
+    /// `r` selects agent `offset + (r - area.top())`.
     offset: usize,
 }
 
+/// One row of the client list: an AGENT (the pulse or a worker session), with
+/// its pending ask attached when it has one. The list shows the whole live
+/// fleet — the pulse plus every running worker — not just the agents that are
+/// currently blocked on a human, so an idle worker is still visible.
+#[derive(Clone)]
+struct AgentRow {
+    /// Session id — a worker id, or [`session::PULSE_SESSION`] for the pulse.
+    id: String,
+    /// The control loop's row (rendered first, styled distinctly).
+    is_pulse: bool,
+    /// Whether the underlying session is currently alive.
+    alive: bool,
+    /// Session state string (`running` / `exited` / `killed` / `gone`), or
+    /// `live` / `down` for the pulse.
+    state: String,
+    /// Precomputed relative age for the AGE column (ask age when waiting, else
+    /// the session's idle time).
+    age: String,
+    /// This agent's pending ask, if it is currently blocked on a human.
+    ask: Option<Ask>,
+}
+
 struct App {
-    asks: Vec<Ask>,
+    /// The live fleet: pulse + workers, each with its pending ask (if any).
+    rows: Vec<AgentRow>,
     /// Top visible row (viewport scroll). The WHEEL scrolls this directly and
     /// leaves the selection put; arrows/click move the selection and only nudge
     /// this enough to keep the selected row visible. Decoupling the two is why
@@ -256,9 +289,9 @@ struct App {
     list_offset: usize,
     /// Visible list rows from the last draw — selection-follow + wheel clamp.
     list_rows: usize,
-    /// The selected ask, tracked by its STABLE id — not by list index.
-    /// `mailbox::pending` re-sorts every tick and asks come and go, so an
-    /// index would silently point at a different ask (and, mid-answer, drift
+    /// The selected AGENT, tracked by its STABLE session id — not by list
+    /// index. The fleet re-sorts every tick and agents/asks come and go, so an
+    /// index would silently point at a different agent (and, mid-answer, drift
     /// the answer onto the wrong worker). The id is the source of truth; the
     /// list index is derived from it each refresh.
     selected_id: Option<String>,
@@ -267,27 +300,25 @@ struct App {
     input: String,
     /// Last outcome to show in the footer (an error, or an "answered X" note).
     status: Option<String>,
-    /// The worker's live buffer shown in the detail pane: a scrollable vt100
-    /// replay of the selected ask's worker `output.log`, with the ask itself
-    /// pinned at the very bottom as the LogView's `tail`. Answering thus happens
-    /// "at the end of the buffer" — mirroring (and, eventually, replacing)
-    /// `looop watch`. Owns its own scroll model, background parse, and
-    /// scrollbar.
+    /// The selected agent's live buffer shown in the detail pane: a scrollable
+    /// vt100 replay of its `output.log`, with the pending ask (if any) pinned at
+    /// the very bottom as the LogView's `tail`. Answering thus happens "at the
+    /// end of the buffer" — mirroring (and, eventually, replacing) `looop
+    /// watch`. Owns its own scroll model, background parse, and scrollbar.
     log: LogView,
+    /// Whether the pulse (control loop) currently holds its single-instance
+    /// lock — the header badge + the pulse row's state.
     pulse_alive: bool,
     /// Count of alive worker sessions (pulse excluded) — header context.
     worker_count: usize,
-    /// Worker session id → (alive, state string), for the ask table's STATE
-    /// column (`running` / `exited` / `killed`, or `gone` when not found).
-    worker_state: HashMap<String, (bool, String)>,
-    /// Geometry of the ask list from the last draw, for click→row hit-testing.
+    /// Geometry of the list from the last draw, for click→row hit-testing.
     asks_hit: Option<AsksHit>,
 }
 
 impl App {
     fn new() -> Self {
         Self {
-            asks: Vec::new(),
+            rows: Vec::new(),
             list_offset: 0,
             list_rows: 0,
             selected_id: None,
@@ -297,74 +328,132 @@ impl App {
             log: LogView::new(),
             pulse_alive: false,
             worker_count: 0,
-            worker_state: HashMap::new(),
             asks_hit: None,
         }
     }
 
-    /// Re-read the pending asks + pulse liveness, reconciling the selection by
-    /// id. If the selected id is still present its row index is refreshed; if
-    /// it vanished we fall back to the first ask WHILE BROWSING, but while
-    /// answering we keep the (now-missing) id pinned so `submit` can report it
-    /// instead of silently retargeting a different ask.
+    /// Rebuild the live fleet (pulse + workers, each with its pending ask) and
+    /// re-check the pulse, reconciling the selection by id. If the selected id
+    /// is still present its row index is refreshed; if it vanished we fall back
+    /// to the first row WHILE BROWSING, but while answering we keep the
+    /// (now-missing) id pinned so `submit` can surface that it went away instead
+    /// of silently retargeting a different agent.
     fn refresh(&mut self, paths: &Paths) {
-        self.asks = mailbox::pending(paths);
         self.pulse_alive = run::pulse_running(paths);
+
+        // worker id → its earliest pending ask (a blocked worker has one).
+        // `mailbox::pending` is sorted by ts asc, so `or_insert` keeps the
+        // oldest ask per worker.
+        let mut ask_by_worker: HashMap<String, Ask> = HashMap::new();
+        for ask in mailbox::pending(paths) {
+            ask_by_worker.entry(ask.worker.clone()).or_insert(ask);
+        }
+
         let workers = session::list_workers(paths);
         self.worker_count = workers.iter().filter(|s| s.alive).count();
-        self.worker_state = workers
-            .into_iter()
-            .map(|s| (s.id, (s.alive, s.state)))
-            .collect();
-        if self.asks.is_empty() {
-            self.selected_id = None;
-            self.list_offset = 0;
-            return;
+
+        // The pulse (control loop) is always the top row.
+        let mut rows = vec![AgentRow {
+            id: session::PULSE_SESSION.to_string(),
+            is_pulse: true,
+            alive: self.pulse_alive,
+            state: if self.pulse_alive { "live" } else { "down" }.to_string(),
+            age: String::new(),
+            ask: None,
+        }];
+
+        // Worker agents: every alive worker, plus any worker still holding a
+        // pending ask (blocked → answerable) even if its liveness dropped.
+        let mut wrows: Vec<AgentRow> = Vec::new();
+        for s in workers {
+            let ask = ask_by_worker.remove(&s.id);
+            if !s.alive && ask.is_none() {
+                continue; // dead corpse with nothing waiting — not a live agent
+            }
+            let age = match &ask {
+                Some(a) => fmt_age(a.ts),
+                None => s
+                    .idle_for()
+                    .map(|d| fmt_secs(d.as_secs()))
+                    .unwrap_or_default(),
+            };
+            wrows.push(AgentRow {
+                id: s.id.clone(),
+                is_pulse: false,
+                alive: s.alive,
+                state: s.state.clone(),
+                age,
+                ask,
+            });
         }
+        // Any ask whose worker isn't in the session list at all (session reaped
+        // but the ask lingers) — surface it so it stays answerable.
+        for (worker, ask) in ask_by_worker.drain() {
+            wrows.push(AgentRow {
+                id: worker,
+                is_pulse: false,
+                alive: false,
+                state: "gone".to_string(),
+                age: fmt_age(ask.ts),
+                ask: Some(ask),
+            });
+        }
+        // Waiting agents (with a pending ask) first — what a human acts on —
+        // then the rest, each group by id for a stable order.
+        wrows.sort_by(|a, b| {
+            b.ask
+                .is_some()
+                .cmp(&a.ask.is_some())
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        rows.extend(wrows);
+        self.rows = rows;
+
         match self.selected_index() {
             Some(pos) => self.ensure_visible(pos),
-            // Selected id gone (or none yet).
+            // Selected id gone.
             None if matches!(self.mode, Mode::Detail) => {
                 // Keep the pinned id so the open pane/`submit` can surface "it
                 // vanished"; the highlight just won't show (it left the list).
             }
             None => {
-                self.selected_id = Some(self.asks[0].id.clone());
+                // Default to the pulse (always row 0) so the list opens focused.
+                self.selected_id = self.rows.first().map(|r| r.id.clone());
                 self.list_offset = 0;
             }
         }
     }
 
-    /// Row index of the currently-selected ask id, if it is still pending.
+    /// Row index of the currently-selected agent id, if it is still listed.
     fn selected_index(&self) -> Option<usize> {
         let id = self.selected_id.as_deref()?;
-        self.asks.iter().position(|a| a.id == id)
+        self.rows.iter().position(|r| r.id == id)
     }
 
-    fn selected(&self) -> Option<&Ask> {
-        self.selected_index().map(|i| &self.asks[i])
+    fn selected(&self) -> Option<&AgentRow> {
+        self.selected_index().map(|i| &self.rows[i])
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.asks.is_empty() {
+        if self.rows.is_empty() {
             return;
         }
         let cur = self.selected_index().unwrap_or(0) as isize;
-        let last = self.asks.len() as isize - 1;
+        let last = self.rows.len() as isize - 1;
         let idx = cur.saturating_add(delta).clamp(0, last) as usize;
         self.select_index(idx);
     }
 
     /// Point the selection at row `idx`. When it actually CHANGES the target
-    /// ask, reset the detail scroll and clear any half-typed answer — so a
-    /// pending answer can never be submitted against a different ask than the
+    /// agent, reset the detail scroll and clear any half-typed answer — so a
+    /// pending answer can never be submitted against a different agent than the
     /// one it was typed for. Shared by keyboard + mouse selection.
     fn select_index(&mut self, idx: usize) {
-        let id = self.asks[idx].id.clone();
+        let id = self.rows[idx].id.clone();
         if self.selected_id.as_deref() != Some(id.as_str()) {
-            // New target ask: follow its worker buffer's tail and drop any
-            // half-typed answer so it can't land on the wrong worker. The
-            // LogView re-points to the new worker's log on the next `sync`.
+            // New target agent: follow its buffer's tail and drop any half-typed
+            // answer so it can't land on the wrong worker. The LogView re-points
+            // to the new agent's log on the next `sync`.
             self.log.follow_tail();
             self.input.clear();
         }
@@ -393,7 +482,7 @@ impl App {
         self.mode = Mode::Detail;
     }
 
-    /// Row index of the ask under a click at `(col, row)`, if it landed on a
+    /// Row index of the agent under a click at `(col, row)`, if it landed on a
     /// real row of the list (mirrors watch's `select_at` hit-test).
     fn ask_at(&self, col: u16, row: u16) -> Option<usize> {
         let hit = self.asks_hit?;
@@ -402,7 +491,7 @@ impl App {
             return None;
         }
         let idx = hit.offset + (row - a.top()) as usize;
-        (idx < self.asks.len()).then_some(idx)
+        (idx < self.rows.len()).then_some(idx)
     }
 
     /// Route a mouse event by focus — wheel + click on the list (List) or the
@@ -455,15 +544,22 @@ impl App {
         }
     }
 
-    /// Durably resolve the selected ask with the typed text. On success close
-    /// the pane back to the list and refresh (the answered ask leaves the
-    /// pending list). On failure — including the ask having vanished (another
-    /// client answered it, the worker exited) — STAY in the open pane with the
-    /// typed text intact and surface the reason, so the human can copy/edit.
+    /// Durably resolve the selected agent's pending ask with the typed text. On
+    /// success close the pane back to the list and refresh (the answered ask
+    /// leaves the pending list). On failure — including the ask having vanished
+    /// (another client answered it, the worker exited) or the selected agent
+    /// having none — STAY in the open pane with the typed text intact and
+    /// surface the reason, so the human can copy/edit.
     fn submit(&mut self, paths: &Paths) {
-        let Some(id) = self.selected_id.clone() else {
-            self.status = Some("no ask selected".into());
-            self.mode = Mode::List;
+        let Some(id) = self
+            .selected()
+            .and_then(|r| r.ask.as_ref())
+            .map(|a| a.id.clone())
+        else {
+            self.status = Some(match self.selected() {
+                Some(r) => format!("{}: no pending ask to answer", r.id),
+                None => "no agent selected".into(),
+            });
             return;
         };
         if self.input.trim().is_empty() {
@@ -491,12 +587,11 @@ impl App {
                 last_refresh = Instant::now();
             }
 
-            // Keep the buffer pointed at the selected ask's worker in BOTH
+            // Keep the buffer pointed at the selected agent's session in BOTH
             // modes so the detail pane opens instantly (no re-parse flash) and
             // feed any newly-appended bytes. The heavy initial parse runs on the
             // LogView's background worker; the incremental tail feed is cheap.
-            self.log
-                .set_target(self.selected().map(|a| a.worker.clone()));
+            self.log.set_target(self.selected().map(|r| r.id.clone()));
             self.log.sync(paths);
 
             terminal.draw(|f| self.draw(f))?;
@@ -612,7 +707,7 @@ impl App {
             Span::raw(format!(
                 "  ·  {} running  ·  {} pending",
                 self.worker_count,
-                self.asks.len()
+                self.rows.iter().filter(|r| r.ask.is_some()).count()
             )),
         ]);
         frame.render_widget(Paragraph::new(line), area);
@@ -630,10 +725,10 @@ impl App {
         };
         let dim = dim();
 
-        if self.asks.is_empty() {
+        if self.rows.is_empty() {
             self.asks_hit = None;
             frame.render_widget(
-                Paragraph::new(Span::styled(" no pending asks", dim)),
+                Paragraph::new(Span::styled(" no agents", dim)),
                 Rect {
                     width: col_w,
                     ..area
@@ -646,7 +741,7 @@ impl App {
         // start one row below. Scroll/hit-test math is over the DATA rows only.
         let visible = (area.height as usize).saturating_sub(1);
         self.list_rows = visible;
-        let len = self.asks.len();
+        let len = self.rows.len();
         let max_off = len.saturating_sub(visible);
         self.list_offset = self.list_offset.min(max_off);
         let off = self.list_offset;
@@ -664,21 +759,31 @@ impl App {
         };
 
         let rows: Vec<Row> = self
-            .asks
+            .rows
             .iter()
-            .map(|a| {
-                let (state, color) = self.state_cell(&a.worker);
-                let prompt = a.prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+            .map(|r| {
+                let (state, color) = self.state_cell(r);
+                // The PROMPT column shows the pending ask (what a human acts
+                // on); an agent with no ask reads dim — the pulse as its role,
+                // an idle worker as a `—` placeholder.
+                let (opts, prompt, prompt_style) = match &r.ask {
+                    Some(a) => {
+                        let prompt = a.prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+                        (a.options.join("/"), prompt, Style::default())
+                    }
+                    None if r.is_pulse => (String::new(), "control loop".to_string(), dim),
+                    None => (String::new(), "—".to_string(), dim),
+                };
                 let row = Row::new(vec![
-                    Cell::from(a.id.clone()),
-                    Cell::from(fmt_age(a.ts)).style(dim),
+                    Cell::from(r.id.clone()),
+                    Cell::from(r.age.clone()).style(dim),
                     Cell::from(state).style(Style::default().fg(color)),
-                    Cell::from(a.options.join("/")).style(dim),
-                    Cell::from(prompt),
+                    Cell::from(opts).style(dim),
+                    Cell::from(prompt).style(prompt_style),
                 ]);
                 // Highlight the selected row via its own style (the widget runs
                 // with `selected = None` + a manual offset — see below).
-                if Some(a.id.as_str()) == self.selected_id.as_deref() {
+                if Some(r.id.as_str()) == self.selected_id.as_deref() {
                     row.style(Style::default().bg(SURFACE))
                 } else {
                     row
@@ -734,24 +839,29 @@ impl App {
         });
     }
 
-    /// The STATE cell for the worker behind an ask: `running` (green), the
-    /// recorded exit state (`exited` dim / `killed` red), or `gone` (dim)
-    /// when the session isn't in the session list at all.
-    fn state_cell(&self, worker: &str) -> (String, Color) {
-        match self.worker_state.get(worker) {
-            Some((true, _)) => ("running".into(), Color::Green),
-            Some((false, st)) if st == "killed" => (st.clone(), Color::Red),
-            Some((false, st)) => (st.clone(), Color::DarkGray),
-            None => ("gone".into(), Color::DarkGray),
-        }
+    /// The STATE cell for an agent row: the pulse reads `live` (green) /
+    /// `down` (red); a worker reads `running` (green), its recorded exit state
+    /// (`killed` red, others dim), or `gone` (dim) when reaped out from under a
+    /// lingering ask.
+    fn state_cell(&self, row: &AgentRow) -> (String, Color) {
+        let color = if row.alive {
+            Color::Green
+        } else if row.state == "killed" || (row.is_pulse && row.state == "down") {
+            Color::Red
+        } else {
+            Color::DarkGray
+        };
+        (row.state.clone(), color)
     }
 
     /// The floating DETAIL pane — overlaid on the list's right while
     /// `Mode::Detail`. It shows the selected ask's WORKER BUFFER: a scrollable
     /// `looop watch`-style vt100 replay of the worker's `output.log`, with the
     /// ask itself (worker · prompt · ref · options) pinned at the very BOTTOM
-    /// as the buffer's tail. The answer input is pinned below that and always
-    /// focused — so answering happens at the end of the buffer.
+    /// as the buffer's tail. The answer input is pinned below that and focused
+    /// — so answering happens at the end of the buffer — but ONLY when the
+    /// selected agent has a pending ask; for a read-only agent (the pulse, an
+    /// idle worker) the buffer fills the whole pane with no input row.
     fn draw_detail(&mut self, frame: &mut Frame, area: Rect) {
         // Floats where the right pane used to sit: anchored to the right, full
         // height, starting just past the ask-list column so that column stays
@@ -769,9 +879,17 @@ impl App {
         frame.render_widget(Clear, float);
         frame.render_widget(block, float);
 
-        // Split the inner area: the buffer fills the top; the input takes a
-        // separator row + one text row pinned along the bottom.
-        let input_h = 2u16.min(inner.height);
+        // The answer input only exists when the selected agent has a pending
+        // ask — a read-only agent (pulse / idle worker) has nothing to answer,
+        // so the buffer takes the whole pane. Split the inner area: buffer on
+        // top; when answerable, the input takes a separator + one text row
+        // pinned along the bottom.
+        let answerable = self.selected().is_some_and(|r| r.ask.is_some());
+        let input_h = if answerable {
+            2u16.min(inner.height)
+        } else {
+            0
+        };
         let content = Rect {
             height: inner.height - input_h,
             ..inner
@@ -785,12 +903,23 @@ impl App {
         // Build the ask block pinned at the bottom of the buffer. A dim rule
         // separates the worker's own output above from the structured ask.
         let tail: Vec<Line<'static>> = match self.selected().cloned() {
-            // The ask vanished (answered elsewhere, worker exited) while open.
+            // The agent vanished from the fleet while its pane was open.
             None => vec![Line::from(Span::styled(
-                "this ask is no longer pending — esc to close.",
+                "this agent is no longer listed — esc to close.",
                 dim(),
             ))],
-            Some(a) => {
+            // A live agent with nothing to answer — the pane is a read-only
+            // transcript viewer (the pulse, or an idle/finished worker).
+            Some(r) if r.ask.is_none() => {
+                let what = if r.is_pulse {
+                    "the control loop — nothing to answer"
+                } else {
+                    "no pending ask — nothing to answer"
+                };
+                vec![Line::from(Span::styled(what, dim()))]
+            }
+            Some(r) => {
+                let a = r.ask.expect("ask present");
                 let mut v: Vec<Line<'static>> = vec![
                     Line::from(Span::styled("── ask ──", dim())),
                     Line::from(vec![
@@ -825,7 +954,9 @@ impl App {
         let tail = wrap_lines(tail, content.width as usize);
 
         self.log.render(frame, content, &tail, true);
-        self.draw_input(frame, input_area);
+        if answerable {
+            self.draw_input(frame, input_area);
+        }
     }
 
     /// The always-focused answer editor pinned along the bottom of the detail
@@ -866,10 +997,13 @@ impl App {
             Some(msg) => format!(" {msg} "),
             None => match self.mode {
                 Mode::List => " ↑/↓ move · enter open · q quit ".to_string(),
-                Mode::Detail => {
+                // The answer keys only apply when the selected agent has an ask;
+                // a read-only pane (pulse / idle worker) just scrolls + closes.
+                Mode::Detail if self.selected().is_some_and(|r| r.ask.is_some()) => {
                     " type answer · enter send · ↑/↓ move · pgup/pgdn scroll · esc close "
                         .to_string()
                 }
+                Mode::Detail => " ↑/↓ move · pgup/pgdn scroll · esc close ".to_string(),
             },
         };
         frame.render_widget(Paragraph::new(Span::styled(help, style)).style(style), area);
