@@ -226,16 +226,19 @@ pub fn cmd_client(paths: &Paths) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// The list is the main view (always full-width). Opening an ask (ENTER/click)
-/// floats the DETAIL pane over the right — a scrollable read area on top with
-/// the answer input pinned along its BOTTOM, always visible, so there is no
-/// second "reveal the input" step. ESC closes it back to the list. Mirrors
+/// The list is the main view (always full-width). Opening an agent (ENTER/click)
+/// floats the DETAIL pane over the right — a scrollable read area on top. When
+/// the selected agent has a pending ask, the answer input is pinned along its
+/// BOTTOM and focused, so there is no second "reveal the input" step; for a
+/// read-only agent (the pulse, an idle worker) the pane is a pure transcript
+/// viewer with no input row. ESC closes it back to the list. Mirrors
 /// `looop watch`, where the log owns the screen and the picker floats on top.
 enum Mode {
     /// Focus on the ask list.
     List,
-    /// The detail pane is open: arrows/wheel/scrollbar scroll the read area,
-    /// and typing goes straight into the pinned answer input.
+    /// The detail pane is open: arrows/wheel/scrollbar scroll the read area.
+    /// When the selected agent has a pending ask, typing goes straight into
+    /// the pinned answer input; a read-only pane just scrolls and closes.
     Detail,
 }
 
@@ -360,7 +363,9 @@ impl App {
             is_pulse: true,
             alive: self.pulse_alive,
             state: if self.pulse_alive { "live" } else { "down" }.to_string(),
-            age: String::new(),
+            // The pulse has no meaningful age — use the same "—" placeholder the
+            // OPTS/PROMPT columns use for non-applicable cells.
+            age: "—".to_string(),
             ask: None,
         }];
 
@@ -518,7 +523,10 @@ impl App {
             return false;
         };
         let a = hit.area;
-        if hit.max_off == 0 || col + 1 < a.right() || col > a.right() || row < a.top()
+        if hit.max_off == 0
+            || col + 1 < a.right()
+            || col > a.right()
+            || row < a.top()
             || row >= a.bottom()
         {
             return false;
@@ -594,8 +602,8 @@ impl App {
                     // that ask. Always (re)assign grab results so a plain click
                     // clears any stuck drag state (e.g. a missed mouse-up).
                     self.dragging_list_sb = self.list_scrollbar_grab(m.column, m.row);
-                    self.log.dragging_scrollbar = !self.dragging_list_sb
-                        && self.log.scrollbar_grab(m.column, m.row);
+                    self.log.dragging_scrollbar =
+                        !self.dragging_list_sb && self.log.scrollbar_grab(m.column, m.row);
                     if !self.dragging_list_sb
                         && !self.log.dragging_scrollbar
                         && let Some(idx) = self.ask_at(m.column, m.row)
@@ -723,6 +731,11 @@ impl App {
                 // The buffer scrolls up into history and down toward the tail
                 // (where the ask sits); `Home`/`End` jump to oldest/live.
                 let page = self.log.rows().max(1) as isize;
+                // The answer input only exists when the selected agent has a
+                // pending ask (see `draw_detail`); for a read-only pane (the
+                // pulse, an idle worker) the answer keys do nothing — the pane
+                // just scrolls and closes.
+                let answerable = self.selected().is_some_and(|r| r.alive && r.ask.is_some());
                 match key.code {
                     // Close the pane AND clear the selection — back to the
                     // full-height list with nothing selected.
@@ -730,8 +743,8 @@ impl App {
                         self.mode = Mode::List;
                         self.selected_id = None;
                     }
-                    KeyCode::Enter => self.submit(paths),
-                    KeyCode::Backspace => {
+                    KeyCode::Enter if answerable => self.submit(paths),
+                    KeyCode::Backspace if answerable => {
                         self.input.pop();
                     }
                     KeyCode::Down => self.move_selection(1),
@@ -742,8 +755,9 @@ impl App {
                     KeyCode::Char('u') if ctrl => self.log.scroll(page / 2),
                     KeyCode::End => self.log.follow_tail(),
                     KeyCode::Home => self.log.jump_oldest(),
-                    // Everything else printable is answer text.
-                    KeyCode::Char(c) if !ctrl => self.input.push(c),
+                    // Everything else printable is answer text — but only when
+                    // the pane is answerable (a read-only pane has no input).
+                    KeyCode::Char(c) if !ctrl && answerable => self.input.push(c),
                     _ => {}
                 }
             }
@@ -771,8 +785,8 @@ impl App {
             let data_rows = self.rows.len().clamp(1, 5) as u16;
             let want = data_rows + 1;
             let list_h = want.min(body.height.saturating_sub(4)).max(2);
-            let parts = Layout::vertical([Constraint::Min(4), Constraint::Length(list_h)])
-                .split(body);
+            let parts =
+                Layout::vertical([Constraint::Min(4), Constraint::Length(list_h)]).split(body);
             self.draw_detail(frame, parts[0]);
             self.draw_asks(frame, parts[1]);
         } else {
@@ -941,13 +955,13 @@ impl App {
     }
 
     /// The DETAIL pane — the TOP flex region while `Mode::Detail` (the list
-    /// sits below it). It shows the selected ask's WORKER BUFFER: a scrollable
-    /// `looop watch`-style vt100 replay of the worker's `output.log`, with the
-    /// ask itself (worker · prompt · ref · options) pinned at the very BOTTOM
-    /// as the buffer's tail. The answer input is pinned below that and focused
-    /// — so answering happens at the end of the buffer — but ONLY when the
-    /// selected agent has a pending ask; for a read-only agent (the pulse, an
-    /// idle worker) the buffer fills the whole pane with no input row.
+    /// sits below it). It shows the selected AGENT'S BUFFER: a scrollable
+    /// `looop watch`-style vt100 replay of the agent's `output.log`. When the
+    /// agent has a pending ask, that ask (worker · prompt · ref · options) is
+    /// pinned at the very BOTTOM as the buffer's tail, with the answer input
+    /// pinned below that and focused — so answering happens at the end of the
+    /// buffer. For a read-only agent (the pulse, an idle worker) the buffer
+    /// fills the whole pane with no ask tail and no input row.
     fn draw_detail(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::default().borders(Borders::ALL).border_style(dim());
         let inner = block.inner(area);
@@ -959,9 +973,7 @@ impl App {
         // so the buffer takes the whole pane. Split the inner area: buffer on
         // top; when answerable, the input takes a separator + one text row
         // pinned along the bottom.
-        let answerable = self
-            .selected()
-            .is_some_and(|r| r.alive && r.ask.is_some());
+        let answerable = self.selected().is_some_and(|r| r.alive && r.ask.is_some());
         let input_h = if answerable {
             2u16.min(inner.height)
         } else {
