@@ -106,11 +106,6 @@ fn fmt_age(ts: u64) -> String {
     fmt_secs(crate::util::now_unix().saturating_sub(ts))
 }
 
-/// Width of the left ask-list column while the detail pane is open. The detail
-/// pane floats starting just past it, and the list's scrollbar sits in its
-/// rightmost column. Wide enough for the fixed columns below.
-const LIST_W: u16 = 40;
-
 /// Fixed column widths (cells) for the ask table: id, age, state, options.
 /// PROMPT takes whatever is left. `Table` clips each cell to its width by
 /// DISPLAY width, so wide (CJK) prompt text never bleeds into other columns.
@@ -254,6 +249,9 @@ struct AsksHit {
     /// First visible row index (the list's scroll offset), so a click on row
     /// `r` selects agent `offset + (r - area.top())`.
     offset: usize,
+    /// Max scroll offset (`len - visible`), for scrollbar drag mapping. Zero
+    /// when the list fits and no scrollbar is drawn.
+    max_off: usize,
 }
 
 /// One row of the client list: an AGENT (the pulse or a worker session), with
@@ -313,6 +311,9 @@ struct App {
     worker_count: usize,
     /// Geometry of the list from the last draw, for click→row hit-testing.
     asks_hit: Option<AsksHit>,
+    /// Whether a drag on the bottom list's scrollbar is in progress (Detail
+    /// mode) — mirrors `LogView::dragging_scrollbar` for the main buffer.
+    dragging_list_sb: bool,
 }
 
 impl App {
@@ -329,6 +330,7 @@ impl App {
             pulse_alive: false,
             worker_count: 0,
             asks_hit: None,
+            dragging_list_sb: false,
         }
     }
 
@@ -411,16 +413,14 @@ impl App {
 
         match self.selected_index() {
             Some(pos) => self.ensure_visible(pos),
-            // Selected id gone.
-            None if matches!(self.mode, Mode::Detail) => {
-                // Keep the pinned id so the open pane/`submit` can surface "it
-                // vanished"; the highlight just won't show (it left the list).
-            }
-            None => {
-                // Default to the pulse (always row 0) so the list opens focused.
-                self.selected_id = self.rows.first().map(|r| r.id.clone());
-                self.list_offset = 0;
-            }
+            // Selected id gone while a pane is open: keep the pinned id so the
+            // open pane/`submit` can surface "it vanished"; the highlight just
+            // won't show (it left the list).
+            None if matches!(self.mode, Mode::Detail) => {}
+            // Browsing with no live selection — the list opens (and stays) with
+            // NOTHING selected until the human arrows/clicks a row. No
+            // auto-focus on row 0.
+            None => {}
         }
     }
 
@@ -438,9 +438,14 @@ impl App {
         if self.rows.is_empty() {
             return;
         }
-        let cur = self.selected_index().unwrap_or(0) as isize;
         let last = self.rows.len() as isize - 1;
-        let idx = cur.saturating_add(delta).clamp(0, last) as usize;
+        let idx = match self.selected_index() {
+            // Move relative to the current selection.
+            Some(cur) => (cur as isize).saturating_add(delta).clamp(0, last) as usize,
+            // Nothing selected yet (fresh start): the first arrow enters the
+            // list at the top rather than skipping row 0.
+            None => 0,
+        };
         self.select_index(idx);
     }
 
@@ -494,6 +499,51 @@ impl App {
         (idx < self.rows.len()).then_some(idx)
     }
 
+    /// Whether `row` falls in the bottom list strip (its column-header row plus
+    /// the data rows) — used to route the wheel to the list vs. the buffer in
+    /// Detail mode.
+    fn in_list_region(&self, row: u16) -> bool {
+        self.asks_hit.is_some_and(|hit| {
+            // The header sits one row above the data area.
+            let top = hit.area.top().saturating_sub(1);
+            row >= top && row < hit.area.bottom()
+        })
+    }
+
+    /// Begin a drag on the bottom list's scrollbar. Returns `true` (and scrubs
+    /// the offset) if `(col, row)` landed on the bar's rightmost column within
+    /// the track. Mirrors `LogView::scrollbar_grab` for the main buffer.
+    fn list_scrollbar_grab(&mut self, col: u16, row: u16) -> bool {
+        let Some(hit) = self.asks_hit else {
+            return false;
+        };
+        let a = hit.area;
+        if hit.max_off == 0 || col + 1 < a.right() || col > a.right() || row < a.top()
+            || row >= a.bottom()
+        {
+            return false;
+        }
+        self.list_scrollbar_scrub(row);
+        true
+    }
+
+    /// Scrub the list offset to `row` on the scrollbar track (column ignored,
+    /// used while a grab is held): top = first row, bottom = last page.
+    fn list_scrollbar_scrub(&mut self, row: u16) {
+        let Some(hit) = self.asks_hit else {
+            return;
+        };
+        let a = hit.area;
+        let span = a.height.saturating_sub(1);
+        let clamped = row.clamp(a.top(), a.bottom().saturating_sub(1));
+        self.list_offset = if span == 0 {
+            0
+        } else {
+            let frac = (clamped - a.top()) as f64 / span as f64;
+            (frac * hit.max_off as f64).round() as usize
+        };
+    }
+
     /// Route a mouse event by focus — wheel + click on the list (List) or the
     /// detail modal + its scrollbar (Detail). Mirrors watch's mouse model.
     fn on_mouse(&mut self, m: MouseEvent) {
@@ -521,24 +571,48 @@ impl App {
             // down); a click on a still-visible list row switches the buffer to
             // that ask's worker.
             Mode::Detail => match m.kind {
-                MouseEventKind::ScrollUp => self.log.scroll(WHEEL_STEP as isize),
-                MouseEventKind::ScrollDown => self.log.scroll(-(WHEEL_STEP as isize)),
+                // The wheel scrolls whichever pane the cursor is over: the
+                // bottom list strip scrolls its view, the buffer above scrolls
+                // into history (up) / toward the tail (down).
+                MouseEventKind::ScrollUp => {
+                    if self.in_list_region(m.row) {
+                        self.list_offset = self.list_offset.saturating_sub(WHEEL_STEP);
+                    } else {
+                        self.log.scroll(WHEEL_STEP as isize);
+                    }
+                }
+                MouseEventKind::ScrollDown => {
+                    if self.in_list_region(m.row) {
+                        self.list_offset = self.list_offset.saturating_add(WHEEL_STEP);
+                    } else {
+                        self.log.scroll(-(WHEEL_STEP as isize));
+                    }
+                }
                 MouseEventKind::Down(MouseButton::Left) => {
-                    // Prefer the scrollbar; otherwise a click on a still-visible
-                    // list row switches the buffer to that ask. Always (re)assign
-                    // the grab result so a non-scrollbar click clears any stuck
-                    // drag state (e.g. a missed mouse-up).
-                    self.log.dragging_scrollbar = self.log.scrollbar_grab(m.column, m.row);
-                    if !self.log.dragging_scrollbar
+                    // Prefer a scrollbar grab (list strip or buffer); otherwise a
+                    // click on a still-visible list row switches the buffer to
+                    // that ask. Always (re)assign grab results so a plain click
+                    // clears any stuck drag state (e.g. a missed mouse-up).
+                    self.dragging_list_sb = self.list_scrollbar_grab(m.column, m.row);
+                    self.log.dragging_scrollbar = !self.dragging_list_sb
+                        && self.log.scrollbar_grab(m.column, m.row);
+                    if !self.dragging_list_sb
+                        && !self.log.dragging_scrollbar
                         && let Some(idx) = self.ask_at(m.column, m.row)
                     {
                         self.select_index(idx);
                     }
                 }
+                MouseEventKind::Drag(MouseButton::Left) if self.dragging_list_sb => {
+                    self.list_scrollbar_scrub(m.row);
+                }
                 MouseEventKind::Drag(MouseButton::Left) if self.log.dragging_scrollbar => {
                     self.log.scrollbar_scrub(m.row);
                 }
-                MouseEventKind::Up(MouseButton::Left) => self.log.dragging_scrollbar = false,
+                MouseEventKind::Up(MouseButton::Left) => {
+                    self.log.dragging_scrollbar = false;
+                    self.dragging_list_sb = false;
+                }
                 _ => {}
             },
         }
@@ -553,6 +627,7 @@ impl App {
     fn submit(&mut self, paths: &Paths) {
         let Some(id) = self
             .selected()
+            .filter(|r| r.alive)
             .and_then(|r| r.ask.as_ref())
             .map(|a| a.id.clone())
         else {
@@ -649,7 +724,12 @@ impl App {
                 // (where the ask sits); `Home`/`End` jump to oldest/live.
                 let page = self.log.rows().max(1) as isize;
                 match key.code {
-                    KeyCode::Esc => self.mode = Mode::List,
+                    // Close the pane AND clear the selection — back to the
+                    // full-height list with nothing selected.
+                    KeyCode::Esc => {
+                        self.mode = Mode::List;
+                        self.selected_id = None;
+                    }
                     KeyCode::Enter => self.submit(paths),
                     KeyCode::Backspace => {
                         self.input.pop();
@@ -680,13 +760,23 @@ impl App {
         .split(frame.area());
         self.draw_header(frame, chunks[0]);
 
-        // The list is the main view and owns the whole body at full width; the
-        // detail pane floats OVER its right (mirroring `looop watch`'s
-        // log+picker) and carries the answer input pinned at its bottom.
+        // Flex layout. Browsing (List): the list owns the whole body. Viewing
+        // (Detail): the selected agent's buffer takes the TOP (flex), and the
+        // list shrinks to a scrollable strip of at most 5 rows pinned at the
+        // BOTTOM — both panes scroll independently (wheel + scrollbar).
         let body = chunks[1];
-        self.draw_asks(frame, body);
         if matches!(self.mode, Mode::Detail) {
-            self.draw_detail(frame, body);
+            // +1 for the table's column-header row; keep ≥4 rows for the buffer
+            // (border + ≥2 content) so a tall list can't crowd it out.
+            let data_rows = self.rows.len().clamp(1, 5) as u16;
+            let want = data_rows + 1;
+            let list_h = want.min(body.height.saturating_sub(4)).max(2);
+            let parts = Layout::vertical([Constraint::Min(4), Constraint::Length(list_h)])
+                .split(body);
+            self.draw_detail(frame, parts[0]);
+            self.draw_asks(frame, parts[1]);
+        } else {
+            self.draw_asks(frame, body);
         }
         self.draw_footer(frame, chunks[2]);
     }
@@ -714,15 +804,10 @@ impl App {
     }
 
     fn draw_asks(&mut self, frame: &mut Frame, area: Rect) {
-        // Borderless — like watch's log. With the detail pane CLOSED the list
-        // owns the whole width (full screen); when it's OPEN the list shrinks to
-        // the left `LIST_W` column and the bordered detail pane floats over the
-        // rest, reading as ON TOP rather than as a second split pane.
-        let col_w = if matches!(self.mode, Mode::Detail) {
-            LIST_W.min(area.width)
-        } else {
-            area.width
-        };
+        // Borderless — like watch's log. The list owns the full width of
+        // whatever area it's handed: the whole body while browsing, or the
+        // bottom strip while a detail buffer is open above it.
+        let col_w = area.width;
         let dim = dim();
 
         if self.rows.is_empty() {
@@ -836,6 +921,7 @@ impl App {
                 ..data_area
             },
             offset: off,
+            max_off: if overflow { max_off } else { 0 },
         });
     }
 
@@ -854,8 +940,8 @@ impl App {
         (row.state.clone(), color)
     }
 
-    /// The floating DETAIL pane — overlaid on the list's right while
-    /// `Mode::Detail`. It shows the selected ask's WORKER BUFFER: a scrollable
+    /// The DETAIL pane — the TOP flex region while `Mode::Detail` (the list
+    /// sits below it). It shows the selected ask's WORKER BUFFER: a scrollable
     /// `looop watch`-style vt100 replay of the worker's `output.log`, with the
     /// ask itself (worker · prompt · ref · options) pinned at the very BOTTOM
     /// as the buffer's tail. The answer input is pinned below that and focused
@@ -863,28 +949,19 @@ impl App {
     /// selected agent has a pending ask; for a read-only agent (the pulse, an
     /// idle worker) the buffer fills the whole pane with no input row.
     fn draw_detail(&mut self, frame: &mut Frame, area: Rect) {
-        // Floats where the right pane used to sit: anchored to the right, full
-        // height, starting just past the ask-list column so that column stays
-        // visible on the left. It overlays the list rather than splitting it.
-        let list_w = LIST_W.min(area.width);
-        let float = Rect {
-            x: area.x + list_w,
-            y: area.y,
-            width: area.width.saturating_sub(list_w).max(1),
-            height: area.height,
-        };
-
         let block = Block::default().borders(Borders::ALL).border_style(dim());
-        let inner = block.inner(float);
-        frame.render_widget(Clear, float);
-        frame.render_widget(block, float);
+        let inner = block.inner(area);
+        frame.render_widget(Clear, area);
+        frame.render_widget(block, area);
 
         // The answer input only exists when the selected agent has a pending
         // ask — a read-only agent (pulse / idle worker) has nothing to answer,
         // so the buffer takes the whole pane. Split the inner area: buffer on
         // top; when answerable, the input takes a separator + one text row
         // pinned along the bottom.
-        let answerable = self.selected().is_some_and(|r| r.ask.is_some());
+        let answerable = self
+            .selected()
+            .is_some_and(|r| r.alive && r.ask.is_some());
         let input_h = if answerable {
             2u16.min(inner.height)
         } else {
@@ -909,15 +986,9 @@ impl App {
                 dim(),
             ))],
             // A live agent with nothing to answer — the pane is a read-only
-            // transcript viewer (the pulse, or an idle/finished worker).
-            Some(r) if r.ask.is_none() => {
-                let what = if r.is_pulse {
-                    "the control loop — nothing to answer"
-                } else {
-                    "no pending ask — nothing to answer"
-                };
-                vec![Line::from(Span::styled(what, dim()))]
-            }
+            // transcript viewer (the pulse, or an idle/finished worker), so
+            // there's no footer: the absent input area speaks for itself.
+            Some(r) if r.ask.is_none() => vec![],
             Some(r) => {
                 let a = r.ask.expect("ask present");
                 let mut v: Vec<Line<'static>> = vec![
