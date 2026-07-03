@@ -34,7 +34,6 @@ mod session;
 mod store;
 mod tick;
 mod util;
-mod watch;
 mod worldhash;
 
 use anyhow::Result;
@@ -136,11 +135,10 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
         // not even want), then runs the deps preflight itself.
         Cmd::Up(a) => service::cmd_up(paths, a.json),
         Cmd::Down => gated(&|| service::cmd_down(paths)),
-        // Read-only observer TUI — no deps gate (only reads logs + lists
-        // sessions, never launches an agent).
-        Cmd::Watch(a) => watch::cmd_watch(paths, &a),
-        // Non-agent client TUI — gated (it resolves asks, a contract write).
-        Cmd::Client => gated(&|| client::cmd_client(paths)),
+        // Non-agent observer + ask-answering TUI — gated (it resolves asks, a
+        // contract write). Reads any session's log (live or finished) and
+        // answers pending asks by hand.
+        Cmd::Client(a) => gated(&|| client::cmd_client(paths, &a)),
         Cmd::Underscore { verb } => match verb {
             Verb::Pulse => gated(&|| service::cmd_pulse(paths)),
             Verb::State(a) => gated(&|| tick::cmd_state(paths, a.json)),

@@ -35,7 +35,7 @@ THREE LAYERS
   contract  the `looop _ …` verbs. The ONE supported surface to read + steer
             core. This — not the backend layout — is the stable boundary. The
             `_ ` prefix marks the plumbing surface (the contract a client drives);
-            the bare commands (`up` / `down` / `watch`) are the porcelain
+            the bare commands (`up` / `down` / `client`) are the porcelain
             a human runs by hand.
   client    anything that drives the contract for a human. The human reaches
             core ONLY through the contract; a bare terminal is the thinnest

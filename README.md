@@ -107,8 +107,8 @@ looop dependency.)
 ```sh
 looop init     # interactive setup — required before `up`; pick the runner wiring
 looop up       # start the autonomous pulse (detached)
-looop watch    # live log + running-session selector (read-only)
-looop client   # non-agent TUI: pending asks always on screen, answer by hand
+looop client   # TUI: whole fleet + each agent's log; answer asks by hand
+               #   (--since/--all + `tab` also show finished workers)
 looop down     # stop the pulse and all workers
 ```
 
