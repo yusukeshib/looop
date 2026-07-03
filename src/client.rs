@@ -308,10 +308,8 @@ struct App {
     /// watch`. Owns its own scroll model, background parse, and scrollbar.
     log: LogView,
     /// Whether the pulse (control loop) currently holds its single-instance
-    /// lock — the header badge + the pulse row's state.
+    /// lock — the pulse row's state.
     pulse_alive: bool,
-    /// Count of alive worker sessions (pulse excluded) — header context.
-    worker_count: usize,
     /// Geometry of the list from the last draw, for click→row hit-testing.
     asks_hit: Option<AsksHit>,
     /// Whether a drag on the bottom list's scrollbar is in progress (Detail
@@ -331,7 +329,6 @@ impl App {
             status: None,
             log: LogView::new(),
             pulse_alive: false,
-            worker_count: 0,
             asks_hit: None,
             dragging_list_sb: false,
         }
@@ -355,7 +352,6 @@ impl App {
         }
 
         let workers = session::list_workers(paths);
-        self.worker_count = workers.iter().filter(|s| s.alive).count();
 
         // The pulse (control loop) is always the top row.
         let mut rows = vec![AgentRow {
@@ -767,18 +763,16 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         let chunks = Layout::vertical([
-            Constraint::Length(1), // header
             Constraint::Min(3),    // asks | detail
             Constraint::Length(1), // footer
         ])
         .split(frame.area());
-        self.draw_header(frame, chunks[0]);
 
         // Flex layout. Browsing (List): the list owns the whole body. Viewing
         // (Detail): the selected agent's buffer takes the TOP (flex), and the
         // list shrinks to a scrollable strip of at most 5 rows pinned at the
         // BOTTOM — both panes scroll independently (wheel + scrollbar).
-        let body = chunks[1];
+        let body = chunks[0];
         if matches!(self.mode, Mode::Detail) {
             // +1 for the table's column-header row; keep ≥4 rows for the buffer
             // (border + ≥2 content) so a tall list can't crowd it out.
@@ -792,29 +786,7 @@ impl App {
         } else {
             self.draw_asks(frame, body);
         }
-        self.draw_footer(frame, chunks[2]);
-    }
-
-    fn draw_header(&self, frame: &mut Frame, area: Rect) {
-        let (pulse, pstyle) = if self.pulse_alive {
-            ("live", Style::default().fg(Color::Green))
-        } else {
-            ("DOWN — run `looop up`", Style::default().fg(Color::Red))
-        };
-        let line = Line::from(vec![
-            Span::styled(
-                " looop client ",
-                Style::default().fg(Color::Black).bg(Color::White),
-            ),
-            Span::raw("  pulse: "),
-            Span::styled(pulse, pstyle),
-            Span::raw(format!(
-                "  ·  {} running  ·  {} pending",
-                self.worker_count,
-                self.rows.iter().filter(|r| r.ask.is_some()).count()
-            )),
-        ]);
-        frame.render_widget(Paragraph::new(line), area);
+        self.draw_footer(frame, chunks[1]);
     }
 
     fn draw_asks(&mut self, frame: &mut Frame, area: Rect) {
@@ -861,7 +833,7 @@ impl App {
             .rows
             .iter()
             .map(|r| {
-                let (state, color) = self.state_cell(r);
+                let (state, state_style) = self.state_cell(r);
                 // The PROMPT column shows the pending ask (what a human acts
                 // on); an agent with no ask reads dim — the pulse as its role,
                 // an idle worker as a `—` placeholder.
@@ -876,7 +848,7 @@ impl App {
                 let row = Row::new(vec![
                     Cell::from(r.id.clone()),
                     Cell::from(r.age.clone()).style(dim),
-                    Cell::from(state).style(Style::default().fg(color)),
+                    Cell::from(state).style(state_style),
                     Cell::from(opts).style(dim),
                     Cell::from(prompt).style(prompt_style),
                 ]);
@@ -943,7 +915,17 @@ impl App {
     /// `down` (red); a worker reads `running` (green), its recorded exit state
     /// (`killed` red, others dim), or `gone` (dim) when reaped out from under a
     /// lingering ask.
-    fn state_cell(&self, row: &AgentRow) -> (String, Color) {
+    fn state_cell(&self, row: &AgentRow) -> (String, Style) {
+        // A pending ask is what a human must act on — surface it as its own
+        // attention state (bold yellow), overriding the underlying liveness.
+        if row.ask.is_some() {
+            return (
+                "pending".to_string(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
         let color = if row.alive {
             Color::Green
         } else if row.state == "killed" || (row.is_pulse && row.state == "down") {
@@ -951,7 +933,7 @@ impl App {
         } else {
             Color::DarkGray
         };
-        (row.state.clone(), color)
+        (row.state.clone(), Style::default().fg(color))
     }
 
     /// The DETAIL pane — the TOP flex region while `Mode::Detail` (the list
