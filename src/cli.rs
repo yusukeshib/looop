@@ -75,9 +75,6 @@ pub struct ClientArgs {
     /// Also show finished/dead workers, not just the live fleet.
     #[arg(long, short = 'a')]
     pub all: bool,
-    /// Also show dead workers idle less than a duration (e.g. 1d, 12h, 30m).
-    #[arg(long, short = 's')]
-    pub since: Option<String>,
 }
 
 /// The `_` plumbing: STEER verbs a human/client uses + WORKER self-callbacks.

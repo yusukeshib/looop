@@ -108,7 +108,7 @@ looop dependency.)
 looop init     # interactive setup — required before `up`; pick the runner wiring
 looop up       # start the autonomous pulse (detached)
 looop client   # TUI: whole fleet + each agent's log; answer asks by hand
-               #   (--since/--all + `tab` also show finished workers)
+               #   (--all / `tab` also show finished workers, latest first)
 looop down     # stop the pulse and all workers
 ```
 
