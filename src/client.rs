@@ -213,46 +213,21 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// Recency window used by [`Filter::Recent`] when `--since` isn't given, and
-/// the window the `Tab`-cycled `recent` filter uses.
-const DEFAULT_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
-
 /// Which dead workers the fleet list includes (alive workers, the pulse, and
-/// any worker holding a pending ask are ALWAYS shown). Cycled live with `Tab`
-/// (Active → Recent → All → Active).
+/// any worker holding a pending ask are ALWAYS shown). Toggled live with
+/// `Tab`. Finished workers older than the session TTL are reaped by the pulse,
+/// so `All` is naturally bounded by that retention window.
 #[derive(Clone, Copy)]
 enum Filter {
     /// Only the live fleet — finished/dead workers hidden. The default.
     Active,
-    /// Live fleet + dead workers idle less than this window.
-    Recent(Duration),
-    /// Every worker, no matter how stale.
+    /// Every worker still on disk, including finished/dead ones.
     All,
-}
-
-/// Parse a human duration: bare seconds (`90`) or a single unit suffix
-/// `s`/`m`/`h`/`d` (`30m`, `12h`, `1d`).
-fn parse_duration(s: &str) -> Result<Duration> {
-    let s = s.trim();
-    let (num, mult) = match s.chars().last() {
-        Some('s') => (&s[..s.len() - 1], 1),
-        Some('m') => (&s[..s.len() - 1], 60),
-        Some('h') => (&s[..s.len() - 1], 60 * 60),
-        Some('d') => (&s[..s.len() - 1], 24 * 60 * 60),
-        _ => (s, 1),
-    };
-    let n: u64 = num
-        .trim()
-        .parse()
-        .map_err(|_| anyhow::anyhow!("looop client: bad duration '{s}' (try 1d, 12h, 30m, 90s)"))?;
-    Ok(Duration::from_secs(n * mult))
 }
 
 /// `looop client` — bring up the ask-answering TUI.
 pub fn cmd_client(paths: &Paths, args: &crate::cli::ClientArgs) -> Result<ExitCode> {
-    let filter = if let Some(dur) = &args.since {
-        Filter::Recent(parse_duration(dur)?)
-    } else if args.all {
+    let filter = if args.all {
         Filter::All
     } else {
         Filter::Active
@@ -301,6 +276,9 @@ struct AgentRow {
     /// Precomputed relative age for the AGE column (ask age when waiting, else
     /// the session's idle time).
     age: String,
+    /// Time since the session's last state change — the sort key that keeps
+    /// the list in most-recently-active/finished order. `None` sorts last.
+    idle: Option<Duration>,
     /// This agent's pending ask, if it is currently blocked on a human.
     ask: Option<Ask>,
 }
@@ -341,10 +319,8 @@ struct App {
     /// Whether a drag on the bottom list's scrollbar is in progress — mirrors
     /// `LogView::dragging_scrollbar` for the main buffer.
     dragging_list_sb: bool,
-    /// Which dead workers the list includes. Cycled live with `Tab`.
+    /// Which dead workers the list includes. Toggled live with `Tab`.
     filter: Filter,
-    /// The window `Filter::Recent` uses when cycled to with `Tab`.
-    recent_window: Duration,
     /// Count of workers hidden by the current filter — shown in the footer.
     hidden: usize,
     /// A `--id`/`looop client <id>` preselect to honor once the row appears.
@@ -353,12 +329,6 @@ struct App {
 
 impl App {
     fn new(initial: Option<String>, filter: Filter) -> Self {
-        // A `--since` window carries its own duration; otherwise the `Tab`-
-        // cycled `recent` filter uses the default window.
-        let recent_window = match filter {
-            Filter::Recent(w) => w,
-            _ => DEFAULT_WINDOW,
-        };
         Self {
             rows: Vec::new(),
             list_offset: 0,
@@ -371,7 +341,6 @@ impl App {
             asks_hit: None,
             dragging_list_sb: false,
             filter,
-            recent_window,
             hidden: 0,
             pending_select: initial,
         }
@@ -402,12 +371,13 @@ impl App {
             alive: self.pulse_alive,
             state: if self.pulse_alive { "live" } else { "down" }.to_string(),
             age: String::new(),
+            idle: None,
             ask: None,
         }];
 
         // Worker agents. A pending ask (answerable) or a live worker is ALWAYS
         // shown; a dead worker with nothing waiting is subject to the filter
-        // (Active hides it, Recent keeps it within the window, All keeps it).
+        // (Active hides it, All keeps it).
         let mut wrows: Vec<AgentRow> = Vec::new();
         let mut hidden = 0usize;
         for s in workers {
@@ -417,18 +387,15 @@ impl App {
                 || match self.filter {
                     Filter::All => true,
                     Filter::Active => false,
-                    Filter::Recent(w) => s.idle_for().map(|d| d < w).unwrap_or(true),
                 };
             if !keep {
                 hidden += 1;
                 continue;
             }
+            let idle = s.idle_for();
             let age = match &ask {
                 Some(a) => fmt_age(a.ts),
-                None => s
-                    .idle_for()
-                    .map(|d| fmt_secs(d.as_secs()))
-                    .unwrap_or_default(),
+                None => idle.map(|d| fmt_secs(d.as_secs())).unwrap_or_default(),
             };
             wrows.push(AgentRow {
                 id: s.id.clone(),
@@ -436,6 +403,7 @@ impl App {
                 alive: s.alive,
                 state: s.state.clone(),
                 age,
+                idle,
                 ask,
             });
         }
@@ -448,16 +416,28 @@ impl App {
                 alive: false,
                 state: "gone".to_string(),
                 age: fmt_age(ask.ts),
+                idle: None,
                 ask: Some(ask),
             });
         }
         // Waiting agents (with a pending ask) first — what a human acts on —
-        // then the rest, each group by id for a stable order.
+        // longest-waiting ask on top. Then the rest in most-recently-
+        // active/finished order (smallest idle first; unknown idle last),
+        // id as the final tiebreak for stability.
         wrows.sort_by(|a, b| {
-            b.ask
-                .is_some()
-                .cmp(&a.ask.is_some())
-                .then_with(|| a.id.cmp(&b.id))
+            match (&a.ask, &b.ask) {
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                // Oldest ask (longest waiting) on top.
+                (Some(x), Some(y)) => x.ts.cmp(&y.ts),
+                // Smallest idle (most recently active/finished) first;
+                // unknown idle sinks to the bottom.
+                (None, None) => {
+                    let key = |r: &AgentRow| r.idle.unwrap_or(Duration::MAX);
+                    key(a).cmp(&key(b))
+                }
+            }
+            .then_with(|| a.id.cmp(&b.id))
         });
         rows.extend(wrows);
         self.rows = rows;
@@ -755,12 +735,12 @@ impl App {
             }
             KeyCode::Down => self.move_selection(1),
             KeyCode::Up => self.move_selection(-1),
-            // Tab cycles which dead workers the list includes. It's not a
-            // printable answer char, so it can't collide with typing an answer.
+            // Tab toggles whether finished/dead workers are listed. It's not
+            // a printable answer char, so it can't collide with typing an
+            // answer.
             KeyCode::Tab => {
                 self.filter = match self.filter {
-                    Filter::Active => Filter::Recent(self.recent_window),
-                    Filter::Recent(_) => Filter::All,
+                    Filter::Active => Filter::All,
                     Filter::All => Filter::Active,
                 };
                 self.refresh(paths);
@@ -1086,7 +1066,6 @@ impl App {
         // mirroring `looop watch`'s selector footer.
         let fname = match self.filter {
             Filter::Active => "active",
-            Filter::Recent(_) => "recent",
             Filter::All => "all",
         };
         let hidden = if self.hidden > 0 {
@@ -1157,19 +1136,5 @@ mod tests {
         let out = wrap_lines(lines.clone(), 0);
         assert_eq!(out.len(), 1);
         assert_eq!(plain(&out[0]), "anything");
-    }
-
-    #[test]
-    fn parse_duration_units_and_bare_seconds() {
-        assert_eq!(parse_duration("90").unwrap(), Duration::from_secs(90));
-        assert_eq!(parse_duration("30m").unwrap(), Duration::from_secs(1800));
-        assert_eq!(parse_duration("12h").unwrap(), Duration::from_secs(43200));
-        assert_eq!(parse_duration("1d").unwrap(), Duration::from_secs(86400));
-    }
-
-    #[test]
-    fn parse_duration_rejects_garbage() {
-        assert!(parse_duration("soon").is_err());
-        assert!(parse_duration("").is_err());
     }
 }

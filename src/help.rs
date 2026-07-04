@@ -25,13 +25,12 @@ Usage:
   looop up [--json]              start the pulse: the autonomous loop (sense +
                                 decide + run workers), detached. --json logs NDJSON.
   looop down                     stop the pulse and all workers
-  looop client [<id>] [--since <dur>] [--all]
-                                observer + ask-answering TUI: the whole live fleet
+  looop client [<id>] [--all]   observer + ask-answering TUI: the whole live fleet
                                 on screen, each agent's colored log buffer + pending
                                 ask, answer by hand. <id> preselects (e.g.
-                                `looop client pulse`); --since 1d/12h/30m or --all
-                                also show finished workers, `tab` cycles
-                                active/recent/all. Read-only if you never answer.
+                                `looop client pulse`); --all also shows finished
+                                workers (most recently finished first), `tab`
+                                toggles active/all. Read-only if you never answer.
                                 (the humble alternative to an agent concierge:
                                 tell any coding agent to work as a concierge for `looop`)
   looop version | help           print version / show this help
