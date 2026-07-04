@@ -393,9 +393,17 @@ impl LogView {
                 .get("text")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
+            // babysit emits per-row SGR but trims trailing blank cells, so a row
+            // that ends mid-style (e.g. a red error line whose own `\x1b[0m`
+            // landed in the now-trimmed trailing blanks) never emits its reset.
+            // ANSI SGR state carries across `\n`, so that color then bleeds onto
+            // the following dim rows. Each vt100 row is an independent screen
+            // render, so terminate every row with a reset before it is parsed.
+            let screen = screen.replace('\n', "\x1b[0m\n");
             let text = screen
+                .as_str()
                 .into_text()
-                .unwrap_or_else(|_| Text::from(screen.to_string()));
+                .unwrap_or_else(|_| Text::from(screen.clone()));
             for (r, line) in text.lines.iter().enumerate().take(rows) {
                 let l = off + (rows - 1 - r); // this row's log-tail distance
                 let overall = l + extra;
@@ -695,6 +703,47 @@ mod tests {
         assert_eq!(lines[0].spans[0].content.as_ref(), "l0");
         assert_eq!(lines[2].spans[0].content.as_ref(), "l2");
         assert!(lines[4].spans.is_empty() || lines[4].spans[0].content.as_ref().is_empty());
+    }
+
+    // A red Error line that WRAPS must not bleed its color onto the following
+    // dim heartbeat lines. babysit's per-row renderer trims trailing blank cells
+    // (where the line's own reset lived), so we re-terminate each row before
+    // ansi_to_tui parses it. Guards against the "red leaks downward" regression.
+    #[test]
+    fn wrapped_color_does_not_bleed_onto_next_rows() {
+        let mut parser = vt100::Parser::new(30, 40, 0); // narrow → the error line wraps
+        let bytes = concat!(
+            "\x1b[2m[08:05:24]\x1b[0m \x1b[1m\x1b[31m\u{2717}\x1b[0m ",
+            "\x1b[31mtick failed after 300s (fail #1) \u{b7} replay: /Users/y/.local/state/looop/runs/tick-1\x1b[0m\r\n",
+            "\x1b[2m[08:05:24] \u{b7} next beat in 60s (idle)\x1b[0m\r\n",
+            "\x1b[2m[08:06:24] \u{b7} 20 sensors ok (39s)\x1b[0m\r\n",
+        );
+        parser.process(bytes.as_bytes());
+        let shot = render::render_screen(parser.screen(), ShotFormat::Ansi, false);
+        let screen = shot
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        // Same normalization the render path applies.
+        let screen = screen.replace('\n', "\x1b[0m\n");
+        let text = screen.as_str().into_text().unwrap();
+        // Find the two heartbeat rows and assert none of their spans are red.
+        let mut checked = 0;
+        for line in &text.lines {
+            let joined: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+            if joined.contains("next beat") || joined.contains("sensors ok") {
+                checked += 1;
+                for sp in &line.spans {
+                    assert_ne!(
+                        sp.style.fg,
+                        Some(Color::Red),
+                        "red leaked onto dim row: {:?}",
+                        joined
+                    );
+                }
+            }
+        }
+        assert_eq!(checked, 2, "expected to find both heartbeat rows");
     }
 
     #[test]
