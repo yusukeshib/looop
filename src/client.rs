@@ -865,9 +865,12 @@ impl App {
             })
             .collect();
 
-        // Size the ID column to the widest id actually present (ids are
-        // user-chosen path segments, so ASCII — `chars().count()` is the
-        // display width) instead of a fixed 16 that clips longer ids. Clamp
+        // Size the ID column to the widest id actually present, using
+        // `chars().count()` as a cheap approximation of display width
+        // (ids are user-chosen path segments and in practice ASCII, so this
+        // matches; it can under-count for wide/combining chars, but that
+        // only risks a slightly tight column, never a panic) instead of a
+        // fixed 16 that clips longer ids. Clamp
         // to `C_ID` as a floor and leave at least `MIN_PROMPT` cells for the
         // PROMPT column so a long id can't crowd out what a human acts on.
         const MIN_PROMPT: u16 = 20;
