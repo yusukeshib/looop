@@ -865,8 +865,27 @@ impl App {
             })
             .collect();
 
+        // Size the ID column to the widest id actually present (ids are
+        // user-chosen path segments, so ASCII — `chars().count()` is the
+        // display width) instead of a fixed 16 that clips longer ids. Clamp
+        // to `C_ID` as a floor and leave at least `MIN_PROMPT` cells for the
+        // PROMPT column so a long id can't crowd out what a human acts on.
+        const MIN_PROMPT: u16 = 20;
+        let fixed = C_AGE + C_STATE + C_OPTS; // non-id, non-prompt columns
+        let spacing = 4; // 4 gaps between 5 columns at column_spacing(1)
+        let id_ceiling = table_w
+            .saturating_sub(fixed + spacing + MIN_PROMPT)
+            .max(C_ID);
+        let id_w = self
+            .rows
+            .iter()
+            .map(|r| r.id.chars().count() as u16)
+            .chain(std::iter::once(2)) // the "ID" header
+            .max()
+            .unwrap_or(C_ID)
+            .clamp(C_ID, id_ceiling);
         let widths = [
-            Constraint::Length(C_ID),
+            Constraint::Length(id_w),
             Constraint::Length(C_AGE),
             Constraint::Length(C_STATE),
             Constraint::Length(C_OPTS),
