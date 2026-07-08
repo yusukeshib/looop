@@ -659,13 +659,22 @@ unsafe fn dup_cloexec(fd: i32) -> i32 {
     unsafe extern "C" {
         fn dup(fd: i32) -> i32;
         fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+        fn close(fd: i32) -> i32;
     }
     const F_SETFD: i32 = 2;
     const FD_CLOEXEC: i32 = 1;
     unsafe {
         let copy = dup(fd);
-        if copy >= 0 {
-            fcntl(copy, F_SETFD, FD_CLOEXEC);
+        if copy < 0 {
+            return copy;
+        }
+        // If we can't set close-on-exec the copy would leak into the detached
+        // worker (the very leak this guards against), so treat it as a hard
+        // failure: close the copy and return a negative fd so the caller falls
+        // back safely instead of running with a non-CLOEXEC descriptor.
+        if fcntl(copy, F_SETFD, FD_CLOEXEC) < 0 {
+            close(copy);
+            return -1;
         }
         copy
     }
