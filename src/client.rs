@@ -73,6 +73,7 @@ use ratatui::widgets::{
     Block, Borders, Cell, Clear, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState,
     Table, TableState,
 };
+use unicode_width::UnicodeWidthChar;
 
 /// Re-list asks / re-check the pulse this often, and the input-poll timeout.
 const TICK: Duration = Duration::from_millis(250);
@@ -170,8 +171,9 @@ fn chars_to_line(chars: &[(char, Style)], base: Style) -> Line<'static> {
 
 /// Word-wrap styled `lines` to `width` columns, preserving each span's style.
 /// Breaks at the last space that fits; a word longer than the whole width is
-/// hard-split. Width is counted in `char`s (good enough for the ask block; CJK
-/// double-width isn't special-cased). The `LogView` paints its `tail` verbatim
+/// hard-split. Width is counted in display columns via `unicode-width`, so CJK
+/// double-width glyphs (and other wide characters) consume two columns and wrap
+/// before they run off the right edge. The `LogView` paints its `tail` verbatim
 /// against a fixed-width log grid, so the ask block must be pre-wrapped here to
 /// stay readable in a narrow detail pane.
 fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
@@ -193,7 +195,21 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
         }
         let mut start = 0usize;
         while start < chars.len() {
-            let mut end = (start + width).min(chars.len());
+            // Walk forward accumulating DISPLAY columns (CJK glyphs = 2), so the
+            // window ends at the last char that still fits within `width` cols.
+            let mut end = start;
+            let mut cols = 0usize;
+            while end < chars.len() {
+                // `width()` returns None for control chars (e.g. `\t`); treat
+                // those as at least 1 column so they still advance the window
+                // and can't silently disable wrapping.
+                let w = chars[end].0.width().unwrap_or(1);
+                if end > start && cols + w > width {
+                    break;
+                }
+                cols += w;
+                end += 1;
+            }
             if end < chars.len() {
                 // Prefer breaking at the last space in the window (dropped).
                 if let Some(sp) = (start..end).rev().find(|&i| chars[i].0 == ' ')
@@ -1150,6 +1166,23 @@ mod tests {
         assert_eq!(out[0].spans[0].style.fg, Some(Color::Red));
         assert_eq!(plain(&out[1]), "bbb");
         assert_eq!(out[1].spans.last().unwrap().style.fg, Some(Color::Green));
+    }
+
+    #[test]
+    fn wrap_counts_cjk_as_double_width() {
+        // 6 double-width glyphs = 12 display columns; at width 6 that must wrap
+        // into rows of at most 3 glyphs (6 columns), not 6 glyphs (12 columns).
+        let lines = vec![Line::from("あいうえおか")];
+        let out = wrap_lines(lines, 6);
+        assert!(out.iter().all(|l| {
+            plain(l)
+                .chars()
+                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+                .sum::<usize>()
+                <= 6
+        }));
+        let joined: String = out.iter().map(plain).collect();
+        assert_eq!(joined, "あいうえおか");
     }
 
     #[test]
