@@ -615,12 +615,18 @@ pub fn run_detached_worker(args: &[String]) -> anyhow::Result<i32> {
 /// Run `f` with this process's stdout (fd 1) redirected to /dev/null, then
 /// restore it. Used to swallow babysit's parent-path banner while keeping
 /// looop's own output. Unix-only; a no-op redirect failure just runs `f`.
+///
+/// The `saved` copy of fd 1 is created close-on-exec: `f` spawns the detached
+/// worker, so a plain `dup(1)` would leak our stdout into that child. When the
+/// caller captured our stdout through a pipe (`$(looop _ worker start …)`), a
+/// leaked write end keeps that pipe open for the worker's entire lifetime, so
+/// the caller's read never sees EOF and the command *looks* hung even though we
+/// returned immediately. `dup_cloexec` keeps the copy out of the child.
 #[cfg(unix)]
 pub(crate) fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
     unsafe extern "C" {
-        fn dup(fd: i32) -> i32;
         fn dup2(a: i32, b: i32) -> i32;
         fn close(fd: i32) -> i32;
     }
@@ -629,7 +635,9 @@ pub(crate) fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
     };
     let _ = std::io::stdout().flush();
     unsafe {
-        let saved = dup(1);
+        // Close-on-exec so the detached worker `f` spawns never inherits this
+        // copy of our stdout (see the doc comment above).
+        let saved = dup_cloexec(1);
         if saved < 0 {
             return f();
         }
@@ -639,6 +647,27 @@ pub(crate) fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
         dup2(saved, 1);
         close(saved);
         out
+    }
+}
+
+/// `dup(fd)` that returns a close-on-exec copy, so it is not inherited across a
+/// later `exec`/spawn. Returns a negative value on failure (caller falls back).
+/// F_SETFD / FD_CLOEXEC are 2 / 1 on both macOS and Linux, so we avoid pulling
+/// in libc as a direct dependency.
+#[cfg(unix)]
+unsafe fn dup_cloexec(fd: i32) -> i32 {
+    unsafe extern "C" {
+        fn dup(fd: i32) -> i32;
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+    }
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
+    unsafe {
+        let copy = dup(fd);
+        if copy >= 0 {
+            fcntl(copy, F_SETFD, FD_CLOEXEC);
+        }
+        copy
     }
 }
 
@@ -685,6 +714,38 @@ mod tests {
     fn pulse_is_recognized() {
         assert!(sess(PULSE_SESSION).is_pulse());
         assert!(!sess("triage").is_pulse());
+    }
+
+    // Regression: the fd we dup inside suppress_stdout MUST be close-on-exec.
+    // A plain dup(1) leaked our stdout into the detached worker; when the
+    // caller captured our stdout via a pipe (`out=$(looop _ worker start …)`)
+    // that leaked write end kept the pipe open for the worker's whole lifetime,
+    // so the caller never saw EOF and `worker start` looked hung. Assert the
+    // copy carries FD_CLOEXEC so no spawned child can inherit it.
+    #[cfg(unix)]
+    #[test]
+    fn dup_cloexec_sets_close_on_exec() {
+        unsafe extern "C" {
+            fn fcntl(fd: i32, cmd: i32, ...) -> i32;
+            fn close(fd: i32) -> i32;
+        }
+        const F_GETFD: i32 = 1;
+        const FD_CLOEXEC: i32 = 1;
+        unsafe {
+            // dup fd 2 (stderr): always open under the test harness, and we
+            // never touch its target so this stays side-effect free.
+            let copy = dup_cloexec(2);
+            assert!(copy >= 0, "dup_cloexec failed");
+            let flags = fcntl(copy, F_GETFD);
+            close(copy);
+            assert!(flags >= 0, "F_GETFD failed");
+            assert_eq!(
+                flags & FD_CLOEXEC,
+                FD_CLOEXEC,
+                "dup_cloexec copy must be close-on-exec so detached workers don't \
+                 inherit (and pin open) the caller's captured stdout pipe"
+            );
+        }
     }
 
     // A template WITHOUT the {{model}}/{{thinking}} placeholders and no flags
