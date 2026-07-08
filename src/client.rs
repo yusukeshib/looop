@@ -200,7 +200,10 @@ fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
             let mut end = start;
             let mut cols = 0usize;
             while end < chars.len() {
-                let w = chars[end].0.width().unwrap_or(0);
+                // `width()` returns None for control chars (e.g. `\t`); treat
+                // those as at least 1 column so they still advance the window
+                // and can't silently disable wrapping.
+                let w = chars[end].0.width().unwrap_or(1);
                 if end > start && cols + w > width {
                     break;
                 }
