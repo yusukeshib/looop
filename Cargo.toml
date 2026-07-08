@@ -1,6 +1,6 @@
 [package]
 name = "looop"
-version = "0.45.3"
+version = "0.45.4"
 edition = "2024"
 description = "A tiny, portable, Kubernetes-shaped control loop for your work"
 license = "MIT"
@@ -47,6 +47,10 @@ tui-markdown = { version = "0.3", default-features = false }
 # depends on vt100 (and exposes `render::render_screen`); we pin it directly to
 # name the `vt100::Parser`/`Screen` types and drive scrollback ourselves.
 vt100 = "0.16"
+# `looop client` word-wraps the ask block to the detail pane by DISPLAY width so
+# CJK / double-width glyphs wrap before running off the right edge instead of
+# being counted as one column each.
+unicode-width = "0.2"
 
 [profile.release]
 strip = true
