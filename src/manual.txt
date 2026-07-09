@@ -135,6 +135,12 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
             decide move, prompt on stdin) and `worker_command` (launch a worker
             session; `{{prompt_file}}` is its brief). Optional: `interval`
             (cadence), `session_ttl` (corpse retention).
+            RPC WORKERS: to run a worker in an agent's RPC mode (e.g. pi
+            `--mode rpc`) yet keep a readable transcript, wrap it in the
+            `_ rpc-bridge` adapter as the worker_command:
+              looop _ rpc-bridge --prompt-file {{prompt_file}} -- pi --mode rpc …
+            The bridge renders the child's JSONL to text and wraps input typed
+            via `_ send` as a prompt (idle) / steer (mid-turn).
   DATA    ${XDG_STATE_HOME:-~/.local/state}/looop/  the file-based backend
           └ override with $LOOOP_DATA_DIR
             PLAYBOOK.md  goals/  journal.md  sensors/*.sh   <- durable memory

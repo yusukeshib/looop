@@ -106,6 +106,10 @@ pub enum Verb {
     Kill(KillArgs),
     /// Type input into an interactive worker.
     Send(SendArgs),
+    /// In-worker RPC bridge: run an rpc-speaking agent and translate its
+    /// JSONL stream to readable output (and typed input to prompts/steers).
+    #[command(name = "rpc-bridge")]
+    RpcBridge(RpcBridgeArgs),
     /// Capture a worker's current screen.
     Screenshot(ScreenshotArgs),
     /// Atomically claim a named lease.
@@ -289,6 +293,23 @@ pub struct SendArgs {
     /// Don't send a trailing Enter.
     #[arg(long = "no-newline", short = 'n')]
     pub no_newline: bool,
+}
+
+/// `looop _ rpc-bridge --prompt-file <path> -- <child…>` — the in-worker
+/// adapter a `worker_command` points at so a worker can speak pi's RPC protocol
+/// while still presenting a readable transcript to `looop watch`/`client`.
+/// It spawns `<child…>` (an rpc-speaking agent, e.g. `pi --mode rpc …`), seeds
+/// the first prompt from `--prompt-file`, renders the child's JSONL events to
+/// friendly text on its own stdout (→ PTY → output.log), and wraps any text
+/// typed at its stdin (what `looop _ send` writes) into a prompt/steer command.
+#[derive(Args, Debug)]
+pub struct RpcBridgeArgs {
+    /// File whose contents seed the first `prompt` sent to the child.
+    #[arg(long = "prompt-file")]
+    pub prompt_file: String,
+    /// The rpc-speaking child agent command, after `--`.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub child: Vec<String>,
 }
 
 #[derive(Args, Debug)]

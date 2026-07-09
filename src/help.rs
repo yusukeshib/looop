@@ -44,6 +44,7 @@ Usage:
   looop _ playbook write [body|-]                          (`-`/omit = stdin/heredoc)
   looop _ send <id> "<text>" [--no-newline]   type input into a worker's terminal
   looop _ screenshot <id> [--ansi|--json] [--no-trim]   capture a session's screen
+  looop _ rpc-bridge --prompt-file <p> -- <agent…>   (worker_command wiring) run an rpc agent (e.g. pi --mode rpc), rendering its JSONL + wrapping `send` as prompt/steer
 
   WORKER self-callbacks (auto-injected CONTRACT — not for humans):
   looop _ ask <id> --prompt "…" [--ref P] [--options a,b]   ask + block for answer

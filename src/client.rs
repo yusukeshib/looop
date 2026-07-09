@@ -241,6 +241,19 @@ enum Filter {
     All,
 }
 
+/// What the always-on bottom input does for the SELECTED agent. The field is
+/// always shown for an agent the human can act on; the verb (and thus where
+/// Enter routes the text) depends on the agent's state.
+#[derive(Clone, Copy, PartialEq)]
+enum InputMode {
+    /// The agent has a pending ask — Enter durably resolves it (`mailbox::answer`).
+    Answer,
+    /// A live worker with no ask — Enter types the text into its terminal as a
+    /// STEER (`session::send_to`). Not offered for the pulse (raw keystrokes
+    /// are refused) or a dead worker (nothing to type into).
+    Send,
+}
+
 /// `looop client` — bring up the ask-answering TUI.
 pub fn cmd_client(paths: &Paths, args: &crate::cli::ClientArgs) -> Result<ExitCode> {
     let filter = if args.all {
@@ -494,6 +507,23 @@ impl App {
         self.selected_index().map(|i| &self.rows[i])
     }
 
+    /// The bottom input's mode for the current selection, or `None` when the
+    /// field is hidden (no agent, a dead worker, or the pulse with no ask —
+    /// none of which can receive typed text).
+    fn input_mode(&self) -> Option<InputMode> {
+        let r = self.selected()?;
+        if !r.alive {
+            return None;
+        }
+        if r.ask.is_some() {
+            Some(InputMode::Answer)
+        } else if !r.is_pulse {
+            Some(InputMode::Send)
+        } else {
+            None
+        }
+    }
+
     fn move_selection(&mut self, delta: isize) {
         if self.rows.is_empty() {
             return;
@@ -552,7 +582,7 @@ impl App {
         (idx < self.rows.len()).then_some(idx)
     }
 
-    /// Whether `row` falls in the bottom list strip (its column-header row plus
+    /// Whether `row` falls in the top list strip (its column-header row plus
     /// the data rows) — used to route the wheel to the list vs. the buffer.
     fn in_list_region(&self, row: u16) -> bool {
         self.asks_hit.is_some_and(|hit| {
@@ -599,7 +629,7 @@ impl App {
         };
     }
 
-    /// Route a mouse event. The buffer (top) and the bottom list strip scroll
+    /// Route a mouse event. The top list strip and the buffer (below) scroll
     /// independently — the wheel targets whichever the cursor is over; the
     /// buffer and list each have a draggable scrollbar; a click on a list row
     /// switches the selected agent (and thus the buffer).
@@ -658,29 +688,49 @@ impl App {
     /// selected agent having none — keep the typed text intact and surface the
     /// reason, so the human can copy/edit.
     fn submit(&mut self, paths: &Paths) {
-        let Some(id) = self
-            .selected()
-            .filter(|r| r.alive)
-            .and_then(|r| r.ask.as_ref())
-            .map(|a| a.id.clone())
-        else {
+        let Some(mode) = self.input_mode() else {
             self.status = Some(match self.selected() {
-                Some(r) => format!("{}: no pending ask to answer", r.id),
+                Some(r) => format!("{}: nothing to send", r.id),
                 None => "no agent selected".into(),
             });
             return;
         };
         if self.input.trim().is_empty() {
-            self.status = Some("answer: type some text first".into());
+            self.status = Some("type some text first".into());
             return;
         }
-        match mailbox::answer(paths, &id, &self.input, false) {
-            Ok(()) => {
-                self.status = Some(format!("answered {id}"));
-                self.input.clear();
-                self.refresh(paths);
+        match mode {
+            // A pending ask: durably resolve it. On success the ask leaves the
+            // pending list; the buffer stays on the same agent.
+            InputMode::Answer => {
+                let id = self
+                    .selected()
+                    .and_then(|r| r.ask.as_ref())
+                    .map(|a| a.id.clone())
+                    .expect("answer mode implies a pending ask");
+                match mailbox::answer(paths, &id, &self.input, false) {
+                    Ok(()) => {
+                        self.status = Some(format!("answered {id}"));
+                        self.input.clear();
+                        self.refresh(paths);
+                    }
+                    Err(e) => self.status = Some(format!("{id}: {e}")),
+                }
             }
-            Err(e) => self.status = Some(format!("{id}: {e}")),
+            // A live worker with no ask: type the text into its terminal.
+            InputMode::Send => {
+                let worker = self
+                    .selected()
+                    .map(|r| r.id.clone())
+                    .expect("send mode implies a selected agent");
+                match session::send_to(paths, &worker, &self.input, true) {
+                    Ok(()) => {
+                        self.status = Some(format!("sent to {worker}"));
+                        self.input.clear();
+                    }
+                    Err(e) => self.status = Some(format!("{worker}: {e}")),
+                }
+            }
         }
     }
 
@@ -782,21 +832,31 @@ impl App {
         .split(frame.area());
 
         // Flex layout, driven by the SELECTION (not a separate mode): with a
-        // row selected — which is always the case — the agent's buffer takes
-        // the TOP (flex) and the list shrinks to a scrollable strip of at most
-        // 5 rows pinned at the BOTTOM. With nothing selected (only before the
-        // first refresh) the list owns the whole body.
+        // row selected — which is always the case — the agent list is a
+        // scrollable strip of at most 5 rows pinned at the TOP and the agent's
+        // buffer takes the rest (flex) BELOW it, separated by a gray rule. With
+        // nothing selected (only before the first refresh) the list owns the
+        // whole body.
         let body = chunks[0];
         if self.selected().is_some() {
-            // List height = up to 5 data rows + 1 column-header row + 2 border
-            // rows; keep ≥3 rows for the (borderless) buffer above.
+            // The agent list is a borderless strip pinned at the TOP (up to 5
+            // data rows + 1 column-header row); a gray rule seams it off and
+            // the worker buffer takes the rest below.
             let data_rows = self.rows.len().clamp(1, 5) as u16;
-            let want = data_rows + 3;
-            let list_h = want.min(body.height.saturating_sub(3)).max(3);
-            let parts =
-                Layout::vertical([Constraint::Min(3), Constraint::Length(list_h)]).split(body);
-            self.draw_detail(frame, parts[0]);
-            self.draw_asks(frame, parts[1]);
+            let want = data_rows + 1;
+            let list_h = want.min(body.height.saturating_sub(4)).max(2);
+            let parts = Layout::vertical([
+                Constraint::Length(list_h), // agent list (top, borderless)
+                Constraint::Length(1),      // gray separator rule
+                Constraint::Min(3),         // worker buffer (below, flex)
+            ])
+            .split(body);
+            self.draw_asks(frame, parts[0]);
+            frame.render_widget(
+                Block::default().borders(Borders::TOP).border_style(dim()),
+                parts[1],
+            );
+            self.draw_detail(frame, parts[2]);
         } else {
             self.draw_asks(frame, body);
         }
@@ -804,15 +864,11 @@ impl App {
     }
 
     fn draw_asks(&mut self, frame: &mut Frame, area: Rect) {
-        // The list pane is BORDERED (the buffer above is borderless), so the
-        // agent strip reads as a distinct panel. All geometry below — table,
-        // scrollbar, hit-testing — is relative to the block's INNER area.
+        // The list pane is BORDERLESS and pinned at the TOP; a gray rule (drawn
+        // by `draw`) seams it off from the buffer below. All geometry — table,
+        // scrollbar, hit-testing — is relative to `area` directly.
         let dim = dim();
-        let block = Block::default().borders(Borders::ALL).border_style(dim);
-        let inner = block.inner(area);
         frame.render_widget(Clear, area);
-        frame.render_widget(block, area);
-        let area = inner;
         let col_w = area.width;
 
         if self.rows.is_empty() {
@@ -978,27 +1034,29 @@ impl App {
         (row.state.clone(), Style::default().fg(color))
     }
 
-    /// The DETAIL pane — the TOP flex region (the list sits below it) shown
+    /// The DETAIL pane — the BOTTOM flex region (the list sits above it) shown
     /// whenever a row is selected. It shows the selected ask's WORKER BUFFER: a scrollable
     /// `looop watch`-style vt100 replay of the worker's `output.log`, with the
     /// ask itself (worker · prompt · ref · options) pinned at the very BOTTOM
-    /// as the buffer's tail. The answer input is pinned below that and focused
-    /// — so answering happens at the end of the buffer — but ONLY when the
-    /// selected agent has a pending ask; for a read-only agent (the pulse, an
-    /// idle worker) the buffer fills the whole pane with no input row.
+    /// as the buffer's tail. The input is pinned below that and focused — so
+    /// answering/steering happens at the end of the buffer — whenever the
+    /// selected agent can receive typed text (a pending ask → `answer`, a live
+    /// worker with no ask → `send`). For a read-only agent (the pulse with no
+    /// ask, a dead worker) the buffer fills the whole pane with no input row.
     fn draw_detail(&mut self, frame: &mut Frame, area: Rect) {
         // Borderless — like `looop watch`'s log, the buffer owns its area edge
-        // to edge; the bordered list below provides the visual seam.
+        // to edge; the gray rule above (between list and buffer) is the seam.
         let inner = area;
         frame.render_widget(Clear, area);
 
-        // The answer input only exists when the selected agent has a pending
-        // ask — a read-only agent (pulse / idle worker) has nothing to answer,
-        // so the buffer takes the whole pane. Split the inner area: buffer on
-        // top; when answerable, the input takes a separator + one text row
-        // pinned along the bottom.
-        let answerable = self.selected().is_some_and(|r| r.alive && r.ask.is_some());
-        let input_h = if answerable {
+        // The input exists whenever the selected agent can receive typed text
+        // (see `input_mode`) — an answerable ask or a steerable live worker. A
+        // read-only agent (pulse w/o ask, dead worker) has nothing to type
+        // into, so the buffer takes the whole pane. Split the inner area:
+        // buffer on top; when typeable, the input takes a separator + one text
+        // row pinned along the bottom.
+        let mode = self.input_mode();
+        let input_h = if mode.is_some() {
             2u16.min(inner.height)
         } else {
             0
@@ -1061,14 +1119,15 @@ impl App {
         let tail = wrap_lines(tail, content.width as usize);
 
         self.log.render(frame, content, &tail, true);
-        if answerable {
-            self.draw_input(frame, input_area);
+        if let Some(mode) = mode {
+            self.draw_input(frame, input_area, mode);
         }
     }
 
-    /// The always-focused answer editor pinned along the bottom of the detail
-    /// pane: a `┈` separator row above a single `› …` input line.
-    fn draw_input(&self, frame: &mut Frame, area: Rect) {
+    /// The always-focused editor pinned along the bottom of the detail pane: a
+    /// `┈` separator row above a single `› …` input line. Its placeholder
+    /// reflects the `mode` — answering a pending ask vs. steering a live worker.
+    fn draw_input(&self, frame: &mut Frame, area: Rect, mode: InputMode) {
         let sep = Block::default().borders(Borders::TOP).border_style(dim());
         let field = sep.inner(area);
         frame.render_widget(sep, area);
@@ -1089,8 +1148,12 @@ impl App {
         if self.input.is_empty() {
             // Block cursor first, then a dim placeholder so the field reads as
             // focused and self-explanatory before anything is typed.
+            let hint = match mode {
+                InputMode::Answer => " type answer · enter to send",
+                InputMode::Send => " type message · enter to send",
+            };
             spans.push(Span::styled(" ", Style::default().bg(Color::White)));
-            spans.push(Span::styled(" type answer · enter to send", dim()));
+            spans.push(Span::styled(hint, dim()));
         } else {
             spans.push(Span::raw(shown));
             spans.push(Span::styled(" ", Style::default().bg(Color::White)));
@@ -1113,14 +1176,20 @@ impl App {
         };
         let help = match &self.status {
             Some(msg) => format!(" {msg} "),
-            // The answer keys only apply when the selected agent has a pending
-            // ask; a read-only agent (pulse / idle worker) just scrolls.
-            None if self.selected().is_some_and(|r| r.alive && r.ask.is_some()) => format!(
-                " {fname}{hidden}  type answer · enter send · ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
-            ),
-            None => {
-                format!(" {fname}{hidden}  ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit ")
-            }
+            // The type/enter keys only apply when the selected agent can
+            // receive text (answer an ask, or steer a live worker); a
+            // read-only agent (pulse w/o ask, dead worker) just scrolls.
+            None => match self.input_mode() {
+                Some(InputMode::Answer) => format!(
+                    " {fname}{hidden}  type answer · enter send · ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
+                ),
+                Some(InputMode::Send) => format!(
+                    " {fname}{hidden}  type message · enter send · ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
+                ),
+                None => format!(
+                    " {fname}{hidden}  ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
+                ),
+            },
         };
         frame.render_widget(Paragraph::new(Span::styled(help, style)).style(style), area);
     }

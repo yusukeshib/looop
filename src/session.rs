@@ -328,14 +328,26 @@ pub fn cmd_send(paths: &Paths, args: &crate::cli::SendArgs) -> Result<ExitCode> 
     if reject_pulse(&session, "send") {
         return Ok(ExitCode::from(1));
     }
-    let text = args.text.join(" ");
+    send_to(paths, &args.id, &args.text.join(" "), newline)?;
+    println!("sent to {session}");
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Type `text` into a worker's terminal (a STEER, as if a human were at the
+/// keyboard). Refuses the pulse — the control loop is driven by goals/PLAYBOOK
+/// and asks, never raw keystrokes. Shared by `cmd_send` and the client's
+/// always-on input in its "send" mode.
+pub fn send_to(paths: &Paths, id: &str, text: &str, newline: bool) -> Result<()> {
+    let session = full_session(id);
+    if session == PULSE_SESSION {
+        anyhow::bail!("'{PULSE_SESSION}' is the control loop, not a worker");
+    }
     rt().block_on(
         paths
             .sessions()
-            .send(Some(session.clone()), text, newline, false),
+            .send(Some(session), text.to_string(), newline, false),
     )?;
-    println!("sent to {session}");
-    Ok(ExitCode::SUCCESS)
+    Ok(())
 }
 
 /// `looop _ screenshot <id> [--ansi|--json] [--no-trim]` — capture a session's
