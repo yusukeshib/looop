@@ -25,6 +25,7 @@ mod logview;
 mod mailbox;
 mod paths;
 mod prompt;
+mod rpc;
 mod run;
 mod runner;
 mod seed;
@@ -186,6 +187,10 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
             Verb::Ask(a) => gated(&|| mailbox::cmd_ask(paths, &a)),
             Verb::Kill(a) => gated(&|| session::cmd_kill(paths, &a.id)),
             Verb::Send(a) => gated(&|| session::cmd_send(paths, &a)),
+            // Ungated: an inner exec that IS the worker_command child (like the
+            // pre-clap `run` supervisor), launched only after deps already
+            // passed at worker-start time.
+            Verb::RpcBridge(a) => rpc::cmd_rpc_bridge(&a),
             Verb::Screenshot(a) => gated(&|| session::cmd_screenshot(paths, &a)),
             Verb::Claim(a) => gated(&|| gate::cmd_claim(paths, &a)),
             Verb::Unclaim(a) => gated(&|| gate::cmd_unclaim(paths, &a)),
