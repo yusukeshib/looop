@@ -296,7 +296,10 @@ mod tests {
         });
         let (out, _, at_line_start) = render(&ev);
         assert_eq!(out, "hi there");
-        assert!(!at_line_start, "cursor sits mid-line after non-newline text");
+        assert!(
+            !at_line_start,
+            "cursor sits mid-line after non-newline text"
+        );
     }
 
     #[test]
