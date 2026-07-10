@@ -16,28 +16,29 @@
 //! thing it defers to a human is a worker's blocking ask, and this window is
 //! that human ⇄ mailbox channel, laid bare.
 //!
-//! The fleet list is a full-width TABLE (id · age · state · options · prompt
-//! preview). Every agent is a row: the pulse first, then the workers, with any
-//! worker blocked on a pending ask sorted to the top so it's what you see. A
+//! The fleet list is a full-width TABLE (id · age · state). Every agent is a
+//! row: the pulse first, then the workers, with any worker blocked on a
+//! pending ask sorted to the top and marked `pending` so it's what you see. A
 //! row with no ask (the pulse, an idle worker) reads dim. Opening a row
 //! (ENTER/click) floats a DETAIL pane over the right that shows THAT AGENT'S
 //! LIVE BUFFER — a scrollable `looop watch`-style vt100 replay of its
-//! `output.log`, with the pending ask (if any) pinned at the very BOTTOM. So
-//! you read the agent's own transcript, scroll back through its history, and
-//! answer the question right where it sits, at the end of the buffer. ESC
+//! `output.log`. The pending ask (if any) sits in its OWN bordered box between
+//! the buffer and the input — prompt only, no metadata — so the transcript
+//! stays a pure transcript and the question never scrolls away with it. ESC
 //! closes it back to the list:
 //!
 //! ```text
-//!   ID          AGE  STATE    PROMPT        ┌──────────────────────┐
-//! > triage-2    2m   running  flaky test…   │ …worker output…      ┃ │
-//!   deploy-3    0s   running  dep upgrade…  │ running tests…       ┃ │
-//!   pulse       —    live     control loop  │ ── ask ──             │ │
-//!   builder-1   5m   running  —             │ <the question>       │ │
-//!                                           │ options: ship, hold  │ │
-//!                                           ┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈┈
-//!                                           │ › ship█              │ │
-//!                                           └──────────────────────┘
-//!    type answer · enter send · ↑/↓ move · pgup/pgdn scroll · esc close
+//!    active · type answer · enter send · ↑/↓ switch · pgup/pgdn scroll
+//!   ID          AGE  STATE     ┌──────────────────────┐
+//! > triage-2    2m   pending   │ …worker output…      ┃ │
+//!   deploy-3    0s   running   │ running tests…       ┃ │
+//!   pulse       —    live      │ ┌─ ask ───────────┐ │ │
+//!   builder-1   5m   running   │ │ <the question>   │ │ │
+//!                              │ └─────────────────┘ │ │
+//!                              │ ┌─────────────────┐ │ │
+//!                              │ │ ship█            │ │ │
+//!                              │ └─────────────────┘ │ │
+//!                              └──────────────────────┘
 //! ```
 //!
 //! The buffer replay + scroll model + scrollbar all live in [`crate::logview`],
@@ -82,7 +83,7 @@ const TICK: Duration = Duration::from_millis(250);
 const WHEEL_STEP: usize = 3;
 
 /// The shared dark-surface background (same as `looop watch`): the selected
-/// row's highlight and the footer bar. Dark enough that per-span colors
+/// row's highlight and the status bar. Dark enough that per-span colors
 /// (green/red state, dim gray) stay legible without overriding fg.
 const SURFACE: Color = Color::Rgb(40, 40, 40);
 
@@ -107,13 +108,11 @@ fn fmt_age(ts: u64) -> String {
     fmt_secs(crate::util::now_unix().saturating_sub(ts))
 }
 
-/// Fixed column widths (cells) for the ask table: id, age, state, options.
-/// PROMPT takes whatever is left. `Table` clips each cell to its width by
-/// DISPLAY width, so wide (CJK) prompt text never bleeds into other columns.
+/// Fixed column widths (cells) for the ask table: age and state. The ID
+/// column sizes itself to the widest id present (`C_ID` is its floor).
 const C_ID: u16 = 16;
 const C_AGE: u16 = 5;
 const C_STATE: u16 = 8;
-const C_OPTS: u16 = 12;
 
 /// Render the shared `looop watch`-style vertical scrollbar into `area`'s right
 /// column: a `┃` thumb over a `│` track, no end caps. `pos` is the top-anchored
@@ -123,14 +122,18 @@ fn render_vscrollbar(frame: &mut Frame, area: Rect, max_scroll: usize, pos: usiz
         return;
     }
     // ratatui sizes the thumb as `viewport * track / (content + viewport)`;
-    // inflate the viewport until the thumb is at least MIN_THUMB rows so it
+    // inflate the viewport until the thumb is at least `min_thumb` rows so it
     // stays grabbable on a long list (affects only the thumb SIZE, not the
-    // position mapping).
+    // position mapping). The floor ADAPTS to the track: 4 rows on a tall pane
+    // (the buffer), but never more than half a short track (the 5-row agent
+    // list) — otherwise the floor dominates and the thumb reads near-full
+    // regardless of how much content is hidden.
     const MIN_THUMB: usize = 4;
     let track = area.height as usize;
-    let viewport = if track > MIN_THUMB {
-        (MIN_THUMB * max_scroll.saturating_sub(1))
-            .div_ceil(track - MIN_THUMB)
+    let min_thumb = MIN_THUMB.min(track / 2).max(1);
+    let viewport = if track > min_thumb {
+        (min_thumb * max_scroll.saturating_sub(1))
+            .div_ceil(track - min_thumb)
             .max(track)
     } else {
         track
@@ -332,7 +335,7 @@ struct App {
     /// The answer being typed in the pinned input (active whenever the selected
     /// agent has a pending ask).
     input: String,
-    /// Last outcome to show in the footer (an error, or an "answered X" note).
+    /// Last outcome to show in the status bar (an error, or an "answered X" note).
     status: Option<String>,
     /// The selected agent's live buffer shown in the detail pane: a scrollable
     /// vt100 replay of its `output.log`, with the pending ask (if any) pinned at
@@ -350,7 +353,7 @@ struct App {
     dragging_list_sb: bool,
     /// Which dead workers the list includes. Toggled live with `Tab`.
     filter: Filter,
-    /// Count of workers hidden by the current filter — shown in the footer.
+    /// Count of workers hidden by the current filter — shown in the status bar.
     hidden: usize,
     /// A `--id`/`looop client <id>` preselect to honor once the row appears.
     pending_select: Option<String>,
@@ -545,7 +548,7 @@ impl App {
     /// one it was typed for. Shared by keyboard + mouse selection.
     fn select_index(&mut self, idx: usize) {
         // Navigating away dismisses any lingering action status (e.g. a stale
-        // "no pending ask to answer") so the footer doesn't sit stuck on it.
+        // "no pending ask to answer") so the status bar doesn't sit stuck on it.
         self.status = None;
         let id = self.rows[idx].id.clone();
         if self.selected_id.as_deref() != Some(id.as_str()) {
@@ -826,8 +829,8 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         let chunks = Layout::vertical([
+            Constraint::Length(1), // status bar (top)
             Constraint::Min(3),    // asks | detail
-            Constraint::Length(1), // footer
         ])
         .split(frame.area());
 
@@ -837,7 +840,7 @@ impl App {
         // buffer takes the rest (flex) BELOW it, separated by a gray rule. With
         // nothing selected (only before the first refresh) the list owns the
         // whole body.
-        let body = chunks[0];
+        let body = chunks[1];
         if self.selected().is_some() {
             // The agent list is a borderless strip pinned at the TOP (up to 5
             // data rows + 1 column-header row); a gray rule seams it off and
@@ -860,7 +863,7 @@ impl App {
         } else {
             self.draw_asks(frame, body);
         }
-        self.draw_footer(frame, chunks[1]);
+        self.draw_status(frame, chunks[0]);
     }
 
     fn draw_asks(&mut self, frame: &mut Frame, area: Rect) {
@@ -909,23 +912,10 @@ impl App {
             .iter()
             .map(|r| {
                 let (state, state_style) = self.state_cell(r);
-                // The PROMPT column shows the pending ask (what a human acts
-                // on); an agent with no ask reads dim — the pulse as its role,
-                // an idle worker as a `—` placeholder.
-                let (opts, prompt, prompt_style) = match &r.ask {
-                    Some(a) => {
-                        let prompt = a.prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-                        (a.options.join("/"), prompt, Style::default())
-                    }
-                    None if r.is_pulse => (String::new(), "control loop".to_string(), dim),
-                    None => (String::new(), "—".to_string(), dim),
-                };
                 let row = Row::new(vec![
                     Cell::from(r.id.clone()),
                     Cell::from(r.age.clone()).style(dim),
                     Cell::from(state).style(state_style),
-                    Cell::from(opts).style(dim),
-                    Cell::from(prompt).style(prompt_style),
                 ]);
                 // Highlight the selected row via its own style (the widget runs
                 // with `selected = None` + a manual offset — see below).
@@ -942,15 +932,11 @@ impl App {
         // (ids are user-chosen path segments and in practice ASCII, so this
         // matches; it can under-count for wide/combining chars, but that
         // only risks a slightly tight column, never a panic) instead of a
-        // fixed 16 that clips longer ids. Clamp
-        // to `C_ID` as a floor and leave at least `MIN_PROMPT` cells for the
-        // PROMPT column so a long id can't crowd out what a human acts on.
-        const MIN_PROMPT: u16 = 20;
-        let fixed = C_AGE + C_STATE + C_OPTS; // non-id, non-prompt columns
-        let spacing = 4; // 4 gaps between 5 columns at column_spacing(1)
-        let id_ceiling = table_w
-            .saturating_sub(fixed + spacing + MIN_PROMPT)
-            .max(C_ID);
+        // fixed 16 that clips longer ids. Clamp to `C_ID` as a floor and to
+        // whatever width the fixed columns leave as a ceiling.
+        let fixed = C_AGE + C_STATE; // non-id columns
+        let spacing = 2; // 2 gaps between 3 columns at column_spacing(1)
+        let id_ceiling = table_w.saturating_sub(fixed + spacing).max(C_ID);
         let id_w = self
             .rows
             .iter()
@@ -963,14 +949,9 @@ impl App {
             Constraint::Length(id_w),
             Constraint::Length(C_AGE),
             Constraint::Length(C_STATE),
-            Constraint::Length(C_OPTS),
-            Constraint::Min(10),
         ];
         let table = Table::new(rows, widths)
-            .header(
-                Row::new(["ID", "AGE", "STATE", "OPTS", "PROMPT"])
-                    .style(dim.add_modifier(Modifier::BOLD)),
-            )
+            .header(Row::new(["ID", "AGE", "STATE"]).style(dim.add_modifier(Modifier::BOLD)))
             .column_spacing(1);
 
         // `selected = None` + a MANUAL offset: with no selection the widget
@@ -1035,11 +1016,13 @@ impl App {
     }
 
     /// The DETAIL pane — the BOTTOM flex region (the list sits above it) shown
-    /// whenever a row is selected. It shows the selected ask's WORKER BUFFER: a scrollable
-    /// `looop watch`-style vt100 replay of the worker's `output.log`, with the
-    /// ask itself (worker · prompt · ref · options) pinned at the very BOTTOM
-    /// as the buffer's tail. The input is pinned below that and focused — so
-    /// answering/steering happens at the end of the buffer — whenever the
+    /// whenever a row is selected. It shows the selected agent's WORKER BUFFER:
+    /// a scrollable `looop watch`-style vt100 replay of the worker's
+    /// `output.log`. A pending ask renders in its OWN bordered box between the
+    /// buffer and the input — the PROMPT only (worker/ref/options are noise
+    /// here: the row already names the agent, and options belong in the prompt)
+    /// — fixed in place so it neither scrolls with the transcript nor crowds it
+    /// beyond half the pane. The input is pinned below and focused whenever the
     /// selected agent can receive typed text (a pending ask → `answer`, a live
     /// worker with no ask → `send`). For a read-only agent (the pulse with no
     /// ask, a dead worker) the buffer fills the whole pane with no input row.
@@ -1053,11 +1036,11 @@ impl App {
         // (see `input_mode`) — an answerable ask or a steerable live worker. A
         // read-only agent (pulse w/o ask, dead worker) has nothing to type
         // into, so the buffer takes the whole pane. Split the inner area:
-        // buffer on top; when typeable, the input takes a separator + one text
-        // row pinned along the bottom.
+        // buffer on top; when typeable, the input takes a bordered box (one
+        // text row + borders) pinned along the bottom.
         let mode = self.input_mode();
         let input_h = if mode.is_some() {
-            2u16.min(inner.height)
+            3u16.min(inner.height)
         } else {
             0
         };
@@ -1071,80 +1054,101 @@ impl App {
             ..inner
         };
 
-        // Build the ask block pinned at the bottom of the buffer. A dim rule
-        // separates the worker's own output above from the structured ask.
-        let tail: Vec<Line<'static>> = match self.selected().cloned() {
-            // The agent vanished from the fleet while its pane was open.
+        // The pending ask renders in its OWN bordered box above the input —
+        // prompt only. Wrap it to the box's inner width up front so its height
+        // is known; cap the box at half the pane so a long ask can't evict the
+        // transcript. When the prompt overflows the cap, show its TAIL (the
+        // question conventionally comes last) with a dim `…` marker on top.
+        let ask = self.selected().and_then(|r| r.ask.clone());
+        let ask_lines: Vec<Line<'static>> = match &ask {
+            Some(a) => {
+                // Render the prompt as Markdown, lifting the borrowed lines to
+                // owned; wrap to the box interior (borders take 2 columns).
+                let mut v: Vec<Line<'static>> = Vec::new();
+                for line in tui_markdown::from_str(&a.prompt).lines {
+                    v.push(logview::static_line(&line));
+                }
+                wrap_lines(v, inner.width.saturating_sub(2) as usize)
+            }
+            None => vec![],
+        };
+        let ask_h: u16 = if ask_lines.is_empty() {
+            0
+        } else {
+            let cap = (inner.height.saturating_sub(input_h) / 2).max(3);
+            (ask_lines.len() as u16 + 2).min(cap)
+        };
+
+        let content = Rect {
+            height: content.height.saturating_sub(ask_h),
+            ..content
+        };
+        let ask_area = Rect {
+            y: inner.y + content.height,
+            height: ask_h,
+            ..inner
+        };
+
+        // The agent vanished from the fleet while its pane was open — say so
+        // at the buffer's tail (the one message that still belongs there).
+        let tail: Vec<Line<'static>> = match self.selected() {
             None => vec![Line::from(Span::styled(
                 "this agent is no longer listed — esc to close.",
                 dim(),
             ))],
-            // A live agent with nothing to answer — the pane is a read-only
-            // transcript viewer (the pulse, or an idle/finished worker), so
-            // there's no footer: the absent input area speaks for itself.
-            Some(r) if r.ask.is_none() => vec![],
-            Some(r) => {
-                let a = r.ask.expect("ask present");
-                let mut v: Vec<Line<'static>> = vec![
-                    Line::from(Span::styled("── ask ──", dim())),
-                    Line::from(vec![
-                        Span::styled("worker: ", dim()),
-                        Span::raw(a.worker.clone()),
-                    ]),
-                    Line::from(""),
-                ];
-                // Render the ask prompt as Markdown, lifting the borrowed lines
-                // to owned so the LogView can cache them.
-                for line in tui_markdown::from_str(&a.prompt).lines {
-                    v.push(logview::static_line(&line));
-                }
-                if !a.reference.is_empty() {
-                    v.push(Line::from(""));
-                    v.push(Line::from(vec![
-                        Span::styled("ref: ", dim()),
-                        Span::raw(a.reference.clone()),
-                    ]));
-                }
-                if !a.options.is_empty() {
-                    v.push(Line::from(vec![
-                        Span::styled("options: ", dim()),
-                        Span::raw(a.options.join(", ")),
-                    ]));
-                }
-                v
-            }
+            Some(_) => vec![],
         };
-        // The LogView paints tail lines verbatim (the log grid is fixed-width),
-        // so word-wrap the ask to the pane first — long prompts stay readable.
-        let tail = wrap_lines(tail, content.width as usize);
 
         self.log.render(frame, content, &tail, true);
+        if ask_h > 0 {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_style(dim())
+                .title(Span::styled(" ask ", dim()));
+            let field = block.inner(ask_area);
+            frame.render_widget(block, ask_area);
+            let visible = field.height as usize;
+            let shown: Vec<Line<'static>> = if ask_lines.len() > visible {
+                let mut v = ask_lines[ask_lines.len() - visible..].to_vec();
+                if let Some(first) = v.first_mut() {
+                    *first = Line::from(Span::styled("…", dim()));
+                }
+                v
+            } else {
+                ask_lines
+            };
+            frame.render_widget(Paragraph::new(shown), field);
+        }
         if let Some(mode) = mode {
             self.draw_input(frame, input_area, mode);
         }
     }
 
     /// The always-focused editor pinned along the bottom of the detail pane: a
-    /// `┈` separator row above a single `› …` input line. Its placeholder
-    /// reflects the `mode` — answering a pending ask vs. steering a live worker.
+    /// single input line in a bordered box. Its WHITE border (vs. the dim
+    /// ask box above) marks it as the focused element — where typing lands.
+    /// Its placeholder reflects the `mode` — answering a pending ask vs.
+    /// steering a live worker.
     fn draw_input(&self, frame: &mut Frame, area: Rect, mode: InputMode) {
-        let sep = Block::default().borders(Borders::TOP).border_style(dim());
-        let field = sep.inner(area);
-        frame.render_widget(sep, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::White));
+        let field = block.inner(area);
+        frame.render_widget(block, area);
         if field.height == 0 {
             return;
         }
-        // Single non-wrapping line: `› ` prompt (2 cols) + text + block cursor
-        // (1 col). If the answer overflows, show its TAIL (chars, not bytes) so
-        // the caret stays visible — horizontal scroll rather than run-off.
-        let avail = (field.width as usize).saturating_sub(3);
+        // Single non-wrapping line: text + block cursor (1 col). If the answer
+        // overflows, show its TAIL (chars, not bytes) so the caret stays
+        // visible — horizontal scroll rather than run-off.
+        let avail = (field.width as usize).saturating_sub(1);
         let chars: Vec<char> = self.input.chars().collect();
         let shown: String = if chars.len() > avail {
             chars[chars.len() - avail..].iter().collect()
         } else {
             self.input.clone()
         };
-        let mut spans = vec![Span::styled("› ", dim())];
+        let mut spans = Vec::new();
         if self.input.is_empty() {
             // Block cursor first, then a dim placeholder so the field reads as
             // focused and self-explanatory before anything is typed.
@@ -1161,8 +1165,21 @@ impl App {
         frame.render_widget(Paragraph::new(Line::from(spans)), field);
     }
 
-    fn draw_footer(&self, frame: &mut Frame, area: Rect) {
+    /// The one-line status bar pinned along the TOP of the screen: the filter
+    /// badge, the last outcome (an error or an "answered X" note), and the key
+    /// hints, led by an inverse-video ` looop ` brand tag on the far left. Top
+    /// rather than bottom so it never competes with the input row — the bottom
+    /// of the screen is where you type, the top is where you read the mode.
+    fn draw_status(&self, frame: &mut Frame, area: Rect) {
         let style = Style::default().bg(SURFACE).fg(Color::White);
+        // Inverse-video brand tag: white bg, dark text, bold.
+        let brand = Span::styled(
+            " looop ",
+            Style::default()
+                .bg(Color::White)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        );
         // The filter badge (with any hidden-worker count) leads the hint line,
         // mirroring `looop watch`'s selector footer.
         let fname = match self.filter {
@@ -1191,7 +1208,10 @@ impl App {
                 ),
             },
         };
-        frame.render_widget(Paragraph::new(Span::styled(help, style)).style(style), area);
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![brand, Span::styled(help, style)])).style(style),
+            area,
+        );
     }
 }
 
