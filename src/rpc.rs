@@ -27,7 +27,7 @@
 //! session ends exactly when the agent does.
 
 use crate::cli::RpcBridgeArgs;
-use crate::util::{cyan, dim, hms, red, rst};
+use crate::util::{dim, hms, red, rst};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -215,7 +215,8 @@ fn render_event(
             } else {
                 format!("{}: {}{}", dim(), collapsed, rst())
             };
-            let _ = writeln!(out, "{}{}→ {}{}{}", stamp(), cyan(), name, rst(), argpart);
+            // Whole line dim: tool lines are background progress, not signal.
+            let _ = writeln!(out, "{}{}→ {}{}{}", stamp(), dim(), name, rst(), argpart);
             *at_line_start = true;
             let _ = out.flush();
         }
@@ -230,7 +231,18 @@ fn render_event(
                 .get("toolName")
                 .and_then(Value::as_str)
                 .unwrap_or("tool");
-            let _ = writeln!(out, "{}{}✗ {} failed{}", stamp(), red(), name, rst());
+            // Red carries the failure signal on the `✗` alone; the tool name
+            // stays dim like every other tool line.
+            let _ = writeln!(
+                out,
+                "{}{}✗ {}{}{} failed{}",
+                stamp(),
+                red(),
+                rst(),
+                dim(),
+                name,
+                rst()
+            );
             *at_line_start = true;
             let _ = out.flush();
         }

@@ -9,7 +9,7 @@
 /// Used in-process by `runner::run_streamed` to turn the tick runner's raw
 /// stream into the friendly progress lines archived to runs/<id>/output.log.
 pub(crate) fn format_line(line: &str) -> Option<String> {
-    use crate::util::{cyan, dim, red, rst};
+    use crate::util::{dim, red, rst};
     let Ok(e) = serde_json::from_str::<serde_json::Value>(line) else {
         // Non-JSON: pass through unchanged, but swallow empty lines.
         return if line.is_empty() {
@@ -36,11 +36,21 @@ pub(crate) fn format_line(line: &str) -> Option<String> {
             } else {
                 format!("{}: {}{}", dim(), collapsed, rst())
             };
-            Some(format!("  {}→ {}{}{}", cyan(), name, rst(), argpart))
+            // Whole line dim: tool lines are background progress, not signal.
+            Some(format!("  {}→ {}{}{}", dim(), name, rst(), argpart))
         }
         "tool_execution_end" if e.get("isError").and_then(|b| b.as_bool()).unwrap_or(false) => {
             let name = e.get("toolName").and_then(|t| t.as_str()).unwrap_or("tool");
-            Some(format!("  {}✗ {} failed{}", red(), name, rst()))
+            // Red carries the failure signal on the `✗` alone; the tool name
+            // stays dim like every other tool line.
+            Some(format!(
+                "  {}✗ {}{}{} failed{}",
+                red(),
+                rst(),
+                dim(),
+                name,
+                rst()
+            ))
         }
         "message_end"
             if e.pointer("/message/role").and_then(|r| r.as_str()) == Some("assistant") =>
