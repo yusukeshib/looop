@@ -106,10 +106,14 @@ pub fn cmd_rpc_bridge(args: &RpcBridgeArgs) -> Result<ExitCode> {
     let mut at_line_start = true;
     for line in BufReader::new(child_stdout).lines() {
         let Ok(line) = line else { break };
+        // `lines()` strips `\n` but leaves a trailing `\r` if the child emits
+        // CRLF; drop it so strict JSONL parsing doesn't choke on the carriage
+        // return (which would silently drop the event).
+        let line = line.strip_suffix('\r').unwrap_or(line.as_str());
         if line.is_empty() {
             continue;
         }
-        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
             continue; // Non-JSON on the JSONL channel: ignore (stderr carries logs).
         };
         render_event(&event, &streaming, &mut out, &mut at_line_start);
@@ -120,9 +124,25 @@ pub fn cmd_rpc_bridge(args: &RpcBridgeArgs) -> Result<ExitCode> {
     let _ = out.flush();
 
     let status = child.wait().context("waiting on rpc agent")?;
-    Ok(ExitCode::from(
-        status.code().unwrap_or(0).clamp(0, 255) as u8
-    ))
+    Ok(exit_code_of(&status))
+}
+
+/// Map the child's exit status to an `ExitCode`. A normal exit forwards its
+/// code (clamped to a byte); termination by signal carries no exit code, so we
+/// report `128 + signal` (the shell convention) rather than a spurious `0`,
+/// which would let the supervisor treat an abnormal kill as a clean exit.
+fn exit_code_of(status: &std::process::ExitStatus) -> ExitCode {
+    if let Some(code) = status.code() {
+        return ExitCode::from(code.clamp(0, 255) as u8);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return ExitCode::from((128 + sig).clamp(0, 255) as u8);
+        }
+    }
+    ExitCode::from(1)
 }
 
 /// Write one RPC command object (`{"type": <verb>, "message": <text>}`) as a
@@ -225,5 +245,88 @@ fn fresh_line(out: &mut impl Write, at_line_start: &mut bool) {
         let _ = writeln!(out);
         *at_line_start = true;
         let _ = out.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn write_command_emits_one_jsonl_record() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_command(&mut buf, "prompt", "hello").unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.ends_with('\n'), "must be newline-terminated JSONL");
+        let v: Value = serde_json::from_str(s.trim_end()).unwrap();
+        assert_eq!(v["type"], "prompt");
+        assert_eq!(v["message"], "hello");
+    }
+
+    #[test]
+    fn write_command_escapes_embedded_newlines() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_command(&mut buf, "steer", "line1\nline2 \"q\"").unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        // Exactly one framing newline: the embedded newline stays JSON-escaped.
+        assert_eq!(s.matches('\n').count(), 1);
+        let v: Value = serde_json::from_str(s.trim_end()).unwrap();
+        assert_eq!(v["type"], "steer");
+        assert_eq!(v["message"], "line1\nline2 \"q\"");
+    }
+
+    /// Render one event from a clean line start; return (output, streaming, at_line_start).
+    fn render(event: &Value) -> (String, bool, bool) {
+        let streaming = AtomicBool::new(false);
+        let mut out: Vec<u8> = Vec::new();
+        let mut at_line_start = true;
+        render_event(event, &streaming, &mut out, &mut at_line_start);
+        (
+            String::from_utf8(out).unwrap(),
+            streaming.load(Ordering::Relaxed),
+            at_line_start,
+        )
+    }
+
+    #[test]
+    fn text_delta_streams_verbatim_and_tracks_cursor() {
+        let ev = serde_json::json!({
+            "type": "message_update",
+            "assistantMessageEvent": { "type": "text_delta", "delta": "hi there" }
+        });
+        let (out, _, at_line_start) = render(&ev);
+        assert_eq!(out, "hi there");
+        assert!(!at_line_start, "cursor sits mid-line after non-newline text");
+    }
+
+    #[test]
+    fn text_delta_trailing_newline_marks_line_start() {
+        let ev = serde_json::json!({
+            "type": "message_update",
+            "assistantMessageEvent": { "type": "text_delta", "delta": "done\n" }
+        });
+        let (out, _, at_line_start) = render(&ev);
+        assert_eq!(out, "done\n");
+        assert!(at_line_start);
+    }
+
+    #[test]
+    fn tool_execution_start_formats_arrow_line() {
+        let ev = serde_json::json!({
+            "type": "tool_execution_start",
+            "toolName": "bash",
+            "args": { "command": "ls -la" }
+        });
+        // Colors are off unless init_color() runs, so the line is plain text.
+        let (out, _, at_line_start) = render(&ev);
+        assert_eq!(out, "  → bash: ls -la\n");
+        assert!(at_line_start);
+    }
+
+    #[test]
+    fn turn_start_sets_streaming() {
+        let ev = serde_json::json!({ "type": "turn_start" });
+        let (_, streaming, _) = render(&ev);
+        assert!(streaming);
     }
 }
