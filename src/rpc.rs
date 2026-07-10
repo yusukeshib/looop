@@ -27,7 +27,7 @@
 //! session ends exactly when the agent does.
 
 use crate::cli::RpcBridgeArgs;
-use crate::util::{cyan, dim, red, rst};
+use crate::util::{cyan, dim, hms, red, rst};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -179,17 +179,16 @@ fn render_event(
             };
             let dty = delta.get("type").and_then(Value::as_str).unwrap_or("");
             match dty {
-                // Stream the assistant's visible text verbatim as it arrives.
+                // Stream the assistant's visible text as it arrives, stamping
+                // the start of every line so prose reads like the pulse log
+                // (`[HH:MM:SS] <line>`) rather than an unstamped wall of text.
                 "text_delta" => {
                     if let Some(s) = delta.get("delta").and_then(Value::as_str) {
-                        let _ = write!(out, "{s}");
-                        if let Some(last) = s.chars().last() {
-                            *at_line_start = last == '\n';
-                        }
-                        let _ = out.flush();
+                        write_streamed(out, at_line_start, s);
                     }
                 }
-                // A new assistant text block: make sure it starts on its own line.
+                // A new assistant block: just open on a clean line; the per-line
+                // stamping above supplies the `[HH:MM:SS] ` prefix.
                 "text_start" => fresh_line(out, at_line_start),
                 _ => {} // thinking/toolcall deltas: tool lines come from tool_execution_*.
             }
@@ -216,7 +215,7 @@ fn render_event(
             } else {
                 format!("{}: {}{}", dim(), collapsed, rst())
             };
-            let _ = writeln!(out, "  {}→ {}{}{}", cyan(), name, rst(), argpart);
+            let _ = writeln!(out, "{}{}→ {}{}{}", stamp(), cyan(), name, rst(), argpart);
             *at_line_start = true;
             let _ = out.flush();
         }
@@ -231,12 +230,38 @@ fn render_event(
                 .get("toolName")
                 .and_then(Value::as_str)
                 .unwrap_or("tool");
-            let _ = writeln!(out, "  {}✗ {} failed{}", red(), name, rst());
+            let _ = writeln!(out, "{}{}✗ {} failed{}", stamp(), red(), name, rst());
             *at_line_start = true;
             let _ = out.flush();
         }
         _ => {}
     }
+}
+
+/// The dim `[HH:MM:SS] ` prefix the tick runner stamps on every rendered line
+/// (`runner::run_streamed`). Mirrored here so an RPC worker's transcript reads
+/// identically to the pulse's own log instead of drifting into a second style.
+fn stamp() -> String {
+    format!("{}[{}]{} ", dim(), hms(), rst())
+}
+
+/// Stream `s` to `out`, prefixing the start of every non-empty line with the
+/// `[HH:MM:SS] ` stamp. Tracks `at_line_start` ACROSS calls so a line split
+/// over several `text_delta` chunks is stamped once, at its true start. A bare
+/// newline (blank line) is passed through unstamped so paragraph breaks stay
+/// clean.
+fn write_streamed(out: &mut impl Write, at_line_start: &mut bool, s: &str) {
+    for ch in s.chars() {
+        if *at_line_start && ch != '\n' {
+            let _ = write!(out, "{}", stamp());
+            *at_line_start = false;
+        }
+        let _ = write!(out, "{ch}");
+        if ch == '\n' {
+            *at_line_start = true;
+        }
+    }
+    let _ = out.flush();
 }
 
 /// Emit a newline unless the cursor is already at the start of a line.
@@ -295,7 +320,9 @@ mod tests {
             "assistantMessageEvent": { "type": "text_delta", "delta": "hi there" }
         });
         let (out, _, at_line_start) = render(&ev);
-        assert_eq!(out, "hi there");
+        // The line start is stamped (pulse style); the text follows verbatim.
+        assert!(out.starts_with('['), "stamped line start, got {out:?}");
+        assert!(out.ends_with("hi there"), "verbatim text, got {out:?}");
         assert!(
             !at_line_start,
             "cursor sits mid-line after non-newline text"
@@ -309,7 +336,23 @@ mod tests {
             "assistantMessageEvent": { "type": "text_delta", "delta": "done\n" }
         });
         let (out, _, at_line_start) = render(&ev);
-        assert_eq!(out, "done\n");
+        assert!(out.starts_with('['), "stamped, got {out:?}");
+        assert!(out.ends_with("done\n"), "verbatim text, got {out:?}");
+        assert!(at_line_start);
+    }
+
+    #[test]
+    fn text_delta_stamps_each_line() {
+        // Multi-line prose gets one stamp per non-empty line (pulse style).
+        let ev = serde_json::json!({
+            "type": "message_update",
+            "assistantMessageEvent": { "type": "text_delta", "delta": "one\ntwo\n" }
+        });
+        let (out, _, at_line_start) = render(&ev);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 2, "two stamped lines, got {out:?}");
+        assert!(lines[0].starts_with('[') && lines[0].ends_with("one"));
+        assert!(lines[1].starts_with('[') && lines[1].ends_with("two"));
         assert!(at_line_start);
     }
 
@@ -321,8 +364,27 @@ mod tests {
             "args": { "command": "ls -la" }
         });
         // Colors are off unless init_color() runs, so the line is plain text.
+        // A dim `[HH:MM:SS] ` stamp (real wall-clock, mirroring the pulse) leads
+        // the line, so assert on the stable suffix rather than the full string.
         let (out, _, at_line_start) = render(&ev);
-        assert_eq!(out, "  → bash: ls -la\n");
+        assert!(out.ends_with("→ bash: ls -la\n"), "arrow line, got {out:?}");
+        assert!(
+            out.starts_with('['),
+            "line is timestamp-stamped, got {out:?}"
+        );
+        assert!(at_line_start);
+    }
+
+    #[test]
+    fn text_start_on_clean_line_is_noop() {
+        // text_start only guarantees a clean line; the per-line stamping in
+        // text_delta supplies the prefix, so from a fresh line it emits nothing.
+        let ev = serde_json::json!({
+            "type": "message_update",
+            "assistantMessageEvent": { "type": "text_start" }
+        });
+        let (out, _, at_line_start) = render(&ev);
+        assert_eq!(out, "", "clean-line text_start is a noop, got {out:?}");
         assert!(at_line_start);
     }
 
