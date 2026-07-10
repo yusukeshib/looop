@@ -407,15 +407,16 @@ impl App {
             ask: None,
         }];
 
-        // Worker agents. A pending ask (answerable) or a live worker is ALWAYS
-        // shown; a dead worker with nothing waiting is subject to the filter
-        // (Active hides it, All keeps it).
+        // Worker agents. A live worker is ALWAYS shown. A pending ask is only
+        // *answerable* while its worker is alive to consume the answer, so a
+        // dead worker's lingering ask does NOT force the row on — it's a
+        // stranded ask that needs a re-spawn, not an answer, and is subject to
+        // the filter like any other dead worker (Active hides it, All keeps it).
         let mut wrows: Vec<AgentRow> = Vec::new();
         let mut hidden = 0usize;
         for s in workers {
             let ask = ask_by_worker.remove(&s.id);
-            let keep = ask.is_some()
-                || s.alive
+            let keep = s.alive
                 || match self.filter {
                     Filter::All => true,
                     Filter::Active => false,
@@ -911,7 +912,7 @@ impl App {
             .rows
             .iter()
             .map(|r| {
-                let (state, state_style) = self.state_cell(r);
+                let (state, state_style) = Self::state_cell(r);
                 let row = Row::new(vec![
                     Cell::from(r.id.clone()),
                     Cell::from(r.age.clone()).style(dim),
@@ -989,21 +990,29 @@ impl App {
         });
     }
 
-    /// The STATE cell for an agent row: an agent with a pending ask reads
+    /// The STATE cell for an agent row: a LIVE agent with a pending ask reads
     /// `pending` (bold yellow) so the row awaiting a human answer stands out.
+    /// A DEAD worker still holding an (un-answerable) ask reads `gone` (dim).
     /// Otherwise the pulse reads `live` (green) / `down` (red); a worker reads
-    /// `running` (green), its recorded exit state (`killed` red, others dim),
-    /// or `gone` (dim) when reaped out from under a lingering ask.
-    fn state_cell(&self, row: &AgentRow) -> (String, Style) {
+    /// `running` (green) or its recorded exit state (`killed` red, others dim).
+    fn state_cell(row: &AgentRow) -> (String, Style) {
         // A pending ask is what a human must act on — surface it as its own
         // attention state (bold yellow), overriding the underlying liveness.
-        if row.ask.is_some() {
+        // But only while the agent is ALIVE to consume the answer: a live
+        // worker (or the always-live pulse) with an ask reads `pending`.
+        if row.ask.is_some() && (row.alive || row.is_pulse) {
             return (
                 "pending".to_string(),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             );
+        }
+        // A DEAD worker still holding an ask: the answer can never be
+        // delivered (no live process reads it), so it is NOT `pending`. Read
+        // it as `gone` (dim) — a stranded ask that needs a re-spawn.
+        if row.ask.is_some() {
+            return ("gone".to_string(), Style::default().fg(Color::DarkGray));
         }
         let color = if row.alive {
             Color::Green
@@ -1291,5 +1300,63 @@ mod tests {
         let out = wrap_lines(lines.clone(), 0);
         assert_eq!(out.len(), 1);
         assert_eq!(plain(&out[0]), "anything");
+    }
+
+    fn row(is_pulse: bool, alive: bool, state: &str, ask: bool) -> AgentRow {
+        AgentRow {
+            id: "w".to_string(),
+            is_pulse,
+            alive,
+            state: state.to_string(),
+            age: String::new(),
+            idle: None,
+            ask: ask.then(|| Ask {
+                id: "w-1".to_string(),
+                worker: "w".to_string(),
+                prompt: "q".to_string(),
+                reference: String::new(),
+                options: vec![],
+                ts: 0,
+            }),
+        }
+    }
+
+    #[test]
+    fn state_cell_live_worker_with_ask_is_pending() {
+        let (label, style) = App::state_cell(&row(false, true, "running", true));
+        assert_eq!(label, "pending");
+        assert_eq!(style.fg, Some(Color::Yellow));
+        assert!(style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn state_cell_pulse_with_ask_is_pending() {
+        // The pulse is always live, so its ask is answerable → pending.
+        let (label, _) = App::state_cell(&row(true, true, "live", true));
+        assert_eq!(label, "pending");
+    }
+
+    #[test]
+    fn state_cell_dead_worker_with_ask_is_gone_not_pending() {
+        // The reboot bug: a dead worker still holding an ask must NOT read
+        // `pending` (its answer can never be delivered) — it reads `gone`.
+        let (label, style) = App::state_cell(&row(false, false, "exited", true));
+        assert_eq!(label, "gone");
+        assert_eq!(style.fg, Some(Color::DarkGray));
+        assert!(!style.add_modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
+    fn state_cell_dead_worker_no_ask_shows_recorded_state() {
+        let (label, style) = App::state_cell(&row(false, false, "killed", false));
+        assert_eq!(label, "killed");
+        assert_eq!(style.fg, Some(Color::Red));
+    }
+
+    #[test]
+    fn state_cell_live_worker_no_ask_is_running() {
+        let (label, style) = App::state_cell(&row(false, true, "running", false));
+        assert_eq!(label, "running");
+        assert_eq!(style.fg, Some(Color::Green));
     }
 }
