@@ -4,6 +4,7 @@
 
 use crate::mailbox;
 use crate::paths::Paths;
+use crate::session;
 use crate::store::{Collection, FileStore, Key, StateStore};
 use crate::util;
 use std::fmt::Write as _;
@@ -100,11 +101,18 @@ Every action ALSO takes:
      changed — use it for a time-based follow-up ("re-check in N seconds"), since
      an unchanged world otherwise skips the AI entirely.
 
-PENDING ASKS are workers BLOCKED waiting for a HUMAN answer (via `looop _ ask`).
-They are NOT yours to answer — the human answers them (out of band, through
-whatever client they run). Do not re-dispatch or duplicate work a worker is
-already blocked on; surfacing a blocker to the human happens outside looop, not
-via a duplicate worker.
+PENDING ASKS are asks raised via `looop _ ask` and not yet answered. They are
+NOT yours to answer — the human answers them out of band. Each ask is tagged
+LIVE or STRANDED:
+  • LIVE — the asking worker is still alive and blocked on the human. Do NOT
+    re-dispatch or duplicate work it is already blocked on; the human answers it
+    out of band and the worker resumes.
+  • STRANDED — the asking worker is DEAD (exited/crashed/killed, e.g. after a
+    reboot). Its answer can NEVER be delivered — no live process will consume
+    it, so a human answer is inert. A stranded ask is NOT a reason to noop: if
+    the underlying goal still needs the work, re-dispatch a FRESH worker for it
+    (it can read the prior `reports/*.md` for context and re-raise the ask as a
+    LIVE worker). Treat STRANDED asks as work to resume, not as blockers.
 
 Two of the SENSOR READINGS are looop's OWN state (system sensors, not
 sensors/*.sh):
@@ -201,8 +209,21 @@ pub fn build_prompt(paths: &Paths, snap_dir: &Path) -> String {
     if asks.is_empty() {
         out.push_str("(none)\n");
     } else {
+        // A pending ask only blocks a LIVE worker; a dead worker's ask is
+        // STRANDED (its answer can never be delivered) and must not suppress
+        // re-dispatch. Collect the alive worker ids once to tag each ask.
+        let alive: std::collections::HashSet<String> = session::list_workers(paths)
+            .into_iter()
+            .filter(|s| s.alive)
+            .map(|s| s.id)
+            .collect();
         for a in asks {
-            let _ = writeln!(out, "--- {} (worker {})", a.id, a.worker);
+            let tag = if alive.contains(&a.worker) {
+                "LIVE — blocked on human"
+            } else {
+                "STRANDED — worker DEAD, answer inert; re-dispatch a fresh worker"
+            };
+            let _ = writeln!(out, "--- {} (worker {} — {tag})", a.id, a.worker);
             let _ = writeln!(out, "{}", a.prompt);
             if !a.reference.is_empty() {
                 let _ = writeln!(out, "reference: {}", a.reference);
@@ -290,6 +311,39 @@ mod tests {
         let out = build_prompt(&p, &p.snapshots_dir());
         assert!(out.contains("triage-1"));
         assert!(out.contains("merge PR?"));
+    }
+
+    #[test]
+    fn dead_worker_ask_is_tagged_stranded_not_a_blocker() {
+        // The reboot deadlock: an ask whose worker has no live session must be
+        // surfaced as STRANDED so the decider re-dispatches instead of noop'ing
+        // forever waiting for an answer no live process can consume.
+        let p = fixture(); // no live sessions registered
+        fs::write(
+            p.asks_dir().join("triage-1.json"),
+            serde_json::json!({"id":"triage-1","worker":"triage","prompt":"merge PR?","ts":1})
+                .to_string(),
+        )
+        .unwrap();
+        let out = build_prompt(&p, &p.snapshots_dir());
+        // The ask line for the dead worker is tagged STRANDED, not LIVE.
+        let ask_line = out
+            .lines()
+            .find(|l| l.contains("triage-1") && l.contains("worker triage"))
+            .expect("ask line present");
+        assert!(
+            ask_line.contains("STRANDED"),
+            "dead-worker ask must be STRANDED: {ask_line}"
+        );
+        assert!(
+            !ask_line.contains("LIVE"),
+            "dead-worker ask must not be LIVE: {ask_line}"
+        );
+        // The instructions tell the decider a STRANDED ask is work to resume.
+        assert!(
+            out.contains("re-dispatch a FRESH worker"),
+            "instructions must tell the decider to re-dispatch stranded asks"
+        );
     }
 
     #[test]
