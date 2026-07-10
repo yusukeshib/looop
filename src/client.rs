@@ -1059,8 +1059,9 @@ impl App {
         // is known; cap the box at half the pane so a long ask can't evict the
         // transcript. When the prompt overflows the cap, show its TAIL (the
         // question conventionally comes last) with a dim `…` marker on top.
-        let ask = self.selected().and_then(|r| r.ask.clone());
-        let ask_lines: Vec<Line<'static>> = match &ask {
+        // Borrow the pending ask rather than cloning it — we only need its
+        // prompt to lay out owned lines, so the borrow ends with this match.
+        let ask_lines: Vec<Line<'static>> = match self.selected().and_then(|r| r.ask.as_ref()) {
             Some(a) => {
                 // Render the prompt as Markdown, lifting the borrowed lines to
                 // owned; wrap to the box interior (borders take 2 columns).
@@ -1072,11 +1073,21 @@ impl App {
             }
             None => vec![],
         };
+        // A bordered box needs at least 3 rows (2 borders + 1 content line).
+        // Cap it at half the pane so a long ask can't evict the transcript,
+        // but never let it exceed the space actually left below the input —
+        // and skip it entirely when there's no room for a box at all, else
+        // the ask_area would extend past `inner` and clip/overlap the input.
         let ask_h: u16 = if ask_lines.is_empty() {
             0
         } else {
-            let cap = (inner.height.saturating_sub(input_h) / 2).max(3);
-            (ask_lines.len() as u16 + 2).min(cap)
+            let avail = inner.height.saturating_sub(input_h);
+            if avail < 3 {
+                0
+            } else {
+                let cap = (avail / 2).max(3).min(avail);
+                (ask_lines.len() as u16 + 2).min(cap)
+            }
         };
 
         let content = Rect {
