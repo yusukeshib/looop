@@ -208,6 +208,15 @@ pub fn cmd_answer(paths: &Paths, args: &crate::cli::AnswerArgs) -> Result<ExitCo
         rest.join(" ")
     };
     crate::contract::LocalContract::new(paths).answer(&args.ask_id, &text, args.force)?;
+    // CLI-only feedback: the core is transport-agnostic (no stdout), so the
+    // confirmation line is emitted HERE, not in `answer()`. A TUI client (which
+    // calls the core directly) must not have a stray println corrupt its screen.
+    util::event(
+        util::Level::Ok,
+        "answer",
+        &format!("{}: {text}", args.ask_id),
+        &[("ask_id", serde_json::json!(args.ask_id))],
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -234,12 +243,6 @@ pub(crate) fn answer(paths: &Paths, ask_id: &str, text: &str, force: bool) -> Re
         &Key::Answer(ask_id.to_string()),
         &serde_json::to_string_pretty(&body)?,
     )?;
-    util::event(
-        util::Level::Ok,
-        "answer",
-        &format!("{ask_id}: {text}"),
-        &[("ask_id", serde_json::json!(ask_id))],
-    );
     Ok(())
 }
 
