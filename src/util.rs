@@ -75,9 +75,9 @@ code!(rst, "\x1b[0m");
 code!(dim, "\x1b[2m");
 code!(b, "\x1b[1m");
 code!(cyan, "\x1b[36m");
-code!(grn, "\x1b[32m");
 code!(red, "\x1b[31m");
 code!(yel, "\x1b[33m");
+code!(wht, "\x1b[97m");
 
 /// Severity of a structured log line — picks the human color and rides along as
 /// the `level` field in JSON mode.
@@ -87,7 +87,7 @@ pub enum Level {
     Info,
     /// A step of the beat is starting (cyan).
     Step,
-    /// Success (green).
+    /// Success / a decision (bright white).
     Ok,
     /// Non-fatal caution (yellow).
     Warn,
@@ -109,7 +109,7 @@ impl Level {
         match self {
             Level::Info => "",
             Level::Step => cyan(),
-            Level::Ok => grn(),
+            Level::Ok => wht(),
             Level::Warn => yel(),
             Level::Error => red(),
         }
@@ -142,7 +142,7 @@ pub fn event(level: Level, event: &str, msg: &str, fields: &[(&str, serde_json::
     // the level color (bold for the strongest signals) so it carries the
     // importance the glyph used to.
     let c = level.color();
-    let bold = if matches!(level, Level::Ok | Level::Error) {
+    let bold = if matches!(level, Level::Error) {
         b()
     } else {
         ""
