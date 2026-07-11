@@ -45,6 +45,9 @@ enum Ev {
     Line(String),
     Ask(String),
     Answer(String),
+    /// A human message typed at the bridge (what `looop _ send` writes), echoed
+    /// into the transcript so a steer to a live worker shows up as a turn.
+    Send(String),
     Eof,
 }
 
@@ -84,7 +87,16 @@ pub fn cmd_rpc_bridge(args: &RpcBridgeArgs) -> Result<ExitCode> {
     // prompt/steer. It owns child_stdin for its whole life. This thread is a
     // daemon — when the OUT loop returns (child gone) the process exits and
     // takes it down, so it may sit blocked on `read_line` without leaking.
+    // Everything that reaches the PTY funnels through ONE writer (the OUT loop
+    // below) via a channel, so the child's events, the human's sends, and the
+    // mailbox turns can never interleave into half-lines. Producers: the IN
+    // thread (echoing sends), the child-stdout reader, and the mailbox watcher.
+    let (tx, rx) = channel::<Ev>();
+
+    // IN thread: seed the first prompt, then forward each typed stdin line as a
+    // prompt/steer AND echo it into the transcript as a `send` turn.
     let stdin_streaming = Arc::clone(&streaming);
+    let in_tx = tx.clone();
     thread::spawn(move || {
         if write_command(&mut child_stdin, "prompt", &prompt).is_err() {
             return;
@@ -110,14 +122,11 @@ pub fn cmd_rpc_bridge(args: &RpcBridgeArgs) -> Result<ExitCode> {
             if write_command(&mut child_stdin, verb, text).is_err() {
                 return;
             }
+            // Show it in the transcript (the reply to an ASK arrives via the
+            // mailbox watcher; this covers free-form `_ send` to a live worker).
+            let _ = in_tx.send(Ev::Send(text.to_string()));
         }
     });
-
-    // Everything that reaches the PTY funnels through ONE writer (this thread)
-    // via a channel, so the child's events and the mailbox turns can never
-    // interleave into half-lines. Two producers feed it: the child-stdout
-    // reader and the mailbox watcher.
-    let (tx, rx) = channel::<Ev>();
 
     // Child stdout reader → one Ev::Line per JSONL record, then Ev::Eof.
     let ctx = tx.clone();
@@ -154,6 +163,7 @@ pub fn cmd_rpc_bridge(args: &RpcBridgeArgs) -> Result<ExitCode> {
             }
             Ev::Ask(prompt) => render_turn(&mut out, &mut at_line_start, "ask", yel(), &prompt),
             Ev::Answer(text) => render_turn(&mut out, &mut at_line_start, "answer", cyan(), &text),
+            Ev::Send(text) => render_turn(&mut out, &mut at_line_start, "send", cyan(), &text),
         }
     }
     if !at_line_start {
