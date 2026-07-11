@@ -361,6 +361,34 @@ impl Drop for Spinner {
     }
 }
 
+/// Sleep `secs`, showing a live one-line COUNTDOWN on the pulse's PTY stdout
+/// (`[HH:MM:SS] next beat in Ns (<suffix>)`) that repaints each second and is
+/// erased when it reaches zero, so the next beat prints clean — the idle-wait
+/// counterpart of [`Spinner`]. A no-op decoration unless color (ANSI) is on:
+/// JSON / `NO_COLOR` / non-PTY streams just sleep silently (their structured
+/// `sleep` event is emitted separately), never seeing stray carriage returns.
+pub fn sleep_countdown(secs: u64, suffix: &str) {
+    if !color_on() {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        return;
+    }
+    // Freeze the timestamp at the start (like the spinner) so the line reads as
+    // "the beat logged at [ts], next one in Ns".
+    let ts = hms();
+    for remaining in (1..=secs).rev() {
+        // CR + clear-to-EOL so a shrinking count (60s → 9s) leaves no stale digit.
+        print!(
+            "\r\x1b[2K{}[{ts}] next beat in {remaining}s ({suffix}){}",
+            dim(),
+            rst()
+        );
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    print!("\r\x1b[2K");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
