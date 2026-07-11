@@ -15,7 +15,7 @@
 //!                        pi --mode rpc <flags>
 //!
 //! * OUT (child stdout → PTY): each JSONL event is rendered to readable text
-//!   (streaming assistant deltas, `→ tool: args`, `✗ tool failed`, …) so the
+//!   (streaming assistant deltas, `tool: args`, `tool failed`, …) so the
 //!   log/watch/client transcript reads like an interactive agent.
 //! * IN (PTY → child stdin): the initial prompt (from `--prompt-file`) is sent
 //!   as a `prompt` command; any later line typed at the bridge's stdin (what
@@ -27,7 +27,7 @@
 //! session ends exactly when the agent does.
 
 use crate::cli::RpcBridgeArgs;
-use crate::util::{dim, hms, red, rst};
+use crate::util::{b, dim, hms, red, rst};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -216,7 +216,8 @@ fn render_event(
                 format!("{}: {}{}", dim(), collapsed, rst())
             };
             // Whole line dim: tool lines are background progress, not signal.
-            let _ = writeln!(out, "{}{}→ {}{}{}", stamp(), dim(), name, rst(), argpart);
+            // No glyph — the dim color alone marks it as background.
+            let _ = writeln!(out, "{}{}{}{}{}", stamp(), dim(), name, rst(), argpart);
             *at_line_start = true;
             let _ = out.flush();
         }
@@ -231,18 +232,9 @@ fn render_event(
                 .get("toolName")
                 .and_then(Value::as_str)
                 .unwrap_or("tool");
-            // Red carries the failure signal on the `✗` alone; the tool name
-            // stays dim like every other tool line.
-            let _ = writeln!(
-                out,
-                "{}{}✗ {}{}{} failed{}",
-                stamp(),
-                red(),
-                rst(),
-                dim(),
-                name,
-                rst()
-            );
+            // No glyph — the failure signal rides on the text color (red +
+            // bold), mirroring the pulse's Error lines.
+            let _ = writeln!(out, "{}{}{}{} failed{}", stamp(), red(), b(), name, rst());
             *at_line_start = true;
             let _ = out.flush();
         }
@@ -369,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_execution_start_formats_arrow_line() {
+    fn tool_execution_start_formats_tool_line() {
         let ev = serde_json::json!({
             "type": "tool_execution_start",
             "toolName": "bash",
@@ -379,7 +371,7 @@ mod tests {
         // A dim `[HH:MM:SS] ` stamp (real wall-clock, mirroring the pulse) leads
         // the line, so assert on the stable suffix rather than the full string.
         let (out, _, at_line_start) = render(&ev);
-        assert!(out.ends_with("→ bash: ls -la\n"), "arrow line, got {out:?}");
+        assert!(out.ends_with("bash: ls -la\n"), "tool line, got {out:?}");
         assert!(
             out.starts_with('['),
             "line is timestamp-stamped, got {out:?}"
