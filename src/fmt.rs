@@ -9,7 +9,7 @@
 /// Used in-process by `runner::run_streamed` to turn the tick runner's raw
 /// stream into the friendly progress lines archived to runs/<id>/output.log.
 pub(crate) fn format_line(line: &str) -> Option<String> {
-    use crate::util::{b, dim, red, rst};
+    use crate::util::{dim, red, rst};
     let Ok(e) = serde_json::from_str::<serde_json::Value>(line) else {
         // Non-JSON: pass through unchanged, but swallow empty lines.
         return if line.is_empty() {
@@ -42,9 +42,9 @@ pub(crate) fn format_line(line: &str) -> Option<String> {
         }
         "tool_execution_end" if e.get("isError").and_then(|b| b.as_bool()).unwrap_or(false) => {
             let name = e.get("toolName").and_then(|t| t.as_str()).unwrap_or("tool");
-            // No glyph — the failure signal rides on the text color (red +
-            // bold), mirroring the pulse's Error lines.
-            Some(format!("  {}{}{} failed{}", red(), b(), name, rst()))
+            // No glyph — the failure signal rides on the text color (red),
+            // mirroring the pulse's Error lines.
+            Some(format!("  {}{} failed{}", red(), name, rst()))
         }
         "message_end"
             if e.pointer("/message/role").and_then(|r| r.as_str()) == Some("assistant") =>

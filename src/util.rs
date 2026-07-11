@@ -139,24 +139,9 @@ pub fn event(level: Level, event: &str, msg: &str, fields: &[(&str, serde_json::
         return;
     }
     // Outcomes (ok / warn / error): dim timestamp, then the message tinted by
-    // the level color (bold for the strongest signals) so it carries the
-    // importance the glyph used to.
+    // the level color (no bold) so it carries the importance the glyph used to.
     let c = level.color();
-    let bold = if matches!(level, Level::Error) {
-        b()
-    } else {
-        ""
-    };
-    println!(
-        "{}[{}]{} {}{}{}{}",
-        dim(),
-        hms(),
-        rst(),
-        bold,
-        c,
-        msg,
-        rst()
-    );
+    println!("{}[{}]{} {}{}{}", dim(), hms(), rst(), c, msg, rst());
 }
 
 /// Build one NDJSON object line for a structured event. Always carries the

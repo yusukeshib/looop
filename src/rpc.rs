@@ -27,7 +27,7 @@
 //! session ends exactly when the agent does.
 
 use crate::cli::RpcBridgeArgs;
-use crate::util::{b, dim, hms, red, rst};
+use crate::util::{dim, hms, red, rst};
 use anyhow::{Context, Result};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
@@ -232,9 +232,9 @@ fn render_event(
                 .get("toolName")
                 .and_then(Value::as_str)
                 .unwrap_or("tool");
-            // No glyph — the failure signal rides on the text color (red +
-            // bold), mirroring the pulse's Error lines.
-            let _ = writeln!(out, "{}{}{}{} failed{}", stamp(), red(), b(), name, rst());
+            // No glyph — the failure signal rides on the text color (red),
+            // mirroring the pulse's Error lines.
+            let _ = writeln!(out, "{}{}{} failed{}", stamp(), red(), name, rst());
             *at_line_start = true;
             let _ = out.flush();
         }
