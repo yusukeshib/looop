@@ -711,9 +711,9 @@ impl App {
                 // click on a still-visible list row switches the buffer to
                 // that ask. Always (re)assign grab results so a plain click
                 // clears any stuck drag state (e.g. a missed mouse-up).
-                self.dragging_divider = self.divider.is_some_and(|d| {
-                    m.column == d.x && m.row >= d.top() && m.row < d.bottom()
-                });
+                self.dragging_divider = self
+                    .divider
+                    .is_some_and(|d| m.column == d.x && m.row >= d.top() && m.row < d.bottom());
                 self.dragging_list_sb =
                     !self.dragging_divider && self.list_scrollbar_grab(m.column, m.row);
                 self.log.dragging_scrollbar = !self.dragging_divider
