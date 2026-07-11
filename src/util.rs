@@ -314,10 +314,10 @@ fn is_executable(_p: &std::path::Path) -> bool {
 /// PTY stdout while a long, otherwise-silent step runs. The tick runner can take
 /// minutes and its chatter is teed to the replay archive (NOT echoed live, to
 /// keep the pulse a clean structured-event log) — so without this the stream
-/// goes quiet between `→ … is deciding the one move` and the `✓`/`✗` outcome.
+/// goes quiet between `… is deciding the one move` and the outcome line.
 ///
-/// Repaints ONE line every second via `\r` (spinner glyph + label + elapsed),
-/// then erases it on drop so the next structured event prints clean. It is a
+/// Repaints ONE line every second via `\r` (`[HH:MM:SS] label elapsed`), then
+/// erases it on drop so the next structured event prints clean. It is a
 /// no-op unless color (ANSI) is enabled: JSON mode and `NO_COLOR` streams stay
 /// byte-clean, and a non-PTY consumer never sees stray carriage returns.
 pub struct Spinner {
@@ -335,23 +335,19 @@ impl Spinner {
         let handle = if color_on() {
             let stop = stop.clone();
             let label = label.to_string();
+            // Freeze the start timestamp so the line reads like a normal log
+            // line (`[HH:MM:SS] <label> <elapsed>s`) — no spinner glyph; only
+            // the elapsed counter advances.
+            let ts = hms();
             Some(std::thread::spawn(move || {
-                const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
                 let t0 = std::time::Instant::now();
-                let mut i = 0usize;
                 // Repaint about once a second so the elapsed counter advances
                 // visibly while keeping the PTY transcript small (~one short
                 // line/sec). Poll `stop` in 100ms steps so drop() is responsive.
                 while !stop.load(Ordering::Relaxed) {
                     let secs = t0.elapsed().as_secs();
-                    print!(
-                        "\r{}{} {label} {secs}s{}",
-                        dim(),
-                        FRAMES[i % FRAMES.len()],
-                        rst()
-                    );
+                    print!("\r{}[{ts}] {label} {secs}s{}", dim(), rst());
                     let _ = std::io::Write::flush(&mut std::io::stdout());
-                    i += 1;
                     for _ in 0..10 {
                         if stop.load(Ordering::Relaxed) {
                             break;
