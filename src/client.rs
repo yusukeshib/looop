@@ -54,7 +54,7 @@
 //! never spawns a worker or edits policy — for that, use the agent concierge or
 //! the raw `_` verbs.
 
-use crate::logview::{self, LogView};
+use crate::logview::LogView;
 use crate::mailbox::{self, Ask};
 use crate::paths::Paths;
 use crate::run;
@@ -81,6 +81,12 @@ const TICK: Duration = Duration::from_millis(250);
 
 /// Rows scrolled per mouse-wheel notch (list and detail alike).
 const WHEEL_STEP: usize = 3;
+/// Body width above which the list+buffer sit SIDE BY SIDE (list left, buffer
+/// right) instead of stacked (list top, buffer bottom). At or below it the
+/// terminal is too narrow to give both panes a usable column count, so we stack.
+const WIDE_MIN: u16 = 90;
+/// Floor for the draggable left-pane width (cols).
+const LIST_MIN_W: u16 = 12;
 
 /// The shared dark-surface background (same as `looop watch`): the selected
 /// row's highlight and the status bar. Dark enough that per-span colors
@@ -151,87 +157,6 @@ fn render_vscrollbar(frame: &mut Frame, area: Rect, max_scroll: usize, pos: usiz
     frame.render_stateful_widget(bar, area, &mut state);
 }
 
-/// Group a run of styled chars into a `Line`, coalescing adjacent chars that
-/// share a style into one `Span` (keeps the widget's span list compact).
-fn chars_to_line(chars: &[(char, Style)], base: Style) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut buf = String::new();
-    let mut cur_style: Option<Style> = None;
-    for &(c, st) in chars {
-        if cur_style != Some(st) {
-            if let Some(prev) = cur_style.take() {
-                spans.push(Span::styled(std::mem::take(&mut buf), prev));
-            }
-            cur_style = Some(st);
-        }
-        buf.push(c);
-    }
-    if let Some(st) = cur_style {
-        spans.push(Span::styled(buf, st));
-    }
-    Line::from(spans).style(base)
-}
-
-/// Word-wrap styled `lines` to `width` columns, preserving each span's style.
-/// Breaks at the last space that fits; a word longer than the whole width is
-/// hard-split. Width is counted in display columns via `unicode-width`, so CJK
-/// double-width glyphs (and other wide characters) consume two columns and wrap
-/// before they run off the right edge. The `LogView` paints its `tail` verbatim
-/// against a fixed-width log grid, so the ask block must be pre-wrapped here to
-/// stay readable in a narrow detail pane.
-fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
-    if width == 0 {
-        return lines;
-    }
-    let mut out: Vec<Line<'static>> = Vec::new();
-    for line in lines {
-        let base = line.style;
-        // Flatten the line to a styled-char sequence, then greedily re-emit.
-        let chars: Vec<(char, Style)> = line
-            .spans
-            .iter()
-            .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
-            .collect();
-        if chars.is_empty() {
-            out.push(Line::from("").style(base));
-            continue;
-        }
-        let mut start = 0usize;
-        while start < chars.len() {
-            // Walk forward accumulating DISPLAY columns (CJK glyphs = 2), so the
-            // window ends at the last char that still fits within `width` cols.
-            let mut end = start;
-            let mut cols = 0usize;
-            while end < chars.len() {
-                // `width()` returns None for control chars (e.g. `\t`); treat
-                // those as at least 1 column so they still advance the window
-                // and can't silently disable wrapping.
-                let w = chars[end].0.width().unwrap_or(1);
-                if end > start && cols + w > width {
-                    break;
-                }
-                cols += w;
-                end += 1;
-            }
-            if end < chars.len() {
-                // Prefer breaking at the last space in the window (dropped).
-                if let Some(sp) = (start..end).rev().find(|&i| chars[i].0 == ' ')
-                    && sp > start
-                {
-                    end = sp;
-                }
-            }
-            out.push(chars_to_line(&chars[start..end], base));
-            start = end;
-            // Swallow a single break space so it doesn't lead the next row.
-            if start < chars.len() && chars[start].0 == ' ' {
-                start += 1;
-            }
-        }
-    }
-    out
-}
-
 /// Which dead workers the fleet list includes (alive workers, the pulse, and
 /// any worker holding a pending ask are ALWAYS shown). Toggled live with
 /// `Tab`. Finished workers older than the session TTL are reaped by the pulse,
@@ -288,6 +213,10 @@ struct AsksHit {
     /// Max scroll offset (`len - visible`), for scrollbar drag mapping. Zero
     /// when the list fits and no scrollbar is drawn.
     max_off: usize,
+    /// Rows each agent occupies: 1 in both layouts today (the stacked table and
+    /// the one-line side-by-side list). Kept as a field so a click at `row`
+    /// maps to agent `offset + (row - top) / stride` regardless of layout.
+    stride: usize,
 }
 
 /// One row of the client list: an AGENT (the pulse or a worker session), with
@@ -351,6 +280,19 @@ struct App {
     /// Whether a drag on the bottom list's scrollbar is in progress — mirrors
     /// `LogView::dragging_scrollbar` for the main buffer.
     dragging_list_sb: bool,
+    /// Width (cols) of the left list pane in the side-by-side layout, dragged
+    /// live via the vertical divider. Clamped to a sane range each draw.
+    list_w: u16,
+    /// The divider's screen rect from the last WIDE draw (for a drag grab); the
+    /// grab is gated to this column AND its body rows so a click elsewhere (e.g.
+    /// the status bar) at the same column can't start a resize. `None` when the
+    /// side-by-side layout isn't active.
+    divider: Option<Rect>,
+    /// The left pane's origin column from the last draw — the drag maps a
+    /// pointer column back to a pane width via `col - origin`.
+    list_origin_x: u16,
+    /// Whether a drag on the left/right divider is in progress.
+    dragging_divider: bool,
     /// Which dead workers the list includes. Toggled live with `Tab`.
     filter: Filter,
     /// Count of workers hidden by the current filter — shown in the status bar.
@@ -371,6 +313,10 @@ impl App {
             log: LogView::new(),
             pulse_alive: false,
             asks_hit: None,
+            list_w: 20,
+            divider: None,
+            list_origin_x: 0,
+            dragging_divider: false,
             dragging_list_sb: false,
             filter,
             hidden: 0,
@@ -385,6 +331,21 @@ impl App {
     /// the top row (the pulse).
     fn refresh(&mut self, paths: &Paths) {
         self.pulse_alive = run::pulse_running(paths);
+
+        // Pulse uptime: age of the `pid` file, which the pulse REWRITES each
+        // time it acquires the lock (the lock file itself is never truncated,
+        // so its mtime is stale). Empty when the pulse is down or the file is
+        // gone.
+        let pulse_age = if self.pulse_alive {
+            std::fs::metadata(paths.lock().join("pid"))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| fmt_secs(d.as_secs()))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         // worker id → its earliest pending ask (a blocked worker has one).
         // `mailbox::pending` is sorted by ts asc, so `or_insert` keeps the
@@ -402,7 +363,7 @@ impl App {
             is_pulse: true,
             alive: self.pulse_alive,
             state: if self.pulse_alive { "live" } else { "down" }.to_string(),
-            age: String::new(),
+            age: pulse_age,
             idle: None,
             ask: None,
         }];
@@ -582,17 +543,23 @@ impl App {
         if col < a.left() || col >= a.right() || row < a.top() || row >= a.bottom() {
             return None;
         }
-        let idx = hit.offset + (row - a.top()) as usize;
+        let idx = hit.offset + (row - a.top()) as usize / hit.stride.max(1);
         (idx < self.rows.len()).then_some(idx)
     }
 
-    /// Whether `row` falls in the top list strip (its column-header row plus
-    /// the data rows) — used to route the wheel to the list vs. the buffer.
-    fn in_list_region(&self, row: u16) -> bool {
+    /// Whether `(col, row)` falls in the list pane (its column-header row plus
+    /// the data rows, across the pane's columns) — used to route the wheel to
+    /// the list vs. the buffer. The column check matters in the side-by-side
+    /// layout, where the list sits to the LEFT of the buffer; when stacked the
+    /// list spans the full width so it's a no-op.
+    fn in_list_region(&self, col: u16, row: u16) -> bool {
         self.asks_hit.is_some_and(|hit| {
             // The header sits one row above the data area.
             let top = hit.area.top().saturating_sub(1);
-            row >= top && row < hit.area.bottom()
+            let in_rows = row >= top && row < hit.area.bottom();
+            // Include one extra column past the table for the scrollbar cell.
+            let in_cols = col >= hit.area.left() && col <= hit.area.right();
+            in_rows && in_cols
         })
     }
 
@@ -643,33 +610,45 @@ impl App {
             // bottom list strip scrolls its view, the buffer above scrolls
             // into history (up) / toward the tail (down).
             MouseEventKind::ScrollUp => {
-                if self.in_list_region(m.row) {
+                if self.in_list_region(m.column, m.row) {
                     self.list_offset = self.list_offset.saturating_sub(WHEEL_STEP);
                 } else {
                     self.log.scroll(WHEEL_STEP as isize);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if self.in_list_region(m.row) {
+                if self.in_list_region(m.column, m.row) {
                     self.list_offset = self.list_offset.saturating_add(WHEEL_STEP);
                 } else {
                     self.log.scroll(-(WHEEL_STEP as isize));
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // Prefer a scrollbar grab (list strip or buffer); otherwise a
+                // The divider grab wins first (it sits at the pane seam);
+                // otherwise a scrollbar grab (list strip or buffer), else a
                 // click on a still-visible list row switches the buffer to
                 // that ask. Always (re)assign grab results so a plain click
                 // clears any stuck drag state (e.g. a missed mouse-up).
-                self.dragging_list_sb = self.list_scrollbar_grab(m.column, m.row);
-                self.log.dragging_scrollbar =
-                    !self.dragging_list_sb && self.log.scrollbar_grab(m.column, m.row);
-                if !self.dragging_list_sb
+                self.dragging_divider = self
+                    .divider
+                    .is_some_and(|d| m.column == d.x && m.row >= d.top() && m.row < d.bottom());
+                self.dragging_list_sb =
+                    !self.dragging_divider && self.list_scrollbar_grab(m.column, m.row);
+                self.log.dragging_scrollbar = !self.dragging_divider
+                    && !self.dragging_list_sb
+                    && self.log.scrollbar_grab(m.column, m.row);
+                if !self.dragging_divider
+                    && !self.dragging_list_sb
                     && !self.log.dragging_scrollbar
                     && let Some(idx) = self.ask_at(m.column, m.row)
                 {
                     self.select_index(idx);
                 }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
+                // Map the pointer column back to a pane width; clamp lands in
+                // `draw`, so just record the raw intent here.
+                self.list_w = m.column.saturating_sub(self.list_origin_x).max(LIST_MIN_W);
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_list_sb => {
                 self.list_scrollbar_scrub(m.row);
@@ -680,6 +659,7 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 self.log.dragging_scrollbar = false;
                 self.dragging_list_sb = false;
+                self.dragging_divider = false;
             }
             _ => {}
         }
@@ -830,8 +810,8 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         let chunks = Layout::vertical([
-            Constraint::Length(1), // status bar (top)
             Constraint::Min(3),    // asks | detail
+            Constraint::Length(1), // status bar (bottom)
         ])
         .split(frame.area());
 
@@ -841,30 +821,58 @@ impl App {
         // buffer takes the rest (flex) BELOW it, separated by a gray rule. With
         // nothing selected (only before the first refresh) the list owns the
         // whole body.
-        let body = chunks[1];
+        let body = chunks[0];
         if self.selected().is_some() {
-            // The agent list is a borderless strip pinned at the TOP (up to 5
-            // data rows + 1 column-header row); a gray rule seams it off and
-            // the worker buffer takes the rest below.
-            let data_rows = self.rows.len().clamp(1, 5) as u16;
-            let want = data_rows + 1;
-            let list_h = want.min(body.height.saturating_sub(4)).max(2);
-            let parts = Layout::vertical([
-                Constraint::Length(list_h), // agent list (top, borderless)
-                Constraint::Length(1),      // gray separator rule
-                Constraint::Min(3),         // worker buffer (below, flex)
-            ])
-            .split(body);
-            self.draw_asks(frame, parts[0]);
-            frame.render_widget(
-                Block::default().borders(Borders::TOP).border_style(dim()),
-                parts[1],
-            );
-            self.draw_detail(frame, parts[2]);
+            if body.width > WIDE_MIN {
+                // WIDE: list on the LEFT, buffer on the RIGHT, seamed by a
+                // vertical gray rule the human can DRAG to resize. The width is
+                // clamped so neither pane starves, then persisted.
+                // Leave room for the 1-col divider AND the right pane's Min(20),
+                // so the solver never has to shrink the left pane below list_w
+                // (which would desync list_w from the divider column near the limit).
+                let hi = body.width.saturating_sub(21).max(LIST_MIN_W);
+                let list_w = self.list_w.clamp(LIST_MIN_W, hi);
+                self.list_w = list_w;
+                self.list_origin_x = body.x;
+                let parts = Layout::horizontal([
+                    Constraint::Length(list_w), // agent list (left, borderless)
+                    Constraint::Length(1),      // gray separator rule (draggable)
+                    Constraint::Min(20),        // worker buffer (right, flex)
+                ])
+                .split(body);
+                self.divider = Some(parts[1]);
+                self.draw_list_wide(frame, parts[0]);
+                frame.render_widget(
+                    Block::default().borders(Borders::LEFT).border_style(dim()),
+                    parts[1],
+                );
+                self.draw_detail(frame, parts[2]);
+            } else {
+                self.divider = None;
+                // NARROW: the agent list is a borderless strip pinned at the TOP
+                // (up to 5 data rows + 1 column-header row); a gray rule seams it
+                // off and the worker buffer takes the rest below.
+                let data_rows = self.rows.len().clamp(1, 5) as u16;
+                let want = data_rows + 1;
+                let list_h = want.min(body.height.saturating_sub(4)).max(2);
+                let parts = Layout::vertical([
+                    Constraint::Length(list_h), // agent list (top, borderless)
+                    Constraint::Length(1),      // gray separator rule
+                    Constraint::Min(3),         // worker buffer (below, flex)
+                ])
+                .split(body);
+                self.draw_asks(frame, parts[0]);
+                frame.render_widget(
+                    Block::default().borders(Borders::TOP).border_style(dim()),
+                    parts[1],
+                );
+                self.draw_detail(frame, parts[2]);
+            }
         } else {
+            self.divider = None;
             self.draw_asks(frame, body);
         }
-        self.draw_status(frame, chunks[0]);
+        self.draw_status(frame, chunks[1]);
     }
 
     fn draw_asks(&mut self, frame: &mut Frame, area: Rect) {
@@ -987,6 +995,107 @@ impl App {
             },
             offset: off,
             max_off: if overflow { max_off } else { 0 },
+            stride: 1,
+        });
+    }
+
+    /// The side-by-side (WIDE) list: one LINE per agent —
+    /// `<state-dot> <id> <age>` — with the SELECTED row highlighted by a
+    /// full-width SURFACE background (same as the narrow table) and the state
+    /// shown as a coloured dot. All geometry (scroll, hit-test, scrollbar) is
+    /// in agent units via the `AsksHit` stride, so the shared mouse handlers
+    /// work unchanged.
+    fn draw_list_wide(&mut self, frame: &mut Frame, area: Rect) {
+        const STRIDE: usize = 1; // one line per agent
+        let dim = dim();
+        frame.render_widget(Clear, area);
+        let col_w = area.width;
+
+        if self.rows.is_empty() {
+            self.asks_hit = None;
+            frame.render_widget(Paragraph::new(Span::styled(" no agents", dim)), area);
+            return;
+        }
+
+        let visible = ((area.height as usize) / STRIDE).max(1);
+        self.list_rows = visible;
+        let len = self.rows.len();
+        let max_off = len.saturating_sub(visible);
+        self.list_offset = self.list_offset.min(max_off);
+        let off = self.list_offset;
+        let overflow = len > visible;
+        let table_w = if overflow {
+            col_w.saturating_sub(1)
+        } else {
+            col_w
+        };
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for r in self.rows.iter().skip(off).take(visible) {
+            let selected = Some(r.id.as_str()) == self.selected_id.as_deref();
+            // Selection reads the SAME as the narrow table: a full-width
+            // SURFACE background highlight (no accent bar). Spans carry that bg
+            // so their own fg colors stay intact on top of it.
+            let base = if selected {
+                Style::default().bg(SURFACE)
+            } else {
+                Style::default()
+            };
+            let id_style = if selected {
+                base.fg(Color::White).add_modifier(Modifier::BOLD)
+            } else {
+                base.fg(Color::White)
+            };
+            // One line: `<state-dot> <id> <age>` — the state is a coloured dot
+            // (green live / yellow pending / red killed-or-down / gray
+            // otherwise), the id follows, and the age trails it dim.
+            let (_, state_style) = Self::state_cell(r);
+            let dot_style = if selected {
+                state_style.bg(SURFACE)
+            } else {
+                state_style
+            };
+            let age_style = if selected { dim.bg(SURFACE) } else { dim };
+            let mut spans = vec![
+                Span::styled("●", dot_style),
+                Span::styled(" ", base),
+                Span::styled(r.id.clone(), id_style),
+            ];
+            let mut used = 2 + r.id.chars().count();
+            if !r.age.is_empty() {
+                let a = format!(" {}", r.age);
+                used += a.chars().count();
+                spans.push(Span::styled(a, age_style));
+            }
+            // Pad the highlight to the full pane width so the selected row
+            // reads as a solid bar (like the table widget fills its row).
+            if selected {
+                let pad = (table_w as usize).saturating_sub(used);
+                if pad > 0 {
+                    spans.push(Span::styled(" ".repeat(pad), base));
+                }
+            }
+            lines.push(Line::from(spans).style(base));
+        }
+        frame.render_widget(
+            Paragraph::new(lines),
+            Rect {
+                width: table_w,
+                ..area
+            },
+        );
+
+        if overflow {
+            render_vscrollbar(frame, area, max_off, off);
+        }
+        self.asks_hit = Some(AsksHit {
+            area: Rect {
+                width: table_w,
+                ..area
+            },
+            offset: off,
+            max_off: if overflow { max_off } else { 0 },
+            stride: STRIDE,
         });
     }
 
@@ -1063,51 +1172,10 @@ impl App {
             ..inner
         };
 
-        // The pending ask renders in its OWN bordered box above the input —
-        // prompt only. Wrap it to the box's inner width up front so its height
-        // is known; cap the box at half the pane so a long ask can't evict the
-        // transcript. When the prompt overflows the cap, show its TAIL (the
-        // question conventionally comes last) with a dim `…` marker on top.
-        // Borrow the pending ask rather than cloning it — we only need its
-        // prompt to lay out owned lines, so the borrow ends with this match.
-        let ask_lines: Vec<Line<'static>> = match self.selected().and_then(|r| r.ask.as_ref()) {
-            Some(a) => {
-                // Render the prompt as Markdown, lifting the borrowed lines to
-                // owned; wrap to the box interior (borders take 2 columns).
-                let mut v: Vec<Line<'static>> = Vec::new();
-                for line in tui_markdown::from_str(&a.prompt).lines {
-                    v.push(logview::static_line(&line));
-                }
-                wrap_lines(v, inner.width.saturating_sub(2) as usize)
-            }
-            None => vec![],
-        };
-        // A bordered box needs at least 3 rows (2 borders + 1 content line).
-        // Cap it at half the pane so a long ask can't evict the transcript,
-        // but never let it exceed the space actually left below the input —
-        // and skip it entirely when there's no room for a box at all, else
-        // the ask_area would extend past `inner` and clip/overlap the input.
-        let ask_h: u16 = if ask_lines.is_empty() {
-            0
-        } else {
-            let avail = inner.height.saturating_sub(input_h);
-            if avail < 3 {
-                0
-            } else {
-                let cap = (avail / 2).max(3).min(avail);
-                (ask_lines.len() as u16 + 2).min(cap)
-            }
-        };
-
-        let content = Rect {
-            height: content.height.saturating_sub(ask_h),
-            ..content
-        };
-        let ask_area = Rect {
-            y: inner.y + content.height,
-            height: ask_h,
-            ..inner
-        };
+        // The pending ask is NOT drawn as its own box anymore: it's woven into
+        // the worker's transcript (the rpc-bridge emits `[hms] ask: …` /
+        // `answer: …` lines in FULL), so the buffer already shows it. The pane
+        // is just the buffer + the input pinned below.
 
         // The agent vanished from the fleet while its pane was open — say so
         // at the buffer's tail (the one message that still belongs there).
@@ -1120,36 +1188,15 @@ impl App {
         };
 
         self.log.render(frame, content, &tail, true);
-        if ask_h > 0 {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(dim())
-                .title(Span::styled(" ask ", dim()));
-            let field = block.inner(ask_area);
-            frame.render_widget(block, ask_area);
-            let visible = field.height as usize;
-            let shown: Vec<Line<'static>> = if ask_lines.len() > visible {
-                let mut v = ask_lines[ask_lines.len() - visible..].to_vec();
-                if let Some(first) = v.first_mut() {
-                    *first = Line::from(Span::styled("…", dim()));
-                }
-                v
-            } else {
-                ask_lines
-            };
-            frame.render_widget(Paragraph::new(shown), field);
-        }
-        if let Some(mode) = mode {
-            self.draw_input(frame, input_area, mode);
+        if mode.is_some() {
+            self.draw_input(frame, input_area);
         }
     }
 
     /// The always-focused editor pinned along the bottom of the detail pane: a
     /// single input line in a bordered box. Its WHITE border (vs. the dim
     /// ask box above) marks it as the focused element — where typing lands.
-    /// Its placeholder reflects the `mode` — answering a pending ask vs.
-    /// steering a live worker.
-    fn draw_input(&self, frame: &mut Frame, area: Rect, mode: InputMode) {
+    fn draw_input(&self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::White));
@@ -1158,9 +1205,9 @@ impl App {
         if field.height == 0 {
             return;
         }
-        // Single non-wrapping line: text + block cursor (1 col). If the answer
-        // overflows, show its TAIL (chars, not bytes) so the caret stays
-        // visible — horizontal scroll rather than run-off.
+        // Single non-wrapping line. If the answer overflows, show its TAIL
+        // (chars, not bytes) so the caret stays visible — horizontal scroll
+        // rather than run-off. Reserve one column for the caret cell.
         let avail = (field.width as usize).saturating_sub(1);
         let chars: Vec<char> = self.input.chars().collect();
         let shown: String = if chars.len() > avail {
@@ -1168,38 +1215,29 @@ impl App {
         } else {
             self.input.clone()
         };
-        let mut spans = Vec::new();
-        if self.input.is_empty() {
-            // Block cursor first, then a dim placeholder so the field reads as
-            // focused and self-explanatory before anything is typed.
-            let hint = match mode {
-                InputMode::Answer => " type answer · enter to send",
-                InputMode::Send => " type message · enter to send",
-            };
-            spans.push(Span::styled(" ", Style::default().bg(Color::White)));
-            spans.push(Span::styled(hint, dim()));
-        } else {
-            spans.push(Span::raw(shown));
-            spans.push(Span::styled(" ", Style::default().bg(Color::White)));
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), field);
+        let shown_w: usize = shown
+            .chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum();
+        // Pad to the full field width so shrinking input (backspace) can't leave
+        // stale glyphs behind — Paragraph doesn't clear cells it doesn't write.
+        let pad = (field.width as usize).saturating_sub(shown_w);
+        let line = Line::from(vec![Span::raw(shown), Span::raw(" ".repeat(pad))]);
+        frame.render_widget(Paragraph::new(line), field);
+
+        // Place the REAL terminal cursor at the caret instead of painting a
+        // fake block: a hidden real cursor makes an IME anchor its composition /
+        // candidate window at the wrong spot (wherever the cursor last sat).
+        // Sitting it on the caret keeps the IME popup with the text being typed.
+        let caret_x = field.x + (shown_w as u16).min(field.width.saturating_sub(1));
+        frame.set_cursor_position((caret_x, field.y));
     }
 
-    /// The one-line status bar pinned along the TOP of the screen: the filter
-    /// badge, the last outcome (an error or an "answered X" note), and the key
-    /// hints, led by an inverse-video ` looop ` brand tag on the far left. Top
-    /// rather than bottom so it never competes with the input row — the bottom
-    /// of the screen is where you type, the top is where you read the mode.
+    /// The one-line status bar pinned along the BOTTOM of the screen: the
+    /// filter badge, the last outcome (an error or an "answered X" note), and
+    /// the key hints.
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
         let style = Style::default().bg(SURFACE).fg(Color::White);
-        // Inverse-video brand tag: white bg, dark text, bold.
-        let brand = Span::styled(
-            " looop ",
-            Style::default()
-                .bg(Color::White)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        );
         // The filter badge (with any hidden-worker count) leads the hint line,
         // mirroring `looop watch`'s selector footer.
         let fname = match self.filter {
@@ -1212,24 +1250,24 @@ impl App {
             String::new()
         };
         let help = match &self.status {
-            Some(msg) => format!(" {msg} "),
+            Some(msg) => format!("{msg} "),
             // The type/enter keys only apply when the selected agent can
             // receive text (answer an ask, or steer a live worker); a
             // read-only agent (pulse w/o ask, dead worker) just scrolls.
             None => match self.input_mode() {
                 Some(InputMode::Answer) => format!(
-                    " {fname}{hidden}  type answer · enter send · ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
+                    "{fname}{hidden}  type answer · enter send · ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
                 ),
                 Some(InputMode::Send) => format!(
-                    " {fname}{hidden}  type message · enter send · ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
+                    "{fname}{hidden}  type message · enter send · ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
                 ),
                 None => format!(
-                    " {fname}{hidden}  ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
+                    "{fname}{hidden}  ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
                 ),
             },
         };
         frame.render_widget(
-            Paragraph::new(Line::from(vec![brand, Span::styled(help, style)])).style(style),
+            Paragraph::new(Line::from(vec![Span::styled(help, style)])).style(style),
             area,
         );
     }
@@ -1238,69 +1276,6 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn plain(l: &Line) -> String {
-        l.spans.iter().map(|s| s.content.as_ref()).collect()
-    }
-
-    #[test]
-    fn wrap_breaks_at_spaces_and_preserves_text() {
-        let lines = vec![Line::from("the quick brown fox jumps")];
-        let out = wrap_lines(lines, 10);
-        // Each wrapped row fits the width and no word is split at a space break.
-        assert!(out.iter().all(|l| plain(l).chars().count() <= 10));
-        let joined: String = out.iter().map(plain).collect::<Vec<_>>().join(" ");
-        assert_eq!(joined, "the quick brown fox jumps");
-    }
-
-    #[test]
-    fn wrap_hard_splits_overlong_word() {
-        let lines = vec![Line::from("abcdefghijklmnop")];
-        let out = wrap_lines(lines, 5);
-        assert_eq!(out.len(), 4); // 16 chars / 5
-        assert!(out.iter().all(|l| plain(l).chars().count() <= 5));
-        let joined: String = out.iter().map(|l| plain(l)).collect();
-        assert_eq!(joined, "abcdefghijklmnop");
-    }
-
-    #[test]
-    fn wrap_preserves_span_styles() {
-        let styled = Line::from(vec![
-            Span::styled("aaa", Style::default().fg(Color::Red)),
-            Span::styled(" bbb", Style::default().fg(Color::Green)),
-        ]);
-        let out = wrap_lines(vec![styled], 3);
-        // "aaa" then "bbb" on separate rows, keeping their colors.
-        assert_eq!(plain(&out[0]), "aaa");
-        assert_eq!(out[0].spans[0].style.fg, Some(Color::Red));
-        assert_eq!(plain(&out[1]), "bbb");
-        assert_eq!(out[1].spans.last().unwrap().style.fg, Some(Color::Green));
-    }
-
-    #[test]
-    fn wrap_counts_cjk_as_double_width() {
-        // 6 double-width glyphs = 12 display columns; at width 6 that must wrap
-        // into rows of at most 3 glyphs (6 columns), not 6 glyphs (12 columns).
-        let lines = vec![Line::from("あいうえおか")];
-        let out = wrap_lines(lines, 6);
-        assert!(out.iter().all(|l| {
-            plain(l)
-                .chars()
-                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-                .sum::<usize>()
-                <= 6
-        }));
-        let joined: String = out.iter().map(plain).collect();
-        assert_eq!(joined, "あいうえおか");
-    }
-
-    #[test]
-    fn wrap_zero_width_is_identity() {
-        let lines = vec![Line::from("anything")];
-        let out = wrap_lines(lines.clone(), 0);
-        assert_eq!(out.len(), 1);
-        assert_eq!(plain(&out[0]), "anything");
-    }
 
     fn row(is_pulse: bool, alive: bool, state: &str, ask: bool) -> AgentRow {
         AgentRow {

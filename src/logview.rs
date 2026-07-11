@@ -583,17 +583,6 @@ fn tail_signature(tail: &[Line]) -> u64 {
     h.finish()
 }
 
-/// Deep-clone a borrowed line into an owned `'static` one (owns every span's
-/// text). Used to lift `tui_markdown` output into the tail buffer.
-pub fn static_line(line: &Line) -> Line<'static> {
-    let spans: Vec<Span<'static>> = line
-        .spans
-        .iter()
-        .map(|s| Span::styled(s.content.as_ref().to_string(), s.style))
-        .collect();
-    Line::from(spans).style(line.style)
-}
-
 /// Probe a parser's current scrollback depth (rows above the live screen).
 /// Leaves the viewport parked at the oldest line; the next render repositions
 /// it before drawing.

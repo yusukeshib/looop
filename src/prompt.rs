@@ -94,7 +94,8 @@ Pick exactly ONE `action` and fill its fields:
      a rule once it actually hurts.
 
 Every action ALSO takes:
-  "journal": "<one line: what you did and why>"  — looop appends it, timestamped.
+  "journal": "<one line: what you did and why>"  — looop appends it ALREADY
+     timestamped, so do NOT restate the date or time inside it (no "02:31 AM,").
   "next_interval_s": <int>  — OPTIONAL one-shot cadence nudge (clamped 5..3600):
      tighten when a backlog is piling up, widen when it's been quiet a long while.
      It ALSO forces the next beat to re-decide even if nothing in the world

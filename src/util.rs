@@ -75,9 +75,9 @@ code!(rst, "\x1b[0m");
 code!(dim, "\x1b[2m");
 code!(b, "\x1b[1m");
 code!(cyan, "\x1b[36m");
-code!(grn, "\x1b[32m");
 code!(red, "\x1b[31m");
 code!(yel, "\x1b[33m");
+code!(wht, "\x1b[97m");
 
 /// Severity of a structured log line — picks the human color and rides along as
 /// the `level` field in JSON mode.
@@ -87,7 +87,7 @@ pub enum Level {
     Info,
     /// A step of the beat is starting (cyan).
     Step,
-    /// Success (green).
+    /// Success / a decision (bright white).
     Ok,
     /// Non-fatal caution (yellow).
     Warn,
@@ -109,27 +109,15 @@ impl Level {
         match self {
             Level::Info => "",
             Level::Step => cyan(),
-            Level::Ok => grn(),
+            Level::Ok => wht(),
             Level::Warn => yel(),
             Level::Error => red(),
-        }
-    }
-    /// The human-facing sigil for this line. Carries the signal in human mode
-    /// (the machine `event` name is JSON-only), so importance reads at a glance:
-    /// `·` heartbeat, `→` a step starting, `✓` success/decision, `⚡`/`✗` trouble.
-    fn glyph(self) -> &'static str {
-        match self {
-            Level::Info => "·",
-            Level::Step => "→",
-            Level::Ok => "✓",
-            Level::Warn => "⚡",
-            Level::Error => "✗",
         }
     }
 }
 
 /// The one structured log primitive the pulse uses. Human mode prints a single
-/// concise, consistently-colored line:  `[HH:MM:SS] <event> — <msg>`. JSON mode
+/// concise line `[HH:MM:SS] <msg>` with the message tinted by level. JSON mode
 /// prints one NDJSON object `{ts,level,event,msg,...fields}` — the same shape an
 /// agent watching `looop watch pulse` can parse line-by-line. `fields` carry the
 /// machine-useful extras (runner, secs, run_id, journal, …).
@@ -140,46 +128,20 @@ pub fn event(level: Level, event: &str, msg: &str, fields: &[(&str, serde_json::
         return;
     }
     // Human mode is a *rendering* of the structured event, not a dump of it.
-    // Color encodes IMPORTANCE so the lines a watcher cares about (decisions,
-    // failures, flags) pop and the heartbeat (sense summary, sleep, skip,
-    // cadence) recedes. The machine `event` name is intentionally omitted — the
-    // glyph + msg say it for a human; the name lives in the JSON stream.
-    let glyph = level.glyph();
+    // Color encodes IMPORTANCE (no glyphs): the MESSAGE itself is tinted by
+    // level, so decisions/failures pop and the heartbeat (sense summary, sleep,
+    // skip, cadence) recedes. The machine `event` name is intentionally omitted
+    // for a human — it lives in the JSON stream.
     if matches!(level, Level::Info | Level::Step) {
         // Heartbeat & transient "starting" steps: the whole line is dim so it
-        // sits quietly in the background and lets the OUTCOME (✓/✗) stand out.
-        // The glyph still differs (`·` vs `→`) so a step still reads as a step.
-        println!("{}[{}] {} {}{}", dim(), hms(), glyph, msg, rst());
+        // sits quietly in the background and lets the OUTCOME stand out.
+        println!("{}[{}] {}{}", dim(), hms(), msg, rst());
         return;
     }
+    // Outcomes (ok / warn / error): dim timestamp, then the message tinted by
+    // the level color (no bold) so it carries the importance the glyph used to.
     let c = level.color();
-    let bold = if matches!(level, Level::Ok | Level::Error) {
-        b()
-    } else {
-        ""
-    };
-    // Warnings/errors tint the whole message; success/step keep the body in the
-    // default fg (a long journal line stays readable) and let the colored glyph
-    // carry the signal.
-    let msg_c = if matches!(level, Level::Warn | Level::Error) {
-        c
-    } else {
-        ""
-    };
-    let msg_rst = if msg_c.is_empty() { "" } else { rst() };
-    println!(
-        "{}[{}]{} {}{}{}{} {}{}{}",
-        dim(),
-        hms(),
-        rst(),
-        bold,
-        c,
-        glyph,
-        rst(),
-        msg_c,
-        msg,
-        msg_rst
-    );
+    println!("{}[{}]{} {}{}{}", dim(), hms(), rst(), c, msg, rst());
 }
 
 /// Build one NDJSON object line for a structured event. Always carries the
@@ -337,10 +299,10 @@ fn is_executable(_p: &std::path::Path) -> bool {
 /// PTY stdout while a long, otherwise-silent step runs. The tick runner can take
 /// minutes and its chatter is teed to the replay archive (NOT echoed live, to
 /// keep the pulse a clean structured-event log) — so without this the stream
-/// goes quiet between `→ … is deciding the one move` and the `✓`/`✗` outcome.
+/// goes quiet between `… is deciding the one move` and the outcome line.
 ///
-/// Repaints ONE line every second via `\r` (spinner glyph + label + elapsed),
-/// then erases it on drop so the next structured event prints clean. It is a
+/// Repaints ONE line every second via `\r` (`[HH:MM:SS] label elapsed`), then
+/// erases it on drop so the next structured event prints clean. It is a
 /// no-op unless color (ANSI) is enabled: JSON mode and `NO_COLOR` streams stay
 /// byte-clean, and a non-PTY consumer never sees stray carriage returns.
 pub struct Spinner {
@@ -358,23 +320,19 @@ impl Spinner {
         let handle = if color_on() {
             let stop = stop.clone();
             let label = label.to_string();
+            // Freeze the start timestamp so the line reads like a normal log
+            // line (`[HH:MM:SS] <label> <elapsed>s`) — no spinner glyph; only
+            // the elapsed counter advances.
+            let ts = hms();
             Some(std::thread::spawn(move || {
-                const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
                 let t0 = std::time::Instant::now();
-                let mut i = 0usize;
                 // Repaint about once a second so the elapsed counter advances
                 // visibly while keeping the PTY transcript small (~one short
                 // line/sec). Poll `stop` in 100ms steps so drop() is responsive.
                 while !stop.load(Ordering::Relaxed) {
                     let secs = t0.elapsed().as_secs();
-                    print!(
-                        "\r{}{} {label} {secs}s{}",
-                        dim(),
-                        FRAMES[i % FRAMES.len()],
-                        rst()
-                    );
+                    print!("\r{}[{ts}] {label} {secs}s{}", dim(), rst());
                     let _ = std::io::Write::flush(&mut std::io::stdout());
-                    i += 1;
                     for _ in 0..10 {
                         if stop.load(Ordering::Relaxed) {
                             break;
@@ -401,6 +359,34 @@ impl Drop for Spinner {
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
     }
+}
+
+/// Sleep `secs`, showing a live one-line COUNTDOWN on the pulse's PTY stdout
+/// (`[HH:MM:SS] next beat in Ns (<suffix>)`) that repaints each second and is
+/// erased when it reaches zero, so the next beat prints clean — the idle-wait
+/// counterpart of [`Spinner`]. A no-op decoration unless color (ANSI) is on:
+/// JSON / `NO_COLOR` / non-PTY streams just sleep silently (their structured
+/// `sleep` event is emitted separately), never seeing stray carriage returns.
+pub fn sleep_countdown(secs: u64, suffix: &str) {
+    if !color_on() {
+        std::thread::sleep(std::time::Duration::from_secs(secs));
+        return;
+    }
+    // Freeze the timestamp at the start (like the spinner) so the line reads as
+    // "the beat logged at [ts], next one in Ns".
+    let ts = hms();
+    for remaining in (1..=secs).rev() {
+        // CR + clear-to-EOL so a shrinking count (60s → 9s) leaves no stale digit.
+        print!(
+            "\r\x1b[2K{}[{ts}] next beat in {remaining}s ({suffix}){}",
+            dim(),
+            rst()
+        );
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+        std::thread::sleep(std::time::Duration::from_secs(1));
+    }
+    print!("\r\x1b[2K");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
 }
 
 #[cfg(test)]
@@ -458,16 +444,6 @@ mod tests {
         assert_eq!(Level::Ok.tag(), "ok");
         assert_eq!(Level::Warn.tag(), "warn");
         assert_eq!(Level::Error.tag(), "error");
-    }
-
-    #[test]
-    fn level_glyphs_map_importance() {
-        // Heartbeat recedes; decision and trouble each get a distinct sigil.
-        assert_eq!(Level::Info.glyph(), "·");
-        assert_eq!(Level::Step.glyph(), "→");
-        assert_eq!(Level::Ok.glyph(), "✓");
-        assert_eq!(Level::Warn.glyph(), "⚡");
-        assert_eq!(Level::Error.glyph(), "✗");
     }
 
     #[test]

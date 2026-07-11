@@ -192,19 +192,24 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
             want = req;
             force = true;
         }
-        util::event(
-            Level::Info,
-            "sleep",
-            &format!(
-                "next beat in {want}s ({})",
-                if outcome.acted { "acted" } else { "idle" }
-            ),
-            &[
-                ("secs", serde_json::json!(want)),
-                ("acted", serde_json::json!(outcome.acted)),
-            ],
-        );
-        std::thread::sleep(Duration::from_secs(want));
+        let suffix = if outcome.acted { "acted" } else { "idle" };
+        if util::is_json() {
+            // JSON watchers can't see the live countdown — keep the structured
+            // marker, then sleep plainly.
+            util::event(
+                Level::Info,
+                "sleep",
+                &format!("next beat in {want}s ({suffix})"),
+                &[
+                    ("secs", serde_json::json!(want)),
+                    ("acted", serde_json::json!(outcome.acted)),
+                ],
+            );
+            std::thread::sleep(Duration::from_secs(want));
+        } else {
+            // Human mode: a live countdown that IS the sleep.
+            util::sleep_countdown(want, suffix);
+        }
     }
 }
 

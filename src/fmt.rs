@@ -1,7 +1,7 @@
 //! Progressive output formatter for the tick runner's NDJSON stream.
 //!
 //! `runner::run_streamed` reads the runner's raw NDJSON stdout line-by-line and
-//! renders each line via `format_line` into the friendly `→ tool:` progress that
+//! renders each line via `format_line` into the friendly `tool:` progress that
 //! is archived to runs/<id>/output.log. There is no external formatter and looop
 //! never re-execs itself to post-process its own child.
 
@@ -30,27 +30,22 @@ pub(crate) fn format_line(line: &str) -> Option<String> {
                 .and_then(|v| v.as_str().map(str::to_owned))
                 .or_else(|| args.map(|a| a.to_string()))
                 .unwrap_or_default();
-            let collapsed: String = collapse_ws(&raw).chars().take(100).collect();
+            // LOG output — full command (whitespace collapsed, never truncated).
+            let collapsed: String = collapse_ws(&raw);
             let argpart = if collapsed.is_empty() {
                 String::new()
             } else {
                 format!("{}: {}{}", dim(), collapsed, rst())
             };
             // Whole line dim: tool lines are background progress, not signal.
-            Some(format!("  {}→ {}{}{}", dim(), name, rst(), argpart))
+            // No glyph — the dim color alone marks it as background.
+            Some(format!("  {}{}{}{}", dim(), name, rst(), argpart))
         }
         "tool_execution_end" if e.get("isError").and_then(|b| b.as_bool()).unwrap_or(false) => {
             let name = e.get("toolName").and_then(|t| t.as_str()).unwrap_or("tool");
-            // Red carries the failure signal on the `✗` alone; the tool name
-            // stays dim like every other tool line.
-            Some(format!(
-                "  {}✗ {}{}{} failed{}",
-                red(),
-                rst(),
-                dim(),
-                name,
-                rst()
-            ))
+            // No glyph — the failure signal rides on the text color (red),
+            // mirroring the pulse's Error lines.
+            Some(format!("  {}{} failed{}", red(), name, rst()))
         }
         "message_end"
             if e.pointer("/message/role").and_then(|r| r.as_str()) == Some("assistant") =>

@@ -64,6 +64,27 @@ fn read_answer(store: &impl StateStore, ask_id: &str) -> Option<String> {
     v.get("answer").and_then(|x| x.as_str()).map(str::to_owned)
 }
 
+/// Every ask raised by `worker` (answered or not), oldest first. Used by the
+/// rpc-bridge to weave a worker's ask/answer turns into its own transcript.
+pub(crate) fn asks_of(paths: &Paths, worker: &str) -> Vec<Ask> {
+    let store = FileStore::new(paths);
+    let mut out: Vec<Ask> = store
+        .list(&Collection::Asks)
+        .into_iter()
+        .filter_map(|id| store.read(&Key::Ask(id)))
+        .filter_map(|raw| serde_json::from_str::<Ask>(&raw).ok())
+        .filter(|a| a.worker == worker)
+        .collect();
+    out.sort_by_key(|a| a.ts);
+    out
+}
+
+/// The answer text for `ask_id`, if it has been answered (public sibling of
+/// [`read_answer`] for callers outside the mailbox).
+pub(crate) fn answer_text(paths: &Paths, ask_id: &str) -> Option<String> {
+    read_answer(&FileStore::new(paths), ask_id)
+}
+
 /// All asks that have NO matching answer yet. Read-only; used by `_ state` and
 /// the decide prompt (so looop sees what's blocked) and by `looop watch` / any
 /// client (so the human sees what's waiting on them).
@@ -187,6 +208,15 @@ pub fn cmd_answer(paths: &Paths, args: &crate::cli::AnswerArgs) -> Result<ExitCo
         rest.join(" ")
     };
     crate::contract::LocalContract::new(paths).answer(&args.ask_id, &text, args.force)?;
+    // CLI-only feedback: the core is transport-agnostic (no stdout), so the
+    // confirmation line is emitted HERE, not in `answer()`. A TUI client (which
+    // calls the core directly) must not have a stray println corrupt its screen.
+    util::event(
+        util::Level::Ok,
+        "answer",
+        &format!("{}: {text}", args.ask_id),
+        &[("ask_id", serde_json::json!(args.ask_id))],
+    );
     Ok(ExitCode::SUCCESS)
 }
 
@@ -213,12 +243,6 @@ pub(crate) fn answer(paths: &Paths, ask_id: &str, text: &str, force: bool) -> Re
         &Key::Answer(ask_id.to_string()),
         &serde_json::to_string_pretty(&body)?,
     )?;
-    util::event(
-        util::Level::Ok,
-        "answer",
-        &format!("{ask_id}: {text}"),
-        &[("ask_id", serde_json::json!(ask_id))],
-    );
     Ok(())
 }
 

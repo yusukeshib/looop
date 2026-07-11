@@ -15,7 +15,7 @@
 //!                        pi --mode rpc <flags>
 //!
 //! * OUT (child stdout → PTY): each JSONL event is rendered to readable text
-//!   (streaming assistant deltas, `→ tool: args`, `✗ tool failed`, …) so the
+//!   (streaming assistant deltas, `tool: args`, `tool failed`, …) so the
 //!   log/watch/client transcript reads like an interactive agent.
 //! * IN (PTY → child stdin): the initial prompt (from `--prompt-file`) is sent
 //!   as a `prompt` command; any later line typed at the bridge's stdin (what
@@ -27,16 +27,51 @@
 //! session ends exactly when the agent does.
 
 use crate::cli::RpcBridgeArgs;
-use crate::util::{dim, hms, red, rst};
+use crate::util::{cyan, dim, hms, red, rst, yel};
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Sender, channel};
 use std::thread;
+use std::time::Duration;
+
+/// One item bound for the single OUT writer: a rendered child event line, a
+/// mailbox turn (ask/answer) woven in by the watcher, or the child's EOF.
+enum Ev {
+    Line(String),
+    Ask(String),
+    Answer(String),
+    /// A human message typed at the bridge (what `looop _ send` writes), echoed
+    /// into the transcript so a steer to a live worker shows up as a turn.
+    Send(String),
+    Eof,
+}
+
+/// Silence the PTY's input echo. The bridge's stdin is the worker PTY slave;
+/// `looop _ send` writes lines into it, and with the tty's ECHO flag on the
+/// kernel copies those bytes straight back to the PTY OUTPUT — i.e. into the
+/// transcript — as a raw, unstamped duplicate of the `[hms] send:` line the
+/// bridge already renders. Best-effort (a no-op when stdin isn't a tty); the
+/// child agent reads its OWN piped stdin, so this never affects it.
+#[cfg(unix)]
+fn silence_pty_echo() {
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(0, &mut t) == 0 {
+            t.c_lflag &= !libc::ECHO;
+            let _ = libc::tcsetattr(0, libc::TCSANOW, &t);
+        }
+    }
+}
+#[cfg(not(unix))]
+fn silence_pty_echo() {}
 
 pub fn cmd_rpc_bridge(args: &RpcBridgeArgs) -> Result<ExitCode> {
+    silence_pty_echo();
     let mut child_argv = args.child.iter();
     let Some(program) = child_argv.next() else {
         eprintln!(
@@ -72,7 +107,16 @@ pub fn cmd_rpc_bridge(args: &RpcBridgeArgs) -> Result<ExitCode> {
     // prompt/steer. It owns child_stdin for its whole life. This thread is a
     // daemon — when the OUT loop returns (child gone) the process exits and
     // takes it down, so it may sit blocked on `read_line` without leaking.
+    // Everything that reaches the PTY funnels through ONE writer (the OUT loop
+    // below) via a channel, so the child's events, the human's sends, and the
+    // mailbox turns can never interleave into half-lines. Producers: the IN
+    // thread (echoing sends), the child-stdout reader, and the mailbox watcher.
+    let (tx, rx) = channel::<Ev>();
+
+    // IN thread: seed the first prompt, then forward each typed stdin line as a
+    // prompt/steer AND echo it into the transcript as a `send` turn.
     let stdin_streaming = Arc::clone(&streaming);
+    let in_tx = tx.clone();
     thread::spawn(move || {
         if write_command(&mut child_stdin, "prompt", &prompt).is_err() {
             return;
@@ -98,25 +142,49 @@ pub fn cmd_rpc_bridge(args: &RpcBridgeArgs) -> Result<ExitCode> {
             if write_command(&mut child_stdin, verb, text).is_err() {
                 return;
             }
+            // Show it in the transcript (the reply to an ASK arrives via the
+            // mailbox watcher; this covers free-form `_ send` to a live worker).
+            let _ = in_tx.send(Ev::Send(text.to_string()));
         }
     });
 
-    // OUT loop (this thread): render the child's JSONL to the PTY until EOF.
+    // Child stdout reader → one Ev::Line per JSONL record, then Ev::Eof.
+    let ctx = tx.clone();
+    thread::spawn(move || {
+        for line in BufReader::new(child_stdout).lines() {
+            let Ok(line) = line else { break };
+            // `lines()` strips `\n` but leaves a trailing `\r` if the child
+            // emits CRLF; drop it so strict JSONL parsing doesn't choke.
+            let line = line.strip_suffix('\r').unwrap_or(line.as_str());
+            if line.is_empty() {
+                continue;
+            }
+            if ctx.send(Ev::Line(line.to_string())).is_err() {
+                return;
+            }
+        }
+        let _ = ctx.send(Ev::Eof);
+    });
+
+    // Mailbox watcher → weave this worker's ask/answer turns into its own
+    // transcript. A no-op when the worker id isn't known.
+    spawn_ask_watcher(tx);
+
     let mut out = std::io::stdout();
     let mut at_line_start = true;
-    for line in BufReader::new(child_stdout).lines() {
-        let Ok(line) = line else { break };
-        // `lines()` strips `\n` but leaves a trailing `\r` if the child emits
-        // CRLF; drop it so strict JSONL parsing doesn't choke on the carriage
-        // return (which would silently drop the event).
-        let line = line.strip_suffix('\r').unwrap_or(line.as_str());
-        if line.is_empty() {
-            continue;
+    while let Ok(ev) = rx.recv() {
+        match ev {
+            Ev::Eof => break,
+            Ev::Line(line) => {
+                // Non-JSON on the JSONL channel: ignore (stderr carries logs).
+                if let Ok(event) = serde_json::from_str::<Value>(&line) {
+                    render_event(&event, &streaming, &mut out, &mut at_line_start);
+                }
+            }
+            Ev::Ask(prompt) => render_turn(&mut out, &mut at_line_start, "ask", yel(), &prompt),
+            Ev::Answer(text) => render_turn(&mut out, &mut at_line_start, "answer", cyan(), &text),
+            Ev::Send(text) => render_turn(&mut out, &mut at_line_start, "send", cyan(), &text),
         }
-        let Ok(event) = serde_json::from_str::<Value>(line) else {
-            continue; // Non-JSON on the JSONL channel: ignore (stderr carries logs).
-        };
-        render_event(&event, &streaming, &mut out, &mut at_line_start);
     }
     if !at_line_start {
         let _ = writeln!(out);
@@ -143,6 +211,75 @@ fn exit_code_of(status: &std::process::ExitStatus) -> ExitCode {
         }
     }
     ExitCode::from(1)
+}
+
+/// Poll this worker's mailbox and push its ask/answer turns onto the OUT
+/// channel, so a blocking `looop _ ask` (whose prompt is captured into a shell
+/// variable and never reaches the PTY) and the human/concierge's reply both
+/// land in the transcript as `[HH:MM:SS] ask/answer: …` lines. A no-op when the
+/// worker id (`$LOOOP_SESSION_ID`) isn't set. Only asks raised AFTER the bridge
+/// started are woven in, so a restart never replays stale mailbox history.
+fn spawn_ask_watcher(tx: Sender<Ev>) {
+    let worker = std::env::var("LOOOP_SESSION_ID").unwrap_or_default();
+    if worker.is_empty() {
+        return;
+    }
+    let poll = Duration::from_millis(
+        std::env::var("LOOOP_ASK_POLL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1000),
+    );
+    thread::spawn(move || {
+        let paths = crate::paths::Paths::resolve();
+        let start = crate::util::now_unix();
+        let mut shown_ask: HashSet<String> = HashSet::new();
+        let mut shown_ans: HashSet<String> = HashSet::new();
+        loop {
+            for ask in crate::mailbox::asks_of(&paths, &worker) {
+                if ask.ts >= start
+                    && shown_ask.insert(ask.id.clone())
+                    && tx.send(Ev::Ask(ask.prompt.clone())).is_err()
+                {
+                    return;
+                }
+                // Show the answer once, and only for an ask we already showed.
+                if shown_ask.contains(&ask.id)
+                    && !shown_ans.contains(&ask.id)
+                    && let Some(text) = crate::mailbox::answer_text(&paths, &ask.id)
+                {
+                    shown_ans.insert(ask.id.clone());
+                    if tx.send(Ev::Answer(text)).is_err() {
+                        return;
+                    }
+                }
+            }
+            thread::sleep(poll);
+        }
+    });
+}
+
+/// Render a mailbox turn as `[HH:MM:SS] <label>: <text>` on a fresh line — the
+/// label coloured, the text in the default fg. This is LOG output, so the text
+/// is rendered in FULL (never truncated); internal newlines are preserved so a
+/// multi-paragraph ask/answer reads as-is (the vt100 replay wraps long lines).
+fn render_turn(
+    out: &mut impl Write,
+    at_line_start: &mut bool,
+    label: &str,
+    color: &str,
+    text: &str,
+) {
+    fresh_line(out, at_line_start);
+    let _ = writeln!(
+        out,
+        "{}{color}{label}:{} {}",
+        stamp(),
+        rst(),
+        text.trim_end()
+    );
+    *at_line_start = true;
+    let _ = out.flush();
 }
 
 /// Write one RPC command object (`{"type": <verb>, "message": <text>}`) as a
@@ -208,15 +345,17 @@ fn render_event(
                 .and_then(|v| v.as_str().map(str::to_owned))
                 .or_else(|| args.map(Value::to_string))
                 .unwrap_or_default();
+            // LOG output — show the command in FULL (whitespace collapsed to a
+            // single line, but never truncated).
             let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-            let collapsed: String = collapsed.chars().take(100).collect();
             let argpart = if collapsed.is_empty() {
                 String::new()
             } else {
                 format!("{}: {}{}", dim(), collapsed, rst())
             };
             // Whole line dim: tool lines are background progress, not signal.
-            let _ = writeln!(out, "{}{}→ {}{}{}", stamp(), dim(), name, rst(), argpart);
+            // No glyph — the dim color alone marks it as background.
+            let _ = writeln!(out, "{}{}{}{}{}", stamp(), dim(), name, rst(), argpart);
             *at_line_start = true;
             let _ = out.flush();
         }
@@ -231,18 +370,9 @@ fn render_event(
                 .get("toolName")
                 .and_then(Value::as_str)
                 .unwrap_or("tool");
-            // Red carries the failure signal on the `✗` alone; the tool name
-            // stays dim like every other tool line.
-            let _ = writeln!(
-                out,
-                "{}{}✗ {}{}{} failed{}",
-                stamp(),
-                red(),
-                rst(),
-                dim(),
-                name,
-                rst()
-            );
+            // No glyph — the failure signal rides on the text color (red),
+            // mirroring the pulse's Error lines.
+            let _ = writeln!(out, "{}{}{} failed{}", stamp(), red(), name, rst());
             *at_line_start = true;
             let _ = out.flush();
         }
@@ -288,6 +418,28 @@ fn fresh_line(out: &mut impl Write, at_line_start: &mut bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_turn_stamps_and_keeps_full_text() {
+        let mut out: Vec<u8> = Vec::new();
+        let mut at_line_start = true;
+        // Colors are off without init_color(), so assert on the plain text.
+        // LOG output: internal newlines are preserved, nothing is truncated.
+        render_turn(
+            &mut out,
+            &mut at_line_start,
+            "ask",
+            "",
+            "para one\npara two  \n",
+        );
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with('['), "stamped, got {s:?}");
+        assert!(
+            s.ends_with("ask: para one\npara two\n"),
+            "full text, newlines kept, trailing ws trimmed, got {s:?}"
+        );
+        assert!(at_line_start);
+    }
 
     #[test]
     fn write_command_emits_one_jsonl_record() {
@@ -369,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_execution_start_formats_arrow_line() {
+    fn tool_execution_start_formats_tool_line() {
         let ev = serde_json::json!({
             "type": "tool_execution_start",
             "toolName": "bash",
@@ -379,7 +531,7 @@ mod tests {
         // A dim `[HH:MM:SS] ` stamp (real wall-clock, mirroring the pulse) leads
         // the line, so assert on the stable suffix rather than the full string.
         let (out, _, at_line_start) = render(&ev);
-        assert!(out.ends_with("→ bash: ls -la\n"), "arrow line, got {out:?}");
+        assert!(out.ends_with("bash: ls -la\n"), "tool line, got {out:?}");
         assert!(
             out.starts_with('['),
             "line is timestamp-stamped, got {out:?}"
