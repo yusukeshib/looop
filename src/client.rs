@@ -81,6 +81,12 @@ const TICK: Duration = Duration::from_millis(250);
 
 /// Rows scrolled per mouse-wheel notch (list and detail alike).
 const WHEEL_STEP: usize = 3;
+/// Body width at/above which the list+buffer sit SIDE BY SIDE (list left, buffer
+/// right) instead of stacked (list top, buffer bottom). Below it the terminal is
+/// too narrow to give both panes a usable column count, so we stack.
+const WIDE_MIN: u16 = 90;
+/// Floor for the draggable left-pane width (cols).
+const LIST_MIN_W: u16 = 12;
 
 /// The shared dark-surface background (same as `looop watch`): the selected
 /// row's highlight and the status bar. Dark enough that per-span colors
@@ -288,6 +294,11 @@ struct AsksHit {
     /// Max scroll offset (`len - visible`), for scrollbar drag mapping. Zero
     /// when the list fits and no scrollbar is drawn.
     max_off: usize,
+    /// Rows each agent occupies: 1 in the stacked table layout (one row per
+    /// agent), or the card height in the side-by-side layout (2: an id line +
+    /// a `state age` line). A click at `row` maps to agent
+    /// `offset + (row - top) / stride`.
+    stride: usize,
 }
 
 /// One row of the client list: an AGENT (the pulse or a worker session), with
@@ -351,6 +362,17 @@ struct App {
     /// Whether a drag on the bottom list's scrollbar is in progress — mirrors
     /// `LogView::dragging_scrollbar` for the main buffer.
     dragging_list_sb: bool,
+    /// Width (cols) of the left list pane in the side-by-side layout, dragged
+    /// live via the vertical divider. Clamped to a sane range each draw.
+    list_w: u16,
+    /// The divider's screen column from the last WIDE draw (for a drag grab);
+    /// `None` when the side-by-side layout isn't active.
+    divider_col: Option<u16>,
+    /// The left pane's origin column from the last draw — the drag maps a
+    /// pointer column back to a pane width via `col - origin`.
+    list_origin_x: u16,
+    /// Whether a drag on the left/right divider is in progress.
+    dragging_divider: bool,
     /// Which dead workers the list includes. Toggled live with `Tab`.
     filter: Filter,
     /// Count of workers hidden by the current filter — shown in the status bar.
@@ -371,6 +393,10 @@ impl App {
             log: LogView::new(),
             pulse_alive: false,
             asks_hit: None,
+            list_w: 20,
+            divider_col: None,
+            list_origin_x: 0,
+            dragging_divider: false,
             dragging_list_sb: false,
             filter,
             hidden: 0,
@@ -385,6 +411,21 @@ impl App {
     /// the top row (the pulse).
     fn refresh(&mut self, paths: &Paths) {
         self.pulse_alive = run::pulse_running(paths);
+
+        // Pulse uptime: age of the `pid` file, which the pulse REWRITES each
+        // time it acquires the lock (the lock file itself is never truncated,
+        // so its mtime is stale). Empty when the pulse is down or the file is
+        // gone.
+        let pulse_age = if self.pulse_alive {
+            std::fs::metadata(paths.lock().join("pid"))
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .map(|d| fmt_secs(d.as_secs()))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
 
         // worker id → its earliest pending ask (a blocked worker has one).
         // `mailbox::pending` is sorted by ts asc, so `or_insert` keeps the
@@ -402,7 +443,7 @@ impl App {
             is_pulse: true,
             alive: self.pulse_alive,
             state: if self.pulse_alive { "live" } else { "down" }.to_string(),
-            age: String::new(),
+            age: pulse_age,
             idle: None,
             ask: None,
         }];
@@ -582,17 +623,23 @@ impl App {
         if col < a.left() || col >= a.right() || row < a.top() || row >= a.bottom() {
             return None;
         }
-        let idx = hit.offset + (row - a.top()) as usize;
+        let idx = hit.offset + (row - a.top()) as usize / hit.stride.max(1);
         (idx < self.rows.len()).then_some(idx)
     }
 
-    /// Whether `row` falls in the top list strip (its column-header row plus
-    /// the data rows) — used to route the wheel to the list vs. the buffer.
-    fn in_list_region(&self, row: u16) -> bool {
+    /// Whether `(col, row)` falls in the list pane (its column-header row plus
+    /// the data rows, across the pane's columns) — used to route the wheel to
+    /// the list vs. the buffer. The column check matters in the side-by-side
+    /// layout, where the list sits to the LEFT of the buffer; when stacked the
+    /// list spans the full width so it's a no-op.
+    fn in_list_region(&self, col: u16, row: u16) -> bool {
         self.asks_hit.is_some_and(|hit| {
             // The header sits one row above the data area.
             let top = hit.area.top().saturating_sub(1);
-            row >= top && row < hit.area.bottom()
+            let in_rows = row >= top && row < hit.area.bottom();
+            // Include one extra column past the table for the scrollbar cell.
+            let in_cols = col >= hit.area.left() && col <= hit.area.right();
+            in_rows && in_cols
         })
     }
 
@@ -643,33 +690,43 @@ impl App {
             // bottom list strip scrolls its view, the buffer above scrolls
             // into history (up) / toward the tail (down).
             MouseEventKind::ScrollUp => {
-                if self.in_list_region(m.row) {
+                if self.in_list_region(m.column, m.row) {
                     self.list_offset = self.list_offset.saturating_sub(WHEEL_STEP);
                 } else {
                     self.log.scroll(WHEEL_STEP as isize);
                 }
             }
             MouseEventKind::ScrollDown => {
-                if self.in_list_region(m.row) {
+                if self.in_list_region(m.column, m.row) {
                     self.list_offset = self.list_offset.saturating_add(WHEEL_STEP);
                 } else {
                     self.log.scroll(-(WHEEL_STEP as isize));
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // Prefer a scrollbar grab (list strip or buffer); otherwise a
+                // The divider grab wins first (it sits at the pane seam);
+                // otherwise a scrollbar grab (list strip or buffer), else a
                 // click on a still-visible list row switches the buffer to
                 // that ask. Always (re)assign grab results so a plain click
                 // clears any stuck drag state (e.g. a missed mouse-up).
-                self.dragging_list_sb = self.list_scrollbar_grab(m.column, m.row);
-                self.log.dragging_scrollbar =
-                    !self.dragging_list_sb && self.log.scrollbar_grab(m.column, m.row);
-                if !self.dragging_list_sb
+                self.dragging_divider = self.divider_col == Some(m.column);
+                self.dragging_list_sb =
+                    !self.dragging_divider && self.list_scrollbar_grab(m.column, m.row);
+                self.log.dragging_scrollbar = !self.dragging_divider
+                    && !self.dragging_list_sb
+                    && self.log.scrollbar_grab(m.column, m.row);
+                if !self.dragging_divider
+                    && !self.dragging_list_sb
                     && !self.log.dragging_scrollbar
                     && let Some(idx) = self.ask_at(m.column, m.row)
                 {
                     self.select_index(idx);
                 }
+            }
+            MouseEventKind::Drag(MouseButton::Left) if self.dragging_divider => {
+                // Map the pointer column back to a pane width; clamp lands in
+                // `draw`, so just record the raw intent here.
+                self.list_w = m.column.saturating_sub(self.list_origin_x).max(LIST_MIN_W);
             }
             MouseEventKind::Drag(MouseButton::Left) if self.dragging_list_sb => {
                 self.list_scrollbar_scrub(m.row);
@@ -680,6 +737,7 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 self.log.dragging_scrollbar = false;
                 self.dragging_list_sb = false;
+                self.dragging_divider = false;
             }
             _ => {}
         }
@@ -830,8 +888,8 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         let chunks = Layout::vertical([
-            Constraint::Length(1), // status bar (top)
             Constraint::Min(3),    // asks | detail
+            Constraint::Length(1), // status bar (bottom)
         ])
         .split(frame.area());
 
@@ -841,30 +899,55 @@ impl App {
         // buffer takes the rest (flex) BELOW it, separated by a gray rule. With
         // nothing selected (only before the first refresh) the list owns the
         // whole body.
-        let body = chunks[1];
+        let body = chunks[0];
         if self.selected().is_some() {
-            // The agent list is a borderless strip pinned at the TOP (up to 5
-            // data rows + 1 column-header row); a gray rule seams it off and
-            // the worker buffer takes the rest below.
-            let data_rows = self.rows.len().clamp(1, 5) as u16;
-            let want = data_rows + 1;
-            let list_h = want.min(body.height.saturating_sub(4)).max(2);
-            let parts = Layout::vertical([
-                Constraint::Length(list_h), // agent list (top, borderless)
-                Constraint::Length(1),      // gray separator rule
-                Constraint::Min(3),         // worker buffer (below, flex)
-            ])
-            .split(body);
-            self.draw_asks(frame, parts[0]);
-            frame.render_widget(
-                Block::default().borders(Borders::TOP).border_style(dim()),
-                parts[1],
-            );
-            self.draw_detail(frame, parts[2]);
+            if body.width > WIDE_MIN {
+                // WIDE: list on the LEFT, buffer on the RIGHT, seamed by a
+                // vertical gray rule the human can DRAG to resize. The width is
+                // clamped so neither pane starves, then persisted.
+                let hi = body.width.saturating_sub(20).max(LIST_MIN_W);
+                let list_w = self.list_w.clamp(LIST_MIN_W, hi);
+                self.list_w = list_w;
+                self.list_origin_x = body.x;
+                let parts = Layout::horizontal([
+                    Constraint::Length(list_w), // agent list (left, borderless)
+                    Constraint::Length(1),      // gray separator rule (draggable)
+                    Constraint::Min(20),        // worker buffer (right, flex)
+                ])
+                .split(body);
+                self.divider_col = Some(parts[1].x);
+                self.draw_list_wide(frame, parts[0]);
+                frame.render_widget(
+                    Block::default().borders(Borders::LEFT).border_style(dim()),
+                    parts[1],
+                );
+                self.draw_detail(frame, parts[2]);
+            } else {
+                self.divider_col = None;
+                // NARROW: the agent list is a borderless strip pinned at the TOP
+                // (up to 5 data rows + 1 column-header row); a gray rule seams it
+                // off and the worker buffer takes the rest below.
+                let data_rows = self.rows.len().clamp(1, 5) as u16;
+                let want = data_rows + 1;
+                let list_h = want.min(body.height.saturating_sub(4)).max(2);
+                let parts = Layout::vertical([
+                    Constraint::Length(list_h), // agent list (top, borderless)
+                    Constraint::Length(1),      // gray separator rule
+                    Constraint::Min(3),         // worker buffer (below, flex)
+                ])
+                .split(body);
+                self.draw_asks(frame, parts[0]);
+                frame.render_widget(
+                    Block::default().borders(Borders::TOP).border_style(dim()),
+                    parts[1],
+                );
+                self.draw_detail(frame, parts[2]);
+            }
         } else {
+            self.divider_col = None;
             self.draw_asks(frame, body);
         }
-        self.draw_status(frame, chunks[0]);
+        self.draw_status(frame, chunks[1]);
     }
 
     fn draw_asks(&mut self, frame: &mut Frame, area: Rect) {
@@ -987,6 +1070,91 @@ impl App {
             },
             offset: off,
             max_off: if overflow { max_off } else { 0 },
+            stride: 1,
+        });
+    }
+
+    /// The side-by-side (WIDE) list: one CARD per agent stacked vertically —
+    /// two lines (the id, then `state` + dim age) — with a green vertical
+    /// accent bar down the left edge of each line of the SELECTED card. All
+    /// geometry (scroll, hit-test, scrollbar) is in agent units via the
+    /// `AsksHit` stride, so the shared mouse handlers work unchanged.
+    fn draw_list_wide(&mut self, frame: &mut Frame, area: Rect) {
+        const STRIDE: usize = 2; // 2 content lines, no spacer
+        let dim = dim();
+        frame.render_widget(Clear, area);
+        let col_w = area.width;
+
+        if self.rows.is_empty() {
+            self.asks_hit = None;
+            frame.render_widget(Paragraph::new(Span::styled(" no agents", dim)), area);
+            return;
+        }
+
+        let visible = ((area.height as usize) / STRIDE).max(1);
+        self.list_rows = visible;
+        let len = self.rows.len();
+        let max_off = len.saturating_sub(visible);
+        self.list_offset = self.list_offset.min(max_off);
+        let off = self.list_offset;
+        let overflow = len > visible;
+        let table_w = if overflow {
+            col_w.saturating_sub(1)
+        } else {
+            col_w
+        };
+
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for r in self.rows.iter().skip(off).take(visible) {
+            let selected = Some(r.id.as_str()) == self.selected_id.as_deref();
+            // Green accent bar down the card's left edge when selected — no
+            // background fill; the bar alone marks the selection.
+            let mark = || {
+                if selected {
+                    Span::styled("▎", Style::default().fg(Color::Green))
+                } else {
+                    Span::raw(" ")
+                }
+            };
+            let id_style = if selected {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            let (state, state_style) = Self::state_cell(r);
+            // Line 1: id. Line 2: `<age> <state>` (age dim, state coloured).
+            lines.push(Line::from(vec![
+                mark(),
+                Span::raw(" "),
+                Span::styled(r.id.clone(), id_style),
+            ]));
+            let mut l2 = vec![mark(), Span::raw(" "), Span::styled(state, state_style)];
+            if !r.age.is_empty() {
+                l2.push(Span::styled(format!(" {}", r.age), dim));
+            }
+            lines.push(Line::from(l2));
+        }
+        frame.render_widget(
+            Paragraph::new(lines),
+            Rect {
+                width: table_w,
+                ..area
+            },
+        );
+
+        if overflow {
+            render_vscrollbar(frame, area, max_off, off);
+        }
+        self.asks_hit = Some(AsksHit {
+            area: Rect {
+                width: table_w,
+                ..area
+            },
+            offset: off,
+            max_off: if overflow { max_off } else { 0 },
+            stride: STRIDE,
         });
     }
 
@@ -1139,17 +1307,15 @@ impl App {
             };
             frame.render_widget(Paragraph::new(shown), field);
         }
-        if let Some(mode) = mode {
-            self.draw_input(frame, input_area, mode);
+        if mode.is_some() {
+            self.draw_input(frame, input_area);
         }
     }
 
     /// The always-focused editor pinned along the bottom of the detail pane: a
     /// single input line in a bordered box. Its WHITE border (vs. the dim
     /// ask box above) marks it as the focused element — where typing lands.
-    /// Its placeholder reflects the `mode` — answering a pending ask vs.
-    /// steering a live worker.
-    fn draw_input(&self, frame: &mut Frame, area: Rect, mode: InputMode) {
+    fn draw_input(&self, frame: &mut Frame, area: Rect) {
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::White));
@@ -1168,38 +1334,25 @@ impl App {
         } else {
             self.input.clone()
         };
+        // text + block cursor (1 col), then pad the rest of the field with
+        // spaces so shrinking input (backspace) can't leave stale glyphs behind
+        // — Paragraph doesn't clear cells it doesn't write.
         let mut spans = Vec::new();
-        if self.input.is_empty() {
-            // Block cursor first, then a dim placeholder so the field reads as
-            // focused and self-explanatory before anything is typed.
-            let hint = match mode {
-                InputMode::Answer => " type answer · enter to send",
-                InputMode::Send => " type message · enter to send",
-            };
-            spans.push(Span::styled(" ", Style::default().bg(Color::White)));
-            spans.push(Span::styled(hint, dim()));
-        } else {
-            spans.push(Span::raw(shown));
-            spans.push(Span::styled(" ", Style::default().bg(Color::White)));
+        let shown_w = shown.chars().count();
+        spans.push(Span::raw(shown));
+        spans.push(Span::styled(" ", Style::default().bg(Color::White)));
+        let pad = (field.width as usize).saturating_sub(shown_w + 1);
+        if pad > 0 {
+            spans.push(Span::raw(" ".repeat(pad)));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), field);
     }
 
-    /// The one-line status bar pinned along the TOP of the screen: the filter
-    /// badge, the last outcome (an error or an "answered X" note), and the key
-    /// hints, led by an inverse-video ` looop ` brand tag on the far left. Top
-    /// rather than bottom so it never competes with the input row — the bottom
-    /// of the screen is where you type, the top is where you read the mode.
+    /// The one-line status bar pinned along the BOTTOM of the screen: the
+    /// filter badge, the last outcome (an error or an "answered X" note), and
+    /// the key hints.
     fn draw_status(&self, frame: &mut Frame, area: Rect) {
         let style = Style::default().bg(SURFACE).fg(Color::White);
-        // Inverse-video brand tag: white bg, dark text, bold.
-        let brand = Span::styled(
-            " looop ",
-            Style::default()
-                .bg(Color::White)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD),
-        );
         // The filter badge (with any hidden-worker count) leads the hint line,
         // mirroring `looop watch`'s selector footer.
         let fname = match self.filter {
@@ -1212,24 +1365,24 @@ impl App {
             String::new()
         };
         let help = match &self.status {
-            Some(msg) => format!(" {msg} "),
+            Some(msg) => format!("{msg} "),
             // The type/enter keys only apply when the selected agent can
             // receive text (answer an ask, or steer a live worker); a
             // read-only agent (pulse w/o ask, dead worker) just scrolls.
             None => match self.input_mode() {
                 Some(InputMode::Answer) => format!(
-                    " {fname}{hidden}  type answer · enter send · ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
+                    "{fname}{hidden}  type answer · enter send · ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
                 ),
                 Some(InputMode::Send) => format!(
-                    " {fname}{hidden}  type message · enter send · ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
+                    "{fname}{hidden}  type message · enter send · ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
                 ),
                 None => format!(
-                    " {fname}{hidden}  ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
+                    "{fname}{hidden}  ↑/↓ switch · tab filter · pgup/pgdn scroll · ^c quit "
                 ),
             },
         };
         frame.render_widget(
-            Paragraph::new(Line::from(vec![brand, Span::styled(help, style)])).style(style),
+            Paragraph::new(Line::from(vec![Span::styled(help, style)])).style(style),
             area,
         );
     }
