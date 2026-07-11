@@ -1205,9 +1205,9 @@ impl App {
         if field.height == 0 {
             return;
         }
-        // Single non-wrapping line: text + block cursor (1 col). If the answer
-        // overflows, show its TAIL (chars, not bytes) so the caret stays
-        // visible — horizontal scroll rather than run-off.
+        // Single non-wrapping line. If the answer overflows, show its TAIL
+        // (chars, not bytes) so the caret stays visible — horizontal scroll
+        // rather than run-off. Reserve one column for the caret cell.
         let avail = (field.width as usize).saturating_sub(1);
         let chars: Vec<char> = self.input.chars().collect();
         let shown: String = if chars.len() > avail {
@@ -1215,21 +1215,22 @@ impl App {
         } else {
             self.input.clone()
         };
-        // text + block cursor (1 col), then pad the rest of the field with
-        // spaces so shrinking input (backspace) can't leave stale glyphs behind
-        // — Paragraph doesn't clear cells it doesn't write.
-        let mut spans = Vec::new();
         let shown_w: usize = shown
             .chars()
             .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
             .sum();
-        spans.push(Span::raw(shown));
-        spans.push(Span::styled(" ", Style::default().bg(Color::White)));
-        let pad = (field.width as usize).saturating_sub(shown_w + 1);
-        if pad > 0 {
-            spans.push(Span::raw(" ".repeat(pad)));
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), field);
+        // Pad to the full field width so shrinking input (backspace) can't leave
+        // stale glyphs behind — Paragraph doesn't clear cells it doesn't write.
+        let pad = (field.width as usize).saturating_sub(shown_w);
+        let line = Line::from(vec![Span::raw(shown), Span::raw(" ".repeat(pad))]);
+        frame.render_widget(Paragraph::new(line), field);
+
+        // Place the REAL terminal cursor at the caret instead of painting a
+        // fake block: a hidden real cursor makes an IME anchor its composition /
+        // candidate window at the wrong spot (wherever the cursor last sat).
+        // Sitting it on the caret keeps the IME popup with the text being typed.
+        let caret_x = field.x + (shown_w as u16).min(field.width.saturating_sub(1));
+        frame.set_cursor_position((caret_x, field.y));
     }
 
     /// The one-line status bar pinned along the BOTTOM of the screen: the
