@@ -54,7 +54,7 @@
 //! never spawns a worker or edits policy — for that, use the agent concierge or
 //! the raw `_` verbs.
 
-use crate::logview::{self, LogView};
+use crate::logview::LogView;
 use crate::mailbox::{self, Ask};
 use crate::paths::Paths;
 use crate::run;
@@ -155,87 +155,6 @@ fn render_vscrollbar(frame: &mut Frame, area: Rect, max_scroll: usize, pos: usiz
         .track_symbol(Some("│"))
         .track_style(Style::default().fg(Color::DarkGray));
     frame.render_stateful_widget(bar, area, &mut state);
-}
-
-/// Group a run of styled chars into a `Line`, coalescing adjacent chars that
-/// share a style into one `Span` (keeps the widget's span list compact).
-fn chars_to_line(chars: &[(char, Style)], base: Style) -> Line<'static> {
-    let mut spans: Vec<Span<'static>> = Vec::new();
-    let mut buf = String::new();
-    let mut cur_style: Option<Style> = None;
-    for &(c, st) in chars {
-        if cur_style != Some(st) {
-            if let Some(prev) = cur_style.take() {
-                spans.push(Span::styled(std::mem::take(&mut buf), prev));
-            }
-            cur_style = Some(st);
-        }
-        buf.push(c);
-    }
-    if let Some(st) = cur_style {
-        spans.push(Span::styled(buf, st));
-    }
-    Line::from(spans).style(base)
-}
-
-/// Word-wrap styled `lines` to `width` columns, preserving each span's style.
-/// Breaks at the last space that fits; a word longer than the whole width is
-/// hard-split. Width is counted in display columns via `unicode-width`, so CJK
-/// double-width glyphs (and other wide characters) consume two columns and wrap
-/// before they run off the right edge. The `LogView` paints its `tail` verbatim
-/// against a fixed-width log grid, so the ask block must be pre-wrapped here to
-/// stay readable in a narrow detail pane.
-fn wrap_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
-    if width == 0 {
-        return lines;
-    }
-    let mut out: Vec<Line<'static>> = Vec::new();
-    for line in lines {
-        let base = line.style;
-        // Flatten the line to a styled-char sequence, then greedily re-emit.
-        let chars: Vec<(char, Style)> = line
-            .spans
-            .iter()
-            .flat_map(|s| s.content.chars().map(move |c| (c, s.style)))
-            .collect();
-        if chars.is_empty() {
-            out.push(Line::from("").style(base));
-            continue;
-        }
-        let mut start = 0usize;
-        while start < chars.len() {
-            // Walk forward accumulating DISPLAY columns (CJK glyphs = 2), so the
-            // window ends at the last char that still fits within `width` cols.
-            let mut end = start;
-            let mut cols = 0usize;
-            while end < chars.len() {
-                // `width()` returns None for control chars (e.g. `\t`); treat
-                // those as at least 1 column so they still advance the window
-                // and can't silently disable wrapping.
-                let w = chars[end].0.width().unwrap_or(1);
-                if end > start && cols + w > width {
-                    break;
-                }
-                cols += w;
-                end += 1;
-            }
-            if end < chars.len() {
-                // Prefer breaking at the last space in the window (dropped).
-                if let Some(sp) = (start..end).rev().find(|&i| chars[i].0 == ' ')
-                    && sp > start
-                {
-                    end = sp;
-                }
-            }
-            out.push(chars_to_line(&chars[start..end], base));
-            start = end;
-            // Swallow a single break space so it doesn't lead the next row.
-            if start < chars.len() && chars[start].0 == ' ' {
-                start += 1;
-            }
-        }
-    }
-    out
 }
 
 /// Which dead workers the fleet list includes (alive workers, the pulse, and
@@ -1253,51 +1172,10 @@ impl App {
             ..inner
         };
 
-        // The pending ask renders in its OWN bordered box above the input —
-        // prompt only. Wrap it to the box's inner width up front so its height
-        // is known; cap the box at half the pane so a long ask can't evict the
-        // transcript. When the prompt overflows the cap, show its TAIL (the
-        // question conventionally comes last) with a dim `…` marker on top.
-        // Borrow the pending ask rather than cloning it — we only need its
-        // prompt to lay out owned lines, so the borrow ends with this match.
-        let ask_lines: Vec<Line<'static>> = match self.selected().and_then(|r| r.ask.as_ref()) {
-            Some(a) => {
-                // Render the prompt as Markdown, lifting the borrowed lines to
-                // owned; wrap to the box interior (borders take 2 columns).
-                let mut v: Vec<Line<'static>> = Vec::new();
-                for line in tui_markdown::from_str(&a.prompt).lines {
-                    v.push(logview::static_line(&line));
-                }
-                wrap_lines(v, inner.width.saturating_sub(2) as usize)
-            }
-            None => vec![],
-        };
-        // A bordered box needs at least 3 rows (2 borders + 1 content line).
-        // Cap it at half the pane so a long ask can't evict the transcript,
-        // but never let it exceed the space actually left below the input —
-        // and skip it entirely when there's no room for a box at all, else
-        // the ask_area would extend past `inner` and clip/overlap the input.
-        let ask_h: u16 = if ask_lines.is_empty() {
-            0
-        } else {
-            let avail = inner.height.saturating_sub(input_h);
-            if avail < 3 {
-                0
-            } else {
-                let cap = (avail / 2).max(3).min(avail);
-                (ask_lines.len() as u16 + 2).min(cap)
-            }
-        };
-
-        let content = Rect {
-            height: content.height.saturating_sub(ask_h),
-            ..content
-        };
-        let ask_area = Rect {
-            y: inner.y + content.height,
-            height: ask_h,
-            ..inner
-        };
+        // The pending ask is NOT drawn as its own box anymore: it's woven into
+        // the worker's transcript (the rpc-bridge emits `[hms] ask: …` /
+        // `answer: …` lines in FULL), so the buffer already shows it. The pane
+        // is just the buffer + the input pinned below.
 
         // The agent vanished from the fleet while its pane was open — say so
         // at the buffer's tail (the one message that still belongs there).
@@ -1310,25 +1188,6 @@ impl App {
         };
 
         self.log.render(frame, content, &tail, true);
-        if ask_h > 0 {
-            let block = Block::default()
-                .borders(Borders::ALL)
-                .border_style(dim())
-                .title(Span::styled(" ask ", dim()));
-            let field = block.inner(ask_area);
-            frame.render_widget(block, ask_area);
-            let visible = field.height as usize;
-            let shown: Vec<Line<'static>> = if ask_lines.len() > visible {
-                let mut v = ask_lines[ask_lines.len() - visible..].to_vec();
-                if let Some(first) = v.first_mut() {
-                    *first = Line::from(Span::styled("…", dim()));
-                }
-                v
-            } else {
-                ask_lines
-            };
-            frame.render_widget(Paragraph::new(shown), field);
-        }
         if mode.is_some() {
             self.draw_input(frame, input_area);
         }
@@ -1416,69 +1275,6 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn plain(l: &Line) -> String {
-        l.spans.iter().map(|s| s.content.as_ref()).collect()
-    }
-
-    #[test]
-    fn wrap_breaks_at_spaces_and_preserves_text() {
-        let lines = vec![Line::from("the quick brown fox jumps")];
-        let out = wrap_lines(lines, 10);
-        // Each wrapped row fits the width and no word is split at a space break.
-        assert!(out.iter().all(|l| plain(l).chars().count() <= 10));
-        let joined: String = out.iter().map(plain).collect::<Vec<_>>().join(" ");
-        assert_eq!(joined, "the quick brown fox jumps");
-    }
-
-    #[test]
-    fn wrap_hard_splits_overlong_word() {
-        let lines = vec![Line::from("abcdefghijklmnop")];
-        let out = wrap_lines(lines, 5);
-        assert_eq!(out.len(), 4); // 16 chars / 5
-        assert!(out.iter().all(|l| plain(l).chars().count() <= 5));
-        let joined: String = out.iter().map(|l| plain(l)).collect();
-        assert_eq!(joined, "abcdefghijklmnop");
-    }
-
-    #[test]
-    fn wrap_preserves_span_styles() {
-        let styled = Line::from(vec![
-            Span::styled("aaa", Style::default().fg(Color::Red)),
-            Span::styled(" bbb", Style::default().fg(Color::Green)),
-        ]);
-        let out = wrap_lines(vec![styled], 3);
-        // "aaa" then "bbb" on separate rows, keeping their colors.
-        assert_eq!(plain(&out[0]), "aaa");
-        assert_eq!(out[0].spans[0].style.fg, Some(Color::Red));
-        assert_eq!(plain(&out[1]), "bbb");
-        assert_eq!(out[1].spans.last().unwrap().style.fg, Some(Color::Green));
-    }
-
-    #[test]
-    fn wrap_counts_cjk_as_double_width() {
-        // 6 double-width glyphs = 12 display columns; at width 6 that must wrap
-        // into rows of at most 3 glyphs (6 columns), not 6 glyphs (12 columns).
-        let lines = vec![Line::from("あいうえおか")];
-        let out = wrap_lines(lines, 6);
-        assert!(out.iter().all(|l| {
-            plain(l)
-                .chars()
-                .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
-                .sum::<usize>()
-                <= 6
-        }));
-        let joined: String = out.iter().map(plain).collect();
-        assert_eq!(joined, "あいうえおか");
-    }
-
-    #[test]
-    fn wrap_zero_width_is_identity() {
-        let lines = vec![Line::from("anything")];
-        let out = wrap_lines(lines.clone(), 0);
-        assert_eq!(out.len(), 1);
-        assert_eq!(plain(&out[0]), "anything");
-    }
 
     fn row(is_pulse: bool, alive: bool, state: &str, ask: bool) -> AgentRow {
         AgentRow {

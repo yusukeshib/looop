@@ -40,7 +40,6 @@ ansi-to-tui = "8"
 # default-features = false drops the `highlight-code` feature (syntect), keeping
 # that heavy syntax-highlighting stack out — code blocks still render, just
 # without per-language coloring.
-tui-markdown = { version = "0.3", default-features = false }
 # `looop watch` replays the raw PTY `output.log` through a virtual terminal so
 # an interactive agent's in-place redraws (cursor moves, line clears) render as
 # the actual SCREEN instead of a garbled append of every frame. babysit already
