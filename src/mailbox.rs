@@ -64,6 +64,27 @@ fn read_answer(store: &impl StateStore, ask_id: &str) -> Option<String> {
     v.get("answer").and_then(|x| x.as_str()).map(str::to_owned)
 }
 
+/// Every ask raised by `worker` (answered or not), oldest first. Used by the
+/// rpc-bridge to weave a worker's ask/answer turns into its own transcript.
+pub(crate) fn asks_of(paths: &Paths, worker: &str) -> Vec<Ask> {
+    let store = FileStore::new(paths);
+    let mut out: Vec<Ask> = store
+        .list(&Collection::Asks)
+        .into_iter()
+        .filter_map(|id| store.read(&Key::Ask(id)))
+        .filter_map(|raw| serde_json::from_str::<Ask>(&raw).ok())
+        .filter(|a| a.worker == worker)
+        .collect();
+    out.sort_by_key(|a| a.ts);
+    out
+}
+
+/// The answer text for `ask_id`, if it has been answered (public sibling of
+/// [`read_answer`] for callers outside the mailbox).
+pub(crate) fn answer_text(paths: &Paths, ask_id: &str) -> Option<String> {
+    read_answer(&FileStore::new(paths), ask_id)
+}
+
 /// All asks that have NO matching answer yet. Read-only; used by `_ state` and
 /// the decide prompt (so looop sees what's blocked) and by `looop watch` / any
 /// client (so the human sees what's waiting on them).

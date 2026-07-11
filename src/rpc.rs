@@ -27,14 +27,26 @@
 //! session ends exactly when the agent does.
 
 use crate::cli::RpcBridgeArgs;
-use crate::util::{dim, hms, red, rst};
+use crate::util::{cyan, dim, hms, red, rst, yel};
 use anyhow::{Context, Result};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Sender, channel};
 use std::thread;
+use std::time::Duration;
+
+/// One item bound for the single OUT writer: a rendered child event line, a
+/// mailbox turn (ask/answer) woven in by the watcher, or the child's EOF.
+enum Ev {
+    Line(String),
+    Ask(String),
+    Answer(String),
+    Eof,
+}
 
 pub fn cmd_rpc_bridge(args: &RpcBridgeArgs) -> Result<ExitCode> {
     let mut child_argv = args.child.iter();
@@ -101,22 +113,48 @@ pub fn cmd_rpc_bridge(args: &RpcBridgeArgs) -> Result<ExitCode> {
         }
     });
 
-    // OUT loop (this thread): render the child's JSONL to the PTY until EOF.
+    // Everything that reaches the PTY funnels through ONE writer (this thread)
+    // via a channel, so the child's events and the mailbox turns can never
+    // interleave into half-lines. Two producers feed it: the child-stdout
+    // reader and the mailbox watcher.
+    let (tx, rx) = channel::<Ev>();
+
+    // Child stdout reader → one Ev::Line per JSONL record, then Ev::Eof.
+    let ctx = tx.clone();
+    thread::spawn(move || {
+        for line in BufReader::new(child_stdout).lines() {
+            let Ok(line) = line else { break };
+            // `lines()` strips `\n` but leaves a trailing `\r` if the child
+            // emits CRLF; drop it so strict JSONL parsing doesn't choke.
+            let line = line.strip_suffix('\r').unwrap_or(line.as_str());
+            if line.is_empty() {
+                continue;
+            }
+            if ctx.send(Ev::Line(line.to_string())).is_err() {
+                return;
+            }
+        }
+        let _ = ctx.send(Ev::Eof);
+    });
+
+    // Mailbox watcher → weave this worker's ask/answer turns into its own
+    // transcript. A no-op when the worker id isn't known.
+    spawn_ask_watcher(tx);
+
     let mut out = std::io::stdout();
     let mut at_line_start = true;
-    for line in BufReader::new(child_stdout).lines() {
-        let Ok(line) = line else { break };
-        // `lines()` strips `\n` but leaves a trailing `\r` if the child emits
-        // CRLF; drop it so strict JSONL parsing doesn't choke on the carriage
-        // return (which would silently drop the event).
-        let line = line.strip_suffix('\r').unwrap_or(line.as_str());
-        if line.is_empty() {
-            continue;
+    while let Ok(ev) = rx.recv() {
+        match ev {
+            Ev::Eof => break,
+            Ev::Line(line) => {
+                // Non-JSON on the JSONL channel: ignore (stderr carries logs).
+                if let Ok(event) = serde_json::from_str::<Value>(&line) {
+                    render_event(&event, &streaming, &mut out, &mut at_line_start);
+                }
+            }
+            Ev::Ask(prompt) => render_turn(&mut out, &mut at_line_start, "ask", yel(), &prompt),
+            Ev::Answer(text) => render_turn(&mut out, &mut at_line_start, "answer", cyan(), &text),
         }
-        let Ok(event) = serde_json::from_str::<Value>(line) else {
-            continue; // Non-JSON on the JSONL channel: ignore (stderr carries logs).
-        };
-        render_event(&event, &streaming, &mut out, &mut at_line_start);
     }
     if !at_line_start {
         let _ = writeln!(out);
@@ -143,6 +181,86 @@ fn exit_code_of(status: &std::process::ExitStatus) -> ExitCode {
         }
     }
     ExitCode::from(1)
+}
+
+/// Poll this worker's mailbox and push its ask/answer turns onto the OUT
+/// channel, so a blocking `looop _ ask` (whose prompt is captured into a shell
+/// variable and never reaches the PTY) and the human/concierge's reply both
+/// land in the transcript as `[HH:MM:SS] ask/answer: …` lines. A no-op when the
+/// worker id (`$LOOOP_SESSION_ID`) isn't set. Only asks raised AFTER the bridge
+/// started are woven in, so a restart never replays stale mailbox history.
+fn spawn_ask_watcher(tx: Sender<Ev>) {
+    let worker = std::env::var("LOOOP_SESSION_ID").unwrap_or_default();
+    if worker.is_empty() {
+        return;
+    }
+    let poll = Duration::from_millis(
+        std::env::var("LOOOP_ASK_POLL_MS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(1000),
+    );
+    thread::spawn(move || {
+        let paths = crate::paths::Paths::resolve();
+        let start = crate::util::now_unix();
+        let mut shown_ask: HashSet<String> = HashSet::new();
+        let mut shown_ans: HashSet<String> = HashSet::new();
+        loop {
+            for ask in crate::mailbox::asks_of(&paths, &worker) {
+                if ask.ts >= start
+                    && shown_ask.insert(ask.id.clone())
+                    && tx.send(Ev::Ask(ask.prompt.clone())).is_err()
+                {
+                    return;
+                }
+                // Show the answer once, and only for an ask we already showed.
+                if shown_ask.contains(&ask.id)
+                    && !shown_ans.contains(&ask.id)
+                    && let Some(text) = crate::mailbox::answer_text(&paths, &ask.id)
+                {
+                    shown_ans.insert(ask.id.clone());
+                    if tx.send(Ev::Answer(text)).is_err() {
+                        return;
+                    }
+                }
+            }
+            thread::sleep(poll);
+        }
+    });
+}
+
+/// Render a mailbox turn as `[HH:MM:SS] <label>: <text>` on a fresh line — the
+/// label coloured, the (whitespace-collapsed, truncated) text in the default fg
+/// so a multi-paragraph prompt/answer can't shred the transcript.
+fn render_turn(
+    out: &mut impl Write,
+    at_line_start: &mut bool,
+    label: &str,
+    color: &str,
+    text: &str,
+) {
+    fresh_line(out, at_line_start);
+    let _ = writeln!(
+        out,
+        "{}{color}{label}:{} {}",
+        stamp(),
+        rst(),
+        one_line(text, 200)
+    );
+    *at_line_start = true;
+    let _ = out.flush();
+}
+
+/// Collapse whitespace to single spaces and cap at `max` chars (with an ellipsis
+/// when truncated) — one clean line for the transcript.
+fn one_line(s: &str, max: usize) -> String {
+    let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.chars().count() > max {
+        let head: String = collapsed.chars().take(max).collect();
+        format!("{head}…")
+    } else {
+        collapsed
+    }
 }
 
 /// Write one RPC command object (`{"type": <verb>, "message": <text>}`) as a
@@ -280,6 +398,35 @@ fn fresh_line(out: &mut impl Write, at_line_start: &mut bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_line_collapses_and_truncates() {
+        assert_eq!(one_line("  a\n b\t c ", 100), "a b c");
+        assert_eq!(one_line("abcdef", 3), "abc…");
+        // Multibyte-safe: never splits a char, counts chars not bytes.
+        assert_eq!(one_line("あいうえお", 3), "あいう…");
+    }
+
+    #[test]
+    fn render_turn_stamps_a_labeled_line() {
+        let mut out: Vec<u8> = Vec::new();
+        let mut at_line_start = true;
+        // Colors are off without init_color(), so assert on the plain text.
+        render_turn(
+            &mut out,
+            &mut at_line_start,
+            "ask",
+            "",
+            "multi\nline  prompt",
+        );
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.starts_with('['), "stamped, got {s:?}");
+        assert!(
+            s.ends_with("ask: multi line prompt\n"),
+            "one clean line, got {s:?}"
+        );
+        assert!(at_line_start);
+    }
 
     #[test]
     fn write_command_emits_one_jsonl_record() {
