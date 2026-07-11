@@ -877,6 +877,7 @@ dependencies = [
  "babysit",
  "chrono",
  "clap",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

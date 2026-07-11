@@ -51,7 +51,27 @@ enum Ev {
     Eof,
 }
 
+/// Silence the PTY's input echo. The bridge's stdin is the worker PTY slave;
+/// `looop _ send` writes lines into it, and with the tty's ECHO flag on the
+/// kernel copies those bytes straight back to the PTY OUTPUT — i.e. into the
+/// transcript — as a raw, unstamped duplicate of the `[hms] send:` line the
+/// bridge already renders. Best-effort (a no-op when stdin isn't a tty); the
+/// child agent reads its OWN piped stdin, so this never affects it.
+#[cfg(unix)]
+fn silence_pty_echo() {
+    unsafe {
+        let mut t: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(0, &mut t) == 0 {
+            t.c_lflag &= !libc::ECHO;
+            let _ = libc::tcsetattr(0, libc::TCSANOW, &t);
+        }
+    }
+}
+#[cfg(not(unix))]
+fn silence_pty_echo() {}
+
 pub fn cmd_rpc_bridge(args: &RpcBridgeArgs) -> Result<ExitCode> {
+    silence_pty_echo();
     let mut child_argv = args.child.iter();
     let Some(program) = child_argv.next() else {
         eprintln!(
