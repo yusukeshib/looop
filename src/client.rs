@@ -81,9 +81,9 @@ const TICK: Duration = Duration::from_millis(250);
 
 /// Rows scrolled per mouse-wheel notch (list and detail alike).
 const WHEEL_STEP: usize = 3;
-/// Body width at/above which the list+buffer sit SIDE BY SIDE (list left, buffer
-/// right) instead of stacked (list top, buffer bottom). Below it the terminal is
-/// too narrow to give both panes a usable column count, so we stack.
+/// Body width above which the list+buffer sit SIDE BY SIDE (list left, buffer
+/// right) instead of stacked (list top, buffer bottom). At or below it the
+/// terminal is too narrow to give both panes a usable column count, so we stack.
 const WIDE_MIN: u16 = 90;
 /// Floor for the draggable left-pane width (cols).
 const LIST_MIN_W: u16 = 12;
@@ -365,9 +365,11 @@ struct App {
     /// Width (cols) of the left list pane in the side-by-side layout, dragged
     /// live via the vertical divider. Clamped to a sane range each draw.
     list_w: u16,
-    /// The divider's screen column from the last WIDE draw (for a drag grab);
-    /// `None` when the side-by-side layout isn't active.
-    divider_col: Option<u16>,
+    /// The divider's screen rect from the last WIDE draw (for a drag grab); the
+    /// grab is gated to this column AND its body rows so a click elsewhere (e.g.
+    /// the status bar) at the same column can't start a resize. `None` when the
+    /// side-by-side layout isn't active.
+    divider: Option<Rect>,
     /// The left pane's origin column from the last draw — the drag maps a
     /// pointer column back to a pane width via `col - origin`.
     list_origin_x: u16,
@@ -394,7 +396,7 @@ impl App {
             pulse_alive: false,
             asks_hit: None,
             list_w: 20,
-            divider_col: None,
+            divider: None,
             list_origin_x: 0,
             dragging_divider: false,
             dragging_list_sb: false,
@@ -709,7 +711,9 @@ impl App {
                 // click on a still-visible list row switches the buffer to
                 // that ask. Always (re)assign grab results so a plain click
                 // clears any stuck drag state (e.g. a missed mouse-up).
-                self.dragging_divider = self.divider_col == Some(m.column);
+                self.dragging_divider = self.divider.is_some_and(|d| {
+                    m.column == d.x && m.row >= d.top() && m.row < d.bottom()
+                });
                 self.dragging_list_sb =
                     !self.dragging_divider && self.list_scrollbar_grab(m.column, m.row);
                 self.log.dragging_scrollbar = !self.dragging_divider
@@ -905,7 +909,10 @@ impl App {
                 // WIDE: list on the LEFT, buffer on the RIGHT, seamed by a
                 // vertical gray rule the human can DRAG to resize. The width is
                 // clamped so neither pane starves, then persisted.
-                let hi = body.width.saturating_sub(20).max(LIST_MIN_W);
+                // Leave room for the 1-col divider AND the right pane's Min(20),
+                // so the solver never has to shrink the left pane below list_w
+                // (which would desync list_w from the divider column near the limit).
+                let hi = body.width.saturating_sub(21).max(LIST_MIN_W);
                 let list_w = self.list_w.clamp(LIST_MIN_W, hi);
                 self.list_w = list_w;
                 self.list_origin_x = body.x;
@@ -915,7 +922,7 @@ impl App {
                     Constraint::Min(20),        // worker buffer (right, flex)
                 ])
                 .split(body);
-                self.divider_col = Some(parts[1].x);
+                self.divider = Some(parts[1]);
                 self.draw_list_wide(frame, parts[0]);
                 frame.render_widget(
                     Block::default().borders(Borders::LEFT).border_style(dim()),
@@ -923,7 +930,7 @@ impl App {
                 );
                 self.draw_detail(frame, parts[2]);
             } else {
-                self.divider_col = None;
+                self.divider = None;
                 // NARROW: the agent list is a borderless strip pinned at the TOP
                 // (up to 5 data rows + 1 column-header row); a gray rule seams it
                 // off and the worker buffer takes the rest below.
@@ -944,7 +951,7 @@ impl App {
                 self.draw_detail(frame, parts[2]);
             }
         } else {
-            self.divider_col = None;
+            self.divider = None;
             self.draw_asks(frame, body);
         }
         self.draw_status(frame, chunks[1]);
@@ -1124,7 +1131,7 @@ impl App {
                 Style::default().fg(Color::White)
             };
             let (state, state_style) = Self::state_cell(r);
-            // Line 1: id. Line 2: `<age> <state>` (age dim, state coloured).
+            // Line 1: id. Line 2: `<state> <age>` (state coloured, age dim).
             lines.push(Line::from(vec![
                 mark(),
                 Span::raw(" "),
@@ -1338,7 +1345,10 @@ impl App {
         // spaces so shrinking input (backspace) can't leave stale glyphs behind
         // — Paragraph doesn't clear cells it doesn't write.
         let mut spans = Vec::new();
-        let shown_w = shown.chars().count();
+        let shown_w: usize = shown
+            .chars()
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum();
         spans.push(Span::raw(shown));
         spans.push(Span::styled(" ", Style::default().bg(Color::White)));
         let pad = (field.width as usize).saturating_sub(shown_w + 1);
