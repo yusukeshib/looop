@@ -215,15 +215,20 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
     let _ = fs::write(&prompt_file, prompt::build_prompt(paths, &snap));
 
     let t0 = Instant::now();
-    util::event(
-        Level::Step,
-        "tick.start",
-        &format!("{runner_name} is deciding the one move"),
-        &[
-            ("runner", serde_json::json!(runner_name)),
-            ("run_id", serde_json::json!(run_id)),
-        ],
-    );
+    // In human mode the live spinner below IS the "deciding" indicator, so this
+    // line would just duplicate it — emit the marker only to the JSON pulse
+    // stream (whose watchers can't see the spinner).
+    if util::is_json() {
+        util::event(
+            Level::Step,
+            "tick.start",
+            &format!("{runner_name} is deciding the one move"),
+            &[
+                ("runner", serde_json::json!(runner_name)),
+                ("run_id", serde_json::json!(run_id)),
+            ],
+        );
+    }
     events::emit(
         paths,
         "decide_start",
