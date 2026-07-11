@@ -30,7 +30,8 @@ pub(crate) fn format_line(line: &str) -> Option<String> {
                 .and_then(|v| v.as_str().map(str::to_owned))
                 .or_else(|| args.map(|a| a.to_string()))
                 .unwrap_or_default();
-            let collapsed: String = collapse_ws(&raw).chars().take(100).collect();
+            // LOG output — full command (whitespace collapsed, never truncated).
+            let collapsed: String = collapse_ws(&raw);
             let argpart = if collapsed.is_empty() {
                 String::new()
             } else {

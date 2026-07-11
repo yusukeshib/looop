@@ -230,8 +230,9 @@ fn spawn_ask_watcher(tx: Sender<Ev>) {
 }
 
 /// Render a mailbox turn as `[HH:MM:SS] <label>: <text>` on a fresh line — the
-/// label coloured, the (whitespace-collapsed, truncated) text in the default fg
-/// so a multi-paragraph prompt/answer can't shred the transcript.
+/// label coloured, the text in the default fg. This is LOG output, so the text
+/// is rendered in FULL (never truncated); internal newlines are preserved so a
+/// multi-paragraph ask/answer reads as-is (the vt100 replay wraps long lines).
 fn render_turn(
     out: &mut impl Write,
     at_line_start: &mut bool,
@@ -245,22 +246,10 @@ fn render_turn(
         "{}{color}{label}:{} {}",
         stamp(),
         rst(),
-        one_line(text, 200)
+        text.trim_end()
     );
     *at_line_start = true;
     let _ = out.flush();
-}
-
-/// Collapse whitespace to single spaces and cap at `max` chars (with an ellipsis
-/// when truncated) — one clean line for the transcript.
-fn one_line(s: &str, max: usize) -> String {
-    let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    if collapsed.chars().count() > max {
-        let head: String = collapsed.chars().take(max).collect();
-        format!("{head}…")
-    } else {
-        collapsed
-    }
 }
 
 /// Write one RPC command object (`{"type": <verb>, "message": <text>}`) as a
@@ -326,8 +315,9 @@ fn render_event(
                 .and_then(|v| v.as_str().map(str::to_owned))
                 .or_else(|| args.map(Value::to_string))
                 .unwrap_or_default();
+            // LOG output — show the command in FULL (whitespace collapsed to a
+            // single line, but never truncated).
             let collapsed: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
-            let collapsed: String = collapsed.chars().take(100).collect();
             let argpart = if collapsed.is_empty() {
                 String::new()
             } else {
@@ -400,30 +390,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn one_line_collapses_and_truncates() {
-        assert_eq!(one_line("  a\n b\t c ", 100), "a b c");
-        assert_eq!(one_line("abcdef", 3), "abc…");
-        // Multibyte-safe: never splits a char, counts chars not bytes.
-        assert_eq!(one_line("あいうえお", 3), "あいう…");
-    }
-
-    #[test]
-    fn render_turn_stamps_a_labeled_line() {
+    fn render_turn_stamps_and_keeps_full_text() {
         let mut out: Vec<u8> = Vec::new();
         let mut at_line_start = true;
         // Colors are off without init_color(), so assert on the plain text.
+        // LOG output: internal newlines are preserved, nothing is truncated.
         render_turn(
             &mut out,
             &mut at_line_start,
             "ask",
             "",
-            "multi\nline  prompt",
+            "para one\npara two  \n",
         );
         let s = String::from_utf8(out).unwrap();
         assert!(s.starts_with('['), "stamped, got {s:?}");
         assert!(
-            s.ends_with("ask: multi line prompt\n"),
-            "one clean line, got {s:?}"
+            s.ends_with("ask: para one\npara two\n"),
+            "full text, newlines kept, trailing ws trimmed, got {s:?}"
         );
         assert!(at_line_start);
     }
