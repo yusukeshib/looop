@@ -294,10 +294,9 @@ struct AsksHit {
     /// Max scroll offset (`len - visible`), for scrollbar drag mapping. Zero
     /// when the list fits and no scrollbar is drawn.
     max_off: usize,
-    /// Rows each agent occupies: 1 in the stacked table layout (one row per
-    /// agent), or the card height in the side-by-side layout (2: an id line +
-    /// a `state age` line). A click at `row` maps to agent
-    /// `offset + (row - top) / stride`.
+    /// Rows each agent occupies: 1 in both layouts today (the stacked table and
+    /// the one-line side-by-side list). Kept as a field so a click at `row`
+    /// maps to agent `offset + (row - top) / stride` regardless of layout.
     stride: usize,
 }
 
@@ -1081,13 +1080,14 @@ impl App {
         });
     }
 
-    /// The side-by-side (WIDE) list: one CARD per agent stacked vertically —
-    /// two lines (the id, then `state` + dim age) — with a green vertical
-    /// accent bar down the left edge of each line of the SELECTED card. All
-    /// geometry (scroll, hit-test, scrollbar) is in agent units via the
-    /// `AsksHit` stride, so the shared mouse handlers work unchanged.
+    /// The side-by-side (WIDE) list: one LINE per agent —
+    /// `<state-dot> <id> <age>` — with the SELECTED row highlighted by a
+    /// full-width SURFACE background (same as the narrow table) and the state
+    /// shown as a coloured dot. All geometry (scroll, hit-test, scrollbar) is
+    /// in agent units via the `AsksHit` stride, so the shared mouse handlers
+    /// work unchanged.
     fn draw_list_wide(&mut self, frame: &mut Frame, area: Rect) {
-        const STRIDE: usize = 2; // 2 content lines, no spacer
+        const STRIDE: usize = 1; // one line per agent
         let dim = dim();
         frame.render_widget(Clear, area);
         let col_w = area.width;
@@ -1114,34 +1114,49 @@ impl App {
         let mut lines: Vec<Line<'static>> = Vec::new();
         for r in self.rows.iter().skip(off).take(visible) {
             let selected = Some(r.id.as_str()) == self.selected_id.as_deref();
-            // Green accent bar down the card's left edge when selected — no
-            // background fill; the bar alone marks the selection.
-            let mark = || {
-                if selected {
-                    Span::styled("▎", Style::default().fg(Color::Green))
-                } else {
-                    Span::raw(" ")
-                }
+            // Selection reads the SAME as the narrow table: a full-width
+            // SURFACE background highlight (no accent bar). Spans carry that bg
+            // so their own fg colors stay intact on top of it.
+            let base = if selected {
+                Style::default().bg(SURFACE)
+            } else {
+                Style::default()
             };
             let id_style = if selected {
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD)
+                base.fg(Color::White).add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::White)
+                base.fg(Color::White)
             };
-            let (state, state_style) = Self::state_cell(r);
-            // Line 1: id. Line 2: `<state> <age>` (state coloured, age dim).
-            lines.push(Line::from(vec![
-                mark(),
-                Span::raw(" "),
+            // One line: `<state-dot> <id> <age>` — the state is a coloured dot
+            // (green live / yellow pending / red killed-or-down / gray
+            // otherwise), the id follows, and the age trails it dim.
+            let (_, state_style) = Self::state_cell(r);
+            let dot_style = if selected {
+                state_style.bg(SURFACE)
+            } else {
+                state_style
+            };
+            let age_style = if selected { dim.bg(SURFACE) } else { dim };
+            let mut spans = vec![
+                Span::styled("●", dot_style),
+                Span::styled(" ", base),
                 Span::styled(r.id.clone(), id_style),
-            ]));
-            let mut l2 = vec![mark(), Span::raw(" "), Span::styled(state, state_style)];
+            ];
+            let mut used = 2 + r.id.chars().count();
             if !r.age.is_empty() {
-                l2.push(Span::styled(format!(" {}", r.age), dim));
+                let a = format!(" {}", r.age);
+                used += a.chars().count();
+                spans.push(Span::styled(a, age_style));
             }
-            lines.push(Line::from(l2));
+            // Pad the highlight to the full pane width so the selected row
+            // reads as a solid bar (like the table widget fills its row).
+            if selected {
+                let pad = (table_w as usize).saturating_sub(used);
+                if pad > 0 {
+                    spans.push(Span::styled(" ".repeat(pad), base));
+                }
+            }
+            lines.push(Line::from(spans).style(base));
         }
         frame.render_widget(
             Paragraph::new(lines),
