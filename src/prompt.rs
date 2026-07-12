@@ -1,6 +1,13 @@
 //! DECIDE — assemble the one-tick prompt: the PLAYBOOK, goals, sensor readings,
 //! pending asks, worker sessions and recent journal. The instruction text is
-//! fixed; only the marked dynamic fields (data dir, local time) are substituted.
+//! fixed; only the data dir (stable per install) is substituted into it.
+//!
+//! ORDERING (prompt-cache friendly, deliberate): sections ride from most stable
+//! to most volatile — INSTRUCTIONS + CONSTITUTION (static bytes), PLAYBOOK +
+//! GOALS (change on edits), then snapshots/asks/journal, and LAST the current
+//! time + closing instruction. Provider prompt caching hits the longest
+//! byte-identical prefix, so the per-beat-changing time must never sit above
+//! the static sections — keep anything time-varying at the tail.
 
 use crate::mailbox;
 use crate::paths::Paths;
@@ -54,8 +61,9 @@ describing your chosen move to `.decision.json` in your working directory. looop
 — not you — then executes it. This is what guarantees one move per tick and lets
 looop gate risky actions. So:
   • Do NOT edit goals/, sensors/, PLAYBOOK.md or journal.md directly.
-  • Do NOT run side-effecting commands yourself. Read-only inspection to inform
-    your decision is fine; the MOVE itself must be the JSON action below.
+  • Do NOT run side-effecting commands yourself. Read-only inspection is
+    allowed but rarely needed (see the note above the NOW section); the MOVE
+    itself must be the JSON action below.
   • Emit exactly one object. If nothing needs doing, emit the `noop` action.
 
 Pick exactly ONE `action` and fill its fields:
@@ -123,9 +131,11 @@ sensors/*.sh):
     last acted on that goal; null = never). FAIRNESS: you pick ONE move per beat,
     so a constantly-changing goal can starve the rest. When several goals are
     ready and roughly comparable, prefer the one you've neglected longest.
-Current local time: __NOW__.
 
-Write your single JSON object to `.decision.json` now, then stop.
+The material below is your decision input. Decide from it alone whenever it
+suffices; run read-only inspection ONLY when a fact you genuinely need is
+missing from it — one narrow query, not a survey. Most beats need zero tools:
+read, emit the JSON move, stop.
 
 "#;
 
@@ -157,9 +167,7 @@ fn tail_lines(text: &str, n: usize) -> String {
 pub fn build_prompt(paths: &Paths, snap_dir: &Path) -> String {
     let mut out = String::new();
 
-    let instr = INSTRUCTIONS
-        .replace("__DATA__", &paths.data_dir.to_string_lossy())
-        .replace("__NOW__", &util::date_fmt("%Y-%m-%d %H:%M %Z"));
+    let instr = INSTRUCTIONS.replace("__DATA__", &paths.data_dir.to_string_lossy());
     out.push_str(&instr);
 
     // CONSTITUTION (immutable, binary-embedded) — ahead of the PLAYBOOK and
@@ -257,6 +265,19 @@ pub fn build_prompt(paths: &Paths, snap_dir: &Path) -> String {
         _ => out.push_str("(empty)\n"),
     }
 
+    // NOW (volatile tail — keep LAST). The current time is the only instruction
+    // field that changes every beat; anchoring it (and the closing instruction)
+    // at the very END keeps the long prefix above byte-identical across beats so
+    // provider prompt caching can hit it. Do not move time-varying text above
+    // the stable sections.
+    out.push_str("\n=== NOW ===\n");
+    let _ = writeln!(
+        out,
+        "Current local time: {}.",
+        util::date_fmt("%Y-%m-%d %H:%M %Z")
+    );
+    out.push_str("\nWrite your single JSON object to `.decision.json` now, then stop.\n");
+
     out
 }
 
@@ -285,6 +306,7 @@ mod tests {
             "=== SENSOR READINGS ===",
             "=== PENDING ASKS",
             "=== RECENT JOURNAL ===",
+            "=== NOW ===",
         ] {
             assert!(out.contains(marker), "missing section: {marker}");
         }
@@ -298,6 +320,45 @@ mod tests {
         );
         assert!(out.contains("PB RULES"), "playbook body inlined");
         assert!(out.contains("triage the inbox"), "goal body inlined");
+    }
+
+    #[test]
+    fn volatile_time_rides_at_the_tail_for_prompt_cache_stability() {
+        // Provider prompt caching hits the longest byte-identical PREFIX, so the
+        // per-beat-changing time must sit BELOW every stable section, and the
+        // closing instruction must be the very last line.
+        let p = fixture();
+        let out = build_prompt(&p, &p.snapshots_dir());
+        assert!(!out.contains("__NOW__"), "no leftover placeholder");
+        let now_pos = out.find("Current local time:").expect("time present");
+        for stable in [
+            "=== CONSTITUTION",
+            "=== PLAYBOOK ===",
+            "=== GOALS ===",
+            "=== SENSOR READINGS ===",
+            "=== PENDING ASKS",
+            "=== RECENT JOURNAL ===",
+        ] {
+            assert!(
+                out.find(stable).unwrap() < now_pos,
+                "{stable} must precede the volatile time tail"
+            );
+        }
+        assert!(
+            out.trim_end().ends_with("then stop."),
+            "closing instruction is the last line"
+        );
+    }
+
+    #[test]
+    fn prompt_prefix_before_now_is_stable_across_builds() {
+        // Two builds over the same world must produce a byte-identical prefix
+        // above the NOW tail — that identity is what makes prompt caching work.
+        let p = fixture();
+        let a = build_prompt(&p, &p.snapshots_dir());
+        let b = build_prompt(&p, &p.snapshots_dir());
+        let prefix = |s: &str| s.split("=== NOW ===").next().unwrap().to_string();
+        assert_eq!(prefix(&a), prefix(&b), "stable sections must not drift");
     }
 
     #[test]
