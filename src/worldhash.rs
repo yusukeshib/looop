@@ -7,9 +7,9 @@
 //!     no-op. This is the WHOLE observed-state half: the live worker fleet and
 //!     the worker leases are themselves system sensors (`sys-sessions` /
 //!     `sys-claims`), so they flow through this same snapshot loop — there is no
-//!     bespoke per-kind hashing. A worker's stable identity (id/state/exit_code,
-//!     plus a ⚑note while alive) lives in that snapshot's `.signal`; its volatile
-//!     age rides in `.detail` and never wakes the loop.
+//!     bespoke per-kind hashing. A worker's stable identity (id/state/exit_code)
+//!     lives in that snapshot's `.signal`; volatile context (counts, ages) rides
+//!     in `.detail` and never wakes the loop.
 //!
 //! ASYMMETRY (M3, deliberate): PLAYBOOK.md and goals/*.md are hashed whole, so
 //! editing them wakes the loop next beat. The sensor SCRIPTS (sensors/*.sh) are

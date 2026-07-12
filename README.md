@@ -57,8 +57,9 @@ Two properties make all this dependable:
 - **Level-triggered.** All state is plain files, so the loop re-senses every beat
   and a crashed pulse just re-reads its files on restart. A pending ask survives
   restarts — no queues, no lost work.
-- **One move per beat.** Each beat does at most one thing; a daily budget caps
-  spend. Behavior stays legible and cheap — an unchanged world costs no LLM call.
+- **One move per beat.** Each beat does at most one thing. Behavior stays legible
+  and cheap — an unchanged world costs no LLM call, and a repeatedly-failing beat
+  backs off exponentially instead of burning retries.
 
 ## One beat: sense → decide → act
 
