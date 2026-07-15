@@ -111,14 +111,14 @@ impl Paths {
     pub fn reports_dir(&self) -> PathBuf {
         self.data_dir.join("reports")
     }
-    /// Mailbox: questions a worker raises for the human (`looop _ ask`).
+    /// Mailbox: questions a worker raises for the human (`looop ask`).
     /// One JSON file per ask (`asks/<worker>-<n>.json`); a matching
     /// `answers/<worker>-<n>.json` resolves it. Durable + level-triggered — a
     /// crashed pulse re-reads the unanswered asks on restart.
     pub fn asks_dir(&self) -> PathBuf {
         self.data_dir.join("asks")
     }
-    /// Mailbox: answers the human writes back (`looop _ answer`).
+    /// Mailbox: answers the human writes back (`looop answer`).
     pub fn answers_dir(&self) -> PathBuf {
         self.data_dir.join("answers")
     }

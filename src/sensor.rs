@@ -208,7 +208,7 @@ fn all_sensors(paths: &Paths) -> Vec<Sensor> {
 /// System sensor: the live worker fleet (the pulse excludes itself, so it never
 /// feeds its own wake signal). The wake SIGNAL is each worker's stable identity
 /// — id/state/exit_code — so a worker starting or dying moves the world hash and
-/// wakes a blocked `looop _ wait`. Sorted by id so the snapshot (and hash) is
+/// wakes a blocked `looop wait`. Sorted by id so the snapshot (and hash) is
 /// order-stable.
 fn sys_sessions(paths: &Paths) -> serde_json::Value {
     let mut workers = session::list_workers(paths);

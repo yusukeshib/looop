@@ -1,9 +1,9 @@
 //! ask/answer mailbox — the worker ↔ human question channel.
 //!
-//! A worker that needs a decision only a HUMAN can make calls `looop _ ask <id>
+//! A worker that needs a decision only a HUMAN can make calls `looop ask <id>
 //! --prompt "…"`, which writes a durable question file under `asks/` and then
 //! BLOCKS until a matching `answers/` file appears, printing the answer to stdout.
-//! The human answers with `looop _ answer <ask_id> "…"` — directly, or through any
+//! The human answers with `looop answer <ask_id> "…"` — directly, or through any
 //! client (an agent concierge, a notify script, …) that surfaces pending asks and
 //! relays the reply. looop's own decide loop sees pending asks but does NOT answer
 //! them: they
@@ -64,29 +64,8 @@ fn read_answer(store: &impl StateStore, ask_id: &str) -> Option<String> {
     v.get("answer").and_then(|x| x.as_str()).map(str::to_owned)
 }
 
-/// Every ask raised by `worker` (answered or not), oldest first. Used by the
-/// rpc-bridge to weave a worker's ask/answer turns into its own transcript.
-pub(crate) fn asks_of(paths: &Paths, worker: &str) -> Vec<Ask> {
-    let store = FileStore::new(paths);
-    let mut out: Vec<Ask> = store
-        .list(&Collection::Asks)
-        .into_iter()
-        .filter_map(|id| store.read(&Key::Ask(id)))
-        .filter_map(|raw| serde_json::from_str::<Ask>(&raw).ok())
-        .filter(|a| a.worker == worker)
-        .collect();
-    out.sort_by_key(|a| a.ts);
-    out
-}
-
-/// The answer text for `ask_id`, if it has been answered (public sibling of
-/// [`read_answer`] for callers outside the mailbox).
-pub(crate) fn answer_text(paths: &Paths, ask_id: &str) -> Option<String> {
-    read_answer(&FileStore::new(paths), ask_id)
-}
-
-/// All asks that have NO matching answer yet. Read-only; used by `_ state` and
-/// the decide prompt (so looop sees what's blocked) and by `looop watch` / any
+/// All asks that have NO matching answer yet. Read-only; used by `state` and
+/// the decide prompt (so looop sees what's blocked) and by any
 /// client (so the human sees what's waiting on them).
 pub fn pending(paths: &Paths) -> Vec<Ask> {
     let store = FileStore::new(paths);
@@ -103,10 +82,10 @@ pub fn pending(paths: &Paths) -> Vec<Ask> {
     out
 }
 
-/// `looop _ ask <worker> --prompt "…" [--ref PATH] [--options a,b,c]`
+/// `looop ask <worker> --prompt "…" [--ref PATH] [--options a,b,c]`
 ///
 /// Worker self-callback (CONTRACT). Writes the ask, then BLOCKS polling answers/
-/// until the human replies (`looop _ answer`), printing the answer to stdout and
+/// until the human replies (`looop answer`), printing the answer to stdout and
 /// exiting 0.
 /// `<worker>` defaults to `$LOOOP_SESSION_ID` when omitted.
 pub fn cmd_ask(paths: &Paths, args: &crate::cli::AskArgs) -> Result<ExitCode> {
@@ -117,7 +96,7 @@ pub fn cmd_ask(paths: &Paths, args: &crate::cli::AskArgs) -> Result<ExitCode> {
         _ => std::env::var("LOOOP_SESSION_ID").unwrap_or_default(),
     };
     if worker.is_empty() {
-        eprintln!("usage: looop _ ask <worker> --prompt \"…\" [--ref PATH] [--options a,b]");
+        eprintln!("usage: looop ask <worker> --prompt \"…\" [--ref PATH] [--options a,b]");
         return Ok(ExitCode::from(1));
     }
     let reference = args.reference.clone().unwrap_or_default();
@@ -133,7 +112,7 @@ pub fn cmd_ask(paths: &Paths, args: &crate::cli::AskArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// CONTRACT core for `_ ask`: write the durable ask, then BLOCK polling answers/
+/// CONTRACT core for `ask`: write the durable ask, then BLOCK polling answers/
 /// until the human replies, returning the answer text. Transport-agnostic (no
 /// stdout): the CLI presenter prints it; a remote backend would long-poll.
 pub(crate) fn ask(
@@ -168,8 +147,8 @@ pub(crate) fn ask(
         ],
     );
 
-    // Block until answered. The human sees this ask (via `looop watch` / a
-    // client / `looop _ state`) and replies with `looop _ answer <id>`.
+    // Block until answered. The human sees this ask (via a
+    // client / `looop state`) and replies with `looop answer <id>`.
     let poll = Duration::from_millis(
         std::env::var("LOOOP_ASK_POLL_MS")
             .ok()
@@ -184,13 +163,13 @@ pub(crate) fn ask(
     }
 }
 
-/// `looop _ answer <ask_id> <text…>`
+/// `looop answer <ask_id> <text…>`
 ///
 /// Root-agent callback: resolve a pending ask. Writes `answers/<ask_id>.json`,
-/// which unblocks the worker's `_ ask`. Refuses an unknown ask id.
+/// which unblocks the worker's `ask`. Refuses an unknown ask id.
 pub fn cmd_answer(paths: &Paths, args: &crate::cli::AnswerArgs) -> Result<ExitCode> {
     use crate::contract::Contract;
-    // Body resolution mirrors `_ goal/sensor/playbook write`: inline words win,
+    // Body resolution mirrors `goal/sensor/playbook write`: inline words win,
     // otherwise (no body, or a lone `-`) read the whole answer from stdin so a
     // multi-line design decision can be piped or passed via heredoc without the
     // `-` (or the heredoc terminator) leaking into the saved answer. clap pulls
@@ -220,7 +199,7 @@ pub fn cmd_answer(paths: &Paths, args: &crate::cli::AnswerArgs) -> Result<ExitCo
     Ok(ExitCode::SUCCESS)
 }
 
-/// CONTRACT core for `_ answer`: durably resolve a pending ask. Refuses an
+/// CONTRACT core for `answer`: durably resolve a pending ask. Refuses an
 /// unknown ask id, and (without `force`) an already-answered one. Transport-
 /// agnostic: no stdin, no stdout.
 pub(crate) fn answer(paths: &Paths, ask_id: &str, text: &str, force: bool) -> Result<()> {
@@ -246,8 +225,8 @@ pub(crate) fn answer(paths: &Paths, ask_id: &str, text: &str, force: bool) -> Re
     Ok(())
 }
 
-/// `looop _ asks [--json]` — a client's narrow view: ONLY the pending asks,
-/// not the full `_ state` dump (snapshots / journal / fleet). Plain output is a
+/// `looop asks [--json]` — a client's narrow view: ONLY the pending asks,
+/// not the full `state` dump (snapshots / journal / fleet). Plain output is a
 /// compact list; `--json` emits the array of ask objects. A client's main job is
 /// relaying asks, so this makes that a single cheap call.
 pub fn cmd_asks(paths: &Paths, json: bool) -> Result<ExitCode> {
@@ -286,7 +265,7 @@ mod tests {
     use std::fs;
 
     /// Build an `AnswerArgs` the way clap would after parsing
-    /// `_ answer <id> <text…> [--force]`.
+    /// `answer <id> <text…> [--force]`.
     fn ans(id: &str, text: &str, force: bool) -> crate::cli::AnswerArgs {
         crate::cli::AnswerArgs {
             ask_id: id.into(),

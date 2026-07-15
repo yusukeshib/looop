@@ -1,5 +1,5 @@
 //! The CONTRACT — the steering surface that drives looop's world, abstracted
-//! behind a trait so the transport (today: the `looop _ …` CLI) is decoupled
+//! behind a trait so the transport (today: the `looop …` CLI) is decoupled
 //! from the backend that fulfils it.
 //!
 //! For a long time looop had two abstractions at very different layers:
@@ -24,8 +24,8 @@
 //! Scope: this trait covers the STATE / STEERING contract — the verbs a remote
 //! backend can meaningfully serve (read state, relay/answer asks, write
 //! goals/sensors/PLAYBOOK, run a reversible command, spawn a worker, take a
-//! lease). The host-local session-I/O verbs (`_ kill` / `_ send` /
-//! `_ screenshot`) are deliberately NOT here: they manipulate a live PTY on THIS
+//! lease). The host-local session-I/O verbs (`kill` / `send` /
+//! `screenshot`) are deliberately NOT here: they manipulate a live PTY on THIS
 //! host (babysit renders a terminal grid straight to stdout), so they are a
 //! host capability, not a transport-agnostic contract operation.
 

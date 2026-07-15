@@ -3,7 +3,7 @@
 //! Config (the runner wiring) is written separately by `looop init`; this module
 //! only lays down the DATA dir: an embedded starter PLAYBOOK + goals + heartbeat
 //! sensor, written ONCE. Setup is surfaced as a real pending Ask so a first-run
-//! concierge waiting on `looop _ wait --only-asks` wakes immediately and can start
+//! concierge waiting on `looop wait --only-asks` wakes immediately and can start
 //! the interview that rewrites the seed into the user's real config. The program
 //! makes no decisions — it only lays down bytes.
 
@@ -99,7 +99,7 @@ fn seed_data(paths: &Paths) -> Result<()> {
 
 fn seed_setup_ask(store: &impl StateStore) -> Result<()> {
     // A fresh loop must be visible to the thinnest concierge, which normally
-    // blocks on `looop _ wait --only-asks`. Journal-only setup notices are too
+    // blocks on `looop wait --only-asks`. Journal-only setup notices are too
     // easy to miss, so seed a real mailbox item. It is intentionally from the
     // synthetic `setup` worker: no worker is blocked on the answer; the concierge
     // uses the pending ask as the human-facing trigger for the setup interview.

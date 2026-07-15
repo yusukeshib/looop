@@ -6,7 +6,7 @@
 //!   * AUTONOMOUS — looop's per-beat decide: the `tick` runner writes ONE JSON
 //!     action to `.decision.json`; [`consume_decision`] parses + executes it.
 //!     This is the primary driver — looop is the brain.
-//!   * MANUAL — the `looop _ …` verbs (cmd_goal/sensor/playbook/run/worker)
+//!   * MANUAL — the `looop …` verbs (cmd_goal/sensor/playbook/run/worker)
 //!     a human or client calls to steer by hand. Same [`Action`]s, same gates.
 //!
 //! looop is the SOLE executor either way: judgment (free to inspect) stays
@@ -20,7 +20,7 @@ use serde::Deserialize;
 use std::fs;
 use std::process::ExitCode;
 
-/// One typed mutation of looop's world. Built by the `_ …` verb handlers below
+/// One typed mutation of looop's world. Built by the `…` verb handlers below
 /// (no longer deserialized from an LLM decision) and run through [`run_action`].
 #[derive(Debug, Deserialize, PartialEq)]
 #[serde(tag = "action", rename_all = "snake_case")]
@@ -401,8 +401,8 @@ pub fn run_action(paths: &Paths, action: &Action, journal: Option<&str>) -> Resu
 
 /// Resolve an action body from the parsed positional words, falling back to
 /// stdin when none are given OR a lone `-` is passed (so a human/client can
-/// heredoc a multi-line goal/PLAYBOOK body, matching the `_ answer` convention).
-/// clap already rejects mistyped flags (`_ playbook write --help` prints help
+/// heredoc a multi-line goal/PLAYBOOK body, matching the `answer` convention).
+/// clap already rejects mistyped flags (`playbook write --help` prints help
 /// instead of writing the literal text), so this no longer has to guard against
 /// flag-like bodies — a body that genuinely starts with `--` arrives here only
 /// via the `--` end-of-options separator or stdin.
@@ -423,7 +423,7 @@ fn ok(summary: String) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `looop _ goal write <id> [body…|-]`
+/// `looop goal write <id> [body…|-]`
 pub fn write_goal(
     paths: &Paths,
     id: &str,
@@ -435,13 +435,13 @@ pub fn write_goal(
     ok(crate::contract::LocalContract::new(paths).goal_write(id, &body, journal)?)
 }
 
-/// `looop _ goal archive <id>`
+/// `looop goal archive <id>`
 pub fn archive_goal(paths: &Paths, id: &str, journal: Option<&str>) -> Result<ExitCode> {
     use crate::contract::Contract;
     ok(crate::contract::LocalContract::new(paths).goal_archive(id, journal)?)
 }
 
-/// `looop _ sensor write <name> [script…|-]`
+/// `looop sensor write <name> [script…|-]`
 pub fn write_sensor(
     paths: &Paths,
     name: &str,
@@ -453,21 +453,21 @@ pub fn write_sensor(
     ok(crate::contract::LocalContract::new(paths).sensor_write(name, &script, journal)?)
 }
 
-/// `looop _ playbook write [body…|-]`
+/// `looop playbook write [body…|-]`
 pub fn write_playbook(paths: &Paths, body: &[String], journal: Option<&str>) -> Result<ExitCode> {
     use crate::contract::Contract;
     let body = resolve_body(body)?;
     ok(crate::contract::LocalContract::new(paths).playbook_write(&body, journal)?)
 }
 
-/// `looop _ run [--reason TEXT] <cmd…>` — one ad-hoc, REVERSIBLE shell command.
+/// `looop run [--reason TEXT] <cmd…>` — one ad-hoc, REVERSIBLE shell command.
 /// The command is captured verbatim (its own `--flags` pass through), so
 /// `--reason`/`--journal` must precede it.
 pub fn cmd_run(paths: &Paths, args: &crate::cli::RunArgs) -> Result<ExitCode> {
     use crate::contract::Contract;
     let cmd = args.cmd.join(" ");
     if cmd.trim().is_empty() {
-        eprintln!("usage: looop _ run [--reason TEXT] <cmd…>");
+        eprintln!("usage: looop run [--reason TEXT] <cmd…>");
         return Ok(ExitCode::from(1));
     }
     let reason = args.reason.clone().unwrap_or_default();
@@ -478,7 +478,7 @@ pub fn cmd_run(paths: &Paths, args: &crate::cli::RunArgs) -> Result<ExitCode> {
     )?)
 }
 
-/// `looop _ worker start <id> <prompt…|-> [--model M] [--thinking L]` — spawn a
+/// `looop worker start <id> <prompt…|-> [--model M] [--thinking L]` — spawn a
 /// worker session (journaled). `model`/`thinking` are optional per-worker
 /// overrides for the `worker_command` template's placeholders.
 pub fn start_worker(
@@ -492,7 +492,7 @@ pub fn start_worker(
     use crate::contract::Contract;
     let prompt = resolve_body(prompt)?;
     if prompt.trim().is_empty() {
-        eprintln!("usage: looop _ worker start <id> <prompt…|->");
+        eprintln!("usage: looop worker start <id> <prompt…|->");
         return Ok(ExitCode::from(1));
     }
     ok(crate::contract::LocalContract::new(paths)

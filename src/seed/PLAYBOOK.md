@@ -24,7 +24,7 @@ move as one JSON action — looop executes it. One move per beat.
   blocks the next one). The worker starts in the data dir; if it edits CODE it must
   make its OWN sandbox first (a git worktree) and cd
   in — never edit code in the data dir. A worker that needs a human decision runs
-  `looop _ ask` and BLOCKS — that pending ask is how a blocker reaches the human
+  `looop ask` and BLOCKS — that pending ask is how a blocker reaches the human
   (via a client).
 - noop — when nothing needs doing (its journal line is how you surface a notice a
   client relays).
@@ -32,7 +32,7 @@ move as one JSON action — looop executes it. One move per beat.
 ## Guardrails
 - NEVER do irreversible things (merge, public comments, closing issues, deleting
   data, deploys) yourself. Start a worker that prepares it fully and runs
-  `looop _ ask` to WAIT for the human's decision — the human decides, not you.
-- When you lack information or authority, start a worker that runs `looop _ ask`
+  `looop ask` to WAIT for the human's decision — the human decides, not you.
+- When you lack information or authority, start a worker that runs `looop ask`
   (the human answers via a client) rather than guess.
 - One move per beat. When unsure, `noop` and say why in the journal.

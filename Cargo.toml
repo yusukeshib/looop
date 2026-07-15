@@ -1,6 +1,6 @@
 [package]
 name = "looop"
-version = "0.48.1"
+version = "0.50.0"
 edition = "2024"
 description = "A tiny, portable, Kubernetes-shaped control loop for your work"
 license = "MIT"
@@ -26,28 +26,10 @@ babysit = { version = "0.12", default-features = false }
 # supervisor (serve_worker), which babysit runs under a multi-thread runtime
 # (`#[tokio::main]`). Match that so the in-process worker behaves identically.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "signal"] }
-# `looop watch`: a two-pane TUI (live colored log + running-session selector).
-# ratatui re-exports its crossterm backend, so we drive terminal setup/events
-# through `ratatui::crossterm` and don't pin crossterm separately. ansi-to-tui
-# parses the PTY log's ANSI/SGR escapes into styled ratatui lines so the log
-# pane stays colored.
-# `unstable-rendered-line-info` exposes `Paragraph::line_count`, which the client
-# detail modal uses to measure wrapped content height and clamp its scrollbar.
-ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
-ansi-to-tui = "8"
-# `looop watch` replays the raw PTY `output.log` through a virtual terminal so
-# an interactive agent's in-place redraws (cursor moves, line clears) render as
-# the actual SCREEN instead of a garbled append of every frame. babysit already
-# depends on vt100 (and exposes `render::render_screen`); we pin it directly to
-# name the `vt100::Parser`/`Screen` types and drive scrollback ourselves.
-vt100 = "0.16"
-# `looop client` sizes the fleet-list ID column by DISPLAY width so CJK /
-# double-width glyphs are measured as two columns, not one.
-unicode-width = "0.2"
-# The rpc-bridge silences its PTY's input echo (termios ECHO) so `looop _ send`
-# lines aren't copied raw into the transcript alongside the rendered `send:`
-# turn. Raw libc so we don't pull in a heavier terminal crate.
-libc = "0.2"
+# `looop init` drives its interactive picker through `ratatui::crossterm`
+# (ratatui re-exports its crossterm backend, so we don't pin crossterm
+# separately).
+ratatui = { version = "0.30" }
 
 [profile.release]
 strip = true

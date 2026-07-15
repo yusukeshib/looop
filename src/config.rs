@@ -13,7 +13,7 @@
 //! NOT INITIALIZED = no config file. `looop up` REFUSES to start the pulse in
 //! that state and tells the operator to run `looop init`, which writes the runner
 //! wiring. The inline `DEFAULT_CONFIG` (claude) is both the first-run default and
-//! the safety net for `Config::load` (e.g. a `_` verb that runs without a file).
+//! the safety net for `Config::load` (e.g. a plumbing verb that runs without a file).
 //!
 //! looop is deliberately a GLUE layer: after init, runtime config is just these
 //! two command strings. Preset knowledge (codex/opencode/pi flags, model ids,
@@ -37,7 +37,7 @@
 //! editing the commands (`looop init` or the file directly).
 //!
 //! PER-WORKER MODEL: the `worker_command` may also carry `{{model}}` and
-//! `{{thinking}}` placeholders. On `looop _ worker start` they are substituted
+//! `{{thinking}}` placeholders. On `looop worker start` they are substituted
 //! with the `--model`/`--thinking` flags (highest precedence), else the optional
 //! `worker_model` / `worker_thinking` config keys, else the empty string. A
 //! template WITHOUT these placeholders is left untouched (so pre-existing
@@ -121,7 +121,7 @@ impl Config {
     }
 
     /// The default value expanded into the worker command's `{{model}}`
-    /// placeholder when `looop _ worker start` runs without `--model`. Optional:
+    /// placeholder when `looop worker start` runs without `--model`. Optional:
     /// absent (or empty) means "no default", so the placeholder expands to the
     /// empty string unless a `--model` flag overrides it. Configs that carry
     /// neither this key nor the placeholder behave exactly as before.
@@ -130,7 +130,7 @@ impl Config {
     }
 
     /// The default value expanded into the worker command's `{{thinking}}`
-    /// placeholder when `looop _ worker start` runs without `--thinking`.
+    /// placeholder when `looop worker start` runs without `--thinking`.
     /// Same optional/back-compat semantics as [`Config::worker_model`].
     pub fn worker_thinking(&self) -> Option<String> {
         self.string_key("worker_thinking")

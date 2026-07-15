@@ -1,8 +1,8 @@
 //! ACT — run the configured tick runner once, teeing its output to the per-beat
 //! archive (runs/<id>/output.log) and tick.log so a beat is replayable. The
 //! pulse keeps its own stream a clean structured-event log: the runner's
-//! free-form chatter is archived to the tee files but never echoed live (watch
-//! it with `looop watch pulse` / replay it from runs/<id>/output.log).
+//! free-form chatter is archived to the tee files but never echoed live
+//! (replay it from runs/<id>/output.log).
 //!
 //! Formatting happens IN-PROCESS here: we read the runner's raw NDJSON stdout
 //! line-by-line and render each line via `fmt::format_line` (the friendly

@@ -8,10 +8,9 @@
 //! detacher re-execing looop itself (current_exe) as the headless session
 //! supervisor (`looop run --detached-id <id> -- <cmd>`). That ONE path
 //! supervises both kinds of detached session: a worker (cmd is the agent) and
-//! the pulse (cmd is `looop _ pulse`, the reconcile-loop body).
+//! the pulse (cmd is `looop pulse`, the reconcile-loop body).
 
 mod cli;
-mod client;
 mod config;
 mod contract;
 mod deps;
@@ -21,11 +20,9 @@ mod fmt;
 mod gate;
 mod help;
 mod init;
-mod logview;
 mod mailbox;
 mod paths;
 mod prompt;
-mod rpc;
 mod run;
 mod runner;
 mod seed;
@@ -48,7 +45,15 @@ fn main() -> ExitCode {
     util::init_format();
     util::init_color();
 
-    let raw: Vec<String> = std::env::args().skip(1).collect();
+    let mut raw: Vec<String> = std::env::args().skip(1).collect();
+
+    // BACK-COMPAT shim: the plumbing verbs used to live under a `_` namespace
+    // (`looop _ state`, `looop _ ask`, …). They are top-level now, but prompts,
+    // playbooks and running workers seeded by older versions still say `_` —
+    // silently strip a leading `_` so both spellings work.
+    if raw.first().map(String::as_str) == Some("_") {
+        raw.remove(0);
+    }
 
     // PRE-CLAP shortcut (the ONE path that bypasses clap): babysit's detacher
     // re-execs us as the headless session supervisor (`looop run --detached-id
@@ -79,7 +84,9 @@ fn main() -> ExitCode {
     }
 
     use clap::Parser;
-    let cli = match cli::Cli::try_parse() {
+    let cli = match cli::Cli::try_parse_from(
+        std::iter::once("looop".to_string()).chain(raw.iter().cloned()),
+    ) {
         Ok(c) => c,
         Err(e) => {
             // Remap clap's exit codes to looop's convention: usage/parse errors
@@ -101,10 +108,10 @@ fn main() -> ExitCode {
 }
 
 /// Route a parsed command to its handler. The deps gate wraps every verb that
-/// actually touches the loop's tools; read-only/meta verbs (watch, help,
-/// version) skip it, matching the pre-clap wiring.
+/// actually touches the loop's tools; read-only/meta verbs (help, version)
+/// skip it, matching the pre-clap wiring.
 fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
-    use cli::{Cmd, GoalOp, PlaybookOp, SensorOp, Verb, WorkerOp};
+    use cli::{Cmd, GoalOp, PlaybookOp, SensorOp, WorkerOp};
 
     // A bare `looop` is not a command (the loop runs as the `looop up` service).
     // With no verb, show clap's auto-generated SHORT command summary — the long
@@ -136,65 +143,55 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
         // not even want), then runs the deps preflight itself.
         Cmd::Up(a) => service::cmd_up(paths, a.json),
         Cmd::Down => gated(&|| service::cmd_down(paths)),
-        // Non-agent observer + ask-answering TUI — gated (it resolves asks, a
-        // contract write). Reads any session's log (live or finished) and
-        // answers pending asks by hand.
-        Cmd::Client(a) => gated(&|| client::cmd_client(paths, &a)),
-        Cmd::Underscore { verb } => match verb {
-            Verb::Pulse => gated(&|| service::cmd_pulse(paths)),
-            Verb::State(a) => gated(&|| tick::cmd_state(paths, a.json)),
-            Verb::Wait(a) => gated(&|| tick::cmd_wait(paths, &a)),
-            Verb::Asks(a) => gated(&|| mailbox::cmd_asks(paths, a.json)),
-            Verb::Answer(a) => gated(&|| mailbox::cmd_answer(paths, &a)),
-            Verb::Goal(a) => gated(&|| match &a.op {
-                GoalOp::Write { id, body, journal } => {
-                    executor::write_goal(paths, id, body, journal.journal.as_deref())
-                }
-                GoalOp::Archive { id, journal } => {
-                    executor::archive_goal(paths, id, journal.journal.as_deref())
-                }
-            }),
-            Verb::Sensor(a) => gated(&|| {
-                let SensorOp::Write {
-                    name,
-                    script,
-                    journal,
-                } = &a.op;
-                executor::write_sensor(paths, name, script, journal.journal.as_deref())
-            }),
-            Verb::Playbook(a) => gated(&|| {
-                let PlaybookOp::Write { body, journal } = &a.op;
-                executor::write_playbook(paths, body, journal.journal.as_deref())
-            }),
-            Verb::Run(a) => gated(&|| executor::cmd_run(paths, &a)),
-            Verb::Worker(a) => gated(&|| match &a.op {
-                WorkerOp::Start {
-                    id,
-                    prompt,
-                    model,
-                    thinking,
-                    journal,
-                } => executor::start_worker(
-                    paths,
-                    id,
-                    prompt,
-                    model.as_deref(),
-                    thinking.as_deref(),
-                    journal.journal.as_deref(),
-                ),
-                WorkerOp::Kill { id } => session::cmd_kill(paths, id),
-            }),
-            Verb::Ask(a) => gated(&|| mailbox::cmd_ask(paths, &a)),
-            Verb::Kill(a) => gated(&|| session::cmd_kill(paths, &a.id)),
-            Verb::Send(a) => gated(&|| session::cmd_send(paths, &a)),
-            // Ungated: an inner exec that IS the worker_command child (like the
-            // pre-clap `run` supervisor), launched only after deps already
-            // passed at worker-start time.
-            Verb::RpcBridge(a) => rpc::cmd_rpc_bridge(&a),
-            Verb::Screenshot(a) => gated(&|| session::cmd_screenshot(paths, &a)),
-            Verb::Claim(a) => gated(&|| gate::cmd_claim(paths, &a)),
-            Verb::Unclaim(a) => gated(&|| gate::cmd_unclaim(paths, &a)),
-        },
+        Cmd::Pulse => gated(&|| service::cmd_pulse(paths)),
+        Cmd::State(a) => gated(&|| tick::cmd_state(paths, a.json)),
+        Cmd::Wait(a) => gated(&|| tick::cmd_wait(paths, &a)),
+        Cmd::Asks(a) => gated(&|| mailbox::cmd_asks(paths, a.json)),
+        Cmd::Answer(a) => gated(&|| mailbox::cmd_answer(paths, &a)),
+        Cmd::Goal(a) => gated(&|| match &a.op {
+            GoalOp::Write { id, body, journal } => {
+                executor::write_goal(paths, id, body, journal.journal.as_deref())
+            }
+            GoalOp::Archive { id, journal } => {
+                executor::archive_goal(paths, id, journal.journal.as_deref())
+            }
+        }),
+        Cmd::Sensor(a) => gated(&|| {
+            let SensorOp::Write {
+                name,
+                script,
+                journal,
+            } = &a.op;
+            executor::write_sensor(paths, name, script, journal.journal.as_deref())
+        }),
+        Cmd::Playbook(a) => gated(&|| {
+            let PlaybookOp::Write { body, journal } = &a.op;
+            executor::write_playbook(paths, body, journal.journal.as_deref())
+        }),
+        Cmd::Run(a) => gated(&|| executor::cmd_run(paths, &a)),
+        Cmd::Worker(a) => gated(&|| match &a.op {
+            WorkerOp::Start {
+                id,
+                prompt,
+                model,
+                thinking,
+                journal,
+            } => executor::start_worker(
+                paths,
+                id,
+                prompt,
+                model.as_deref(),
+                thinking.as_deref(),
+                journal.journal.as_deref(),
+            ),
+            WorkerOp::Kill { id } => session::cmd_kill(paths, id),
+        }),
+        Cmd::Ask(a) => gated(&|| mailbox::cmd_ask(paths, &a)),
+        Cmd::Kill(a) => gated(&|| session::cmd_kill(paths, &a.id)),
+        Cmd::Send(a) => gated(&|| session::cmd_send(paths, &a)),
+        Cmd::Screenshot(a) => gated(&|| session::cmd_screenshot(paths, &a)),
+        Cmd::Claim(a) => gated(&|| gate::cmd_claim(paths, &a)),
+        Cmd::Unclaim(a) => gated(&|| gate::cmd_unclaim(paths, &a)),
     }
 }
 

@@ -102,21 +102,21 @@ const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
 - When you need a human decision / info / approval, do NOT guess — ASK and WAIT.
   This ONE command writes your question to the mailbox and BLOCKS until the root
   agent (or human) answers, printing the answer to stdout:
-    answer=$("$LOOOP_BIN" _ ask __ID__ --prompt "<what you need to know>")
+    answer=$("$LOOOP_BIN" ask __ID__ --prompt "<what you need to know>")
   (optionally --ref reports/x.md and/or --options a,b). Use $answer and continue.
   You do NOT need a terminal, stdin, or attach — just call it and read its output.
   Ask once per question; it returns only when answered.
 - When the task is 100% complete and nothing is waiting, end your own session:
-    "$LOOOP_BIN" _ kill __ID__
+    "$LOOOP_BIN" kill __ID__
   (this lets the pulse prune the corpse). NEVER do this mid-task or while waiting
   on a human.
 - LEASE (ONLY if the PLAYBOOK/goal tells you to claim this task) — announce
   ownership BEFORE any work so a tick or sibling can't duplicate/race you:
-    "$LOOOP_BIN" _ claim <name>   # atomic test-and-set; <name> defined by the goal (e.g. one per repo)
+    "$LOOOP_BIN" claim <name>   # atomic test-and-set; <name> defined by the goal (e.g. one per repo)
   This EXITS NON-ZERO if a live session already holds <name> — if so, do NOT
   proceed: flag the human or pick other work, never race the holder. Release it
   the instant the task is fully done, right before the kill above:
-    "$LOOOP_BIN" _ unclaim <name>
+    "$LOOOP_BIN" unclaim <name>
   If you crash the pulse auto-reaps your claim; on a clean finish YOU release it.
   NEVER sit/sleep/poll while holding a claim — act and move on.
 - SINGLE-WRITER DATA DIR: the pulse (the tick AI) is the SOLE writer of the
@@ -127,7 +127,7 @@ const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
   write the proposal to reports/<id>.md and raise a flag — the human (or the
   next tick) applies it. EXCEPTION: if your task is explicitly a meta task (e.g.
   setup or playbook grooming), you MAY edit those files, but you MUST show the
-  diff and `"$LOOOP_BIN" _ flag` for human approval BEFORE writing. When unsure whether
+  diff and `"$LOOOP_BIN" flag` for human approval BEFORE writing. When unsure whether
   your task is meta, treat the data dir as read-only and propose via reports/.
 - WORKSPACE: you start in the loop data dir (read-only context for you, save the
   meta exception above). If your task touches a code repo, provision your OWN
@@ -267,7 +267,7 @@ pub fn cmd_start_session(
         "started {session} (runner: {runner}{model_note}, cwd: {})",
         paths.data_dir.display()
     );
-    println!("  watch: looop attach {id}");
+    println!("  watch: looop screenshot {id}");
     Ok(StartOutcome {
         code: ExitCode::SUCCESS,
         effective_model: eff_model,
@@ -284,16 +284,15 @@ fn full_session(id: &str) -> String {
 }
 
 /// The pulse is the control loop, NOT a worker: refuse worker-management verbs
-/// aimed at it so a stray `looop _ kill pulse` / `attach pulse` can't decapitate
-/// or hijack the loop. Observe it with `looop watch`/`log`; control it with
-/// a bare `looop`. Returns true (and prints guidance) when `session` is the
-/// reserved pulse id — the caller should then bail with a non-zero code.
+/// aimed at it so a stray `looop kill pulse` can't decapitate
+/// or hijack the loop. Observe it with `looop screenshot pulse`; control it
+/// with `looop up`/`down`. Returns true (and prints guidance) when `session` is
+/// the reserved pulse id — the caller should then bail with a non-zero code.
 fn reject_pulse(session: &str, verb: &str) -> bool {
     if session == PULSE_SESSION {
         eprintln!(
             "looop {verb}: '{PULSE_SESSION}' is the control loop, not a worker — observe it with \
-             `looop watch {PULSE_SESSION}` / `looop log {PULSE_SESSION}`, start it by running \
-             `looop` (Ctrl-C stops it)"
+             `looop screenshot {PULSE_SESSION}`, control it with `looop up` / `looop down`"
         );
         true
     } else {
@@ -301,7 +300,7 @@ fn reject_pulse(session: &str, verb: &str) -> bool {
     }
 }
 
-/// `looop _ kill <id>` — terminate a worker session (in-process). Internal
+/// `looop kill <id>` — terminate a worker session (in-process). Internal
 /// worker self-control callback (CONTRACT), not a human-facing verb.
 pub fn cmd_kill(paths: &Paths, id: &str) -> Result<ExitCode> {
     let session = full_session(id);
@@ -312,7 +311,7 @@ pub fn cmd_kill(paths: &Paths, id: &str) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `looop _ send <id> <text…> [--no-newline]` — type text into a worker's
+/// `looop send <id> <text…> [--no-newline]` — type text into a worker's
 /// terminal as if a human were at the keyboard. A STEER verb: the human (or any
 /// client) nudges a stuck/interactive worker that's waiting on input. By
 /// default a trailing Enter is sent (the common "answer the prompt" case);
@@ -321,7 +320,7 @@ pub fn cmd_kill(paths: &Paths, id: &str) -> Result<ExitCode> {
 pub fn cmd_send(paths: &Paths, args: &crate::cli::SendArgs) -> Result<ExitCode> {
     let newline = !args.no_newline;
     if args.text.is_empty() {
-        eprintln!("usage: looop _ send <id> <text…> [--no-newline]");
+        eprintln!("usage: looop send <id> <text…> [--no-newline]");
         return Ok(ExitCode::from(1));
     }
     let session = full_session(&args.id);
@@ -350,7 +349,7 @@ pub fn send_to(paths: &Paths, id: &str, text: &str, newline: bool) -> Result<()>
     Ok(())
 }
 
-/// `looop _ screenshot <id> [--ansi|--json] [--no-trim]` — capture a session's
+/// `looop screenshot <id> [--ansi|--json] [--no-trim]` — capture a session's
 /// current screen (the rendered terminal grid, not a frame-by-frame append).
 /// A read-only STEER verb usable on any session, including the pulse: it's how
 /// a human (or any client) peeks at what a worker is showing right now without
@@ -368,7 +367,7 @@ pub fn cmd_screenshot(paths: &Paths, args: &crate::cli::ScreenshotArgs) -> Resul
     };
     let trim = !args.no_trim;
     let Some(id) = args.id.as_deref() else {
-        eprintln!("usage: looop _ screenshot <id> [--ansi|--json] [--no-trim]");
+        eprintln!("usage: looop screenshot <id> [--ansi|--json] [--no-trim]");
         return Ok(ExitCode::from(1));
     };
     let session = full_session(id);
@@ -413,26 +412,12 @@ pub struct Session {
     pub state: String,
     pub alive: bool,
     pub exit_code: Option<i64>,
-    /// RFC3339 timestamp of the session's last state change (babysit's
-    /// `last_change`). Empty when babysit didn't report one. `watch` parses
-    /// this to filter stale corpses out of the selector.
-    pub last_change: String,
 }
 
 impl Session {
     /// The pulse session is the control loop, not a worker.
     pub fn is_pulse(&self) -> bool {
         self.id == PULSE_SESSION
-    }
-
-    /// How long since this session last changed state, if its `last_change`
-    /// timestamp parses. `None` ⇒ undatable (treat as fresh — bias toward
-    /// keeping it visible).
-    pub fn idle_for(&self) -> Option<std::time::Duration> {
-        let ts = chrono::DateTime::parse_from_rfc3339(self.last_change.trim()).ok()?;
-        (chrono::Utc::now() - ts.with_timezone(&chrono::Utc))
-            .to_std()
-            .ok()
     }
 }
 
@@ -442,7 +427,6 @@ fn project(info: ::babysit::SessionInfo) -> Session {
         state: info.state,
         alive: info.alive,
         exit_code: info.exit_code.map(|c| c as i64),
-        last_change: info.last_change,
     }
 }
 
@@ -543,7 +527,7 @@ pub fn status_exists(paths: &Paths, session: &str) -> bool {
     list(paths).iter().any(|s| s.id == session)
 }
 
-/// `looop _ kill <id>` — terminate a session.
+/// `looop kill <id>` — terminate a session.
 pub fn kill(paths: &Paths, session: &str) -> anyhow::Result<()> {
     rt().block_on(paths.sessions().kill(Some(session.to_string()), false))
 }
@@ -630,7 +614,7 @@ pub fn run_detached_worker(args: &[String]) -> anyhow::Result<i32> {
 ///
 /// The `saved` copy of fd 1 is created close-on-exec: `f` spawns the detached
 /// worker, so a plain `dup(1)` would leak our stdout into that child. When the
-/// caller captured our stdout through a pipe (`$(looop _ worker start …)`), a
+/// caller captured our stdout through a pipe (`$(looop worker start …)`), a
 /// leaked write end keeps that pipe open for the worker's entire lifetime, so
 /// the caller's read never sees EOF and the command *looks* hung even though we
 /// returned immediately. `dup_cloexec` keeps the copy out of the child.
@@ -739,7 +723,7 @@ mod tests {
 
     // Regression: the fd we dup inside suppress_stdout MUST be close-on-exec.
     // A plain dup(1) leaked our stdout into the detached worker; when the
-    // caller captured our stdout via a pipe (`out=$(looop _ worker start …)`)
+    // caller captured our stdout via a pipe (`out=$(looop worker start …)`)
     // that leaked write end kept the pipe open for the worker's whole lifetime,
     // so the caller never saw EOF and `worker start` looked hung. Assert the
     // copy carries FD_CLOEXEC so no spawned child can inherit it.

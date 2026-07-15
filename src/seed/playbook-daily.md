@@ -9,8 +9,8 @@ improvement:
   human intervention and turn it into a clearer PLAYBOOK rule (or sharpen a vague
   one). Keep it to a single small change.
 - PLAYBOOK changes affect every future move, so PROPOSE the diff to me here and
-  apply it with `looop _ playbook write` only after I confirm.
-- When done, set last-improved below to today's date (via `looop _ goal write
+  apply it with `looop playbook write` only after I confirm.
+- When done, set last-improved below to today's date (via `looop goal write
   playbook-daily`).
 
 last-improved: never

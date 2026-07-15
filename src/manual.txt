@@ -13,7 +13,7 @@ THE IDEA
   (looop observes them next beat); a worker that hits a decision only a human can
   make asks you and waits. You reach looop through a CLIENT — anything that
   drives the contract verbs below on your behalf: a bare terminal (you, typing
-  `looop _ …`), an AGENT client (claude/codex/opencode/pi/custom) you talk to in
+  `looop …`), an AGENT client (claude/codex/opencode/pi/custom) you talk to in
   plain language, which reads state, relays asks, and edits goals for you), or a NOTIFY
   client (a script that pushes pending asks to Slack/SMS/desktop and relays your
   reply back). A client is an INTERFACE, not a decision-maker: looop decides,
@@ -32,11 +32,10 @@ THREE LAYERS
   core      the autonomous pulse + the durable state behind it. Decides + acts.
             State is held in a file-based backend today; that is an
             implementation detail you never address directly.
-  contract  the `looop _ …` verbs. The ONE supported surface to read + steer
-            core. This — not the backend layout — is the stable boundary. The
-            `_ ` prefix marks the plumbing surface (the contract a client drives);
-            the bare commands (`up` / `down` / `client`) are the porcelain
-            a human runs by hand.
+  contract  the `looop …` verbs. The ONE supported surface to read + steer
+            core. This — not the backend layout — is the stable boundary.
+            `up` / `down` are the porcelain a human runs by hand; the rest is
+            the contract a client drives.
   client    anything that drives the contract for a human. The human reaches
             core ONLY through the contract; a bare terminal is the thinnest
             client, an agent/notify client does the same calls on your behalf.
@@ -46,13 +45,13 @@ HOW IT RUNS
      decides ONE move per changed beat, and runs the worker fleet. That is looop.
   2. (optional) run an agent client to watch + steer:
         claude  # or codex/opencode/pi/custom, then say: "be my looop client —
-                #        read `looop --help`, show me `looop _ state`, relay
+                #        read `looop --help`, show me `looop state`, relay
                 #        pending asks and let me answer in plain language, help
                 #        me edit goals/PLAYBOOK. looop itself decides; you never
                 #        decide for it."
   3. `looop down` — stop the pulse and every live worker.
   You can skip a long-running client entirely and drive the contract by hand:
-  `looop _ state`, `looop _ answer`, `looop _ goal write`.
+  `looop state`, `looop answer`, `looop goal write`.
 
 ONE BEAT (sense → decide → act)
   Each beat the pulse wipes + re-runs every `sensors/*.sh` so `snapshots/`
@@ -72,30 +71,30 @@ backend-agnostic: they work the same whether core's state lives in files, an
 embedded DB, or anything else. A client does FOUR things:
 
   1. SUBSCRIBE — block cheaply until something needs a human:
-       looop _ wait --actionable     wake on asks/journal moves
-       looop _ wait --only-asks      wake only on a new pending ask
-       looop _ wait [--json]         wake on any category change
-     `_ wait` prints state + a `changed: […]` diff, so ONE call tells you WHAT
+       looop wait --actionable     wake on asks/journal moves
+       looop wait --only-asks      wake only on a new pending ask
+       looop wait [--json]         wake on any category change
+     `wait` prints state + a `changed: […]` diff, so ONE call tells you WHAT
      moved — no follow-up `tail` / `jq` needed. If the pulse is DOWN it wakes
      immediately with `changed: [pulse-down]` (and state shows `pulse: DOWN`)
      instead of blocking forever on a loop that will never move the files.
 
   2. READ — inspect without blocking:
-       looop _ state [--json]        full world: goals, snapshots, fleet, asks
-       looop _ asks  [--json]        JUST pending asks (id, prompt, ref, options)
+       looop state [--json]        full world: goals, snapshots, fleet, asks
+       looop asks  [--json]        JUST pending asks (id, prompt, ref, options)
 
   3. ANSWER — resolve a worker blocked on a human decision:
-       looop _ answer <ask_id> "<text>"     inline
-       looop _ answer <ask_id> -            multi-line from stdin / heredoc
+       looop answer <ask_id> "<text>"     inline
+       looop answer <ask_id> -            multi-line from stdin / heredoc
      Each ask carries an id, the prompt, an optional `ref` (an artifact to read
      first) and optional `options` (discrete choices — map these to buttons /
      numbered replies). IRREVERSIBLE asks (merge / deploy / delete) MUST get an
      explicit human yes — never auto-answer them.
 
   4. STEER — shape WHAT looop pursues (takes effect next beat):
-       looop _ goal write <id> [body|-]   |   looop _ goal archive <id>
-       looop _ playbook write [body|-]
-       looop _ sensor write <name> [script|-]
+       looop goal write <id> [body|-]   |   looop goal archive <id>
+       looop playbook write [body|-]
+       looop sensor write <name> [script|-]
      These are the supported steering surface: validated, journaled, and
      single-writer-safe. (The backend also keeps goals/PLAYBOOK/sensors as plain
      files you can git + inspect; editing those files directly works and is seen
@@ -103,29 +102,29 @@ embedded DB, or anything else. A client does FOUR things:
      interface. Clients steer through the verbs.)
 
   Optional nudge verbs for a live worker session:
-       looop _ send <id> "<text>"    type into a worker's terminal
-       looop _ screenshot <id>       capture what a worker shows right now
+       looop send <id> "<text>"    type into a worker's terminal
+       looop screenshot <id>       capture what a worker shows right now
 
   BUILD A NOTIFY CLIENT — no core changes; just drive the contract in a loop:
-       while looop _ wait --only-asks --json >/tmp/ev; do
+       while looop wait --only-asks --json >/tmp/ev; do
          # push each new ask to your channel — CARRY THE ASK ID so the reply
          # correlates — then, on the human's reply:
-         looop _ answer "<ask_id>" "<reply>"
+         looop answer "<ask_id>" "<reply>"
        done
      Push once per ask; escalate on age. Route by urgency: desktop/digest for
      low, chat for normal, SMS/voice for irreversible.
 
   BUILD AN AGENT CLIENT (a "concierge") — any agent session pointed at looop:
-  have it `_ wait`, relay pending asks to you in plain language, `_ answer` your
+  have it `wait`, relay pending asks to you in plain language, `answer` your
   reply, and edit goals/PLAYBOOK via the write verbs. It interfaces; looop decides.
 
 WORKER CONTRACT (auto-injected into every worker — for reference)
   A worker that needs a human decision runs ONE blocking call and waits:
-     answer=$("$LOOOP_BIN" _ ask "$LOOOP_SESSION_ID" --prompt "…" [--ref P] [--options a,b])
+     answer=$("$LOOOP_BIN" ask "$LOOOP_SESSION_ID" --prompt "…" [--ref P] [--options a,b])
   It needs no terminal/attach — `ask` returns when answered (a client replies via
-  `looop _ answer`). Workers write only to claims/, reports/ and their own code
-  sandbox; they end themselves with `_ kill`, and lease shared resources with
-  `_ claim`/`_ unclaim`.
+  `looop answer`). Workers write only to claims/, reports/ and their own code
+  sandbox; they end themselves with `kill`, and lease shared resources with
+  `claim`/`unclaim`.
 
 CODE / CONFIG / DATA are cleanly separated (all overridable by env)
   EXEC    this one binary                          the program (portable)
@@ -135,12 +134,6 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
             decide move, prompt on stdin) and `worker_command` (launch a worker
             session; `{{prompt_file}}` is its brief). Optional: `interval`
             (cadence), `session_ttl` (corpse retention).
-            RPC WORKERS: to run a worker in an agent's RPC mode (e.g. pi
-            `--mode rpc`) yet keep a readable transcript, wrap it in the
-            `_ rpc-bridge` adapter as the worker_command:
-              looop _ rpc-bridge --prompt-file {{prompt_file}} -- pi --mode rpc …
-            The bridge renders the child's JSONL to text and wraps input typed
-            via `_ send` as a prompt (idle) / steer (mid-turn).
   DATA    ${XDG_STATE_HOME:-~/.local/state}/looop/  the file-based backend
           └ override with $LOOOP_DATA_DIR
             PLAYBOOK.md  goals/  journal.md  sensors/*.sh   <- durable memory

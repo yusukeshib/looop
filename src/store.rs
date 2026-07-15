@@ -14,7 +14,7 @@
 //! layout wholesale.
 //!
 //! NOT in scope (deliberately, separate concerns):
-//!   * CHANGE DETECTION — `worldhash` (the wake hash) and tick's `_ wait`
+//!   * CHANGE DETECTION — `worldhash` (the wake hash) and tick's `wait`
 //!     fingerprints read policy files directly. Detecting "what changed" is
 //!     inherently backend-specific (a DB would use a version column / NOTIFY),
 //!     so it belongs to the backend, not to a generic consumer.
@@ -32,11 +32,11 @@ use std::io;
 /// maps each variant to its own storage (FileStore -> a path; a DB -> a row).
 #[derive(Debug, Clone)]
 pub enum Key {
-    /// A worker's pending question (`looop _ ask`).
+    /// A worker's pending question (`looop ask`).
     Ask(String),
-    /// The human's answer to an ask (`looop _ answer`).
+    /// The human's answer to an ask (`looop answer`).
     Answer(String),
-    /// A worker's resource lease (`looop _ claim`).
+    /// A worker's resource lease (`looop claim`).
     Claim(String),
     /// A goal spec (`goals/<id>.md`).
     Goal(String),
