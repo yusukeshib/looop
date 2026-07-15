@@ -78,6 +78,15 @@ embedded DB, or anything else. A client does FOUR things:
      moved — no follow-up `tail` / `jq` needed. If the pulse is DOWN it wakes
      immediately with `changed: [pulse-down]` (and state shows `pulse: DOWN`)
      instead of blocking forever on a loop that will never move the files.
+     ⚠ TWO WAKES THAT MUST NOT BE RE-ARMED BLINDLY (both return instantly,
+     so a subscribe-handle-resubscribe loop becomes a tight busy-loop):
+       • pulse-down — nothing will move until the pulse is restarted; tell
+         the human to run `looop up`, and only resume waiting once
+         `state --json` shows `pulse_alive: true` again.
+       • a HELD ask — an ask the human is deliberately leaving unanswered
+         keeps the pending set non-empty, so `--only-asks` returns in 0s with
+         an unchanged `world_hash` every time. Stop waiting, leave the blocked
+         worker parked, and check `state` on demand until the ask resolves.
 
   2. READ — inspect without blocking:
        looop state [--json]        full world: goals, snapshots, fleet, asks
@@ -88,8 +97,13 @@ embedded DB, or anything else. A client does FOUR things:
        looop answer <ask_id> -            multi-line from stdin / heredoc
      Each ask carries an id, the prompt, an optional `ref` (an artifact to read
      first) and optional `options` (discrete choices — map these to buttons /
-     numbered replies). IRREVERSIBLE asks (merge / deploy / delete) MUST get an
-     explicit human yes — never auto-answer them.
+     numbered replies; free-text answers are always allowed). IRREVERSIBLE asks
+     (merge / deploy / delete) MUST get an explicit human yes — never
+     auto-answer them.
+     ⚠ A worker blocked on an ask is NOT idle — never kill it; answer it or
+     leave it parked (killing strands the eventual answer and loses context).
+     Answering an ask whose worker already EXITED only records the answer —
+     the dead worker won't act on it; spawn a fresh worker instead.
 
   4. STEER — shape WHAT looop pursues (takes effect next beat):
        looop goal write <id> [body|-]   |   looop goal archive <id>
@@ -104,6 +118,10 @@ embedded DB, or anything else. A client does FOUR things:
   Optional nudge verbs for a live worker session:
        looop send <id> "<text>"    type into a worker's terminal
        looop screenshot <id>       capture what a worker shows right now
+     ⚠ `send` TYPES, it does not SUBMIT: many agents' multiline composers
+     ignore the trailing newline, leaving the text sitting unsent in the
+     draft box. Follow up with a bare Enter — `looop send <id> ""` — then
+     `screenshot <id>` to confirm the draft cleared.
 
   BUILD A NOTIFY CLIENT — no core changes; just drive the contract in a loop:
        while looop wait --only-asks --json >/tmp/ev; do
