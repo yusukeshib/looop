@@ -115,13 +115,11 @@ embedded DB, or anything else. A client does FOUR things:
      next beat, but skips the journal entry — it is an escape hatch, not the
      interface. Clients steer through the verbs.)
 
-  Optional nudge verbs for a live worker session:
-       looop send <id> "<text>"    type into a worker's terminal
+  Optional peek verb for a live worker session:
        looop screenshot <id>       capture what a worker shows right now
-     ⚠ `send` TYPES, it does not SUBMIT: many agents' multiline composers
-     ignore the trailing newline, leaving the text sitting unsent in the
-     draft box. Follow up with a bare Enter — `looop send <id> ""` — then
-     `screenshot <id>` to confirm the draft cleared.
+     Read-only. A worker's ONLY input channel is the ask/answer mailbox —
+     there is deliberately no way to type into its terminal, so every human
+     decision leaves a durable ask/answer record.
 
   BUILD A NOTIFY CLIENT — no core changes; just drive the contract in a loop:
        while looop wait --only-asks --json >/tmp/ev; do

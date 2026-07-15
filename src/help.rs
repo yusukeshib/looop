@@ -34,7 +34,6 @@ Usage:
   looop goal write <id> [body|-] | goal archive <id>     (`-`/omit = stdin/heredoc)
   looop sensor write <name> [script|-]                   (`-`/omit = stdin/heredoc)
   looop playbook write [body|-]                          (`-`/omit = stdin/heredoc)
-  looop send <id> "<text>" [--no-newline]   type input into a worker's terminal
   looop screenshot <id> [--ansi|--json] [--no-trim]   capture a session's screen
 
   WORKER self-callbacks (auto-injected CONTRACT — not for humans):

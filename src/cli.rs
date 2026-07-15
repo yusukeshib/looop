@@ -75,8 +75,6 @@ pub enum Cmd {
     Ask(AskArgs),
     /// Kill a session by id.
     Kill(KillArgs),
-    /// Type input into an interactive worker.
-    Send(SendArgs),
     /// Capture a worker's current screen.
     Screenshot(ScreenshotArgs),
     /// Atomically claim a named lease.
@@ -257,16 +255,6 @@ pub struct AskArgs {
 #[derive(Args, Debug)]
 pub struct KillArgs {
     pub id: String,
-}
-
-#[derive(Args, Debug)]
-pub struct SendArgs {
-    pub id: String,
-    /// The text to type. Variadic; put `--no-newline` anywhere.
-    pub text: Vec<String>,
-    /// Don't send a trailing Enter.
-    #[arg(long = "no-newline", short = 'n')]
-    pub no_newline: bool,
 }
 
 #[derive(Args, Debug)]

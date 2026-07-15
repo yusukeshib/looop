@@ -188,7 +188,6 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
         }),
         Cmd::Ask(a) => gated(&|| mailbox::cmd_ask(paths, &a)),
         Cmd::Kill(a) => gated(&|| session::cmd_kill(paths, &a.id)),
-        Cmd::Send(a) => gated(&|| session::cmd_send(paths, &a)),
         Cmd::Screenshot(a) => gated(&|| session::cmd_screenshot(paths, &a)),
         Cmd::Claim(a) => gated(&|| gate::cmd_claim(paths, &a)),
         Cmd::Unclaim(a) => gated(&|| gate::cmd_unclaim(paths, &a)),

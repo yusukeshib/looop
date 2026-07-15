@@ -24,8 +24,8 @@
 //! Scope: this trait covers the STATE / STEERING contract — the verbs a remote
 //! backend can meaningfully serve (read state, relay/answer asks, write
 //! goals/sensors/PLAYBOOK, run a reversible command, spawn a worker, take a
-//! lease). The host-local session-I/O verbs (`kill` / `send` /
-//! `screenshot`) are deliberately NOT here: they manipulate a live PTY on THIS
+//! lease). The host-local session-I/O verbs (`kill` / `screenshot`) are
+//! deliberately NOT here: they manipulate a live PTY on THIS
 //! host (babysit renders a terminal grid straight to stdout), so they are a
 //! host capability, not a transport-agnostic contract operation.
 

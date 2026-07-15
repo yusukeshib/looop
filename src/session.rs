@@ -311,44 +311,6 @@ pub fn cmd_kill(paths: &Paths, id: &str) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `looop send <id> <text…> [--no-newline]` — type text into a worker's
-/// terminal as if a human were at the keyboard. A STEER verb: the human (or any
-/// client) nudges a stuck/interactive worker that's waiting on input. By
-/// default a trailing Enter is sent (the common "answer the prompt" case);
-/// `--no-newline` suppresses it (e.g. partial input). Refuses the pulse — the
-/// control loop is driven by goals/PLAYBOOK + asks, never raw keystrokes.
-pub fn cmd_send(paths: &Paths, args: &crate::cli::SendArgs) -> Result<ExitCode> {
-    let newline = !args.no_newline;
-    if args.text.is_empty() {
-        eprintln!("usage: looop send <id> <text…> [--no-newline]");
-        return Ok(ExitCode::from(1));
-    }
-    let session = full_session(&args.id);
-    if reject_pulse(&session, "send") {
-        return Ok(ExitCode::from(1));
-    }
-    send_to(paths, &args.id, &args.text.join(" "), newline)?;
-    println!("sent to {session}");
-    Ok(ExitCode::SUCCESS)
-}
-
-/// Type `text` into a worker's terminal (a STEER, as if a human were at the
-/// keyboard). Refuses the pulse — the control loop is driven by goals/PLAYBOOK
-/// and asks, never raw keystrokes. Shared by `cmd_send` and the client's
-/// always-on input in its "send" mode.
-pub fn send_to(paths: &Paths, id: &str, text: &str, newline: bool) -> Result<()> {
-    let session = full_session(id);
-    if session == PULSE_SESSION {
-        anyhow::bail!("'{PULSE_SESSION}' is the control loop, not a worker");
-    }
-    rt().block_on(
-        paths
-            .sessions()
-            .send(Some(session), text.to_string(), newline, false),
-    )?;
-    Ok(())
-}
-
 /// `looop screenshot <id> [--ansi|--json] [--no-trim]` — capture a session's
 /// current screen (the rendered terminal grid, not a frame-by-frame append).
 /// A read-only STEER verb usable on any session, including the pulse: it's how
