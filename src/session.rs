@@ -124,10 +124,10 @@ const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
   claims/ (your lease), reports/ (deliverables) and your own code sandbox. Do
   NOT edit PLAYBOOK/goals/sensors: a concurrent tick reads them every beat, so a
   racing writer tears the loop's state. If your task implies a policy change,
-  write the proposal to reports/<id>.md and raise a flag — the human (or the
+  write the proposal to reports/<id>.md and raise an ask — the human (or the
   next tick) applies it. EXCEPTION: if your task is explicitly a meta task (e.g.
   setup or playbook grooming), you MAY edit those files, but you MUST show the
-  diff and `"$LOOOP_BIN" flag` for human approval BEFORE writing. When unsure whether
+  diff and ASK (above) for human approval BEFORE writing. When unsure whether
   your task is meta, treat the data dir as read-only and propose via reports/.
 - WORKSPACE: you start in the loop data dir (read-only context for you, save the
   meta exception above). If your task touches a code repo, provision your OWN
@@ -267,7 +267,7 @@ pub fn cmd_start_session(
         "started {session} (runner: {runner}{model_note}, cwd: {})",
         paths.data_dir.display()
     );
-    println!("  watch: looop screenshot {id}");
+    println!("  peek: looop screenshot {id}");
     Ok(StartOutcome {
         code: ExitCode::SUCCESS,
         effective_model: eff_model,
