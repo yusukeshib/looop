@@ -21,6 +21,11 @@
 
           cargoLock.lockFile = ./Cargo.lock;
 
+          # The test suite exercises PTYs/terminal state (portable-pty, crossterm,
+          # vt100) which hang or fail inside the Nix build sandbox (no real tty).
+          # Run `cargo test` in the devShell / CI instead of during the package build.
+          doCheck = false;
+
           meta = with pkgs.lib; {
             description = "A tiny, portable, Kubernetes-shaped control loop for your work";
             homepage = "https://github.com/yusukeshib/looop";
