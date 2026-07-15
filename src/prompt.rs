@@ -106,6 +106,9 @@ Pick exactly ONE `action` and fill its fields:
      later beat (it can read reports/ for the prior context). NEVER kill a
      "waiting-ask" worker — it is the human's turn, and killing it strands
      their eventual answer.
+     ⚠ If a more urgent move wins this beat, set next_interval_s so you come
+     back to the stuck worker — it never changes the world again on its own,
+     so an unchanged world would otherwise skip you right past it.
 
   {"action":"write_playbook","body":"<full PLAYBOOK.md contents>"}
      Change your own judgment / guardrails. Deliberate — only harden a drift into
