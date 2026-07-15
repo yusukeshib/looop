@@ -235,6 +235,21 @@ pub enum WorkerOp {
     },
     /// Kill a worker by id.
     Kill { id: String },
+    /// List the fleet with health (busy / waiting-ask / stuck / dead).
+    List {
+        /// Emit JSON instead of the table.
+        #[arg(long, conflicts_with = "watch")]
+        json: bool,
+        /// Also show finished/dead workers, not just the live fleet.
+        #[arg(long, short = 'a')]
+        all: bool,
+        /// Re-render every few seconds until Ctrl-C.
+        #[arg(long)]
+        watch: bool,
+        /// Refresh interval for --watch, in seconds.
+        #[arg(long, default_value_t = 2, requires = "watch")]
+        interval: u64,
+    },
 }
 
 #[derive(Args, Debug)]

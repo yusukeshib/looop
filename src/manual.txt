@@ -115,11 +115,14 @@ embedded DB, or anything else. A client does FOUR things:
      next beat, but skips the journal entry — it is an escape hatch, not the
      interface. Clients steer through the verbs.)
 
-  Optional peek verb for a live worker session:
-       looop screenshot <id>       capture what a worker shows right now
-     Read-only. A worker's ONLY input channel is the ask/answer mailbox —
-     there is deliberately no way to type into its terminal, so every human
-     decision leaves a durable ask/answer record.
+  Optional peek verbs for the fleet (read-only):
+       looop worker list [--all] [--watch]   fleet + health, idle/uptime/ask age
+       looop screenshot <id>                 capture what a worker shows right now
+     health: busy (producing output) · waiting-ask (the human's turn) · stuck
+     (alive, no ask, silent ≥ LOOOP_WORKER_STUCK_SECS — the pulse kills these)
+     · dead. A worker's ONLY input channel is the ask/answer mailbox — there is
+     deliberately no way to type into its terminal, so every human decision
+     leaves a durable ask/answer record.
 
   BUILD A NOTIFY CLIENT — no core changes; just drive the contract in a loop:
        while looop wait --only-asks --json >/tmp/ev; do

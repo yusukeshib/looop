@@ -241,40 +241,74 @@ fn worker_health(
     }
 }
 
-fn sys_sessions(paths: &Paths) -> serde_json::Value {
+/// One worker's full health projection — the shared source for the
+/// `sys-sessions` snapshot AND `looop worker list`.
+pub(crate) struct WorkerHealth {
+    pub id: String,
+    pub state: String,
+    pub alive: bool,
+    pub exit_code: Option<i64>,
+    /// busy / waiting-ask / stuck / dead — see [`worker_health`].
+    pub health: &'static str,
+    /// Seconds since the last PTY output (output.log mtime).
+    pub idle_s: Option<u64>,
+    /// Seconds since the session started.
+    pub uptime_s: Option<u64>,
+    /// Seconds the worker's pending ask has been waiting on the human.
+    pub ask_age_s: Option<u64>,
+}
+
+/// The whole fleet's health, sorted by id (order-stable for the wake hash).
+pub(crate) fn fleet_health(paths: &Paths) -> Vec<WorkerHealth> {
     let stuck_after = env_num("LOOOP_WORKER_STUCK_SECS", 900);
     let pending = crate::mailbox::pending(paths);
     let mut workers = session::list_workers(paths);
     workers.sort_by(|a, b| a.id.cmp(&b.id));
+    workers
+        .into_iter()
+        .map(|s| {
+            let ask = pending.iter().find(|a| a.worker == s.id);
+            let idle = session::output_idle_secs(paths, &s.id);
+            WorkerHealth {
+                health: worker_health(s.alive, ask.is_some(), idle, stuck_after),
+                idle_s: idle,
+                uptime_s: s.uptime_secs(),
+                ask_age_s: ask.map(|a| crate::util::now_unix().saturating_sub(a.ts)),
+                id: s.id,
+                state: s.state,
+                alive: s.alive,
+                exit_code: s.exit_code,
+            }
+        })
+        .collect()
+}
 
+fn sys_sessions(paths: &Paths) -> serde_json::Value {
+    let fleet = fleet_health(paths);
     let mut signal: Vec<serde_json::Value> = Vec::new();
     let mut detail_workers = serde_json::Map::new();
-    for s in &workers {
-        let ask = pending.iter().find(|a| a.worker == s.id);
-        let idle = session::output_idle_secs(paths, &s.id);
-        let health = worker_health(s.alive, ask.is_some(), idle, stuck_after);
+    for w in &fleet {
         signal.push(serde_json::json!({
-            "id": s.id,
-            "state": s.state,
-            "exit_code": s.exit_code,
-            "health": health,
+            "id": w.id,
+            "state": w.state,
+            "exit_code": w.exit_code,
+            "health": w.health,
         }));
         let mut d = serde_json::Map::new();
-        if let Some(i) = idle {
+        if let Some(i) = w.idle_s {
             d.insert("idle_s".into(), serde_json::json!(i));
         }
-        if let Some(u) = s.uptime_secs() {
+        if let Some(u) = w.uptime_s {
             d.insert("uptime_s".into(), serde_json::json!(u));
         }
-        if let Some(a) = ask {
-            let age = crate::util::now_unix().saturating_sub(a.ts);
-            d.insert("ask_age_s".into(), serde_json::json!(age));
+        if let Some(a) = w.ask_age_s {
+            d.insert("ask_age_s".into(), serde_json::json!(a));
         }
-        detail_workers.insert(s.id.clone(), serde_json::Value::Object(d));
+        detail_workers.insert(w.id.clone(), serde_json::Value::Object(d));
     }
     serde_json::json!({
         "signal": signal,
-        "detail": { "count": workers.len(), "workers": detail_workers },
+        "detail": { "count": fleet.len(), "workers": detail_workers },
     })
 }
 

@@ -35,6 +35,7 @@ Usage:
   looop sensor write <name> [script|-]                   (`-`/omit = stdin/heredoc)
   looop playbook write [body|-]                          (`-`/omit = stdin/heredoc)
   looop screenshot <id> [--ansi|--json] [--no-trim]   capture a session's screen
+  looop worker list [--json|--all|--watch [--interval N]]   fleet + health (busy/waiting-ask/stuck/dead), idle/uptime/ask age
 
   WORKER self-callbacks (auto-injected CONTRACT — not for humans):
   looop ask <id> --prompt "…" [--ref P] [--options a,b]   ask + block for answer

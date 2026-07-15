@@ -302,6 +302,112 @@ fn reject_pulse(session: &str, verb: &str) -> bool {
 
 /// `looop kill <id>` — terminate a worker session (in-process). Internal
 /// worker self-control callback (CONTRACT), not a human-facing verb.
+/// `looop worker list [--json] [--all] [--watch [--interval N]]` — the fleet
+/// with its health reading (the same projection the `sys-sessions` snapshot
+/// feeds the decider): id, state, health, idle (since last PTY output), uptime,
+/// and how long a pending ask has been waiting. Live workers only by default;
+/// `--all` includes corpses. `--watch` re-renders every `--interval` seconds
+/// (default 2) until Ctrl-C — the humble replacement for a fleet TUI.
+pub fn cmd_worker_list(
+    paths: &Paths,
+    json: bool,
+    all: bool,
+    watch: bool,
+    interval: u64,
+) -> Result<ExitCode> {
+    loop {
+        let fleet: Vec<crate::sensor::WorkerHealth> = crate::sensor::fleet_health(paths)
+            .into_iter()
+            .filter(|w| all || w.alive)
+            .collect();
+        if json {
+            let rows: Vec<serde_json::Value> = fleet
+                .iter()
+                .map(|w| {
+                    serde_json::json!({
+                        "id": w.id,
+                        "state": w.state,
+                        "alive": w.alive,
+                        "exit_code": w.exit_code,
+                        "health": w.health,
+                        "idle_s": w.idle_s,
+                        "uptime_s": w.uptime_s,
+                        "ask_age_s": w.ask_age_s,
+                    })
+                })
+                .collect();
+            println!("{}", serde_json::to_string_pretty(&rows)?);
+            return Ok(ExitCode::SUCCESS);
+        }
+        if watch {
+            // Clear + home, then repaint — watch(1) style, no TUI machinery.
+            print!("\x1b[2J\x1b[H");
+            println!(
+                "fleet · {}  (refresh {interval}s — Ctrl-C to stop)\n",
+                crate::util::date_fmt("%H:%M:%S")
+            );
+        }
+        render_fleet(&fleet);
+        if !watch {
+            return Ok(ExitCode::SUCCESS);
+        }
+        std::thread::sleep(std::time::Duration::from_secs(interval.max(1)));
+    }
+}
+
+/// The plain fleet table. Columns are fixed-name, width sized to content.
+fn render_fleet(fleet: &[crate::sensor::WorkerHealth]) {
+    use crate::util::{dim, red, rst, yel};
+    if fleet.is_empty() {
+        println!("no workers");
+        return;
+    }
+    let idw = fleet.iter().map(|w| w.id.len()).max().unwrap_or(2).max(2);
+    println!(
+        "{}{:idw$}  {:11}  {:8}  {:>6}  {:>6}  {:>7}{}",
+        dim(),
+        "ID",
+        "HEALTH",
+        "STATE",
+        "IDLE",
+        "UP",
+        "ASK",
+        rst()
+    );
+    for w in fleet {
+        let (hl, hr) = match w.health {
+            "stuck" => (red(), rst()),
+            "waiting-ask" => (yel(), rst()),
+            "dead" => (dim(), rst()),
+            _ => ("", ""),
+        };
+        let state = match (w.state.as_str(), w.exit_code) {
+            ("exited", Some(c)) => format!("exit {c}"),
+            (s, _) => s.to_string(),
+        };
+        println!(
+            "{:idw$}  {hl}{:11}{hr}  {:8}  {:>6}  {:>6}  {:>7}",
+            w.id,
+            w.health,
+            state,
+            fmt_dur(w.idle_s),
+            fmt_dur(w.uptime_s),
+            fmt_dur(w.ask_age_s),
+        );
+    }
+}
+
+/// Compact duration: `-` (unknown), `42s`, `5m`, `2h`, `3d`.
+fn fmt_dur(secs: Option<u64>) -> String {
+    match secs {
+        None => "-".to_string(),
+        Some(s) if s < 60 => format!("{s}s"),
+        Some(s) if s < 3600 => format!("{}m", s / 60),
+        Some(s) if s < 86400 => format!("{}h", s / 3600),
+        Some(s) => format!("{}d", s / 86400),
+    }
+}
+
 pub fn cmd_kill(paths: &Paths, id: &str) -> Result<ExitCode> {
     let session = full_session(id);
     if reject_pulse(&session, "kill") {
@@ -703,6 +809,15 @@ pub fn await_alive(paths: &Paths, session: &str, timeout: std::time::Duration) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmt_dur_is_compact_and_handles_unknown() {
+        assert_eq!(fmt_dur(None), "-");
+        assert_eq!(fmt_dur(Some(42)), "42s");
+        assert_eq!(fmt_dur(Some(300)), "5m");
+        assert_eq!(fmt_dur(Some(7200)), "2h");
+        assert_eq!(fmt_dur(Some(259_200)), "3d");
+    }
 
     fn sess(id: &str) -> Session {
         Session {

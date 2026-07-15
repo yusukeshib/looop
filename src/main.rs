@@ -185,6 +185,12 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
                 journal.journal.as_deref(),
             ),
             WorkerOp::Kill { id } => session::cmd_kill(paths, id),
+            WorkerOp::List {
+                json,
+                all,
+                watch,
+                interval,
+            } => session::cmd_worker_list(paths, *json, *all, *watch, *interval),
         }),
         Cmd::Ask(a) => gated(&|| mailbox::cmd_ask(paths, &a)),
         Cmd::Kill(a) => gated(&|| session::cmd_kill(paths, &a.id)),
