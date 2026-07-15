@@ -97,6 +97,16 @@ Pick exactly ONE `action` and fill its fields:
      `looop ask <id> --prompt "…"` and BLOCKS until the human answers — prefer
      one worker per goal over spawning a second for the same goal.
 
+  {"action":"kill_worker","id":"<worker-id>","reason":"..."}
+     Terminate a live worker. Workers have NO input channel (no terminal a
+     human or you can type into) — the ask/answer mailbox is their only I/O —
+     so a worker that is alive, NOT waiting on an ask, and silent past the
+     stuck threshold (sys-sessions health: "stuck") cannot be nudged, only
+     killed. If its goal still needs the work, re-dispatch a FRESH worker on a
+     later beat (it can read reports/ for the prior context). NEVER kill a
+     "waiting-ask" worker — it is the human's turn, and killing it strands
+     their eventual answer.
+
   {"action":"write_playbook","body":"<full PLAYBOOK.md contents>"}
      Change your own judgment / guardrails. Deliberate — only harden a drift into
      a rule once it actually hurts.
@@ -125,8 +135,16 @@ LIVE or STRANDED:
 
 Two of the SENSOR READINGS are looop's OWN state (system sensors, not
 sensors/*.sh):
-  • sys-sessions — the live worker fleet. Prefer steering work through ONE worker
-    per goal over spawning a SECOND one for the same goal.
+  • sys-sessions — the live worker fleet, each tagged with a health reading:
+      busy         actively producing terminal output — leave it alone
+      waiting-ask  blocked on a pending ask — the HUMAN's turn; idle forever is
+                   legitimate, never kill it
+      stuck        alive, no ask, no output past the threshold — unreachable
+                   (workers have no input channel); kill_worker is the only
+                   remedy, then re-dispatch fresh if the goal still needs work
+    .detail.workers[id] carries the raw numbers (idle_s / uptime_s / ask_age_s).
+    Prefer steering work through ONE worker per goal over spawning a SECOND one
+    for the same goal.
   • sys-goals — per-goal staleness (.detail.goals[id].age_s = seconds since you
     last acted on that goal; null = never). FAIRNESS: you pick ONE move per beat,
     so a constantly-changing goal can starve the rest. When several goals are

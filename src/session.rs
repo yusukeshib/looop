@@ -374,12 +374,25 @@ pub struct Session {
     pub state: String,
     pub alive: bool,
     pub exit_code: Option<i64>,
+    /// RFC3339 timestamp of the session's start (babysit's `started_at`).
+    /// Empty when babysit didn't report one. Feeds the sys-sessions health
+    /// reading's `uptime_s` detail.
+    pub started_at: String,
 }
 
 impl Session {
     /// The pulse session is the control loop, not a worker.
     pub fn is_pulse(&self) -> bool {
         self.id == PULSE_SESSION
+    }
+
+    /// Seconds since this session started, if `started_at` parses.
+    pub fn uptime_secs(&self) -> Option<u64> {
+        let ts = chrono::DateTime::parse_from_rfc3339(self.started_at.trim()).ok()?;
+        (chrono::Utc::now() - ts.with_timezone(&chrono::Utc))
+            .to_std()
+            .ok()
+            .map(|d| d.as_secs())
     }
 }
 
@@ -389,7 +402,28 @@ fn project(info: ::babysit::SessionInfo) -> Session {
         state: info.state,
         alive: info.alive,
         exit_code: info.exit_code.map(|c| c as i64),
+        started_at: info.started_at,
     }
+}
+
+/// Seconds since `id`'s terminal last produced OUTPUT — the mtime of the
+/// session's PTY tee (`sessions/<id>/output.log`). This is the fleet's
+/// last-stdout-time health signal: a live worker that is neither writing output
+/// nor blocked on an ask has no other way to show progress (there is no input
+/// channel to nudge it), so a long silence here means it is likely stuck.
+/// `None` when the log is missing or undatable (bias: treat as fresh).
+pub fn output_idle_secs(paths: &Paths, id: &str) -> Option<u64> {
+    let log = paths
+        .sessions()
+        .session_dir(&full_session(id))
+        .join("output.log");
+    std::fs::metadata(log)
+        .ok()?
+        .modified()
+        .ok()?
+        .elapsed()
+        .ok()
+        .map(|d| d.as_secs())
 }
 
 /// List every session in this profile's fleet. Any failure yields an empty

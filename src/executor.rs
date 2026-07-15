@@ -57,6 +57,16 @@ pub enum Action {
         #[serde(default)]
         thinking: Option<String>,
     },
+    /// Terminate a live worker session. The remedy for a STUCK worker (see the
+    /// sys-sessions `health` reading): a worker has no input channel, so one
+    /// that is alive, not waiting on an ask, and silent past the threshold can
+    /// only be killed (and re-dispatched fresh if its goal still needs work).
+    /// Refuses the pulse (the control loop is not a worker).
+    KillWorker {
+        id: String,
+        #[serde(default)]
+        reason: String,
+    },
 }
 
 /// A short, stable word naming the action's category — for the typed stdout
@@ -70,6 +80,7 @@ pub fn kind(action: &Action) -> &'static str {
         Action::WriteSensor { .. } => "sensor",
         Action::WritePlaybook { .. } => "playbook",
         Action::StartWorker { .. } => "worker",
+        Action::KillWorker { .. } => "kill",
     }
 }
 
@@ -82,6 +93,9 @@ fn goal_of(action: &Action) -> Option<String> {
         Action::WriteGoal { id, .. } => Some(id.clone()),
         Action::ArchiveGoal { id } => Some(id.clone()),
         Action::StartWorker { id, .. } => Some(id.clone()),
+        // Worker id == goal id by convention; killing a stuck worker IS acting
+        // on that goal (the next beat may re-dispatch it fresh).
+        Action::KillWorker { id, .. } => Some(id.clone()),
         _ => None,
     }
 }
@@ -279,6 +293,19 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
                 .map(|m| format!("start-worker {id} (model: {m})"))
                 .unwrap_or_else(|| format!("start-worker {id}"));
             Ok(note)
+        }
+
+        Action::KillWorker { id, reason } => {
+            // Reuses the CLI kill path: pulse guard + in-process babysit kill.
+            let code = session::cmd_kill(paths, id)?;
+            if code != std::process::ExitCode::SUCCESS {
+                bail!("kill_worker {id:?} refused (the pulse is not a worker)");
+            }
+            Ok(if reason.trim().is_empty() {
+                format!("kill-worker {id}")
+            } else {
+                format!("kill-worker {id} · {}", reason.trim())
+            })
         }
     }
 }
@@ -576,6 +603,28 @@ mod tests {
             act.get("triage").and_then(|v| v.as_u64()).is_some(),
             "acting on a goal stamps its activity time"
         );
+    }
+
+    #[test]
+    fn kill_worker_action_parses_and_is_goal_stamped() {
+        // The tick's JSON decision shape round-trips into the typed action…
+        let a: Action =
+            serde_json::from_str(r#"{"action":"kill_worker","id":"triage","reason":"stuck 22m"}"#)
+                .unwrap();
+        assert_eq!(
+            a,
+            Action::KillWorker {
+                id: "triage".into(),
+                reason: "stuck 22m".into()
+            }
+        );
+        // …`reason` is optional…
+        assert!(serde_json::from_str::<Action>(r#"{"action":"kill_worker","id":"t"}"#).is_ok());
+        // …and killing a worker counts as acting on its goal (worker id == goal
+        // id), so sys-goals staleness doesn't misreport the goal as neglected.
+        assert_eq!(goal_of(&a), Some("triage".to_string()));
+        assert_eq!(kind(&a), "kill");
+        assert!(!is_non_idempotent(&a));
     }
 
     #[test]
