@@ -70,12 +70,14 @@ pub enum Cmd {
     /// One ad-hoc, REVERSIBLE shell command.
     Run(RunArgs),
     /// Spawn / kill a worker session.
+    #[command(alias = "w")]
     Worker(WorkerArgs),
     /// Worker self-callback: raise a blocking ask for the human.
     Ask(AskArgs),
     /// Kill a session by id.
     Kill(KillArgs),
     /// Capture a worker's current screen.
+    #[command(alias = "ss")]
     Screenshot(ScreenshotArgs),
     /// Atomically claim a named lease.
     Claim(ClaimArgs),
@@ -163,6 +165,7 @@ pub struct GoalArgs {
 #[derive(Subcommand, Debug)]
 pub enum GoalOp {
     /// Create or replace a goal. Omit body or pass `-` to read stdin/heredoc.
+    #[command(alias = "w")]
     Write {
         id: String,
         body: Vec<String>,
@@ -186,6 +189,7 @@ pub struct SensorArgs {
 #[derive(Subcommand, Debug)]
 pub enum SensorOp {
     /// Create or replace a sensor. Omit script or pass `-` to read stdin/heredoc.
+    #[command(alias = "w")]
     Write {
         name: String,
         script: Vec<String>,
@@ -203,6 +207,7 @@ pub struct PlaybookArgs {
 #[derive(Subcommand, Debug)]
 pub enum PlaybookOp {
     /// Rewrite the PLAYBOOK. Omit body or pass `-` to read stdin/heredoc.
+    #[command(alias = "w")]
     Write {
         body: Vec<String>,
         #[command(flatten)]
@@ -252,6 +257,7 @@ pub enum WorkerOp {
     /// Kill a worker by id.
     Kill { id: String },
     /// List the fleet with health (busy / waiting-ask / stuck / dead).
+    #[command(alias = "ls")]
     List {
         /// Emit JSON instead of the table.
         #[arg(long, conflicts_with = "watch")]

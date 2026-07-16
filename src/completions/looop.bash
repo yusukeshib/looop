@@ -72,7 +72,7 @@ _looop() {
     local cur prev words cword
     _init_completion || return
 
-    local subcommands="init up down state wait asks answer goal sensor playbook run worker screenshot kill claim unclaim config version help"
+    local subcommands="init up down state wait asks answer goal sensor playbook run worker w screenshot ss kill claim unclaim config version help"
 
     if [[ $cword -eq 1 ]]; then
         COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
@@ -102,31 +102,31 @@ _looop() {
             ;;
         goal)
             if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "write archive" -- "$cur"))
+                COMPREPLY=($(compgen -W "write w archive" -- "$cur"))
             elif [[ $cword -eq 3 ]]; then
                 COMPREPLY=($(compgen -W "$(__looop_goals_list)" -- "$cur"))
             fi
             ;;
         sensor)
             if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "write" -- "$cur"))
-            elif [[ $cword -eq 3 && "${words[2]}" == write ]]; then
+                COMPREPLY=($(compgen -W "write w" -- "$cur"))
+            elif [[ $cword -eq 3 && ( "${words[2]}" == write || "${words[2]}" == w ) ]]; then
                 COMPREPLY=($(compgen -W "$(__looop_sensors_list)" -- "$cur"))
             fi
             ;;
         playbook)
-            [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "write" -- "$cur"))
+            [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "write w" -- "$cur"))
             ;;
-        worker)
+        worker|w)
             if [[ $cword -eq 2 ]]; then
-                COMPREPLY=($(compgen -W "start kill list" -- "$cur"))
+                COMPREPLY=($(compgen -W "start kill list ls" -- "$cur"))
                 return
             fi
             case "${words[2]}" in
                 kill)
                     [[ $cword -eq 3 ]] && COMPREPLY=($(compgen -W "$(__looop_workers_list)" -- "$cur"))
                     ;;
-                list)
+                list|ls)
                     [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--json --all -a --watch --interval" -- "$cur"))
                     ;;
                 start)
@@ -134,7 +134,7 @@ _looop() {
                     ;;
             esac
             ;;
-        screenshot)
+        screenshot|ss)
             if [[ "$cur" == -* ]]; then
                 COMPREPLY=($(compgen -W "--ansi --json --plain --no-trim" -- "$cur"))
             elif [[ $cword -eq 2 ]]; then

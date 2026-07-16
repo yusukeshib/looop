@@ -97,7 +97,9 @@ _looop() {
                 'playbook:Rewrite the PLAYBOOK'
                 'run:One ad-hoc, reversible shell command'
                 'worker:Spawn / kill / list workers'
+                'w:Spawn / kill / list workers (alias of worker)'
                 'screenshot:Capture a worker'"'"'s current screen'
+                'ss:Capture a worker'"'"'s screen (alias of screenshot)'
                 'kill:Kill a session by id'
                 'claim:Atomically claim a named lease'
                 'unclaim:Release a named lease'
@@ -136,41 +138,49 @@ _looop() {
                         local -a goal_ops
                         goal_ops=(
                             'write:Create or replace a goal'
+                            'w:Create or replace a goal (alias of write)'
                             'archive:Archive a goal'
                         )
                         _describe 'goal op' goal_ops
-                    elif (( CURRENT == 3 )) && [[ $words[2] == (archive|write) ]]; then
+                    elif (( CURRENT == 3 )) && [[ $words[2] == (archive|write|w) ]]; then
                         __looop_goals
                     fi
                     ;;
                 sensor)
                     if (( CURRENT == 2 )); then
                         local -a sensor_ops
-                        sensor_ops=('write:Create or replace a sensor')
+                        sensor_ops=(
+                            'write:Create or replace a sensor'
+                            'w:Create or replace a sensor (alias of write)'
+                        )
                         _describe 'sensor op' sensor_ops
-                    elif (( CURRENT == 3 )) && [[ $words[2] == write ]]; then
+                    elif (( CURRENT == 3 )) && [[ $words[2] == (write|w) ]]; then
                         __looop_sensors
                     fi
                     ;;
                 playbook)
                     if (( CURRENT == 2 )); then
                         local -a playbook_ops
-                        playbook_ops=('write:Rewrite the PLAYBOOK')
+                        playbook_ops=(
+                            'write:Rewrite the PLAYBOOK'
+                            'w:Rewrite the PLAYBOOK (alias of write)'
+                        )
                         _describe 'playbook op' playbook_ops
                     fi
                     ;;
-                worker)
+                worker|w)
                     if (( CURRENT == 2 )); then
                         local -a worker_ops
                         worker_ops=(
                             'start:Spawn a worker'
                             'kill:Kill a worker'
                             'list:List the fleet'
+                            'ls:List the fleet (alias of list)'
                         )
                         _describe 'worker op' worker_ops
                     elif [[ $words[2] == kill ]] && (( CURRENT == 3 )); then
                         __looop_workers
-                    elif [[ $words[2] == list ]]; then
+                    elif [[ $words[2] == (list|ls) ]]; then
                         _arguments \
                             '--json[Emit JSON]' \
                             '(-a --all)'{-a,--all}'[Show finished/dead workers too]' \
@@ -182,7 +192,7 @@ _looop() {
                             '--thinking[Thinking level]:level:'
                     fi
                     ;;
-                screenshot)
+                screenshot|ss)
                     if (( CURRENT == 2 )); then
                         __looop_workers
                     else
