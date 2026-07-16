@@ -384,7 +384,7 @@ fn render_fleet(fleet: &[crate::sensor::WorkerHealth]) -> usize {
     }
     let idw = fleet.iter().map(|w| w.id.len()).max().unwrap_or(2).max(2);
     println!(
-        "{}{:idw$}  {:11}  {:8}  {:>6}  {:>6}  {:>7}  {}{}",
+        "{}{:idw$}  {:11}  {:8}  {:>6}  {:>6}  {:>7}  VERIFY{}",
         dim(),
         "ID",
         "HEALTH",
@@ -392,7 +392,6 @@ fn render_fleet(fleet: &[crate::sensor::WorkerHealth]) -> usize {
         "IDLE",
         "UP",
         "ASK",
-        "VERIFY",
         rst()
     );
     for w in fleet {

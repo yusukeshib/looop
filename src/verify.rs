@@ -104,7 +104,7 @@ pub fn reconcile(paths: &Paths) {
         let Some(id) = p.file_stem().and_then(|s| s.to_str()).map(str::to_owned) else {
             continue;
         };
-        if result_path(paths, &id).exists() {
+        if result(paths, &id).is_some() {
             continue; // already verified once
         }
         // Only verify a session we still know about AND that is dead. A
@@ -152,7 +152,11 @@ fn run_one(paths: &Paths, cmd_file: &std::path::Path) -> VerifyResult {
             let mut combined = String::from_utf8_lossy(&o.stdout).into_owned();
             combined.push_str(&String::from_utf8_lossy(&o.stderr));
             let tail = if combined.len() > OUTPUT_TAIL_BYTES {
-                combined[combined.len() - OUTPUT_TAIL_BYTES..].to_string()
+                let mut start = combined.len() - OUTPUT_TAIL_BYTES;
+                while !combined.is_char_boundary(start) {
+                    start += 1;
+                }
+                combined[start..].to_string()
             } else {
                 combined
             };
@@ -202,7 +206,11 @@ mod tests {
     fn store_clears_stale_result_on_id_reuse() {
         let paths = Paths::temp();
         store(&paths, "w1", "true").unwrap();
-        fs::write(result_path(&paths, "w1"), "{\"ok\":true,\"exit_code\":0,\"output\":\"\",\"ts\":1}").unwrap();
+        fs::write(
+            result_path(&paths, "w1"),
+            "{\"ok\":true,\"exit_code\":0,\"output\":\"\",\"ts\":1}",
+        )
+        .unwrap();
         store(&paths, "w1", "false").unwrap();
         assert!(result(&paths, "w1").is_none());
     }
