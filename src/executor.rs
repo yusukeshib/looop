@@ -46,16 +46,16 @@ pub enum Action {
     WriteSensor { name: String, script: String },
     /// Replace PLAYBOOK.md.
     WritePlaybook { body: String },
-    /// Spawn a worker session for hands-on work. `model`/`thinking` are optional
-    /// per-worker overrides expanded into the `worker_command` template's
-    /// `{{model}}`/`{{thinking}}` placeholders (see `session::cmd_start_session`).
+    /// Spawn a worker session for hands-on work. `command` is an optional
+    /// per-worker launch-command override, replacing the `worker_command`
+    /// template wholesale (it must carry `{{prompt_file}}`; see
+    /// `session::cmd_start_session`). Policy for when to override lives in
+    /// the PLAYBOOK — looop itself has no runner vocabulary.
     StartWorker {
         id: String,
         prompt: String,
         #[serde(default)]
-        model: Option<String>,
-        #[serde(default)]
-        thinking: Option<String>,
+        command: Option<String>,
         /// Optional post-condition: ONE shell command that must exit 0 once
         /// the work is truly done (compose with `&&`). Run ONCE by the pulse
         /// on the first beat after the worker dies; the verdict is surfaced in
@@ -277,8 +277,7 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
         Action::StartWorker {
             id,
             prompt,
-            model,
-            thinking,
+            command,
             verify,
         } => {
             // Reuse the worker-launch path (contract injection, reserved-id
@@ -287,20 +286,18 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
                 paths,
                 id,
                 prompt,
-                model.as_deref(),
-                thinking.as_deref(),
+                command.as_deref(),
                 verify.as_deref(),
             )?;
             if outcome.code != std::process::ExitCode::SUCCESS {
                 bail!("start_worker {id:?} failed");
             }
-            // Report the model ONLY when it was actually applied (template used
-            // `{{model}}` and a value resolved). A flag ignored for lack of the
-            // placeholder must not leak into the journal.
-            let note = outcome
-                .effective_model
-                .map(|m| format!("start-worker {id} (model: {m})"))
-                .unwrap_or_else(|| format!("start-worker {id}"));
+            // Flag a command override in the journal so it stays auditable.
+            let note = if outcome.overridden {
+                format!("start-worker {id} (command override)")
+            } else {
+                format!("start-worker {id}")
+            };
             Ok(note)
         }
 
@@ -514,15 +511,14 @@ pub fn cmd_run(paths: &Paths, args: &crate::cli::RunArgs) -> Result<ExitCode> {
     )?)
 }
 
-/// `looop worker start <id> <prompt…|-> [--model M] [--thinking L]` — spawn a
-/// worker session (journaled). `model`/`thinking` are optional per-worker
-/// overrides for the `worker_command` template's placeholders.
+/// `looop worker start <id> <prompt…|-> [--command CMD] [--verify CMD]` —
+/// spawn a worker session (journaled). `command` optionally replaces the
+/// `worker_command` template wholesale for this one worker.
 pub fn start_worker(
     paths: &Paths,
     id: &str,
     prompt: &[String],
-    model: Option<&str>,
-    thinking: Option<&str>,
+    command: Option<&str>,
     verify: Option<&str>,
     journal: Option<&str>,
 ) -> Result<ExitCode> {
@@ -533,7 +529,7 @@ pub fn start_worker(
         return Ok(ExitCode::from(1));
     }
     ok(crate::contract::LocalContract::new(paths)
-        .worker_start(id, &prompt, model, thinking, verify, journal)?)
+        .worker_start(id, &prompt, command, verify, journal)?)
 }
 
 #[cfg(test)]
@@ -650,8 +646,7 @@ mod tests {
         assert!(!is_non_idempotent(&Action::StartWorker {
             id: "w".into(),
             prompt: "p".into(),
-            model: None,
-            thinking: None,
+            command: None,
             verify: None
         }));
     }
@@ -718,8 +713,7 @@ mod tests {
             goal_of(&Action::StartWorker {
                 id: "triage".into(),
                 prompt: "p".into(),
-                model: None,
-                thinking: None,
+                command: None,
                 verify: None
             }),
             Some("triage".into())

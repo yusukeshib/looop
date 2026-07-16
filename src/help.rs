@@ -36,7 +36,7 @@ Usage:
   looop sensor write <name> [script|-]                   (`-`/omit = stdin/heredoc)
   looop playbook write [body|-]                          (`-`/omit = stdin/heredoc)
   looop screenshot <id> [--ansi|--json] [--no-trim]   capture a session's screen
-  looop worker start <id> [prompt|-] [--model M] [--thinking T] [--verify CMD]
+  looop worker start <id> [prompt|-] [--command CMD] [--verify CMD]
                                 spawn a worker; --verify = post-condition shell
                                 command run ONCE after the worker dies (exit 0 =
                                 verified done; fail is surfaced in sys-sessions

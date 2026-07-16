@@ -240,17 +240,12 @@ pub enum WorkerOp {
     Start {
         id: String,
         prompt: Vec<String>,
-        /// Model to launch this worker with (expanded into the
-        /// `worker_command` template's `{{model}}` placeholder). Overrides the
-        /// optional `worker_model` config default. Ignored (with a warning) if
-        /// the template has no `{{model}}` placeholder.
+        /// Full launch-command override for this one worker, replacing the
+        /// config's `worker_command` template wholesale (e.g. a different
+        /// runner, model, or flags). Must contain `{{prompt_file}}` — the
+        /// worker's brief — exactly like the template.
         #[arg(long)]
-        model: Option<String>,
-        /// Thinking level for this worker (expanded into the `{{thinking}}`
-        /// placeholder). Overrides the optional `worker_thinking` config
-        /// default. Ignored (with a warning) if the template lacks it.
-        #[arg(long)]
-        thinking: Option<String>,
+        command: Option<String>,
         /// Post-condition: ONE shell command that must exit 0 once the work
         /// is truly done (compose conditions with `&&`). The pulse runs it
         /// ONCE after the worker dies; a non-zero exit marks the worker

@@ -191,8 +191,8 @@ _looop() {
                             '--interval[Refresh interval seconds]:seconds:'
                     elif [[ $words[2] == start ]]; then
                         _arguments \
-                            '--model[Model to launch this worker with]:model:' \
-                            '--thinking[Thinking level]:level:'
+                            '--command[Full launch-command override (must contain {{prompt_file}})]:command:' \
+                            '--verify[Post-condition shell command]:command:'
                     fi
                     ;;
                 screenshot|ss)

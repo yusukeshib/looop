@@ -175,16 +175,14 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
             WorkerOp::Start {
                 id,
                 prompt,
-                model,
-                thinking,
+                command,
                 verify,
                 journal,
             } => executor::start_worker(
                 paths,
                 id,
                 prompt,
-                model.as_deref(),
-                thinking.as_deref(),
+                command.as_deref(),
                 verify.as_deref(),
                 journal.journal.as_deref(),
             ),

@@ -90,7 +90,8 @@ Pick exactly ONE `action` and fill its fields:
      change-detection hash; the whole object still reaches this prompt.
 
   {"action":"start_worker","id":"<goal-name>","prompt":"<detailed worker brief>",
-   "verify":"<optional post-condition shell command>"}
+   "verify":"<optional post-condition shell command>",
+   "command":"<optional full launch-command override>"}
      Spawn an agent for hands-on, multi-step work. <id> matches the goal file.
      The worker starts in the data dir; if its task edits CODE, tell it to make
      its OWN sandbox first (a git worktree) and cd in —
@@ -106,6 +107,10 @@ Pick exactly ONE `action` and fill its fields:
      once and sys-sessions reports verify:"pass"|"fail" (+ detail
      verify_output). Treat verify:"fail" as a FAILED worker — inspect, then
      respawn with sharper instructions or ask — never as sensor lag.
+     `command` replaces the configured worker launch command WHOLESALE for
+     this one worker (it must contain {{prompt_file}}, the worker's brief).
+     OMIT it unless the PLAYBOOK gives explicit guidance (exact commands valid
+     on this machine) on when and how to override — never invent one.
 
   {"action":"kill_worker","id":"<worker-id>","reason":"..."}
      Terminate a live worker. Workers have NO input channel (no terminal a

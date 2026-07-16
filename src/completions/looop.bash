@@ -130,7 +130,7 @@ _looop() {
                     [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--json --all -a --watch -w --interval" -- "$cur"))
                     ;;
                 start)
-                    [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--model --thinking" -- "$cur"))
+                    [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--command --verify" -- "$cur"))
                     ;;
             esac
             ;;
