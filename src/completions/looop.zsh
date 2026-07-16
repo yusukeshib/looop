@@ -187,7 +187,7 @@ _looop() {
                         _arguments \
                             '--json[Emit JSON]' \
                             '(-a --all)'{-a,--all}'[Show finished/dead workers too]' \
-                            '--watch[Re-render until Ctrl-C]' \
+                            '(-w --watch)'{-w,--watch}'[Re-render until Ctrl-C]' \
                             '--interval[Refresh interval seconds]:seconds:'
                     elif [[ $words[2] == start ]]; then
                         _arguments \

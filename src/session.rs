@@ -350,6 +350,15 @@ pub fn cmd_worker_list(
             return Ok(ExitCode::SUCCESS);
         }
         let mut lines = 0usize;
+        // Clip every line to the terminal width in watch mode: the in-place
+        // repaint below counts LOGICAL lines, so a row that wraps would throw
+        // off the cursor-up arithmetic and leave stale header lines behind.
+        // Re-read the width each tick so a resize self-heals.
+        let clip = if watch {
+            crate::util::term_cols()
+        } else {
+            None
+        };
         if watch {
             // Repaint IN PLACE, not full-screen: move the cursor up over the
             // block we drew last tick and clear from there down (\x1b[J), so
@@ -358,13 +367,17 @@ pub fn cmd_worker_list(
             if prev_lines > 0 {
                 print!("\x1b[{prev_lines}A\x1b[J");
             }
-            println!(
-                "fleet · {}  (refresh {interval}s — Ctrl-C to stop)\n",
-                crate::util::date_fmt("%H:%M:%S")
+            print_clipped(
+                &format!(
+                    "fleet · {}  (refresh {interval}s — Ctrl-C to stop)",
+                    crate::util::date_fmt("%H:%M:%S")
+                ),
+                clip,
             );
+            println!();
             lines += 2; // the header line + its trailing blank line
         }
-        lines += render_fleet(&fleet);
+        lines += render_fleet(&fleet, clip);
         if !watch {
             return Ok(ExitCode::SUCCESS);
         }
@@ -373,26 +386,39 @@ pub fn cmd_worker_list(
     }
 }
 
+/// Print one line, clipped to `clip` columns when set (ANSI-aware). Watch
+/// mode clips so no row ever wraps; one-shot mode passes `None` and prints
+/// full rows.
+fn print_clipped(line: &str, clip: Option<usize>) {
+    match clip {
+        Some(w) => println!("{}", crate::util::clip_ansi(line, w)),
+        None => println!("{line}"),
+    }
+}
+
 /// The plain fleet table. Columns are fixed-name, width sized to content.
 /// Render the fleet table and return the number of terminal lines printed (used
 /// by `--watch` to repaint in place instead of clearing the whole screen).
-fn render_fleet(fleet: &[crate::sensor::WorkerHealth]) -> usize {
+fn render_fleet(fleet: &[crate::sensor::WorkerHealth], clip: Option<usize>) -> usize {
     use crate::util::{dim, red, rst, yel};
     if fleet.is_empty() {
         println!("no workers");
         return 1;
     }
     let idw = fleet.iter().map(|w| w.id.len()).max().unwrap_or(2).max(2);
-    println!(
-        "{}{:idw$}  {:11}  {:8}  {:>6}  {:>6}  {:>7}  VERIFY{}",
-        dim(),
-        "ID",
-        "HEALTH",
-        "STATE",
-        "IDLE",
-        "UP",
-        "ASK",
-        rst()
+    print_clipped(
+        &format!(
+            "{}{:idw$}  {:11}  {:8}  {:>6}  {:>6}  {:>7}  VERIFY{}",
+            dim(),
+            "ID",
+            "HEALTH",
+            "STATE",
+            "IDLE",
+            "UP",
+            "ASK",
+            rst()
+        ),
+        clip,
     );
     for w in fleet {
         let (hl, hr) = match w.health {
@@ -410,14 +436,17 @@ fn render_fleet(fleet: &[crate::sensor::WorkerHealth]) -> usize {
             Some(false) => format!("{}FAIL{}", red(), rst()),
             None => "-".to_string(),
         };
-        println!(
-            "{:idw$}  {hl}{:11}{hr}  {:8}  {:>6}  {:>6}  {:>7}  {verify}",
-            w.id,
-            w.health,
-            state,
-            fmt_dur(w.idle_s),
-            fmt_dur(w.uptime_s),
-            fmt_dur(w.ask_age_s),
+        print_clipped(
+            &format!(
+                "{:idw$}  {hl}{:11}{hr}  {:8}  {:>6}  {:>6}  {:>7}  {verify}",
+                w.id,
+                w.health,
+                state,
+                fmt_dur(w.idle_s),
+                fmt_dur(w.uptime_s),
+                fmt_dur(w.ask_age_s),
+            ),
+            clip,
         );
     }
     // 1 header row + one row per worker.

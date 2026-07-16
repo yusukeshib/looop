@@ -127,7 +127,7 @@ _looop() {
                     [[ $cword -eq 3 ]] && COMPREPLY=($(compgen -W "$(__looop_workers_list)" -- "$cur"))
                     ;;
                 list|ls)
-                    [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--json --all -a --watch --interval" -- "$cur"))
+                    [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--json --all -a --watch -w --interval" -- "$cur"))
                     ;;
                 start)
                     [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--model --thinking" -- "$cur"))

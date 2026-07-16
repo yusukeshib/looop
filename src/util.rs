@@ -56,6 +56,56 @@ fn is_stdout_tty() -> bool {
     false
 }
 
+/// Terminal width (columns) of stdout, if stdout is a tty. Used by
+/// `worker list --watch` to clip rows so they never wrap — wrapping breaks the
+/// cursor-up-N in-place repaint arithmetic (the residue piles up as repeated
+/// header lines in scrollback).
+pub fn term_cols() -> Option<usize> {
+    if !is_stdout_tty() {
+        return None;
+    }
+    ratatui::crossterm::terminal::size()
+        .ok()
+        .map(|(cols, _rows)| cols as usize)
+}
+
+/// Clip `s` to at most `max` visible columns, treating ANSI escape sequences
+/// as zero-width (they are copied through, never split). If the cut happens
+/// after any escape was emitted, a reset is appended so a clipped colored cell
+/// can't bleed its color into the rest of the screen. Assumes 1 column per
+/// char (our tables are ASCII).
+pub fn clip_ansi(s: &str, max: usize) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut width = 0usize;
+    let mut saw_esc = false;
+    let mut truncated = false;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            saw_esc = true;
+            out.push(c);
+            // Copy the CSI sequence through to its final byte (a letter).
+            for c2 in chars.by_ref() {
+                out.push(c2);
+                if c2.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        if width >= max {
+            truncated = true;
+            break;
+        }
+        out.push(c);
+        width += 1;
+    }
+    if truncated && saw_esc {
+        out.push_str("\x1b[0m");
+    }
+    out
+}
+
 #[cfg(unix)]
 unsafe fn libc_isatty(fd: i32) -> bool {
     unsafe extern "C" {
@@ -393,6 +443,21 @@ pub fn sleep_countdown(secs: u64, suffix: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clip_ansi_counts_only_visible_columns() {
+        // Plain text: clipped at the column budget.
+        assert_eq!(clip_ansi("hello world", 5), "hello");
+        // Shorter than the budget: untouched.
+        assert_eq!(clip_ansi("hi", 5), "hi");
+        // Escapes are zero-width and copied through whole.
+        assert_eq!(
+            clip_ansi("\x1b[31mred\x1b[0m ok", 6),
+            "\x1b[31mred\x1b[0m ok"
+        );
+        // A cut after a color start appends a reset so color can't bleed.
+        assert_eq!(clip_ansi("\x1b[31mredredred", 3), "\x1b[31mred\x1b[0m");
+    }
 
     #[test]
     fn write_atomic_replaces_existing_and_leaves_no_temp() {

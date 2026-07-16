@@ -273,7 +273,7 @@ pub enum WorkerOp {
         #[arg(long, short = 'a')]
         all: bool,
         /// Re-render every few seconds until Ctrl-C.
-        #[arg(long)]
+        #[arg(long, short = 'w')]
         watch: bool,
         /// Refresh interval for --watch, in seconds.
         #[arg(long, default_value_t = 2, requires = "watch")]
