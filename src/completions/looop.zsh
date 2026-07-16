@@ -110,6 +110,9 @@ _looop() {
             _describe 'subcommand' subcmds
             ;;
         args)
+            # The `*::` spec above re-scopes $words/$CURRENT to the subcommand:
+            # here $words[1] is the subcommand (not `looop`) and $words[2] is its
+            # first argument, so CURRENT==2 is that first argument.
             case $words[1] in
                 up)
                     _arguments '--json[Emit pulse logs as JSON]'
