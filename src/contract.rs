@@ -79,17 +79,17 @@ pub trait Contract {
     fn playbook_write(&self, body: &str, journal: Option<&str>) -> Result<String>;
     /// Run one ad-hoc, REVERSIBLE shell command; returns the executor's summary.
     fn run(&self, cmd: &str, reason: &str, journal: Option<&str>) -> Result<String>;
-    /// Spawn a worker session; returns the executor's summary line. `model`/
-    /// `thinking` are optional per-worker overrides for the worker command
-    /// template's `{{model}}`/`{{thinking}}` placeholders. `verify` is an
-    /// optional post-condition shell command the pulse runs once after the
-    /// worker dies (exit 0 = work verified done — see `verify.rs`).
+    /// Spawn a worker session; returns the executor's summary line. `command`
+    /// is an optional per-worker launch-command override, replacing the
+    /// `worker_command` template wholesale (must carry `{{prompt_file}}`).
+    /// `verify` is an optional post-condition shell command the pulse runs
+    /// once after the worker dies (exit 0 = work verified done — see
+    /// `verify.rs`).
     fn worker_start(
         &self,
         id: &str,
         prompt: &str,
-        model: Option<&str>,
-        thinking: Option<&str>,
+        command: Option<&str>,
         verify: Option<&str>,
         journal: Option<&str>,
     ) -> Result<String>;
@@ -202,8 +202,7 @@ impl Contract for LocalContract<'_> {
         &self,
         id: &str,
         prompt: &str,
-        model: Option<&str>,
-        thinking: Option<&str>,
+        command: Option<&str>,
         verify: Option<&str>,
         journal: Option<&str>,
     ) -> Result<String> {
@@ -212,8 +211,7 @@ impl Contract for LocalContract<'_> {
             &Action::StartWorker {
                 id: id.to_string(),
                 prompt: prompt.to_string(),
-                model: model.map(str::to_owned),
-                thinking: thinking.map(str::to_owned),
+                command: command.map(str::to_owned),
                 verify: verify.map(str::to_owned),
             },
             journal,

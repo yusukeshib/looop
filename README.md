@@ -168,17 +168,18 @@ or `custom`; after that looop treats the result as plain runner wiring:
 | Key              | Role                                                                                     |
 | ---------------- | ---------------------------------------------------------------------------------------- |
 | `tick_command`   | run ONE disposable decision. The prompt is passed via the `{{prompt_file}}` placeholder (substituted with the prompt file path — read it with `$(cat {{prompt_file}})` or `@{{prompt_file}}`). If you omit the placeholder the prompt is piped in on **stdin** instead. Must run unattended (no permission prompts — the detached pulse can't answer them) and emit a structured event stream looop can render. |
-| `worker_command` | launch a worker agent. Same `{{prompt_file}}` placeholder, substituted with the worker's prompt file path. (A worker can't use the stdin fallback — stdin is its live attach TTY.) It may also carry `{{model}}` and `{{thinking}}` placeholders for per-worker model selection (see below). |
+| `worker_command` | launch a worker agent. Same `{{prompt_file}}` placeholder, substituted with the worker's prompt file path. (A worker can't use the stdin fallback — stdin is its live attach TTY.) |
 
-**Per-worker model selection.** The `worker_command` may include `{{model}}` and `{{thinking}}` placeholders. When a worker starts they are substituted with, in precedence order: the `looop worker start --model M --thinking L` flags, then the optional top-level `worker_model` / `worker_thinking` config keys, then the empty string. A template that omits a placeholder is left untouched, so configs and flag-less starts behave exactly as before; passing `--model` against a template with no `{{model}}` placeholder logs a warning and is ignored. Example wiring:
+**Per-worker command override.** `looop worker start <id> … --command "…"` (and the decider's `start_worker.command` field) replaces the `worker_command` template **wholesale** for that one worker — a different runner, model, or flags. The override is a full launch command and must contain `{{prompt_file}}`, exactly like the template:
 
-```json
-{
-  "worker_command": "pi --model {{model}} --thinking {{thinking}} @{{prompt_file}}",
-  "worker_model": "claude-opus-4-8",
-  "worker_thinking": "medium"
-}
+```sh
+looop worker start heavy-refactor "…brief…" \
+  --command 'pi --model claude-opus-4-8 --thinking high @{{prompt_file}}'
 ```
+
+looop itself has **no runner vocabulary** — which flags mean "model" or "effort" is the runner's business, decided at `looop init` time or per-worker via the override. Policy for *when* to override belongs in your PLAYBOOK (with exact commands valid on your machine); without such guidance the decider always uses the configured template.
+
+> **Removed in 1.0:** the `{{model}}`/`{{thinking}}` placeholders, the `worker_model`/`worker_thinking` config keys, and the `--model`/`--thinking` flags. A `worker_command` still carrying those placeholders is refused at launch — re-run `looop init` (or edit the config) to bake the values into the command.
 
 The built-in presets are:
 
