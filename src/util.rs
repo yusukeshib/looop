@@ -252,6 +252,7 @@ pub fn safe_segment(kind: &str, seg: &str) -> anyhow::Result<()> {
         || seg.contains('\\')
         || seg.starts_with('.')
         || seg == ".."
+        || seg.chars().any(char::is_whitespace)
     {
         anyhow::bail!("invalid {kind} {seg:?}");
     }

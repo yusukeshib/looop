@@ -553,7 +553,7 @@ mod tests {
     fn safe_segment_blocks_traversal() {
         use crate::util::safe_segment;
         assert!(safe_segment("goal id", "ok").is_ok());
-        for bad in ["", "..", "a/b", ".hidden", "a\\b"] {
+        for bad in ["", "..", "a/b", ".hidden", "a\\b", "a b", "a\tb", "a\nb"] {
             assert!(
                 safe_segment("goal id", bad).is_err(),
                 "should reject {bad:?}"

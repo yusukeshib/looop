@@ -315,6 +315,7 @@ pub fn cmd_worker_list(
     watch: bool,
     interval: u64,
 ) -> Result<ExitCode> {
+    let mut prev_lines = 0usize;
     loop {
         let fleet: Vec<crate::sensor::WorkerHealth> = crate::sensor::fleet_health(paths)
             .into_iter()
@@ -339,28 +340,38 @@ pub fn cmd_worker_list(
             println!("{}", serde_json::to_string_pretty(&rows)?);
             return Ok(ExitCode::SUCCESS);
         }
+        let mut lines = 0usize;
         if watch {
-            // Clear + home, then repaint — watch(1) style, no TUI machinery.
-            print!("\x1b[2J\x1b[H");
+            // Repaint IN PLACE, not full-screen: move the cursor up over the
+            // block we drew last tick and clear from there down (\x1b[J), so
+            // everything above it (prompt, prior output, scrollback) stays
+            // intact. No alternate screen buffer, no \x1b[2J whole-screen wipe.
+            if prev_lines > 0 {
+                print!("\x1b[{prev_lines}A\x1b[J");
+            }
             println!(
                 "fleet · {}  (refresh {interval}s — Ctrl-C to stop)\n",
                 crate::util::date_fmt("%H:%M:%S")
             );
+            lines += 2; // the header line + its trailing blank line
         }
-        render_fleet(&fleet);
+        lines += render_fleet(&fleet);
         if !watch {
             return Ok(ExitCode::SUCCESS);
         }
+        prev_lines = lines;
         std::thread::sleep(std::time::Duration::from_secs(interval.max(1)));
     }
 }
 
 /// The plain fleet table. Columns are fixed-name, width sized to content.
-fn render_fleet(fleet: &[crate::sensor::WorkerHealth]) {
+/// Render the fleet table and return the number of terminal lines printed (used
+/// by `--watch` to repaint in place instead of clearing the whole screen).
+fn render_fleet(fleet: &[crate::sensor::WorkerHealth]) -> usize {
     use crate::util::{dim, red, rst, yel};
     if fleet.is_empty() {
         println!("no workers");
-        return;
+        return 1;
     }
     let idw = fleet.iter().map(|w| w.id.len()).max().unwrap_or(2).max(2);
     println!(
@@ -395,6 +406,8 @@ fn render_fleet(fleet: &[crate::sensor::WorkerHealth]) {
             fmt_dur(w.ask_age_s),
         );
     }
+    // 1 header row + one row per worker.
+    1 + fleet.len()
 }
 
 /// Compact duration: `-` (unknown), `42s`, `5m`, `2h`, `3d`.
