@@ -25,8 +25,8 @@ looop pursues by editing goals and the PLAYBOOK; it observes them next beat. Thi
 never blocks the loop — you set direction and walk away.
 
 ```sh
-looop _ goal write ship-v2 -      # declare desired state (effective next beat)
-looop _ playbook write -          # your judgment, priorities, guardrails
+looop goal write ship-v2 -      # declare desired state (effective next beat)
+looop playbook write -          # your judgment, priorities, guardrails
 ```
 
 **Answer — sync, the loop initiates.** looop reaches back for *you* only when it
@@ -35,13 +35,13 @@ irreversible action — merge, deploy, delete — needs an explicit yes. It bloc
 and waits for your call.
 
 ```sh
-looop _ wait --only-asks          # block cheaply until the loop needs you
-looop _ answer <id> "yes"         # unblock the worker / approve the gate
+looop wait --only-asks          # block cheaply until the loop needs you
+looop answer <id> "yes"         # unblock the worker / approve the gate
 ```
 
 The key move: **the intervention point is decoupled from any UI.** Asks and
 answers are a durable file mailbox reached through one backend-agnostic contract
-(`looop _ …`), so the loop never blocks on a particular terminal, tmux, or stdin
+(`looop …`), so the loop never blocks on a particular terminal, tmux, or stdin
 — it just needs an answer *eventually*, from whatever channel reaches you:
 
 - a **bare terminal** — you typing the verbs yourself (the thinnest client);
@@ -76,7 +76,7 @@ Two properties make all this dependable:
 | Layer        | What it is                                                            |
 | ------------ | --------------------------------------------------------------------- |
 | **core**     | the autonomous pulse + the durable state behind it. Decides and acts. |
-| **contract** | the `looop _ …` verbs — the one stable, backend-agnostic surface to read and steer core. |
+| **contract** | the `looop …` verbs — the one stable, backend-agnostic surface to read and steer core. |
 | **client**   | anything that drives the contract for a human (terminal / concierge / notify). An interface, never a decision-maker. |
 
 State is plain files in the data dir, reached *through* the contract — not a
@@ -108,15 +108,13 @@ looop dependency.)
 ```sh
 looop init     # interactive setup — required before `up`; pick the runner wiring
 looop up       # start the autonomous pulse (detached)
-looop client   # TUI: whole fleet + each agent's log; answer asks by hand
-               #   (--all / `tab` also show finished workers, latest first)
 looop down     # stop the pulse and all workers
 ```
 
 The pulse refuses to start until `looop init` writes the runner wiring, so the
 agent CLI driving every tick and worker is always an explicit choice. Read and
-steer core with the `looop _ …` verbs (`_ state`, `_ wait`, `_ answer`,
-`_ goal write`), by hand or through a client.
+steer core with the `looop …` verbs (`state`, `wait`, `answer`,
+`goal write`), by hand or through a client.
 
 ### First run
 
@@ -124,10 +122,9 @@ looop runs headless, so it can't interview you. A fresh data dir is seeded with 
 starter PLAYBOOK, a `setup` goal, and a real pending `setup` ask so a client
 waiting on asks wakes immediately.
 
-Start with `looop up` then `looop client`: the TUI keeps the pending ask list on
-screen and lets you answer by hand — no extra tooling, just looop. Answer the
-starter `setup` ask, edit your goals/PLAYBOOK with the `looop _ …` verbs, archive
-the `setup` goal, and looop runs from there.
+Start with `looop up`, then answer asks by hand (`looop asks`, `looop answer`)
+or through a client. Answer the starter `setup` ask, edit your goals/PLAYBOOK
+with the `looop …` verbs, archive the `setup` goal, and looop runs from there.
 
 **Even easier: an agent concierge.** Point a `claude`/`codex`/`opencode`/`pi`
 session at looop and talk to it in plain language — it relays asks with
@@ -153,7 +150,7 @@ or `custom`; after that looop treats the result as plain runner wiring:
 | `tick_command`   | run ONE disposable decision. The prompt is passed via the `{{prompt_file}}` placeholder (substituted with the prompt file path — read it with `$(cat {{prompt_file}})` or `@{{prompt_file}}`). If you omit the placeholder the prompt is piped in on **stdin** instead. Must run unattended (no permission prompts — the detached pulse can't answer them) and emit a structured event stream looop can render. |
 | `worker_command` | launch a worker agent. Same `{{prompt_file}}` placeholder, substituted with the worker's prompt file path. (A worker can't use the stdin fallback — stdin is its live attach TTY.) It may also carry `{{model}}` and `{{thinking}}` placeholders for per-worker model selection (see below). |
 
-**Per-worker model selection.** The `worker_command` may include `{{model}}` and `{{thinking}}` placeholders. When a worker starts they are substituted with, in precedence order: the `looop _ worker start --model M --thinking L` flags, then the optional top-level `worker_model` / `worker_thinking` config keys, then the empty string. A template that omits a placeholder is left untouched, so configs and flag-less starts behave exactly as before; passing `--model` against a template with no `{{model}}` placeholder logs a warning and is ignored. Example wiring:
+**Per-worker model selection.** The `worker_command` may include `{{model}}` and `{{thinking}}` placeholders. When a worker starts they are substituted with, in precedence order: the `looop worker start --model M --thinking L` flags, then the optional top-level `worker_model` / `worker_thinking` config keys, then the empty string. A template that omits a placeholder is left untouched, so configs and flag-less starts behave exactly as before; passing `--model` against a template with no `{{model}}` placeholder logs a warning and is ignored. Example wiring:
 
 ```json
 {

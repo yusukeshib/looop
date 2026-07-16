@@ -207,23 +207,109 @@ fn all_sensors(paths: &Paths) -> Vec<Sensor> {
 
 /// System sensor: the live worker fleet (the pulse excludes itself, so it never
 /// feeds its own wake signal). The wake SIGNAL is each worker's stable identity
-/// — id/state/exit_code — so a worker starting or dying moves the world hash and
-/// wakes a blocked `looop _ wait`. Sorted by id so the snapshot (and hash) is
-/// order-stable.
-fn sys_sessions(paths: &Paths) -> serde_json::Value {
+/// — id/state/exit_code — plus a COARSE `health` classification, so a worker
+/// starting, dying, or transitioning busy→stuck moves the world hash and wakes
+/// a blocked `looop wait` / the tick exactly once per transition. The raw,
+/// per-second numbers (idle/uptime/ask age) ride in `detail`, which the wake
+/// hash ignores — they inform the decider without churning the hash every beat.
+///
+/// `health` (alive workers only):
+///   • busy         — terminal output within the stuck threshold
+///   • waiting-ask  — blocked on a pending ask (the human's turn; idle forever
+///                    is legitimate)
+///   • stuck        — no pending ask AND no output for ≥ threshold. There is
+///                    no input channel to nudge a worker, so the only remedy
+///                    is kill (+ re-dispatch if the goal still needs work).
+/// Threshold: `LOOOP_WORKER_STUCK_SECS` (default 900).
+/// Pure health classification for one worker (see [`sys_sessions`]). Unknown
+/// idle (missing/undatable log) biases to busy: never call a worker stuck on
+/// evidence we don't have.
+fn worker_health(
+    alive: bool,
+    has_pending_ask: bool,
+    idle_secs: Option<u64>,
+    stuck_after: u64,
+) -> &'static str {
+    if !alive {
+        "dead"
+    } else if has_pending_ask {
+        "waiting-ask"
+    } else if idle_secs.is_some_and(|i| i >= stuck_after) {
+        "stuck"
+    } else {
+        "busy"
+    }
+}
+
+/// One worker's full health projection — the shared source for the
+/// `sys-sessions` snapshot AND `looop worker list`.
+pub(crate) struct WorkerHealth {
+    pub id: String,
+    pub state: String,
+    pub alive: bool,
+    pub exit_code: Option<i64>,
+    /// busy / waiting-ask / stuck / dead — see [`worker_health`].
+    pub health: &'static str,
+    /// Seconds since the last PTY output (output.log mtime).
+    pub idle_s: Option<u64>,
+    /// Seconds since the session started.
+    pub uptime_s: Option<u64>,
+    /// Seconds the worker's pending ask has been waiting on the human.
+    pub ask_age_s: Option<u64>,
+}
+
+/// The whole fleet's health, sorted by id (order-stable for the wake hash).
+pub(crate) fn fleet_health(paths: &Paths) -> Vec<WorkerHealth> {
+    let stuck_after = env_num("LOOOP_WORKER_STUCK_SECS", 900);
+    let pending = crate::mailbox::pending(paths);
     let mut workers = session::list_workers(paths);
     workers.sort_by(|a, b| a.id.cmp(&b.id));
-    let signal: Vec<serde_json::Value> = workers
-        .iter()
+    workers
+        .into_iter()
         .map(|s| {
-            serde_json::json!({
-                "id": s.id,
-                "state": s.state,
-                "exit_code": s.exit_code,
-            })
+            let ask = pending.iter().find(|a| a.worker == s.id);
+            let idle = session::output_idle_secs(paths, &s.id);
+            WorkerHealth {
+                health: worker_health(s.alive, ask.is_some(), idle, stuck_after),
+                idle_s: idle,
+                uptime_s: s.uptime_secs(),
+                ask_age_s: ask.map(|a| crate::util::now_unix().saturating_sub(a.ts)),
+                id: s.id,
+                state: s.state,
+                alive: s.alive,
+                exit_code: s.exit_code,
+            }
         })
-        .collect();
-    serde_json::json!({ "signal": signal, "detail": { "count": workers.len() } })
+        .collect()
+}
+
+fn sys_sessions(paths: &Paths) -> serde_json::Value {
+    let fleet = fleet_health(paths);
+    let mut signal: Vec<serde_json::Value> = Vec::new();
+    let mut detail_workers = serde_json::Map::new();
+    for w in &fleet {
+        signal.push(serde_json::json!({
+            "id": w.id,
+            "state": w.state,
+            "exit_code": w.exit_code,
+            "health": w.health,
+        }));
+        let mut d = serde_json::Map::new();
+        if let Some(i) = w.idle_s {
+            d.insert("idle_s".into(), serde_json::json!(i));
+        }
+        if let Some(u) = w.uptime_s {
+            d.insert("uptime_s".into(), serde_json::json!(u));
+        }
+        if let Some(a) = w.ask_age_s {
+            d.insert("ask_age_s".into(), serde_json::json!(a));
+        }
+        detail_workers.insert(w.id.clone(), serde_json::Value::Object(d));
+    }
+    serde_json::json!({
+        "signal": signal,
+        "detail": { "count": fleet.len(), "workers": detail_workers },
+    })
 }
 
 /// System sensor: live worker leases (claims/*.json). Stale claims are reaped
@@ -376,6 +462,19 @@ mod tests {
             probe: sys_sessions,
         };
         assert_eq!(sys.name(), "sys-sessions");
+    }
+
+    #[test]
+    fn worker_health_classifies_the_four_states() {
+        // Dead wins over everything.
+        assert_eq!(worker_health(false, true, Some(9999), 900), "dead");
+        // A pending ask is the human's turn — legitimate idle, however long.
+        assert_eq!(worker_health(true, true, Some(9999), 900), "waiting-ask");
+        // Silent past the threshold with no ask — stuck.
+        assert_eq!(worker_health(true, false, Some(900), 900), "stuck");
+        assert_eq!(worker_health(true, false, Some(899), 900), "busy");
+        // Unknown idle biases to busy (never stuck on missing evidence).
+        assert_eq!(worker_health(true, false, None, 900), "busy");
     }
 
     #[test]

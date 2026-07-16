@@ -14,7 +14,7 @@ static JSON: OnceLock<bool> = OnceLock::new();
 /// Decide once whether the loop's own log lines are emitted as NDJSON (one
 /// structured object per line) instead of the human-pretty `[HH:MM:SS] …` form.
 /// Driven by `$LOOOP_LOG_FORMAT=json`. Exported so the detached pulse worker and
-/// any child inherit the decision (so `looop watch pulse` sees a clean stream).
+/// any child inherit the decision (so a watcher of the pulse log sees a clean stream).
 pub fn init_format() {
     let json = matches!(std::env::var("LOOOP_LOG_FORMAT").as_deref(), Ok("json"));
     let _ = JSON.set(json);
@@ -119,7 +119,7 @@ impl Level {
 /// The one structured log primitive the pulse uses. Human mode prints a single
 /// concise line `[HH:MM:SS] <msg>` with the message tinted by level. JSON mode
 /// prints one NDJSON object `{ts,level,event,msg,...fields}` — the same shape an
-/// agent watching `looop watch pulse` can parse line-by-line. `fields` carry the
+/// agent tailing the pulse log can parse line-by-line. `fields` carry the
 /// machine-useful extras (runner, secs, run_id, journal, …).
 pub fn event(level: Level, event: &str, msg: &str, fields: &[(&str, serde_json::Value)]) {
     if is_json() {

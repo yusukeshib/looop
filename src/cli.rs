@@ -1,10 +1,10 @@
 //! The single clap-derived front door for the whole CLI.
 //!
-//! Every verb — the human/client surface (`up`, `down`, `watch`) and the
-//! machine-facing `_` plumbing (steer verbs + worker self-callbacks) — is
-//! declared here as typed args. clap owns parsing, so we
+//! Every verb — the human surface (`up`, `down`) and the
+//! machine-facing plumbing (steer verbs + worker self-callbacks) — is
+//! declared here as typed args, all at the top level. clap owns parsing, so we
 //! get, uniformly and for free across every verb:
-//!   • `--help`/`-h` on every subcommand (and it is NON-destructive: `_ playbook
+//!   • `--help`/`-h` on every subcommand (and it is NON-destructive: `playbook
 //!     write --help` prints help instead of writing the literal text `--help`,
 //!     which is the accident this migration closes);
 //!   • rejection of unknown/mistyped flags (exit 1) instead of silently writing
@@ -51,35 +51,6 @@ pub enum Cmd {
     Up(UpArgs),
     /// Tear the pulse (and workers) down.
     Down,
-    /// Non-agent TUI: watch any session's log and answer pending asks by hand.
-    Client(ClientArgs),
-    /// Machine-facing plumbing verbs (the contract a client drives).
-    #[command(name = "_")]
-    Underscore {
-        #[command(subcommand)]
-        verb: Verb,
-    },
-}
-
-#[derive(Args, Debug)]
-pub struct UpArgs {
-    /// Emit pulse logs as JSON.
-    #[arg(long)]
-    pub json: bool,
-}
-
-#[derive(Args, Debug)]
-pub struct ClientArgs {
-    /// Agent id to select initially (e.g. `looop client pulse`).
-    pub id: Option<String>,
-    /// Also show finished/dead workers, not just the live fleet.
-    #[arg(long, short = 'a')]
-    pub all: bool,
-}
-
-/// The `_` plumbing: STEER verbs a human/client uses + WORKER self-callbacks.
-#[derive(Subcommand, Debug)]
-pub enum Verb {
     /// looop's own detached reconcile-loop body (spawned by `up`).
     Pulse,
     /// Full world snapshot: goals, sensors, fleet, asks.
@@ -104,18 +75,19 @@ pub enum Verb {
     Ask(AskArgs),
     /// Kill a session by id.
     Kill(KillArgs),
-    /// Type input into an interactive worker.
-    Send(SendArgs),
-    /// In-worker RPC bridge: run an rpc-speaking agent and translate its
-    /// JSONL stream to readable output (and typed input to prompts/steers).
-    #[command(name = "rpc-bridge")]
-    RpcBridge(RpcBridgeArgs),
     /// Capture a worker's current screen.
     Screenshot(ScreenshotArgs),
     /// Atomically claim a named lease.
     Claim(ClaimArgs),
     /// Release a named lease.
     Unclaim(ClaimArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct UpArgs {
+    /// Emit pulse logs as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Shared by every action verb that funnels through `run_action`: a one-line
@@ -263,6 +235,21 @@ pub enum WorkerOp {
     },
     /// Kill a worker by id.
     Kill { id: String },
+    /// List the fleet with health (busy / waiting-ask / stuck / dead).
+    List {
+        /// Emit JSON instead of the table.
+        #[arg(long, conflicts_with = "watch")]
+        json: bool,
+        /// Also show finished/dead workers, not just the live fleet.
+        #[arg(long, short = 'a')]
+        all: bool,
+        /// Re-render every few seconds until Ctrl-C.
+        #[arg(long)]
+        watch: bool,
+        /// Refresh interval for --watch, in seconds.
+        #[arg(long, default_value_t = 2, requires = "watch")]
+        interval: u64,
+    },
 }
 
 #[derive(Args, Debug)]
@@ -283,33 +270,6 @@ pub struct AskArgs {
 #[derive(Args, Debug)]
 pub struct KillArgs {
     pub id: String,
-}
-
-#[derive(Args, Debug)]
-pub struct SendArgs {
-    pub id: String,
-    /// The text to type. Variadic; put `--no-newline` anywhere.
-    pub text: Vec<String>,
-    /// Don't send a trailing Enter.
-    #[arg(long = "no-newline", short = 'n')]
-    pub no_newline: bool,
-}
-
-/// `looop _ rpc-bridge --prompt-file <path> -- <child…>` — the in-worker
-/// adapter a `worker_command` points at so a worker can speak pi's RPC protocol
-/// while still presenting a readable transcript to `looop watch`/`client`.
-/// It spawns `<child…>` (an rpc-speaking agent, e.g. `pi --mode rpc …`), seeds
-/// the first prompt from `--prompt-file`, renders the child's JSONL events to
-/// friendly text on its own stdout (→ PTY → output.log), and wraps any text
-/// typed at its stdin (what `looop _ send` writes) into a prompt/steer command.
-#[derive(Args, Debug)]
-pub struct RpcBridgeArgs {
-    /// File whose contents seed the first `prompt` sent to the child.
-    #[arg(long = "prompt-file")]
-    pub prompt_file: String,
-    /// The rpc-speaking child agent command, after `--`.
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub child: Vec<String>,
 }
 
 #[derive(Args, Debug)]

@@ -16,7 +16,7 @@ use std::time::Duration;
 
 /// `looop up [--json]` — start the autonomous pulse (idempotent). looop runs
 /// itself from there; steer by editing goals/PLAYBOOK or run a client to watch
-/// and relay (`looop watch`, or an agent session pointed at `looop _ state`).
+/// and relay (`an agent session pointed at `looop state`).
 pub fn cmd_up(paths: &Paths, json: bool) -> Result<ExitCode> {
     // Hard gate: refuse to start the pulse until the operator has run `looop
     // init`. The runner wiring is a deliberate choice (which agent CLI drives
@@ -30,7 +30,7 @@ pub fn cmd_up(paths: &Paths, json: bool) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     // Initialized — now preflight the configured runner before spawning the pulse
-    // (the same gate the `_` verbs get via dispatch, run here after the init
+    // (the same gate the plumbing verbs get via dispatch, run here after the init
     // check so the messages surface in the right order).
     crate::deps::require_deps(paths)?;
     if session::is_alive(paths, PULSE_SESSION) {
@@ -43,11 +43,7 @@ pub fn cmd_up(paths: &Paths, json: bool) -> Result<ExitCode> {
             unsafe { std::env::set_var("LOOOP_LOG_FORMAT", "json") };
         }
         let bin = paths.bin.to_string_lossy().to_string();
-        session::spawn_detached(
-            paths,
-            vec![bin, "_".to_string(), "pulse".to_string()],
-            PULSE_SESSION,
-        )?;
+        session::spawn_detached(paths, vec![bin, "pulse".to_string()], PULSE_SESSION)?;
         session::await_alive(paths, PULSE_SESSION, Duration::from_secs(5));
         println!("looop: pulse started{}", if json { " [json]" } else { "" });
     }
@@ -88,9 +84,9 @@ pub fn cmd_down(paths: &Paths) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `looop _ pulse` (internal) — the headless pulse body babysit wraps. It is the
+/// `looop pulse` (internal) — the headless pulse body babysit wraps. It is the
 /// judgment-free sensing loop (`run::cmd_run`) running under a PTY.
-/// `looop _ pulse` — looop's own detached spawn target: run the autonomous loop
+/// `looop pulse` — looop's own detached spawn target: run the autonomous loop
 /// in the foreground of this (detached) process. Not human-facing; `looop up`
 /// spawns it.
 pub fn cmd_pulse(paths: &Paths) -> Result<ExitCode> {

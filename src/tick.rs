@@ -436,7 +436,7 @@ pub fn state(paths: &Paths) -> serde_json::Value {
     })
 }
 
-/// Which kinds of change should make `_ wait` return. The diff is computed per
+/// Which kinds of change should make `wait` return. The diff is computed per
 /// category (see [`fingerprints`]) so a noisy snapshot-only move can be filtered
 /// out by a client that only cares about asks / journal progress.
 #[derive(Clone, Copy)]
@@ -449,7 +449,7 @@ pub(crate) enum WaitFilter {
     Actionable,
 }
 
-/// Per-category content fingerprints, so `_ wait` can report WHAT changed, not
+/// Per-category content fingerprints, so `wait` can report WHAT changed, not
 /// just that the world hash moved. Categories: asks (the pending mailbox),
 /// journal, playbook, goals, snapshots (sensors + the live worker fleet).
 fn fingerprints(paths: &Paths) -> std::collections::BTreeMap<&'static str, String> {
@@ -544,7 +544,7 @@ pub(crate) fn wait_for_change(paths: &Paths, filter: WaitFilter) -> Vec<String> 
 }
 
 /// Render a unix-seconds age as a compact human delta ("just now", "4m", "2h",
-/// "3d") so the plain `_ state` / `_ wait` output can show how long an ask has
+/// "3d") so the plain `state` / `wait` output can show how long an ask has
 /// been waiting without the caller doing clock math.
 fn fmt_ago(ts: u64) -> String {
     let now = util::now_unix();
@@ -575,13 +575,13 @@ fn one_line(s: &str, max: usize) -> String {
 }
 
 /// Print the current state. `--json` = full structured object; else a summary.
-/// `changed` (set by `_ wait`) is surfaced as a `changed: […]` diff summary so a
+/// `changed` (set by `wait`) is surfaced as a `changed: […]` diff summary so a
 /// caller knows WHICH categories moved without re-diffing the whole state.
 ///
 /// The plain summary is intentionally rich enough to STAND ALONE: pending asks
 /// (with age), the live worker fleet, each sensor's wake signal, and the last
-/// few journal lines — so a client woken by `_ wait` never has to follow up
-/// with `tail journal.md` / `_ state --json | jq` to see what actually moved.
+/// few journal lines — so a client woken by `wait` never has to follow up
+/// with `tail journal.md` / `state --json | jq` to see what actually moved.
 /// Render a state value (from [`crate::contract::Contract::state`] / `wait`) to
 /// stdout. A `"changed"` array on the value (present only for `wait`) prints the
 /// `changed:` diff line; absent (plain `state`) skips it. PRESENTATION ONLY — the
@@ -646,7 +646,7 @@ pub(crate) fn render_state(s: &serde_json::Value, json: bool) -> Result<ExitCode
 
     // Sensor readings — one line per snapshot's wake SIGNAL. This is where a
     // user `gh`/PR-review sensor surfaces (e.g. a stale CHANGES_REQUESTED), so
-    // a client sees PR state in `_ state` instead of shelling out to `gh`.
+    // a client sees PR state in `state` instead of shelling out to `gh`.
     let snaps = s["snapshots"].as_object().cloned().unwrap_or_default();
     if !snaps.is_empty() {
         println!("sensors:");
@@ -690,7 +690,7 @@ pub(crate) fn render_state(s: &serde_json::Value, json: bool) -> Result<ExitCode
     Ok(ExitCode::SUCCESS)
 }
 
-/// `looop _ state [--json]` — read the current world state. Pure read: no
+/// `looop state [--json]` — read the current world state. Pure read: no
 /// sensing, no side effects (the autonomous pulse keeps snapshots fresh).
 pub fn cmd_state(paths: &Paths, json: bool) -> Result<ExitCode> {
     use crate::contract::Contract;
@@ -698,7 +698,7 @@ pub fn cmd_state(paths: &Paths, json: bool) -> Result<ExitCode> {
     render_state(&s, json)
 }
 
-/// `looop _ wait [--json] [--only-asks|--actionable]` — BLOCK until there is
+/// `looop wait [--json] [--only-asks|--actionable]` — BLOCK until there is
 /// something to look at, then print the fresh state plus a `changed: […]` diff
 /// summary. By default any category move (asks / journal / playbook / goals /
 /// snapshots) wakes it; `--actionable` narrows to asks+journal and `--only-asks`

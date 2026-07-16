@@ -2,7 +2,7 @@
 //! whose session is no longer alive (crash-safety), so the AI never has to
 //! clean up a corpse's lease.
 //!
-//! Claims are also the loop's mutual-exclusion primitive. `looop _ claim <name>`
+//! Claims are also the loop's mutual-exclusion primitive. `looop claim <name>`
 //! is an ATOMIC, liveness-aware test-and-set: it creates `claims/<name>.json`
 //! with O_EXCL and FAILS if a LIVE session already holds it, so two workers
 //! racing for the same resource (e.g. a repo) can't both "win" the way the old
@@ -34,7 +34,7 @@ fn session_or_env(session: Option<&str>) -> String {
     }
 }
 
-/// `looop _ claim <name> [--session <id>]` — atomically acquire the lease for
+/// `looop claim <name> [--session <id>]` — atomically acquire the lease for
 /// `<name>`. Exit 0 if we now hold it (or already held it), exit 1 if a LIVE
 /// session holds it. The acquire is O_EXCL so two racers can't both win; a lease
 /// held by a DEAD session is reclaimed. The claim body is `{session,name}`,
@@ -55,7 +55,7 @@ pub fn cmd_claim(paths: &Paths, args: &crate::cli::ClaimArgs) -> Result<ExitCode
     }
 }
 
-/// CONTRACT core for `_ claim`: an atomic, liveness-aware test-and-set on the
+/// CONTRACT core for `claim`: an atomic, liveness-aware test-and-set on the
 /// named lease. Transport-agnostic — returns a typed [`ClaimOutcome`] the
 /// presenter maps to an exit code. `session` is the explicit owner, else the
 /// worker's exported `$LOOOP_SESSION_ID`.
@@ -92,7 +92,7 @@ pub(crate) fn claim(
     bail!("claim {name}: contention reclaiming a stale lease");
 }
 
-/// `looop _ unclaim <name> [--session <id>]` — release a lease we own. Removes
+/// `looop unclaim <name> [--session <id>]` — release a lease we own. Removes
 /// `claims/<name>.json` when it is unowned, owned by us, or held by a DEAD
 /// session; refuses (exit 1) only when a DIFFERENT live session holds it.
 pub fn cmd_unclaim(paths: &Paths, args: &crate::cli::ClaimArgs) -> Result<ExitCode> {
@@ -106,7 +106,7 @@ pub fn cmd_unclaim(paths: &Paths, args: &crate::cli::ClaimArgs) -> Result<ExitCo
     }
 }
 
-/// CONTRACT core for `_ unclaim`: release a lease we may own. `Ok(true)` when the
+/// CONTRACT core for `unclaim`: release a lease we may own. `Ok(true)` when the
 /// lease is now gone (unowned, ours, or a dead holder — all idempotent);
 /// `Ok(false)` when a DIFFERENT live session holds it. Transport-agnostic.
 pub(crate) fn unclaim(paths: &Paths, name: &str, session: Option<&str>) -> Result<bool> {

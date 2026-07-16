@@ -1,4 +1,4 @@
-//! The pulse (`looop _ pulse`) — looop's AUTONOMOUS control loop.
+//! The pulse (`looop pulse`) — looop's AUTONOMOUS control loop.
 //!
 //! Each beat: sense the world, and — when it changed since last beat — hand it to
 //! the configured `tick` runner for ONE move, which looop executes through the

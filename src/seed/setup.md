@@ -8,13 +8,13 @@ client/concierge waiting on asks wakes immediately and starts the interview. Whi
 that ask is pending, `noop` quietly until real goals appear.
 
 The client (or you, the human) then writes the real config:
-- `looop _ playbook write` — rewrite the PLAYBOOK to reflect the above; keep the
+- `looop playbook write` — rewrite the PLAYBOOK to reflect the above; keep the
   Guardrails and the "ask, don't guess" rule, and DROP the starter SETUP priority.
-- `looop _ goal write <id>` — one per thing actually being worked on now.
-- `looop _ sensor write <name>` — each prints ONE small, normalized JSON object to
+- `looop goal write <id>` — one per thing actually being worked on now.
+- `looop sensor write <name>` — each prints ONE small, normalized JSON object to
   stdout (park volatile fields under "detail"; the move-triggering state under
   "signal" so noise doesn't wake the loop).
 
 Once real goals exist (and the SETUP priority is dropped), answer the starter
 `setup-1` ask with a short note like "setup complete" and archive this goal:
-`looop _ goal archive setup`.
+`looop goal archive setup`.

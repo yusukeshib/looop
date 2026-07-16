@@ -370,21 +370,15 @@ fn editable(label: &str, initial: &str) -> Edit {
                 (KeyCode::Char('a'), KeyModifiers::CONTROL) | (KeyCode::Home, _) => pos = 0,
                 (KeyCode::Char('e'), KeyModifiers::CONTROL) | (KeyCode::End, _) => pos = buf.len(),
                 (KeyCode::Left, _) => pos = pos.saturating_sub(1),
-                (KeyCode::Right, _) => {
-                    if pos < buf.len() {
-                        pos += 1;
-                    }
+                (KeyCode::Right, _) if pos < buf.len() => {
+                    pos += 1;
                 }
-                (KeyCode::Backspace, _) => {
-                    if pos > 0 {
-                        pos -= 1;
-                        buf.remove(pos);
-                    }
+                (KeyCode::Backspace, _) if pos > 0 => {
+                    pos -= 1;
+                    buf.remove(pos);
                 }
-                (KeyCode::Delete, _) => {
-                    if pos < buf.len() {
-                        buf.remove(pos);
-                    }
+                (KeyCode::Delete, _) if pos < buf.len() => {
+                    buf.remove(pos);
                 }
                 // Printable input only (skip Ctrl-/Alt-chorded chars).
                 (KeyCode::Char(c), m)
