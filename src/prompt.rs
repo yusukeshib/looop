@@ -89,13 +89,23 @@ Pick exactly ONE `action` and fill its fields:
      "detail":{…counts/timestamps/context…}} — only .signal feeds the
      change-detection hash; the whole object still reaches this prompt.
 
-  {"action":"start_worker","id":"<goal-name>","prompt":"<detailed worker brief>"}
+  {"action":"start_worker","id":"<goal-name>","prompt":"<detailed worker brief>",
+   "verify":"<optional post-condition shell command>"}
      Spawn an agent for hands-on, multi-step work. <id> matches the goal file.
      The worker starts in the data dir; if its task edits CODE, tell it to make
      its OWN sandbox first (a git worktree) and cd in —
      never edit code in the data dir. A worker that needs a human decision runs
      `looop ask <id> --prompt "…"` and BLOCKS until the human answers — prefer
      one worker per goal over spawning a second for the same goal.
+     ⚠ DECLARE `verify` whenever the task has a checkable artifact: ONE shell
+     command that exits 0 only when the work is truly done (compose with &&),
+     e.g. "gh pr list --head <branch> --json number --jq 'length' | grep -qx 1"
+     or "test $(gh pr view N --json reviewThreads … unresolved count) = 0".
+     A worker's exit status CANNOT be trusted (an agent that dies mid-task
+     exits 0 like one that finished); after the worker dies looop runs `verify`
+     once and sys-sessions reports verify:"pass"|"fail" (+ detail
+     verify_output). Treat verify:"fail" as a FAILED worker — inspect, then
+     respawn with sharper instructions or ask — never as sensor lag.
 
   {"action":"kill_worker","id":"<worker-id>","reason":"..."}
      Terminate a live worker. Workers have NO input channel (no terminal a

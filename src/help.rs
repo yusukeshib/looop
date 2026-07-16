@@ -36,7 +36,13 @@ Usage:
   looop sensor write <name> [script|-]                   (`-`/omit = stdin/heredoc)
   looop playbook write [body|-]                          (`-`/omit = stdin/heredoc)
   looop screenshot <id> [--ansi|--json] [--no-trim]   capture a session's screen
-  looop worker list [--json|--all|--watch [--interval N]]   fleet + health (busy/waiting-ask/stuck/dead), idle/uptime/ask age
+  looop worker start <id> [prompt|-] [--model M] [--thinking T] [--verify CMD]
+                                spawn a worker; --verify = post-condition shell
+                                command run ONCE after the worker dies (exit 0 =
+                                verified done; fail is surfaced in sys-sessions
+                                as verify:"fail" — exit status alone is never
+                                trusted as "work done")
+  looop worker list [--json|--all|--watch [--interval N]]   fleet + health (busy/waiting-ask/stuck/dead), idle/uptime/ask age, verify verdict
 
   Shorthands: `worker`=`w`, `worker list`=`ls`, `screenshot`=`ss`,
   and `write`=`w` (`goal w` / `sensor w` / `playbook w`).

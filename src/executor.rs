@@ -56,6 +56,13 @@ pub enum Action {
         model: Option<String>,
         #[serde(default)]
         thinking: Option<String>,
+        /// Optional post-condition: ONE shell command that must exit 0 once
+        /// the work is truly done (compose with `&&`). Run ONCE by the pulse
+        /// on the first beat after the worker dies; the verdict is surfaced in
+        /// sys-sessions so "exit 0 but nothing happened" wakes the tick as a
+        /// FAILED worker instead of a clean corpse. See `verify.rs`.
+        #[serde(default)]
+        verify: Option<String>,
     },
     /// Terminate a live worker session. The remedy for a STUCK worker (see the
     /// sys-sessions `health` reading): a worker has no input channel, so one
@@ -272,6 +279,7 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
             prompt,
             model,
             thinking,
+            verify,
         } => {
             // Reuse the worker-launch path (contract injection, reserved-id
             // guard, corpse reuse, detached spawn).
@@ -281,6 +289,7 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
                 prompt,
                 model.as_deref(),
                 thinking.as_deref(),
+                verify.as_deref(),
             )?;
             if outcome.code != std::process::ExitCode::SUCCESS {
                 bail!("start_worker {id:?} failed");
@@ -514,6 +523,7 @@ pub fn start_worker(
     prompt: &[String],
     model: Option<&str>,
     thinking: Option<&str>,
+    verify: Option<&str>,
     journal: Option<&str>,
 ) -> Result<ExitCode> {
     use crate::contract::Contract;
@@ -523,7 +533,7 @@ pub fn start_worker(
         return Ok(ExitCode::from(1));
     }
     ok(crate::contract::LocalContract::new(paths)
-        .worker_start(id, &prompt, model, thinking, journal)?)
+        .worker_start(id, &prompt, model, thinking, verify, journal)?)
 }
 
 #[cfg(test)]
@@ -641,7 +651,8 @@ mod tests {
             id: "w".into(),
             prompt: "p".into(),
             model: None,
-            thinking: None
+            thinking: None,
+            verify: None
         }));
     }
 
@@ -708,7 +719,8 @@ mod tests {
                 id: "triage".into(),
                 prompt: "p".into(),
                 model: None,
-                thinking: None
+                thinking: None,
+                verify: None
             }),
             Some("triage".into())
         );

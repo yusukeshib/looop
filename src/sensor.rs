@@ -256,6 +256,12 @@ pub(crate) struct WorkerHealth {
     pub uptime_s: Option<u64>,
     /// Seconds the worker's pending ask has been waiting on the human.
     pub ask_age_s: Option<u64>,
+    /// Post-condition verdict for a dead worker with a declared `verify`:
+    /// Some(true)=pass, Some(false)=FAIL (exit status lied — treat as a failed
+    /// worker), None = no verify declared or not yet run.
+    pub verify: Option<bool>,
+    /// Output tail of a FAILED verify (diagnostic for the tick prompt).
+    pub verify_output: Option<String>,
 }
 
 /// The whole fleet's health, sorted by id (order-stable for the wake hash).
@@ -269,11 +275,16 @@ pub(crate) fn fleet_health(paths: &Paths) -> Vec<WorkerHealth> {
         .map(|s| {
             let ask = pending.iter().find(|a| a.worker == s.id);
             let idle = session::output_idle_secs(paths, &s.id);
+            let verdict = crate::verify::result(paths, &s.id);
             WorkerHealth {
                 health: worker_health(s.alive, ask.is_some(), idle, stuck_after),
                 idle_s: idle,
                 uptime_s: s.uptime_secs(),
                 ask_age_s: ask.map(|a| crate::util::now_unix().saturating_sub(a.ts)),
+                verify: verdict.as_ref().map(|v| v.ok),
+                verify_output: verdict
+                    .filter(|v| !v.ok && !v.output.trim().is_empty())
+                    .map(|v| v.output),
                 id: s.id,
                 state: s.state,
                 alive: s.alive,
@@ -288,13 +299,22 @@ fn sys_sessions(paths: &Paths) -> serde_json::Value {
     let mut signal: Vec<serde_json::Value> = Vec::new();
     let mut detail_workers = serde_json::Map::new();
     for w in &fleet {
-        signal.push(serde_json::json!({
+        let mut sig = serde_json::json!({
             "id": w.id,
             "state": w.state,
             "exit_code": w.exit_code,
             "health": w.health,
-        }));
+        });
+        if let Some(v) = w.verify {
+            // In the SIGNAL half on purpose: a post-condition verdict must
+            // change the world hash and wake the tick.
+            sig["verify"] = serde_json::json!(if v { "pass" } else { "fail" });
+        }
+        signal.push(sig);
         let mut d = serde_json::Map::new();
+        if let Some(o) = &w.verify_output {
+            d.insert("verify_output".into(), serde_json::json!(o));
+        }
         if let Some(i) = w.idle_s {
             d.insert("idle_s".into(), serde_json::json!(i));
         }
@@ -376,6 +396,10 @@ pub fn sensor_scripts(paths: &Paths) -> Vec<PathBuf> {
 /// When `verbose`, log each sensor + duration like a tick; otherwise stay quiet
 /// (manual goal runs).
 pub fn run_all(paths: &Paths, snap_dir: &Path, verbose: bool) {
+    // Run due post-condition checks FIRST, so a worker that died since the
+    // last beat gets its verdict recorded before sys-sessions snapshots it —
+    // the fail lands in the same beat's world hash and wakes the tick.
+    crate::verify::reconcile(paths);
     let sensors = all_sensors(paths);
     let total = sensors.len();
     // Per-sensor lines are machine granularity — only the JSON stream gets them.

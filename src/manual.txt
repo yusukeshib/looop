@@ -157,6 +157,10 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
           └ override with $LOOOP_DATA_DIR
             PLAYBOOK.md  goals/  journal.md  sensors/*.sh   <- durable memory
             asks/ answers/   <- the worker <-> human mailbox (surfaced by clients)
+            verify/          <- worker post-conditions (<id>.cmd) + verdicts
+                                (<id>.json): a shell command declared at spawn,
+                                run ONCE by the pulse after the worker dies —
+                                exit status alone is never trusted as "done"
             snapshots/ runs/ .lock .last-tick-hash .tick-backoff  <- scratch
             reports/         <- worker deliverables a human reads (persist)
             sessions/<id>/   <- worker + pulse sessions (babysit state, per
