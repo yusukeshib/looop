@@ -33,6 +33,7 @@ mod shellinit;
 mod store;
 mod tick;
 mod util;
+mod verify;
 mod worldhash;
 
 use anyhow::Result;
@@ -176,6 +177,7 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
                 prompt,
                 model,
                 thinking,
+                verify,
                 journal,
             } => executor::start_worker(
                 paths,
@@ -183,6 +185,7 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
                 prompt,
                 model.as_deref(),
                 thinking.as_deref(),
+                verify.as_deref(),
                 journal.journal.as_deref(),
             ),
             WorkerOp::Kill { id } => session::cmd_kill(paths, id),

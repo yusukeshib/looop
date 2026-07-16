@@ -168,6 +168,7 @@ pub fn cmd_start_session(
     prompt: &str,
     model: Option<&str>,
     thinking: Option<&str>,
+    verify: Option<&str>,
 ) -> Result<StartOutcome> {
     seed::ensure_dirs(paths)?;
 
@@ -205,6 +206,14 @@ pub fn cmd_start_session(
             return Ok(StartOutcome::failed());
         }
         reap(paths, &session); // reuse the id held by a dead corpse (targeted)
+    }
+
+    // Persist the post-condition BEFORE the spawn: a verify declared for a
+    // worker that dies instantly must still be checked on the next beat. No
+    // verify ⇒ clear any stale one left by a prior corpse with this id.
+    match verify {
+        Some(v) if !v.trim().is_empty() => crate::verify::store(paths, &session, v)?,
+        _ => crate::verify::clear(paths, &session),
     }
 
     // Prompt via file (avoids quoting hell; also a record of the ask), with the
@@ -375,7 +384,7 @@ fn render_fleet(fleet: &[crate::sensor::WorkerHealth]) -> usize {
     }
     let idw = fleet.iter().map(|w| w.id.len()).max().unwrap_or(2).max(2);
     println!(
-        "{}{:idw$}  {:11}  {:8}  {:>6}  {:>6}  {:>7}{}",
+        "{}{:idw$}  {:11}  {:8}  {:>6}  {:>6}  {:>7}  {}{}",
         dim(),
         "ID",
         "HEALTH",
@@ -383,6 +392,7 @@ fn render_fleet(fleet: &[crate::sensor::WorkerHealth]) -> usize {
         "IDLE",
         "UP",
         "ASK",
+        "VERIFY",
         rst()
     );
     for w in fleet {
@@ -396,8 +406,13 @@ fn render_fleet(fleet: &[crate::sensor::WorkerHealth]) -> usize {
             ("exited", Some(c)) => format!("exit {c}"),
             (s, _) => s.to_string(),
         };
+        let verify = match w.verify {
+            Some(true) => "pass".to_string(),
+            Some(false) => format!("{}FAIL{}", red(), rst()),
+            None => "-".to_string(),
+        };
         println!(
-            "{:idw$}  {hl}{:11}{hr}  {:8}  {:>6}  {:>6}  {:>7}",
+            "{:idw$}  {hl}{:11}{hr}  {:8}  {:>6}  {:>6}  {:>7}  {verify}",
             w.id,
             w.health,
             state,
@@ -613,6 +628,7 @@ pub fn prune_aged(paths: &Paths, max_age: std::time::Duration) {
                     .unwrap_or(false);
             if old {
                 let _ = tokio::fs::remove_dir_all(&dir).await;
+                crate::verify::clear(paths, &id);
             }
         }
     });
@@ -633,6 +649,7 @@ pub fn reap(paths: &Paths, session: &str) {
         let alive = session::is_pid_alive(meta.babysit_pid);
         if corpse_dead(status.as_ref().map(|s| s.state), alive) {
             let _ = tokio::fs::remove_dir_all(bs.session_dir(session)).await;
+            crate::verify::clear(paths, session);
         }
     });
 }

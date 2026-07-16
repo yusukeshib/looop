@@ -81,13 +81,16 @@ pub trait Contract {
     fn run(&self, cmd: &str, reason: &str, journal: Option<&str>) -> Result<String>;
     /// Spawn a worker session; returns the executor's summary line. `model`/
     /// `thinking` are optional per-worker overrides for the worker command
-    /// template's `{{model}}`/`{{thinking}}` placeholders.
+    /// template's `{{model}}`/`{{thinking}}` placeholders. `verify` is an
+    /// optional post-condition shell command the pulse runs once after the
+    /// worker dies (exit 0 = work verified done — see `verify.rs`).
     fn worker_start(
         &self,
         id: &str,
         prompt: &str,
         model: Option<&str>,
         thinking: Option<&str>,
+        verify: Option<&str>,
         journal: Option<&str>,
     ) -> Result<String>;
     /// Atomically acquire the named lease.
@@ -201,6 +204,7 @@ impl Contract for LocalContract<'_> {
         prompt: &str,
         model: Option<&str>,
         thinking: Option<&str>,
+        verify: Option<&str>,
         journal: Option<&str>,
     ) -> Result<String> {
         run_action(
@@ -210,6 +214,7 @@ impl Contract for LocalContract<'_> {
                 prompt: prompt.to_string(),
                 model: model.map(str::to_owned),
                 thinking: thinking.map(str::to_owned),
+                verify: verify.map(str::to_owned),
             },
             journal,
         )

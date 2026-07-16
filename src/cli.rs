@@ -251,6 +251,13 @@ pub enum WorkerOp {
         /// default. Ignored (with a warning) if the template lacks it.
         #[arg(long)]
         thinking: Option<String>,
+        /// Post-condition: ONE shell command that must exit 0 once the work
+        /// is truly done (compose conditions with `&&`). The pulse runs it
+        /// ONCE after the worker dies; a non-zero exit marks the worker
+        /// verify:fail in sys-sessions — "exit 0 but nothing happened" wakes
+        /// the loop as a FAILED worker instead of a clean corpse.
+        #[arg(long)]
+        verify: Option<String>,
         #[command(flatten)]
         journal: JournalOpt,
     },
