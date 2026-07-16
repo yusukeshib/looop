@@ -81,6 +81,22 @@ pub enum Cmd {
     Claim(ClaimArgs),
     /// Release a named lease.
     Unclaim(ClaimArgs),
+    /// Output shell integration (completions). E.g. eval "$(looop config zsh)".
+    Config(ConfigArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub shell: ConfigShell,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ConfigShell {
+    /// Output Zsh completions + shell integration.
+    Zsh,
+    /// Output Bash completions + shell integration.
+    Bash,
 }
 
 #[derive(Args, Debug)]

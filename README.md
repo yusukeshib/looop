@@ -139,6 +139,26 @@ claude   # then say:
 
 See `looop help` for the full command reference and design manual.
 
+## Shell integration
+
+looop ships completions for zsh and bash. Enable them by evaluating the output of
+`looop config <shell>` from your shell rc:
+
+```sh
+# ~/.zshrc
+eval "$(looop config zsh)"
+
+# ~/.bashrc
+eval "$(looop config bash)"
+```
+
+Completion covers every subcommand and dynamically completes live ids read
+straight from the data dir — pending asks for `looop answer`, goal ids for
+`looop goal`, sensor names for `looop sensor write`, worker/session ids for
+`looop worker kill` / `kill` / `screenshot`, and lease names for `claim` /
+`unclaim`. It honors `$LOOOP_DATA_DIR` (then the XDG default), so per-profile
+data dirs complete correctly.
+
 ## Configuration
 
 The config (`$LOOOP_CONFIG`, default `~/.config/looop/config.json`) is just **two

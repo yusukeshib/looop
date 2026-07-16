@@ -29,6 +29,7 @@ mod seed;
 mod sensor;
 mod service;
 mod session;
+mod shellinit;
 mod store;
 mod tick;
 mod util;
@@ -197,6 +198,9 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
         Cmd::Screenshot(a) => gated(&|| session::cmd_screenshot(paths, &a)),
         Cmd::Claim(a) => gated(&|| gate::cmd_claim(paths, &a)),
         Cmd::Unclaim(a) => gated(&|| gate::cmd_unclaim(paths, &a)),
+        // Not gated: shell integration is meta (like help/version) and must work
+        // before the runner is installed so a user can wire completions early.
+        Cmd::Config(a) => shellinit::cmd_config(&a.shell),
     }
 }
 

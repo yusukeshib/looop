@@ -25,6 +25,7 @@ Usage:
   looop up [--json]              start the pulse: the autonomous loop (sense +
                                 decide + run workers), detached. --json logs NDJSON.
   looop down                     stop the pulse and all workers
+  looop config zsh|bash          shell integration (completions); eval "$(looop config zsh)"
   looop version | help           print version / show this help
 
   STEER (the contract — driven by you or any client; looop does NOT need these to act):
