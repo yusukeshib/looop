@@ -133,28 +133,41 @@ _looop() {
                     ;;
                 goal)
                     if (( CURRENT == 2 )); then
-                        _describe 'goal op' '(write:Create or replace a goal archive:Archive a goal)'
-                    elif (( CURRENT == 3 )) && [[ $words[2] == archive ]]; then
-                        __looop_goals
-                    elif (( CURRENT == 3 )) && [[ $words[2] == write ]]; then
+                        local -a goal_ops
+                        goal_ops=(
+                            'write:Create or replace a goal'
+                            'archive:Archive a goal'
+                        )
+                        _describe 'goal op' goal_ops
+                    elif (( CURRENT == 3 )) && [[ $words[2] == (archive|write) ]]; then
                         __looop_goals
                     fi
                     ;;
                 sensor)
                     if (( CURRENT == 2 )); then
-                        _describe 'sensor op' '(write:Create or replace a sensor)'
+                        local -a sensor_ops
+                        sensor_ops=('write:Create or replace a sensor')
+                        _describe 'sensor op' sensor_ops
                     elif (( CURRENT == 3 )) && [[ $words[2] == write ]]; then
                         __looop_sensors
                     fi
                     ;;
                 playbook)
                     if (( CURRENT == 2 )); then
-                        _describe 'playbook op' '(write:Rewrite the PLAYBOOK)'
+                        local -a playbook_ops
+                        playbook_ops=('write:Rewrite the PLAYBOOK')
+                        _describe 'playbook op' playbook_ops
                     fi
                     ;;
                 worker)
                     if (( CURRENT == 2 )); then
-                        _describe 'worker op' '(start:Spawn a worker kill:Kill a worker list:List the fleet)'
+                        local -a worker_ops
+                        worker_ops=(
+                            'start:Spawn a worker'
+                            'kill:Kill a worker'
+                            'list:List the fleet'
+                        )
+                        _describe 'worker op' worker_ops
                     elif [[ $words[2] == kill ]] && (( CURRENT == 3 )); then
                         __looop_workers
                     elif [[ $words[2] == list ]]; then
@@ -188,7 +201,12 @@ _looop() {
                     ;;
                 config)
                     if (( CURRENT == 2 )); then
-                        _describe 'shell' '(zsh:Zsh completion script bash:Bash completion script)'
+                        local -a shells
+                        shells=(
+                            'zsh:Zsh completion script'
+                            'bash:Bash completion script'
+                        )
+                        _describe 'shell' shells
                     fi
                     ;;
             esac
