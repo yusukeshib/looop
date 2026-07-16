@@ -56,10 +56,14 @@ fn build_worker_cmd(
     };
     for gone in ["{{model}}", "{{thinking}}"] {
         if raw.contains(gone) {
+            let hint = if overridden {
+                "bake the value directly into the --command string instead"
+            } else {
+                "bake the value into the command instead: re-run `looop init` or edit the config"
+            };
             return Err(format!(
                 "{label} still uses the removed {gone} placeholder (and its \
-                 worker_model/worker_thinking config keys are gone) — bake the \
-                 value into the command instead: re-run `looop init` or edit the config"
+                 worker_model/worker_thinking config keys are gone) — {hint}"
             ));
         }
     }
@@ -961,6 +965,10 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("{{thinking}}"));
+        // Override case: hint points at the --command string, not `looop init`
+        // (there's no config template to re-run init for).
+        assert!(!err.contains("looop init"));
+        assert!(err.contains("--command"));
     }
 
     // REGRESSION (#1): placeholder checks run against the ORIGINAL command,
