@@ -112,6 +112,9 @@ fn seed_setup_ask(store: &impl StateStore) -> Result<()> {
         prompt: SEED_SETUP_ASK_PROMPT.to_string(),
         reference: "goals/setup.md".to_string(),
         options: vec![],
+        // Not detached: no checkpoint exists to resume — the concierge drives
+        // the setup interview off the pending ask itself.
+        detach: false,
         ts: crate::util::now_unix(),
     };
     store.write_atomic(

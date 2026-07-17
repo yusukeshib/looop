@@ -94,6 +94,7 @@ Pick exactly ONE `action` and fill its fields:
 
   {"action":"start_worker","id":"<goal-name>","prompt":"<detailed worker brief>",
    "verify":"<optional post-condition shell command>",
+   "resume":"<optional ask id — see ANSWERED ASKS>",
    "command":"<optional full launch-command override>"}
      Spawn an agent for hands-on, multi-step work. <id> matches the goal file.
      The worker starts in the data dir; if its task edits CODE, tell it to make
@@ -110,6 +111,11 @@ Pick exactly ONE `action` and fill its fields:
      once and sys-sessions reports verify:"pass"|"fail" (+ detail
      verify_output). Treat verify:"fail" as a FAILED worker — inspect, then
      respawn with sharper instructions or ask — never as sensor lag.
+     `resume` carries an ANSWERED ASK's id (see the ANSWERED ASKS section):
+     looop injects the original question, the human's answer, and the
+     checkpoint reference into the worker's brief and archives the pair. Use
+     it whenever you re-dispatch work a detached worker checkpointed — your
+     `prompt` then only needs the goal-level brief, not the answer itself.
      `command` replaces the configured worker launch command WHOLESALE for
      this one worker (it must contain {{prompt_file}}, the worker's brief).
      OMIT it unless the PLAYBOOK gives explicit guidance (exact commands valid
@@ -155,17 +161,26 @@ Every action ALSO takes:
      an unchanged world otherwise skips the AI entirely.
 
 PENDING ASKS are asks raised via `looop ask` and not yet answered. They are
-NOT yours to answer — the human answers them out of band. Each ask is tagged
-LIVE or STRANDED:
-  • LIVE — the asking worker is still alive and blocked on the human. Do NOT
+NOT yours to answer — the human answers them out of band. Each ask is tagged:
+  • LIVE — the asking worker is alive and BLOCKED on the human. Do NOT
     re-dispatch or duplicate work it is already blocked on; the human answers it
     out of band and the worker resumes.
-  • STRANDED — the asking worker is DEAD (exited/crashed/killed, e.g. after a
-    reboot). Its answer can NEVER be delivered — no live process will consume
+  • DETACHED — the worker checkpointed its state (see its reference) and exited
+    BY DESIGN; its death is normal, not a failure. WAIT for the human — do NOT
+    re-dispatch while the ask is unanswered. Once answered it moves to the
+    ANSWERED ASKS section below, which is your cue to act.
+  • STRANDED — a BLOCKING ask whose worker is DEAD (crashed/killed, e.g. after
+    a reboot). Its answer can NEVER be delivered — no live process will consume
     it, so a human answer is inert. A stranded ask is NOT a reason to noop: if
     the underlying goal still needs the work, re-dispatch a FRESH worker for it
-    (it can read the prior `reports/*.md` for context and re-raise the ask as a
-    LIVE worker). Treat STRANDED asks as work to resume, not as blockers.
+    (it can read the prior `reports/*.md` for context and re-raise the ask).
+    Treat STRANDED asks as work to resume, not as blockers.
+
+ANSWERED ASKS (when the section is present) are detached asks the human has
+answered. Each is WORK TO RESUME THIS BEAT (unless something is clearly more
+urgent): emit start_worker with `resume:"<ask id>"` — looop injects the
+question, answer, and checkpoint into the fresh worker's brief and archives the
+pair. Do not leave one sitting: it keeps the world "changed" for no reason.
 
 Some of the SENSOR READINGS are looop's OWN state (system sensors, not
 sensors/*.sh):
@@ -390,15 +405,19 @@ pub fn build_prompt(paths: &Paths, snap_dir: &Path) -> String {
         out.push_str("(none)\n");
     } else {
         // A pending ask only blocks a LIVE worker; a dead worker's ask is
-        // STRANDED (its answer can never be delivered) and must not suppress
-        // re-dispatch. Collect the alive worker ids once to tag each ask.
+        // STRANDED (its answer can never be delivered) — unless it was raised
+        // DETACHED, where the worker's exit is by design and the answer is
+        // delivered to a fresh worker via start_worker.resume. Collect the
+        // alive worker ids once to tag each ask.
         let alive: std::collections::HashSet<String> = session::list_workers(paths)
             .into_iter()
             .filter(|s| s.alive)
             .map(|s| s.id)
             .collect();
         for a in asks {
-            let tag = if alive.contains(&a.worker) {
+            let tag = if a.detach {
+                "DETACHED — worker checkpointed and exited by design; WAIT for the human"
+            } else if alive.contains(&a.worker) {
                 "LIVE — blocked on human"
             } else {
                 "STRANDED — worker DEAD, answer inert; re-dispatch a fresh worker"
@@ -410,6 +429,21 @@ pub fn build_prompt(paths: &Paths, snap_dir: &Path) -> String {
             }
             if !a.options.is_empty() {
                 let _ = writeln!(out, "options: {}", a.options.join(", "));
+            }
+        }
+    }
+
+    // ANSWERED ASKS — detached asks the human has answered: work to RESUME.
+    // Rendered only when present (an empty section would just burn prompt).
+    let resumable = mailbox::answered_detached(paths);
+    if !resumable.is_empty() {
+        out.push_str("\n=== ANSWERED ASKS (resume these — start_worker with resume) ===\n");
+        for (a, answer) in &resumable {
+            let _ = writeln!(out, "--- {} (worker {})", a.id, a.worker);
+            let _ = writeln!(out, "question: {}", a.prompt);
+            let _ = writeln!(out, "answer: {answer}");
+            if !a.reference.is_empty() {
+                let _ = writeln!(out, "checkpoint: {}", a.reference);
             }
         }
     }
@@ -548,6 +582,40 @@ mod tests {
         assert!(out.contains("pr #12 open"));
         assert!(out.contains("=== FLAPPING SENSORS"));
         assert!(out.contains("sensor-noisy"));
+    }
+
+    #[test]
+    fn detached_ask_is_tagged_waiting_and_answered_one_renders_resume_section() {
+        let p = fixture();
+        fs::create_dir_all(p.asks_dir()).unwrap();
+        fs::create_dir_all(p.answers_dir()).unwrap();
+        fs::write(
+            p.asks_dir().join("tri-1.json"),
+            serde_json::json!({
+                "id":"tri-1","worker":"tri","prompt":"merge?",
+                "reference":"reports/tri-checkpoint.md","detach":true,"ts":1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let out = build_prompt(&p, &p.snapshots_dir());
+        assert!(
+            out.contains("DETACHED — worker checkpointed and exited by design"),
+            "a detached pending ask must not read as STRANDED"
+        );
+        assert!(!out.contains("=== ANSWERED ASKS"), "not answered yet");
+
+        // Answering moves it out of pending into the resume section.
+        fs::write(
+            p.answers_dir().join("tri-1.json"),
+            serde_json::json!({"answer":"merge it","ts":2}).to_string(),
+        )
+        .unwrap();
+        let out = build_prompt(&p, &p.snapshots_dir());
+        assert!(out.contains("=== ANSWERED ASKS"));
+        assert!(out.contains("answer: merge it"));
+        assert!(out.contains("checkpoint: reports/tri-checkpoint.md"));
+        assert!(!out.contains("DETACHED — worker checkpointed"));
     }
 
     #[test]
