@@ -149,6 +149,8 @@ struct Reading {
 /// line, if any. A sensor with a declared interval is re-run only when its
 /// existing snapshot is older than that — an expensive/rate-limited observer no
 /// longer has to pay the full beat rate. No declaration = every beat (as before).
+/// An EDITED script (mtime newer than its snapshot) always re-runs immediately,
+/// so a fix never has to wait out the stale snapshot's cadence window.
 fn declared_interval(script: &Path) -> Option<u64> {
     let text = fs::read_to_string(script).ok()?;
     for line in text.lines().take(20) {
@@ -185,9 +187,13 @@ impl Sensor {
             Sensor::User(script) => {
                 let out = snap_dir.join(format!("{name}.json"));
                 let err = snap_dir.join(format!("{name}.err"));
-                // Declared cadence: keep the existing snapshot while it's fresh.
+                // Declared cadence: keep the existing snapshot while it's fresh
+                // — unless the SCRIPT was edited after the snapshot was taken
+                // (an edited observer takes effect immediately, not after the
+                // stale snapshot ages out).
                 if let (Some(iv), Some(age)) = (declared_interval(script), file_age_secs(&out))
                     && age < iv
+                    && file_age_secs(script).is_none_or(|script_age| script_age >= age)
                 {
                     return Reading {
                         name,
@@ -475,14 +481,22 @@ pub fn run_all(paths: &Paths, snap_dir: &Path, verbose: bool) {
     let readings: Vec<Reading> = std::thread::scope(|scope| {
         let handles: Vec<_> = sensors
             .iter()
-            .map(|s| scope.spawn(move || s.sense(paths, snap_dir)))
+            .map(|s| (s.name(), scope.spawn(move || s.sense(paths, snap_dir))))
             .collect();
+        // Join per handle: a PANICKING sensor thread becomes a failed reading
+        // for THAT sensor — it must never discard its siblings' outcomes.
         handles
             .into_iter()
-            .map(|h| h.join())
-            .collect::<Result<_, _>>()
-    })
-    .unwrap_or_default();
+            .map(|(name, h)| {
+                h.join().unwrap_or(Reading {
+                    name,
+                    ok: false,
+                    secs: 0,
+                    skipped: false,
+                })
+            })
+            .collect()
+    });
 
     let mut ok = 0usize;
     let mut skipped = 0usize;
@@ -676,6 +690,19 @@ mod tests {
         let r2 = sensor.sense(&p, &p.snapshots_dir());
         assert!(r2.ok && r2.skipped, "fresh snapshot is kept (cadence)");
         assert_eq!(fs::read_to_string(&out).unwrap(), body1);
+
+        // An EDITED script (mtime newer than its snapshot) re-runs immediately
+        // instead of waiting out the cadence window. Simulate by aging the
+        // snapshot's mtime behind the script's.
+        let f = fs::File::options().write(true).open(&out).unwrap();
+        f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(120))
+            .unwrap();
+        drop(f);
+        let r3 = sensor.sense(&p, &p.snapshots_dir());
+        assert!(
+            r3.ok && !r3.skipped,
+            "script newer than snapshot: cadence must not keep the stale reading"
+        );
     }
 
     #[test]
