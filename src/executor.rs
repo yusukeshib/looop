@@ -796,7 +796,14 @@ mod tests {
         assert!(v["output"].as_str().unwrap().contains("query-result"));
 
         // The NEXT executed action consumes the record (shown-once semantics).
-        run_action(&p, &Action::Noop { reason: "ok".into() }, None).unwrap();
+        run_action(
+            &p,
+            &Action::Noop {
+                reason: "ok".into(),
+            },
+            None,
+        )
+        .unwrap();
         assert!(!p.last_shell().is_file(), "consumed by the next action");
     }
 
@@ -812,7 +819,10 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(err.to_string().contains("boom"), "LAST FAILURE sees the cause");
+        assert!(
+            err.to_string().contains("boom"),
+            "LAST FAILURE sees the cause"
+        );
         let raw = fs::read_to_string(p.last_shell()).unwrap();
         let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(v["exit_code"], 7);

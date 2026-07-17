@@ -97,9 +97,8 @@ fn clear_backoff(paths: &Paths) {
 /// the world moving off the failing state (the gate in [`tick`]) — resets it.
 fn record_backoff(paths: &Paths, hash: &str) -> u32 {
     let fails = read_backoff(paths).map(|(_, n, _)| n + 1).unwrap_or(1);
-    let body =
-        serde_json::json!({ "v": 1, "hash": hash, "fails": fails, "ts": util::now_unix() })
-            .to_string();
+    let body = serde_json::json!({ "v": 1, "hash": hash, "fails": fails, "ts": util::now_unix() })
+        .to_string();
     let _ = fs::write(backoff_path(paths), body);
     fails
 }
@@ -128,8 +127,7 @@ fn noop_ttl_secs() -> u64 {
 /// other action — a real move resets the revisit clock).
 fn record_noop(paths: &Paths, kind: &str, hash: &str) {
     if kind == "noop" {
-        let body =
-            serde_json::json!({ "v": 1, "ts": util::now_unix(), "hash": hash }).to_string();
+        let body = serde_json::json!({ "v": 1, "ts": util::now_unix(), "hash": hash }).to_string();
         let _ = fs::write(paths.noop_at(), body);
     } else {
         let _ = fs::remove_file(paths.noop_at());
@@ -441,7 +439,11 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
     // but a noisy one (flapping sensor, aggressive cadence nudges) can burn a
     // decide per beat forever. Cap ATTEMPTS per rolling hour; when exhausted,
     // idle out the beat — the world is level-triggered, so nothing is lost.
-    if let Err(retry_in) = decide_budget(util::now_unix(), &read_decide_ledger(paths), decide_cap_per_hour()) {
+    if let Err(retry_in) = decide_budget(
+        util::now_unix(),
+        &read_decide_ledger(paths),
+        decide_cap_per_hour(),
+    ) {
         util::event(
             Level::Warn,
             "tick.capped",
@@ -1172,8 +1174,7 @@ mod tests {
         let p = Paths::temp();
         fs::create_dir_all(p.snapshots_dir()).unwrap();
         let snap = p.snapshots_dir().join("sensor-noisy.json");
-        let write =
-            |n: u64| fs::write(&snap, format!(r#"{{"signal":{{"n":{n}}}}}"#)).unwrap();
+        let write = |n: u64| fs::write(&snap, format!(r#"{{"signal":{{"n":{n}}}}}"#)).unwrap();
 
         // First sighting establishes a baseline; each subsequent CHANGE bumps
         // the streak. Threshold 5 ⇒ flagged on the 5th consecutive change.
