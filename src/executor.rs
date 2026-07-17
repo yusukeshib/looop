@@ -494,6 +494,12 @@ pub fn consume_decision(paths: &Paths) -> Option<Result<Decided>> {
         } else {
             Some(decision.journal.as_str())
         };
+        // The stored run_shell output describes the PREVIOUS move, and the
+        // prompt behind THIS decision already carried it — consume it now so
+        // it is shown exactly once (a run_shell below re-creates it fresh).
+        // Deliberately HERE and not in run_action: a manual CLI verb executed
+        // between two beats must not eat the output before the decider sees it.
+        let _ = fs::remove_file(paths.last_shell());
         let summary = run_action(paths, &decision.action, journal)?;
         let journal_line = if decision.journal.trim().is_empty() {
             summary.clone()
@@ -521,10 +527,6 @@ pub fn run_action(paths: &Paths, action: &Action, journal: Option<&str>) -> Resu
     if guarded {
         begin_intent(paths, action);
     }
-    // The stored run_shell output describes the PREVIOUS move; the prompt for
-    // this decision already carried it. Consume it now so it is shown exactly
-    // once (a run_shell below re-creates it with fresh output).
-    let _ = fs::remove_file(paths.last_shell());
     let exec_result = execute(paths, action);
     if guarded {
         clear_intent(paths);
@@ -795,16 +797,29 @@ mod tests {
         assert_eq!(v["exit_code"], 0);
         assert!(v["output"].as_str().unwrap().contains("query-result"));
 
-        // The NEXT executed action consumes the record (shown-once semantics).
+        // A MANUAL verb between beats must NOT eat it — the decider hasn't
+        // seen it yet (the prompt is built at decide time).
         run_action(
             &p,
             &Action::Noop {
-                reason: "ok".into(),
+                reason: "manual".into(),
             },
             None,
         )
         .unwrap();
-        assert!(!p.last_shell().is_file(), "consumed by the next action");
+        assert!(
+            p.last_shell().is_file(),
+            "a manual action leaves the record for the decider"
+        );
+
+        // The next DECISION consumes it (its prompt carried the output).
+        fs::write(
+            p.data_dir.join(DECISION_FILE),
+            r#"{"action":"noop","reason":"seen it","journal":"ok"}"#,
+        )
+        .unwrap();
+        consume_decision(&p).unwrap().unwrap();
+        assert!(!p.last_shell().is_file(), "consumed by the next decision");
     }
 
     #[test]
