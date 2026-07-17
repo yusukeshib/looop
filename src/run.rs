@@ -72,7 +72,7 @@ fn read_next_wake(paths: &Paths) -> Option<u64> {
 fn write_next_wake(paths: &Paths, due: u64) {
     let _ = fs::write(
         paths.next_wake(),
-        serde_json::json!({ "due": due }).to_string(),
+        serde_json::json!({ "v": 1, "due": due }).to_string(),
     );
 }
 

@@ -61,7 +61,14 @@ Two properties make all this dependable:
   restarts — no queues, no lost work.
 - **One move per beat.** Each beat does at most one thing. Behavior stays legible
   and cheap — an unchanged world costs no LLM call, and a repeatedly-failing beat
-  backs off exponentially instead of burning retries.
+  backs off exponentially instead of burning retries. Hard ceilings bound the
+  noisy case too: decide attempts are capped per rolling hour
+  (`LOOOP_MAX_DECIDES_PER_HOUR`, default 120), the live worker fleet is capped
+  (`LOOOP_MAX_WORKERS`, default 8), and a sensor whose wake signal changes on
+  every beat is flagged as **flapping** in the decide prompt so the loop fixes
+  the sensor instead of paying for it forever. The PLAYBOOK is snapshotted to
+  `playbook.d/` before every rewrite (`LOOOP_PLAYBOOK_KEEP`, default 20), so no
+  single bad edit — the loop's or yours — can destroy it.
 
 ## One beat: sense → decide → act
 
@@ -188,7 +195,7 @@ looop worker start heavy-refactor "…brief…" \
 
 looop itself has **no runner vocabulary** — which flags mean "model" or "effort" is the runner's business, decided at `looop init` time or per-worker via the override. Policy for *when* to override belongs in your PLAYBOOK (with exact commands valid on your machine); without such guidance the decider always uses the configured template.
 
-> **Removed in 1.0:** the `{{model}}`/`{{thinking}}` placeholders, the `worker_model`/`worker_thinking` config keys, and the `--model`/`--thinking` flags. A `worker_command` still carrying those placeholders is refused at launch — re-run `looop init` (or edit the config) to bake the values into the command.
+> **Removed:** the `{{model}}`/`{{thinking}}` placeholders, the `worker_model`/`worker_thinking` config keys, and the `--model`/`--thinking` flags. A `worker_command` still carrying those placeholders is refused at launch — re-run `looop init` (or edit the config) to bake the values into the command.
 
 The built-in presets are:
 
@@ -196,10 +203,15 @@ The built-in presets are:
 
 ```json
 {
-  "tick_command": "claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model sonnet \"$(cat {{prompt_file}})\"",
+  "tick_command": "claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model sonnet",
   "worker_command": "claude --dangerously-skip-permissions --model opus \"$(cat {{prompt_file}})\""
 }
 ```
+
+(The claude tick takes its prompt on **stdin** — no placeholder — because the
+tick prompt embeds the whole PLAYBOOK + goals + snapshots and a single argv
+string is capped at 128 KiB on Linux; the worker keeps the placeholder since
+its stdin is the live attach TTY.)
 
 **codex**
 

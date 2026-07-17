@@ -72,9 +72,12 @@ Pick exactly ONE `action` and fill its fields:
 
   {"action":"run_shell","cmd":"<one shell command>","reason":"..."}
      One ad-hoc, REVERSIBLE side-effecting command (a gh query, posting a
-     draft…); looop runs it in the data dir. Never irreversible (merge / deploy /
-     delete / public comment) — for those, start a worker that prepares it and
-     asks the human (the worker runs `looop ask`).
+     draft…); looop runs it in the data dir. Its stdout/stderr TAIL is shown to
+     you on the NEXT beat (RUN_SHELL OUTPUT), and looop schedules that beat
+     automatically — so a query's result WILL reach you; do not re-run it.
+     Never irreversible (merge / deploy / delete / public comment) — for those,
+     start a worker that prepares it and asks the human (the worker runs
+     `looop ask`).
 
   {"action":"write_goal","id":"<name>","body":"<full goals/<name>.md contents>"}
      Create or replace a goal — desired state, declarative; evaluated every tick,
@@ -276,6 +279,43 @@ fn what_changed(paths: &Paths) -> Option<String> {
     })
 }
 
+/// The `RUN_SHELL OUTPUT` section body: the output tail of the last executed
+/// `run_shell` move (`.last-shell.json`, written by the executor, consumed —
+/// removed — when the NEXT decision executes, so it is shown exactly once).
+fn run_shell_output(paths: &Paths) -> Option<String> {
+    let raw = fs::read_to_string(paths.last_shell()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let cmd = v.get("cmd").and_then(|x| x.as_str()).unwrap_or("?");
+    let code = v.get("exit_code").and_then(|x| x.as_i64()).unwrap_or(-1);
+    let output = v.get("output").and_then(|x| x.as_str()).unwrap_or("");
+    let body = if output.trim().is_empty() {
+        "(no output)"
+    } else {
+        output
+    };
+    Some(format!("$ {cmd}\n(exit {code})\n{body}"))
+}
+
+/// The `FLAPPING SENSORS` section body: snapshots whose wake signal has changed
+/// on N consecutive beats (tracked by the tick). `None` when nothing flaps.
+fn flapping(paths: &Paths) -> Option<String> {
+    let names = crate::tick::flapping_sensors(paths);
+    if names.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "These snapshots' wake signals have changed on EVERY recent beat: {}.\n\
+         A signal that never settles defeats the unchanged-world skip — every such\n\
+         beat costs a decide. Most likely volatile data (timestamps, counters,\n\
+         ages) is leaking into `.signal`; it belongs in `.detail`. For a\n\
+         `sensor-*` name, fix it with write_sensor THIS beat unless something is\n\
+         clearly more urgent. A `sys-*` name is looop's own probe — usually a\n\
+         very short recurring schedule or a worker restarting in a crash loop;\n\
+         address that cause instead.",
+        names.join(", ")
+    ))
+}
+
 /// The `LAST FAILURE` section body, present only when the previous beat failed
 /// (`.last-failure.json`, cleared by the next usable decision). Cap the error
 /// text so a runaway stderr can't blow up the prompt.
@@ -396,11 +436,22 @@ pub fn build_prompt(paths: &Paths, snap_dir: &Path) -> String {
         _ => out.push_str("(empty)\n"),
     }
 
-    // WHAT CHANGED + LAST FAILURE (volatile — keep BELOW every stable section,
-    // just above NOW, for the same prompt-cache reason as the time below).
+    // WHAT CHANGED + RUN_SHELL OUTPUT + FLAPPING + LAST FAILURE (volatile —
+    // keep BELOW every stable section, just above NOW, for the same
+    // prompt-cache reason as the time below).
     if let Some(diff) = what_changed(paths) {
         out.push_str("\n=== WHAT CHANGED (since your last decision — computed by looop) ===\n");
         out.push_str(&diff);
+        out.push('\n');
+    }
+    if let Some(shell) = run_shell_output(paths) {
+        out.push_str("\n=== RUN_SHELL OUTPUT (your previous move — shown once) ===\n");
+        out.push_str(&shell);
+        out.push('\n');
+    }
+    if let Some(flap) = flapping(paths) {
+        out.push_str("\n=== FLAPPING SENSORS (defeating the skip gate — fix the cause) ===\n");
+        out.push_str(&flap);
         out.push('\n');
     }
     if let Some(fail) = last_failure(paths) {
@@ -464,6 +515,39 @@ mod tests {
         );
         assert!(out.contains("PB RULES"), "playbook body inlined");
         assert!(out.contains("triage the inbox"), "goal body inlined");
+    }
+
+    #[test]
+    fn run_shell_output_and_flapping_sections_render_when_present() {
+        let p = fixture();
+        let out = build_prompt(&p, &p.snapshots_dir());
+        assert!(!out.contains("=== RUN_SHELL OUTPUT"), "absent by default");
+        assert!(!out.contains("=== FLAPPING SENSORS"), "absent by default");
+
+        fs::write(
+            p.last_shell(),
+            serde_json::json!({
+                "v": 1, "ts": 1, "cmd": "gh pr list", "exit_code": 0,
+                "output": "pr #12 open"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        fs::write(
+            p.flap_state(),
+            serde_json::json!({
+                "v": 1,
+                "snaps": { "sensor-noisy": { "last": "x", "streak": 99 } }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let out = build_prompt(&p, &p.snapshots_dir());
+        assert!(out.contains("=== RUN_SHELL OUTPUT"));
+        assert!(out.contains("$ gh pr list"));
+        assert!(out.contains("pr #12 open"));
+        assert!(out.contains("=== FLAPPING SENSORS"));
+        assert!(out.contains("sensor-noisy"));
     }
 
     #[test]

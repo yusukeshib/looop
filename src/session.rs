@@ -40,7 +40,7 @@ struct WorkerCmd {
 /// decided at `looop init` time, per-worker variation is the override above,
 /// and the policy for WHEN to override lives in the PLAYBOOK, not in looop.
 ///
-/// REMOVED IN 1.0: the `{{model}}`/`{{thinking}}` placeholders and their
+/// REMOVED: the `{{model}}`/`{{thinking}}` placeholders and their
 /// `worker_model`/`worker_thinking` config keys. A template still carrying
 /// them would silently launch a broken command if expanded empty (`--model
 /// --thinking …` — the next flag becomes the value), so it is REFUSED with a
@@ -126,9 +126,9 @@ const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
   (the PLAYBOOK names the repos and which to prefer.)
 - DELIVERABLES: write any report / artifact a human will read into the data dir's
   reports/ folder (e.g. reports/<id>.md). That dir PERSISTS across ticks. NEVER
-  write deliverables to snapshots/ — the pulse wipes snapshots/ on EVERY beat, so
-  anything you leave there vanishes before the human sees it. Reference the
-  reports/ path in your flag note so I know where to look.
+  write deliverables to snapshots/ — the pulse OWNS that dir and prunes/rewrites
+  its files on every beat, so anything you leave there is destroyed. Reference
+  the reports/ path in your flag note so I know where to look.
 
 ---
 
@@ -187,6 +187,26 @@ pub fn cmd_start_session(
         return Ok(StartOutcome::failed());
     }
     let session = id.to_string();
+
+    // Fleet-size ceiling (`LOOOP_MAX_WORKERS`, default 8; 0 disables): one move
+    // per beat bounds the spawn RATE but not the standing fleet — without this,
+    // a pathological goal/playbook can accumulate a heavy agent per beat
+    // indefinitely. The refusal reaches the decider as a failed move (LAST
+    // FAILURE names it), so it can kill or wait instead of piling on.
+    let cap: usize = std::env::var("LOOOP_MAX_WORKERS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(8);
+    if cap != 0 {
+        let live = list_workers(paths).iter().filter(|w| w.alive).count();
+        if live >= cap {
+            eprintln!(
+                "start-session: {live} live workers — at the fleet cap (LOOOP_MAX_WORKERS={cap}); \
+                 kill or wait out an existing worker first"
+            );
+            return Ok(StartOutcome::failed());
+        }
+    }
 
     if status_exists(paths, &session) {
         if is_alive(paths, &session) {
@@ -954,7 +974,7 @@ mod tests {
         assert!(!out.overridden);
     }
 
-    // REMOVED IN 1.0: a command still carrying {{model}}/{{thinking}} is
+    // REMOVED: a command still carrying {{model}}/{{thinking}} is
     // refused outright — expanding them empty would silently launch a broken
     // command (`--model --thinking …` parses the next flag as the value).
     #[test]

@@ -40,7 +40,7 @@
 //! contract's `start_worker.command`) replaces the `worker_command` template
 //! WHOLESALE for that one worker — the override is a full launch command and
 //! must carry `{{prompt_file}}` like the template. looop itself has no runner
-//! vocabulary (no model/thinking knobs — the pre-1.0 `{{model}}`/`{{thinking}}`
+//! vocabulary (no model/thinking knobs — the old `{{model}}`/`{{thinking}}`
 //! placeholders and `worker_model`/`worker_thinking` keys are REMOVED, and a
 //! template still carrying them is refused at launch with a pointer to
 //! `looop init`). Policy for WHEN to override belongs in the PLAYBOOK.
@@ -53,8 +53,15 @@ use std::fs;
 /// it now diverges deliberately: the tick commands no longer carry the
 /// `| "$LOOOP_BIN" _ fmt` seam, since output formatting runs in-process
 /// (see `runner::run_streamed`).
+///
+/// The tick prompt is fed via STDIN (no `{{prompt_file}}` placeholder), not
+/// argv: the prompt embeds the whole PLAYBOOK + goals + snapshots + journal
+/// tail, and a single argv string is capped hard at 128KiB on Linux
+/// (MAX_ARG_STRLEN) — a healthy data dir can exceed that, and the failure mode
+/// (E2BIG on every beat) is silent backoff churn. Workers still take the
+/// placeholder: their stdin is the live attach TTY, and their briefs are small.
 pub const DEFAULT_CONFIG: &str = r#"{
-  "tick_command": "claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model sonnet \"$(cat {{prompt_file}})\"",
+  "tick_command": "claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model sonnet",
   "worker_command": "claude --dangerously-skip-permissions --model opus \"$(cat {{prompt_file}})\""
 }
 "#;
@@ -205,11 +212,11 @@ mod tests {
         // The worker prompt placeholder survives JSON round-trip un-escaped.
         assert!(worker.contains("{{prompt_file}}"));
         assert!(worker.contains("$(cat"));
-        // The tick now passes its prompt the SAME way as the worker: via the
-        // `{{prompt_file}}` placeholder rather than relying on the stdin path.
+        // The tick prompt travels via STDIN (no placeholder): a single argv
+        // string is capped at 128KiB on Linux (MAX_ARG_STRLEN), and the tick
+        // prompt — PLAYBOOK + goals + snapshots + journal — can exceed it.
         let tick = cfg.runner_cmd("tick_command").unwrap();
-        assert!(tick.contains("{{prompt_file}}"));
-        assert!(tick.contains("$(cat"));
+        assert!(!tick.contains("{{prompt_file}}"));
     }
 
     #[test]
