@@ -45,8 +45,10 @@ pub fn sense(paths: &Paths) -> String {
     crate::gate::reap_stale_claims(paths);
     crate::executor::warn_if_interrupted(paths);
 
+    // Snapshots are NOT wiped wholesale: a snapshot still fresh under a
+    // declared `# looop:interval=N` cadence survives the beat; run_all prunes
+    // anything a live sensor doesn't own and rewrites the rest.
     let snap = paths.snapshots_dir();
-    let _ = fs::remove_dir_all(&snap);
     let _ = fs::create_dir_all(&snap);
     sensor::run_all(paths, &snap, true);
     events::emit(paths, "sense_done", serde_json::json!({}));
@@ -107,6 +109,66 @@ fn can_skip(hash: &str, last: &str, force: bool) -> bool {
     hash == last && !force
 }
 
+// ---- noop TTL (revisit) -------------------------------------------------------
+
+/// How long an unchanged world may coast on a `noop` decision before the beat
+/// re-decides anyway. A single wrong noop must not park a world state forever:
+/// the skip gate is bypassed once the last decision was a noop older than this.
+/// `LOOOP_NOOP_TTL` seconds; 0 disables; default 6h.
+fn noop_ttl_secs() -> u64 {
+    std::env::var("LOOOP_NOOP_TTL")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(6 * 3600)
+}
+
+/// Record that the latest decision was a noop at `hash` (or clear it for any
+/// other action — a real move resets the revisit clock).
+fn record_noop(paths: &Paths, kind: &str, hash: &str) {
+    if kind == "noop" {
+        let body = serde_json::json!({ "ts": util::now_unix(), "hash": hash }).to_string();
+        let _ = fs::write(paths.noop_at(), body);
+    } else {
+        let _ = fs::remove_file(paths.noop_at());
+    }
+}
+
+/// Whether the skip gate should be BYPASSED: the last decision at this same
+/// world hash was a noop, and it has aged past the TTL. Consuming the record
+/// (fresh one written after the re-decision) keeps this one-shot per TTL window.
+fn noop_revisit_due(paths: &Paths, hash: &str) -> bool {
+    let ttl = noop_ttl_secs();
+    if ttl == 0 {
+        return false;
+    }
+    let Ok(raw) = fs::read_to_string(paths.noop_at()) else {
+        return false;
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    let same = v.get("hash").and_then(|h| h.as_str()) == Some(hash);
+    let ts = v.get("ts").and_then(|t| t.as_u64()).unwrap_or(0);
+    same && util::now_unix().saturating_sub(ts) >= ttl
+}
+
+// ---- last-failure feedback ------------------------------------------------------
+
+/// Persist WHY this beat failed, so the NEXT decide prompt can surface it
+/// (`LAST FAILURE` section) instead of letting the decider re-emit the same
+/// failing move blind. Cleared by the next usable decision.
+fn record_failure(paths: &Paths, run_id: &str, code: &str, error: &str, fails: u32) {
+    let body = serde_json::json!({
+        "ts": util::now_unix(),
+        "run_id": run_id,
+        "code": code,
+        "error": error,
+        "fails": fails,
+    })
+    .to_string();
+    let _ = fs::write(paths.last_failure(), body);
+}
+
 /// What one beat produced: whether the AI acted (drives cadence) and the
 /// decider's optional one-shot cadence nudge, handed back to the run loop
 /// in-memory (no `.next-interval` file round-trip).
@@ -135,14 +197,27 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
         .trim()
         .to_string();
     if can_skip(&hash, &last, force) {
-        util::event(
-            Level::Info,
-            "tick.skip",
-            "world unchanged — no AI call",
-            &[],
-        );
-        events::emit(paths, "world_unchanged", serde_json::json!({}));
-        return TickOutcome::idle();
+        // Noop TTL: an unchanged world normally skips, but if the decision that
+        // committed this hash was a NOOP and it has aged past the TTL, re-decide
+        // — one wrong noop must not park this world state forever.
+        if noop_revisit_due(paths, &hash) {
+            util::event(
+                Level::Info,
+                "tick.revisit",
+                "world unchanged but the last noop aged past LOOOP_NOOP_TTL — re-deciding",
+                &[],
+            );
+            events::emit(paths, "noop_revisit", serde_json::json!({}));
+        } else {
+            util::event(
+                Level::Info,
+                "tick.skip",
+                "world unchanged — no AI call",
+                &[],
+            );
+            events::emit(paths, "world_unchanged", serde_json::json!({}));
+            return TickOutcome::idle();
+        }
     }
     if hash == last && force {
         util::event(
@@ -261,7 +336,18 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
     let (acted, next_interval_s) = match (runner_ok, outcome) {
         (true, Some(Ok(d))) => {
             let _ = fs::write(paths.data_dir.join(".last-tick-hash"), format!("{hash}\n"));
+            // Commit the WHAT-CHANGED baseline alongside the hash: the next
+            // decide prompt diffs the live world against the world THIS decision
+            // saw. A failed beat leaves both uncommitted, so the same diff is
+            // re-reported until a decision lands.
+            if let Ok(items) = serde_json::to_string(&crate::worldhash::world_items(paths)) {
+                let _ = fs::write(paths.last_world(), items);
+            }
             clear_backoff(paths);
+            // This decision consumed the previous failure (if any): the decider
+            // saw it in the prompt and moved past it.
+            let _ = fs::remove_file(paths.last_failure());
+            record_noop(paths, d.kind, &hash);
             let next_interval_s = d.next_interval_s;
             util::event(
                 Level::Ok,
@@ -292,12 +378,13 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
                 ("run_id", serde_json::json!(run_id)),
                 ("fails", serde_json::json!(fails)),
             ];
-            let (level, code, msg) = match failure {
+            let (level, code, err, msg) = match failure {
                 (true, Some(Err(e))) => {
                     fields.push(("error", serde_json::json!(e.to_string())));
                     (
                         Level::Error,
                         "tick.failed",
+                        e.to_string(),
                         format!(
                             "decision failed after {secs}s (fail #{fails}): {e} · replay: {replay}"
                         ),
@@ -306,6 +393,9 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
                 (true, None) => (
                     Level::Warn,
                     "tick.no_decision",
+                    "the runner ran but emitted no .decision.json (it must write exactly one \
+                     JSON action object to .decision.json, then stop)"
+                        .to_string(),
                     format!(
                         "ran {secs}s but emitted no .decision.json (no move, fail #{fails}) · replay: {replay}"
                     ),
@@ -315,10 +405,15 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
                     (
                         Level::Error,
                         "tick.failed",
+                        "the runner command itself failed (crashed / exited nonzero) before \
+                         producing a decision"
+                            .to_string(),
                         format!("tick failed after {secs}s (fail #{fails}) · replay: {replay}"),
                     )
                 }
             };
+            // Durable feedback for the NEXT decide prompt (LAST FAILURE section).
+            record_failure(paths, &run_id, code, &err, fails);
             util::event(level, code, &msg, &fields);
             events::emit(
                 paths,
@@ -738,6 +833,55 @@ mod tests {
         assert_eq!(backoff_delay(1), BACKOFF_BASE_SECS);
         assert_eq!(backoff_delay(2), BACKOFF_BASE_SECS * 2);
         assert_eq!(backoff_delay(99), BACKOFF_CAP_SECS);
+    }
+
+    #[test]
+    fn noop_ttl_bypasses_skip_only_for_an_aged_noop_at_the_same_hash() {
+        let p = Paths::temp();
+        // No record: never revisit.
+        assert!(!noop_revisit_due(&p, "h1"));
+
+        // Fresh noop at h1: not due yet.
+        record_noop(&p, "noop", "h1");
+        assert!(!noop_revisit_due(&p, "h1"));
+
+        // Age the record past the TTL: due at the SAME hash only.
+        let old = util::now_unix() - noop_ttl_secs() - 1;
+        fs::write(
+            p.noop_at(),
+            serde_json::json!({ "ts": old, "hash": "h1" }).to_string(),
+        )
+        .unwrap();
+        assert!(
+            noop_revisit_due(&p, "h1"),
+            "aged noop at same hash re-decides"
+        );
+        assert!(
+            !noop_revisit_due(&p, "h2"),
+            "different world: normal skip rules"
+        );
+
+        // A real (non-noop) decision clears the record.
+        record_noop(&p, "goal", "h1");
+        assert!(!p.noop_at().is_file());
+        assert!(!noop_revisit_due(&p, "h1"));
+    }
+
+    #[test]
+    fn record_failure_persists_the_feedback_for_the_next_prompt() {
+        let p = Paths::temp();
+        record_failure(
+            &p,
+            "tick-x",
+            "tick.failed",
+            "run_shell exited 2: gh not found",
+            3,
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(p.last_failure()).unwrap()).unwrap();
+        assert_eq!(v["code"], "tick.failed");
+        assert_eq!(v["fails"], 3);
+        assert!(v["error"].as_str().unwrap().contains("gh not found"));
     }
 
     #[test]

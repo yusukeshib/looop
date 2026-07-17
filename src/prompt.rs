@@ -113,10 +113,10 @@ Pick exactly ONE `action` and fill its fields:
      on this machine) on when and how to override — never invent one.
 
   {"action":"kill_worker","id":"<worker-id>","reason":"..."}
-     Terminate a live worker. Workers have NO input channel (no terminal a
-     human or you can type into) — the ask/answer mailbox is their only I/O —
-     so a worker that is alive, NOT waiting on an ask, and silent past the
-     stuck threshold (sys-sessions health: "stuck") cannot be nudged, only
+     Terminate a live worker. Workers have no interactive terminal — the
+     mailbox (ask/answer, plus human steering via `looop tell`) is their only
+     I/O — so a worker that is alive, NOT waiting on an ask, and silent past
+     the stuck threshold (sys-sessions health: "stuck") cannot be nudged, only
      killed. If its goal still needs the work, re-dispatch a FRESH worker on a
      later beat (it can read reports/ for the prior context). NEVER kill a
      "waiting-ask" worker — it is the human's turn, and killing it strands
@@ -128,6 +128,19 @@ Pick exactly ONE `action` and fill its fields:
   {"action":"write_playbook","body":"<full PLAYBOOK.md contents>"}
      Change your own judgment / guardrails. Deliberate — only harden a drift into
      a rule once it actually hurts.
+
+  {"action":"write_schedule","name":"<name>","in_s":<int>,"note":"why"}
+  {"action":"write_schedule","name":"<name>","every_s":<int>,"note":"why"}
+     A DURABLE time trigger (schedules/<name>.json — survives restarts; unlike
+     next_interval_s it has NO 3600s cap). `in_s` = one-shot, fires once that
+     many seconds from now; `every_s` = recurring, fires every period. When a
+     schedule fires, the sys-schedules signal changes, which WAKES the loop —
+     use this for "re-check in 2 days", daily digests, deadline reminders. A
+     fired one-shot stays "due" (one wake, no spam) until you drop it: after
+     handling it, emit drop_schedule on a later beat.
+
+  {"action":"drop_schedule","name":"<name>"}   remove schedules/<name>.json
+     (a handled one-shot, or a recurring schedule that is no longer needed).
 
 Every action ALSO takes:
   "journal": "<one line: what you did and why>"  — looop appends it ALREADY
@@ -151,7 +164,7 @@ LIVE or STRANDED:
     (it can read the prior `reports/*.md` for context and re-raise the ask as a
     LIVE worker). Treat STRANDED asks as work to resume, not as blockers.
 
-Two of the SENSOR READINGS are looop's OWN state (system sensors, not
+Some of the SENSOR READINGS are looop's OWN state (system sensors, not
 sensors/*.sh):
   • sys-sessions — the live worker fleet, each tagged with a health reading:
       busy         actively producing terminal output — leave it alone
@@ -167,6 +180,17 @@ sensors/*.sh):
     last acted on that goal; null = never). FAIRNESS: you pick ONE move per beat,
     so a constantly-changing goal can starve the rest. When several goals are
     ready and roughly comparable, prefer the one you've neglected longest.
+  • sys-schedules — your durable time triggers (write_schedule above). A
+    one-shot reads "pending" then "due" (handle it, then drop_schedule); a
+    recurring one bumps its period counter every interval. Both changes wake
+    the loop through the normal world hash.
+
+Near the end, two VOLATILE sections tell you why you were woken:
+  • WHAT CHANGED — the world items that differ since your LAST decision
+    (computed by looop, not for you to re-derive). Ground your move in it.
+  • LAST FAILURE — present only if your previous attempt failed. NEVER re-emit
+    the same move unchanged over a LAST FAILURE: fix the cause it names, choose
+    a different move, or route the problem through a worker that asks the human.
 
 The material below is your decision input. Decide from it alone whenever it
 suffices; run read-only inspection ONLY when a fact you genuinely need is
@@ -198,6 +222,77 @@ fn tail_lines(text: &str, n: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(n);
     lines[start..].join("\n")
+}
+
+/// Clip a value for inline display in the WHAT-CHANGED diff.
+fn clip(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let cut: String = s.chars().take(max).collect();
+    format!("{cut}…")
+}
+
+/// The `WHAT CHANGED` section body: the world items that differ between the
+/// baseline committed by the LAST decision (`.last-world.json`) and the live
+/// world. `None` when there is no baseline yet (first decision). looop computes
+/// this diff — the decider must not be left to re-derive it from 20 journal
+/// lines. Volatile: rendered in the prompt tail, below every stable section.
+fn what_changed(paths: &Paths) -> Option<String> {
+    let raw = fs::read_to_string(paths.last_world()).ok()?;
+    let base: std::collections::BTreeMap<String, String> = serde_json::from_str(&raw).ok()?;
+    let cur = crate::worldhash::world_items(paths);
+
+    const VAL_MAX: usize = 240;
+    let mut lines = Vec::new();
+    for (k, v) in &cur {
+        match base.get(k) {
+            None => lines.push(format!("+ {k} appeared: {}", clip(v, VAL_MAX))),
+            Some(old) if old != v => {
+                if k.starts_with("snap:") {
+                    lines.push(format!(
+                        "~ {k} signal: {} → {}",
+                        clip(old, VAL_MAX),
+                        clip(v, VAL_MAX)
+                    ));
+                } else {
+                    lines.push(format!("~ {k} edited (body below)"));
+                }
+            }
+            Some(_) => {}
+        }
+    }
+    for k in base.keys() {
+        if !cur.contains_key(k) {
+            lines.push(format!("- {k} gone"));
+        }
+    }
+    Some(if lines.is_empty() {
+        "(nothing — this re-decide was forced: pulse start, cadence nudge, or a noop \
+         aged past its TTL. Re-judge the same world.)"
+            .to_string()
+    } else {
+        lines.join("\n")
+    })
+}
+
+/// The `LAST FAILURE` section body, present only when the previous beat failed
+/// (`.last-failure.json`, cleared by the next usable decision). Cap the error
+/// text so a runaway stderr can't blow up the prompt.
+fn last_failure(paths: &Paths) -> Option<String> {
+    let raw = fs::read_to_string(paths.last_failure()).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("?");
+    let error = v.get("error").and_then(|x| x.as_str()).unwrap_or("?");
+    let fails = v.get("fails").and_then(|x| x.as_u64()).unwrap_or(1);
+    let ts = v.get("ts").and_then(|x| x.as_u64()).unwrap_or(0);
+    let ago = crate::util::now_unix().saturating_sub(ts);
+    Some(format!(
+        "Your previous decide attempt FAILED ({code}, fail #{fails}, {ago}s ago):\n{}\n\
+         Do NOT re-emit the same move unchanged — fix what this names, pick a\n\
+         different move, or route it through a worker that asks the human.",
+        clip(error, 2048)
+    ))
 }
 
 pub fn build_prompt(paths: &Paths, snap_dir: &Path) -> String {
@@ -301,6 +396,19 @@ pub fn build_prompt(paths: &Paths, snap_dir: &Path) -> String {
         _ => out.push_str("(empty)\n"),
     }
 
+    // WHAT CHANGED + LAST FAILURE (volatile — keep BELOW every stable section,
+    // just above NOW, for the same prompt-cache reason as the time below).
+    if let Some(diff) = what_changed(paths) {
+        out.push_str("\n=== WHAT CHANGED (since your last decision — computed by looop) ===\n");
+        out.push_str(&diff);
+        out.push('\n');
+    }
+    if let Some(fail) = last_failure(paths) {
+        out.push_str("\n=== LAST FAILURE (your previous attempt — do not repeat it) ===\n");
+        out.push_str(&fail);
+        out.push('\n');
+    }
+
     // NOW (volatile tail — keep LAST). The current time is the only instruction
     // field that changes every beat; anchoring it (and the closing instruction)
     // at the very END keeps the long prefix above byte-identical across beats so
@@ -395,6 +503,89 @@ mod tests {
         let b = build_prompt(&p, &p.snapshots_dir());
         let prefix = |s: &str| s.split("=== NOW ===").next().unwrap().to_string();
         assert_eq!(prefix(&a), prefix(&b), "stable sections must not drift");
+    }
+
+    #[test]
+    fn what_changed_names_the_items_that_woke_the_loop() {
+        let p = fixture();
+        fs::create_dir_all(p.snapshots_dir()).unwrap();
+        fs::write(
+            p.snapshots_dir().join("sensor-gh.json"),
+            r#"{"signal":{"open":3},"detail":{"ts":1}}"#,
+        )
+        .unwrap();
+
+        // No baseline yet: no section (first decision judges the world whole).
+        assert!(
+            build_prompt(&p, &p.snapshots_dir())
+                .find("=== WHAT CHANGED")
+                .is_none()
+        );
+
+        // Commit a baseline, then move the sensor signal and add a goal.
+        fs::write(
+            p.last_world(),
+            serde_json::to_string(&crate::worldhash::world_items(&p)).unwrap(),
+        )
+        .unwrap();
+        fs::write(
+            p.snapshots_dir().join("sensor-gh.json"),
+            r#"{"signal":{"open":5},"detail":{"ts":2}}"#,
+        )
+        .unwrap();
+        fs::write(p.goals_dir().join("new.md"), b"a new goal\n").unwrap();
+
+        let out = build_prompt(&p, &p.snapshots_dir());
+        let diff_pos = out.find("=== WHAT CHANGED").expect("diff section present");
+        assert!(out.contains(r#"~ snap:sensor-gh signal: {"open":3} → {"open":5}"#));
+        assert!(out.contains("+ goal:new appeared"));
+        // Volatile: below every stable section, above NOW.
+        assert!(out.find("=== RECENT JOURNAL ===").unwrap() < diff_pos);
+        assert!(diff_pos < out.find("=== NOW ===").unwrap());
+    }
+
+    #[test]
+    fn what_changed_reports_a_forced_redecide_when_nothing_differs() {
+        let p = fixture();
+        fs::create_dir_all(p.snapshots_dir()).unwrap();
+        fs::write(
+            p.last_world(),
+            serde_json::to_string(&crate::worldhash::world_items(&p)).unwrap(),
+        )
+        .unwrap();
+        let out = build_prompt(&p, &p.snapshots_dir());
+        assert!(out.contains("=== WHAT CHANGED"));
+        assert!(out.contains("this re-decide was forced"));
+    }
+
+    #[test]
+    fn last_failure_is_surfaced_until_cleared() {
+        let p = fixture();
+        assert!(!build_prompt(&p, &p.snapshots_dir()).contains("=== LAST FAILURE"));
+
+        fs::write(
+            p.last_failure(),
+            serde_json::json!({
+                "ts": crate::util::now_unix(),
+                "run_id": "tick-1",
+                "code": "tick.failed",
+                "error": "run_shell exited 127: gh: command not found",
+                "fails": 2,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let out = build_prompt(&p, &p.snapshots_dir());
+        let pos = out
+            .find("=== LAST FAILURE")
+            .expect("failure section present");
+        assert!(out.contains("gh: command not found"));
+        assert!(out.contains("fail #2"));
+        assert!(out.contains("Do NOT re-emit the same move unchanged"));
+        assert!(
+            pos < out.find("=== NOW ===").unwrap(),
+            "volatile tail placement"
+        );
     }
 
     #[test]

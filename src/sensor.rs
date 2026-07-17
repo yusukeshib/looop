@@ -132,6 +132,7 @@ const SYSTEM_SENSORS: &[(&str, Probe)] = &[
     ("sessions", sys_sessions),
     ("claims", sys_claims),
     ("goals", sys_goals),
+    ("schedules", crate::schedule::sys_schedules),
 ];
 
 /// One sensor's outcome, for the run summary.
@@ -139,6 +140,29 @@ struct Reading {
     name: String,
     ok: bool,
     secs: u64,
+    /// True when the sensor was NOT re-run this beat because its snapshot is
+    /// still fresh under a declared `# looop:interval=N` cadence.
+    skipped: bool,
+}
+
+/// A sensor script's declared cadence: the first `# looop:interval=<seconds>`
+/// line, if any. A sensor with a declared interval is re-run only when its
+/// existing snapshot is older than that — an expensive/rate-limited observer no
+/// longer has to pay the full beat rate. No declaration = every beat (as before).
+fn declared_interval(script: &Path) -> Option<u64> {
+    let text = fs::read_to_string(script).ok()?;
+    for line in text.lines().take(20) {
+        if let Some(rest) = line.trim().strip_prefix("# looop:interval=") {
+            return rest.trim().parse().ok();
+        }
+    }
+    None
+}
+
+/// Age of `path` in seconds via mtime; `None` when absent/unreadable.
+fn file_age_secs(path: &Path) -> Option<u64> {
+    let m = fs::metadata(path).ok()?.modified().ok()?;
+    m.elapsed().ok().map(|d| d.as_secs())
 }
 
 impl Sensor {
@@ -161,6 +185,17 @@ impl Sensor {
             Sensor::User(script) => {
                 let out = snap_dir.join(format!("{name}.json"));
                 let err = snap_dir.join(format!("{name}.err"));
+                // Declared cadence: keep the existing snapshot while it's fresh.
+                if let (Some(iv), Some(age)) = (declared_interval(script), file_age_secs(&out))
+                    && age < iv
+                {
+                    return Reading {
+                        name,
+                        ok: true,
+                        secs: 0,
+                        skipped: true,
+                    };
+                }
                 let rc = exec_sensor(script, &out, &err);
                 if rc == 124 {
                     let to = env_num("LOOOP_SENSOR_TIMEOUT", 60);
@@ -186,6 +221,7 @@ impl Sensor {
             name,
             ok,
             secs: t0.elapsed().as_secs(),
+            skipped: false,
         }
     }
 }
@@ -324,6 +360,13 @@ fn sys_sessions(paths: &Paths) -> serde_json::Value {
         if let Some(a) = w.ask_age_s {
             d.insert("ask_age_s".into(), serde_json::json!(a));
         }
+        // Undelivered steering (`looop tell`) — volatile detail: the human may
+        // want to know a message hasn't been picked up yet, but delivery lag
+        // must not wake the loop.
+        let tells = crate::mailbox::pending_tells(paths, &w.id).len();
+        if tells > 0 {
+            d.insert("pending_tells".into(), serde_json::json!(tells));
+        }
         detail_workers.insert(w.id.clone(), serde_json::Value::Object(d));
     }
     serde_json::json!({
@@ -402,19 +445,55 @@ pub fn run_all(paths: &Paths, snap_dir: &Path, verbose: bool) {
     crate::verify::reconcile(paths);
     let sensors = all_sensors(paths);
     let total = sensors.len();
+
+    // Prune snapshots that no live sensor owns (a deleted sensor's leftovers).
+    // Snapshots are no longer wiped wholesale each beat — a fresh file under a
+    // declared `# looop:interval` cadence must survive — so staleness is handled
+    // by name instead: anything not in the current sensor set goes.
+    let owned: std::collections::HashSet<String> = sensors.iter().map(|s| s.name()).collect();
+    for e in fs::read_dir(snap_dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        let stem = p
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        if !owned.contains(&stem) {
+            let _ = fs::remove_file(&p);
+        }
+    }
+
     // Per-sensor lines are machine granularity — only the JSON stream gets them.
     // The human pulse stream gets ONE summary line (below), so a healthy fleet of
     // sensors doesn't drown the decisions a watcher actually cares about.
     let json = util::is_json();
     let t0_all = Instant::now();
-    let mut ok = 0usize;
-    let mut failed: Vec<String> = Vec::new();
 
-    for s in &sensors {
-        let r = s.sense(paths, snap_dir);
+    // Sensors are independent by construction (each owns its snapshot file), so
+    // run them CONCURRENTLY: the beat's sense phase costs max(sensor latency),
+    // not the sum — one slow network observer no longer stalls the whole pulse.
+    // Events are emitted after the join so the log stream stays ordered.
+    let readings: Vec<Reading> = std::thread::scope(|scope| {
+        let handles: Vec<_> = sensors
+            .iter()
+            .map(|s| scope.spawn(move || s.sense(paths, snap_dir)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join())
+            .collect::<Result<_, _>>()
+    })
+    .unwrap_or_default();
+
+    let mut ok = 0usize;
+    let mut skipped = 0usize;
+    let mut failed: Vec<String> = Vec::new();
+    for r in &readings {
+        if r.skipped {
+            skipped += 1;
+        }
         if r.ok {
             ok += 1;
-            if verbose && json {
+            if verbose && json && !r.skipped {
                 util::event(
                     Level::Ok,
                     "sense.ok",
@@ -440,7 +519,7 @@ pub fn run_all(paths: &Paths, snap_dir: &Path, verbose: bool) {
                     ],
                 );
             }
-            failed.push(r.name);
+            failed.push(r.name.clone());
         }
     }
 
@@ -452,14 +531,20 @@ pub fn run_all(paths: &Paths, snap_dir: &Path, verbose: bool) {
         let fields = [
             ("ok", serde_json::json!(ok)),
             ("total", serde_json::json!(total)),
+            ("skipped", serde_json::json!(skipped)),
             ("failed", serde_json::json!(failed)),
             ("secs", serde_json::json!(secs)),
         ];
         if failed.is_empty() {
+            let cadence = if skipped > 0 {
+                format!(" · {skipped} fresh (cadence)")
+            } else {
+                String::new()
+            };
             util::event(
                 Level::Info,
                 "sense",
-                &format!("{ok} sensors ok ({secs}s)"),
+                &format!("{ok} sensors ok ({secs}s){cadence}"),
                 &fields,
             );
         } else {
@@ -549,6 +634,69 @@ mod tests {
         );
         // An empty signal must never wake the loop.
         assert_eq!(crate::worldhash::wake_signal(v), serde_json::json!({}));
+    }
+
+    #[test]
+    fn declared_interval_parses_the_cadence_comment() {
+        let p = Paths::temp();
+        fs::create_dir_all(p.sensors_dir()).unwrap();
+        let s = p.sensors_dir().join("gh.sh");
+        fs::write(&s, "#!/bin/sh\n# looop:interval=300\necho '{}'\n").unwrap();
+        assert_eq!(declared_interval(&s), Some(300));
+        let t = p.sensors_dir().join("fast.sh");
+        fs::write(&t, "#!/bin/sh\necho '{}'\n").unwrap();
+        assert_eq!(declared_interval(&t), None, "no declaration = every beat");
+    }
+
+    #[test]
+    fn fresh_snapshot_is_kept_under_a_declared_cadence() {
+        let p = Paths::temp();
+        fs::create_dir_all(p.sensors_dir()).unwrap();
+        fs::create_dir_all(p.snapshots_dir()).unwrap();
+        let script = p.sensors_dir().join("slow.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\n# looop:interval=3600\necho '{\"signal\":{\"ran\":true}}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let sensor = Sensor::User(script);
+        let out = p.snapshots_dir().join("sensor-slow.json");
+
+        // No snapshot yet: runs.
+        let r1 = sensor.sense(&p, &p.snapshots_dir());
+        assert!(r1.ok && !r1.skipped, "first sense runs the script");
+        let body1 = fs::read_to_string(&out).unwrap();
+
+        // Snapshot fresh under the 1h cadence: kept, not re-run.
+        let r2 = sensor.sense(&p, &p.snapshots_dir());
+        assert!(r2.ok && r2.skipped, "fresh snapshot is kept (cadence)");
+        assert_eq!(fs::read_to_string(&out).unwrap(), body1);
+    }
+
+    #[test]
+    fn run_all_prunes_snapshots_no_live_sensor_owns() {
+        let p = Paths::temp();
+        fs::create_dir_all(p.sensors_dir()).unwrap();
+        fs::create_dir_all(p.snapshots_dir()).unwrap();
+        // A leftover from a since-deleted sensor.
+        let stale = p.snapshots_dir().join("sensor-gone.json");
+        fs::write(&stale, "{}").unwrap();
+
+        run_all(&p, &p.snapshots_dir(), false);
+        assert!(!stale.exists(), "unowned snapshot pruned");
+        assert!(
+            p.snapshots_dir().join("sys-sessions.json").is_file(),
+            "system snapshots written"
+        );
+        assert!(
+            p.snapshots_dir().join("sys-schedules.json").is_file(),
+            "sys-schedules registered"
+        );
     }
 
     #[test]

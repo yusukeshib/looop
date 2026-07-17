@@ -34,7 +34,18 @@ Usage:
   looop answer <ask_id> "<text>"|- [--force]  resolve a worker's ask (`-`/empty = stdin; --force to re-answer)
   looop goal write <id> [body|-] | goal archive <id>     (`-`/omit = stdin/heredoc)
   looop sensor write <name> [script|-]                   (`-`/omit = stdin/heredoc)
+                                a script may declare `# looop:interval=<secs>` —
+                                it is then re-run only when its snapshot is older
+                                (rate-limited/expensive observers skip beats)
   looop playbook write [body|-]                          (`-`/omit = stdin/heredoc)
+  looop schedule write <name> --in S | --every S [--note …]   durable time trigger:
+                                one-shot (--in) or recurring (--every, min 60s);
+                                when due it WAKES the loop (survives restarts —
+                                unlike next_interval_s there is no 3600s cap)
+  looop schedule rm <name> | schedule list [--json]
+  looop tell <worker> "<msg>"   queue steering INTO a live worker — it picks the
+                                message up at its next `told` check or along with
+                                its next ask answer
   looop screenshot <id> [--ansi|--json] [--no-trim]   capture a session's screen
   looop worker start <id> [prompt|-] [--command CMD] [--verify CMD]
                                 spawn a worker; --verify = post-condition shell
@@ -45,10 +56,11 @@ Usage:
   looop worker list [--json|--all|--watch [--interval N]]   fleet + health (busy/waiting-ask/stuck/dead), idle/uptime/ask age, verify verdict
 
   Shorthands: `worker`=`w`, `worker list`=`ls`, `screenshot`=`ss`,
-  and `write`=`w` (`goal w` / `sensor w` / `playbook w`).
+  and `write`=`w` (`goal w` / `sensor w` / `playbook w` / `schedule w`).
 
   WORKER self-callbacks (auto-injected CONTRACT — not for humans):
   looop ask <id> --prompt "…" [--ref P] [--options a,b]   ask + block for answer
+  looop told [id]               print + consume pending steering messages
   looop kill <id> | claim <name> | unclaim <name>
 
 Paths (override via env LOOOP_CONFIG / LOOOP_DATA_DIR):

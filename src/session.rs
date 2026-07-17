@@ -90,6 +90,12 @@ const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
   (optionally --ref reports/x.md and/or --options a,b). Use $answer and continue.
   You do NOT need a terminal, stdin, or attach — just call it and read its output.
   Ask once per question; it returns only when answered.
+- STEERING: the human can queue mid-task course corrections for you. Between
+  major steps (and BEFORE any big/irreversible-adjacent step), run:
+    "$LOOOP_BIN" told
+  It prints and consumes any pending steering messages (nothing = no output);
+  obey them immediately. Steering also rides along automatically on every ask
+  answer, prefixed "[steering from the human …]".
 - When the task is 100% complete and nothing is waiting, end your own session:
     "$LOOOP_BIN" kill __ID__
   (this lets the pulse prune the corpse). NEVER do this mid-task or while waiting

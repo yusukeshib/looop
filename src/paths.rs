@@ -137,6 +137,45 @@ impl Paths {
     pub fn action_wal(&self) -> PathBuf {
         self.data_dir.join(".action-wal.json")
     }
+    /// The previous beat's FAILURE record (`{ts,run_id,code,error}`), written on
+    /// a failed decide and cleared on the next usable decision. Surfaced in the
+    /// decide prompt (`LAST FAILURE`) so the decider can correct instead of
+    /// blindly re-emitting the same failing move.
+    pub fn last_failure(&self) -> PathBuf {
+        self.data_dir.join(".last-failure.json")
+    }
+    /// The world-item baseline behind the prompt's `WHAT CHANGED` section: a
+    /// JSON object mapping item name (playbook / goal:<id> / snap:<name>) to its
+    /// digest or wake-signal, committed alongside `.last-tick-hash` on a usable
+    /// decision. The next decide prompt diffs the live world against it.
+    pub fn last_world(&self) -> PathBuf {
+        self.data_dir.join(".last-world.json")
+    }
+    /// Durable one-shot cadence nudge: `{"due": <unix>}`. Written when a decision
+    /// carries `next_interval_s`, consumed (forcing a re-decide) when due. A
+    /// pulse crash during the sleep no longer loses the follow-up.
+    pub fn next_wake(&self) -> PathBuf {
+        self.data_dir.join(".next-wake.json")
+    }
+    /// The last noop decision (`{ts,hash}`). When the world hash still matches
+    /// after `LOOOP_NOOP_TTL` seconds, the beat re-decides instead of skipping —
+    /// a single wrong noop can no longer park a world state forever.
+    pub fn noop_at(&self) -> PathBuf {
+        self.data_dir.join(".noop-at.json")
+    }
+    /// Durable time triggers (`schedules/<name>.json`): one-shot (`at`) or
+    /// recurring (`every_s`). Fed to the world hash through the `sys-schedules`
+    /// system sensor, so a due schedule WAKES the loop level-triggered — no
+    /// in-memory timer to lose.
+    pub fn schedules_dir(&self) -> PathBuf {
+        self.data_dir.join("schedules")
+    }
+    /// Mailbox: steering messages a human sends INTO a running worker
+    /// (`looop tell <worker> …`). Drained by the worker via `looop told` and
+    /// piggybacked on `looop ask` answers.
+    pub fn tells_dir(&self) -> PathBuf {
+        self.data_dir.join("tells")
+    }
 
     /// A throwaway `Paths` rooted at a freshly-created temp data dir. Test-only.
     #[cfg(test)]

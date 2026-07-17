@@ -74,6 +74,13 @@ pub enum Cmd {
     Worker(WorkerArgs),
     /// Worker self-callback: raise a blocking ask for the human.
     Ask(AskArgs),
+    /// Queue a steering message INTO a live worker (picked up via `told` /
+    /// piggybacked on its next ask answer).
+    Tell(TellArgs),
+    /// Worker self-callback: print + consume pending steering messages.
+    Told(ToldArgs),
+    /// Durable time triggers (one-shot / recurring) that wake the loop when due.
+    Schedule(ScheduleArgs),
     /// Kill a session by id.
     Kill(KillArgs),
     /// Capture a worker's current screen.
@@ -294,6 +301,60 @@ pub struct AskArgs {
 #[derive(Args, Debug)]
 pub struct KillArgs {
     pub id: String,
+}
+
+#[derive(Args, Debug)]
+pub struct TellArgs {
+    /// The live worker to steer.
+    pub worker: String,
+    /// The steering message.
+    #[arg(trailing_var_arg = true)]
+    pub body: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ToldArgs {
+    /// The worker draining its messages. Defaults to $LOOOP_SESSION_ID.
+    pub worker: Option<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct ScheduleArgs {
+    #[command(subcommand)]
+    pub op: ScheduleOp,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ScheduleOp {
+    /// Create or replace a schedule. Exactly one of --in / --every.
+    #[command(alias = "w")]
+    Write {
+        name: String,
+        /// One-shot: fire once, this many seconds from now.
+        #[arg(long = "in", value_name = "SECS")]
+        in_s: Option<u64>,
+        /// Recurring: fire every N seconds (min 60).
+        #[arg(long, value_name = "SECS")]
+        every: Option<u64>,
+        /// Why this trigger exists (shown to the decider when it fires).
+        #[arg(long)]
+        note: Option<String>,
+        #[command(flatten)]
+        journal: JournalOpt,
+    },
+    /// Remove a schedule.
+    Rm {
+        name: String,
+        #[command(flatten)]
+        journal: JournalOpt,
+    },
+    /// List schedules with their current signal (pending/due/period).
+    #[command(alias = "ls")]
+    List {
+        /// Emit JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Args, Debug)]

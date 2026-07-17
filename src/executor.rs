@@ -74,6 +74,21 @@ pub enum Action {
         #[serde(default)]
         reason: String,
     },
+    /// Create/replace a durable time trigger (`schedules/<name>.json`). Exactly
+    /// one of `in_s` (one-shot) / `every_s` (recurring). Unlike
+    /// `next_interval_s` it survives restarts and has no 3600s cap — due-ness
+    /// wakes the loop through the `sys-schedules` sensor (see `schedule.rs`).
+    WriteSchedule {
+        name: String,
+        #[serde(default)]
+        in_s: Option<u64>,
+        #[serde(default)]
+        every_s: Option<u64>,
+        #[serde(default)]
+        note: String,
+    },
+    /// Remove a schedule (a handled one-shot / an obsolete recurring).
+    DropSchedule { name: String },
 }
 
 /// A short, stable word naming the action's category — for the typed stdout
@@ -88,6 +103,8 @@ pub fn kind(action: &Action) -> &'static str {
         Action::WritePlaybook { .. } => "playbook",
         Action::StartWorker { .. } => "worker",
         Action::KillWorker { .. } => "kill",
+        Action::WriteSchedule { .. } => "schedule",
+        Action::DropSchedule { .. } => "drop-schedule",
     }
 }
 
@@ -313,6 +330,15 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
                 format!("kill-worker {id} · {}", reason.trim())
             })
         }
+
+        Action::WriteSchedule {
+            name,
+            in_s,
+            every_s,
+            note,
+        } => crate::schedule::write(paths, name, *in_s, *every_s, note),
+
+        Action::DropSchedule { name } => crate::schedule::drop(paths, name),
     }
 }
 

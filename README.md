@@ -27,6 +27,8 @@ never blocks the loop — you set direction and walk away.
 ```sh
 looop goal write ship-v2 -      # declare desired state (effective next beat)
 looop playbook write -          # your judgment, priorities, guardrails
+looop tell ship-v2 "skip the docs, focus the API"   # steer a RUNNING worker
+looop schedule write digest --every 86400 --note "daily digest"  # durable timer
 ```
 
 **Answer — sync, the loop initiates.** looop reaches back for *you* only when it
@@ -63,10 +65,15 @@ Two properties make all this dependable:
 
 ## One beat: sense → decide → act
 
-1. **SENSE** — run every `sensors/*.sh`, refreshing `snapshots/`. World unchanged
-   since last beat → stop here, no LLM call.
+1. **SENSE** — run every `sensors/*.sh` (concurrently; a script may declare
+   `# looop:interval=<secs>` to skip beats while its snapshot is fresh),
+   refreshing `snapshots/`. World unchanged since last beat → stop here, no LLM
+   call — unless the last decision was a `noop` older than `LOOOP_NOOP_TTL`
+   (default 6h), which re-decides so one wrong noop can't park a world forever.
 2. **DECIDE** — on change, hand the PLAYBOOK + goals + readings + pending asks to
-   the LLM, which returns **one** typed move.
+   the LLM — plus a computed **WHAT CHANGED** diff (why it was woken) and, after
+   a failed beat, a **LAST FAILURE** section (so it corrects instead of
+   re-emitting the same failing move) — which returns **one** typed move.
 3. **ACT** — execute it: write a goal/sensor/PLAYBOOK, run one reversible command,
    or spawn a worker. Irreversible moves are gated — they wait for your `answer`
    (see above), and so does any worker that hits a human-only decision.
@@ -89,6 +96,8 @@ public interface:
 | `sensors/*.sh`     | observers — each prints **one JSON object**             |
 | `journal.md`       | action log — one line per move                          |
 | `asks/` `answers/` | the worker ↔ human mailbox                              |
+| `tells/`           | steering messages into a running worker (`looop tell`)  |
+| `schedules/`       | durable time triggers — one-shot / recurring; due-ness wakes the loop |
 
 ## Install
 

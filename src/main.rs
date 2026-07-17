@@ -25,6 +25,7 @@ mod paths;
 mod prompt;
 mod run;
 mod runner;
+mod schedule;
 mod seed;
 mod sensor;
 mod service;
@@ -195,6 +196,9 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
             } => session::cmd_worker_list(paths, *json, *all, *watch, *interval),
         }),
         Cmd::Ask(a) => gated(&|| mailbox::cmd_ask(paths, &a)),
+        Cmd::Tell(a) => gated(&|| mailbox::cmd_tell(paths, &a)),
+        Cmd::Told(a) => gated(&|| mailbox::cmd_told(paths, &a)),
+        Cmd::Schedule(a) => gated(&|| schedule::cmd_schedule(paths, &a)),
         Cmd::Kill(a) => gated(&|| session::cmd_kill(paths, &a.id)),
         Cmd::Screenshot(a) => gated(&|| session::cmd_screenshot(paths, &a)),
         Cmd::Claim(a) => gated(&|| gate::cmd_claim(paths, &a)),
