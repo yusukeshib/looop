@@ -64,6 +64,44 @@ fn hash_policy_into(paths: &Paths, buf: &mut Vec<u8>) {
     }
 }
 
+/// The world broken into NAMED items, for the prompt's `WHAT CHANGED` diff:
+///   * `playbook` / `goal:<id>` → a short content hash (policy files — the diff
+///     names WHICH file moved; the decider re-reads the live body anyway),
+///   * `snap:<name>` → the canonical wake-signal JSON itself (small by design —
+///     the diff can show old → new inline).
+///
+/// Uses the SAME inputs and signal-reduction as [`world_hash`], so "the hash
+/// moved" and "some item differs" can never disagree.
+pub fn world_items(paths: &Paths) -> std::collections::BTreeMap<String, String> {
+    let mut m = std::collections::BTreeMap::new();
+
+    if paths.playbook().is_file()
+        && let Ok(bytes) = fs::read(paths.playbook())
+    {
+        m.insert("playbook".to_string(), util::content_hash(&bytes));
+    }
+    for f in util::sorted_glob(&paths.goals_dir(), "md") {
+        if let (Some(stem), Ok(bytes)) = (f.file_stem(), fs::read(&f)) {
+            m.insert(
+                format!("goal:{}", stem.to_string_lossy()),
+                util::content_hash(&bytes),
+            );
+        }
+    }
+    for f in util::sorted_glob(&paths.snapshots_dir(), "json") {
+        let Some(stem) = f.file_stem().map(|s| s.to_string_lossy().to_string()) else {
+            continue;
+        };
+        let raw = fs::read(&f).unwrap_or_default();
+        let val = match serde_json::from_slice::<serde_json::Value>(&raw) {
+            Ok(v) => wake_signal(v).to_string(),
+            Err(_) => format!("(non-JSON, {} bytes)", raw.len()),
+        };
+        m.insert(format!("snap:{stem}"), val);
+    }
+    m
+}
+
 pub fn world_hash(paths: &Paths) -> String {
     let mut buf: Vec<u8> = Vec::new();
 

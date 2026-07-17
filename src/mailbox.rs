@@ -157,10 +157,133 @@ pub(crate) fn ask(
     );
     loop {
         if let Some(answer) = read_answer(&store, &id) {
-            return Ok(answer);
+            // Piggyback any steering the human sent while this worker was
+            // blocked (`looop tell`): the ask's return is the one moment we KNOW
+            // the worker is reading, so undelivered tells ride along with the
+            // answer instead of waiting for a `told` poll that may never come.
+            let tells = drain_tells(paths, worker);
+            if tells.is_empty() {
+                return Ok(answer);
+            }
+            return Ok(format!(
+                "[steering from the human while you waited — obey alongside the answer]\n{}\n---\n{answer}",
+                tells.join("\n")
+            ));
         }
         std::thread::sleep(poll);
     }
+}
+
+// ---- tells — the human → worker steering channel --------------------------------
+
+/// One steering message for a running worker. Serialized to `tells/<id>.json`;
+/// consumed (deleted) when the worker drains it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Tell {
+    pub id: String,
+    pub worker: String,
+    pub msg: String,
+    pub ts: u64,
+}
+
+/// Allocate `<worker>-<n>` one past the highest pending tell for the worker.
+fn next_tell_id(store: &impl StateStore, worker: &str) -> String {
+    let mut max = 0u64;
+    for stem in store.list(&Collection::Tells) {
+        if let Some(idx) = stem.strip_prefix(&format!("{worker}-"))
+            && let Ok(n) = idx.parse::<u64>()
+        {
+            max = max.max(n);
+        }
+    }
+    format!("{worker}-{}", max + 1)
+}
+
+/// Undelivered tells for `worker`, oldest first.
+pub fn pending_tells(paths: &Paths, worker: &str) -> Vec<Tell> {
+    let store = FileStore::new(paths);
+    let mut out: Vec<Tell> = store
+        .list(&Collection::Tells)
+        .into_iter()
+        .filter_map(|id| {
+            let raw = store.read(&Key::Tell(id))?;
+            serde_json::from_str::<Tell>(&raw).ok()
+        })
+        .filter(|t| t.worker == worker)
+        .collect();
+    out.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
+    out
+}
+
+/// Consume (return + delete) every pending tell for `worker`, oldest first.
+pub fn drain_tells(paths: &Paths, worker: &str) -> Vec<String> {
+    let store = FileStore::new(paths);
+    pending_tells(paths, worker)
+        .into_iter()
+        .map(|t| {
+            let _ = store.remove(&Key::Tell(t.id.clone()));
+            format!("• {}", t.msg)
+        })
+        .collect()
+}
+
+/// `looop tell <worker> <message…|->` — human/concierge verb: queue a steering
+/// message INTO a live worker. Delivery is pull-based (the worker's only I/O is
+/// the mailbox): the worker picks it up at its next `looop told` check, or
+/// piggybacked on its next `looop ask` answer. Refuses a dead worker — a corpse
+/// will never read it; steer via goals / a fresh worker instead.
+pub fn cmd_tell(paths: &Paths, args: &crate::cli::TellArgs) -> Result<ExitCode> {
+    util::safe_segment("worker id", &args.worker)?;
+    let msg = args.body.join(" ").trim().to_string();
+    if msg.is_empty() {
+        bail!("tell: empty message");
+    }
+    if !crate::session::is_alive(paths, &args.worker) {
+        bail!(
+            "tell {}: not a live worker (a dead worker can never read it — steer via goals or a fresh worker)",
+            args.worker
+        );
+    }
+    let store = FileStore::new(paths);
+    let id = next_tell_id(&store, &args.worker);
+    let tell = Tell {
+        id: id.clone(),
+        worker: args.worker.clone(),
+        msg,
+        ts: util::now_unix(),
+    };
+    store.write_atomic(
+        &Key::Tell(id.clone()),
+        &serde_json::to_string_pretty(&tell)?,
+    )?;
+    util::event(
+        util::Level::Ok,
+        "tell",
+        &format!("queued for {}: {}", args.worker, tell.msg),
+        &[
+            ("tell_id", serde_json::json!(id)),
+            ("worker", serde_json::json!(args.worker)),
+        ],
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `looop told [worker]` — worker self-callback: print + consume any steering
+/// messages queued for it (one per line). Prints nothing when there are none.
+/// `<worker>` defaults to `$LOOOP_SESSION_ID`.
+pub fn cmd_told(paths: &Paths, args: &crate::cli::ToldArgs) -> Result<ExitCode> {
+    let worker = match &args.worker {
+        Some(w) if !w.is_empty() => w.clone(),
+        _ => std::env::var("LOOOP_SESSION_ID").unwrap_or_default(),
+    };
+    if worker.is_empty() {
+        eprintln!("usage: looop told [worker]  (or run inside a worker with $LOOOP_SESSION_ID)");
+        return Ok(ExitCode::from(1));
+    }
+    for line in drain_tells(paths, &worker) {
+        println!("{line}");
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `looop answer <ask_id> <text…>`
@@ -335,6 +458,44 @@ mod tests {
         assert_eq!(
             read_answer(&FileStore::new(&p), "w-1").as_deref(),
             Some("second")
+        );
+    }
+
+    #[test]
+    fn tells_queue_in_order_and_drain_consumes() {
+        let p = Paths::temp();
+        let store = FileStore::new(&p);
+        for (i, msg) in ["focus the PR", "skip the docs"].iter().enumerate() {
+            let id = next_tell_id(&store, "triage");
+            assert_eq!(id, format!("triage-{}", i + 1));
+            let t = Tell {
+                id: id.clone(),
+                worker: "triage".into(),
+                msg: msg.to_string(),
+                ts: i as u64,
+            };
+            store
+                .write_atomic(&Key::Tell(id), &serde_json::to_string(&t).unwrap())
+                .unwrap();
+        }
+        assert_eq!(pending_tells(&p, "triage").len(), 2);
+        assert_eq!(pending_tells(&p, "other").len(), 0, "scoped per worker");
+
+        let drained = drain_tells(&p, "triage");
+        assert_eq!(drained, vec!["• focus the PR", "• skip the docs"]);
+        assert!(pending_tells(&p, "triage").is_empty(), "drain consumes");
+    }
+
+    #[test]
+    fn tell_refuses_a_dead_worker() {
+        let p = Paths::temp();
+        let args = crate::cli::TellArgs {
+            worker: "ghost".into(),
+            body: vec!["hello".into()],
+        };
+        assert!(
+            cmd_tell(&p, &args).is_err(),
+            "a corpse can never read a tell — refuse it"
         );
     }
 

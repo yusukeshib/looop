@@ -55,6 +55,39 @@ fn interval(env: &str, cfg: &Config, key: &str, fallback: u64) -> u64 {
         .unwrap_or(fallback)
 }
 
+// ---- durable cadence nudge (.next-wake.json) ---------------------------------
+
+/// The pending next-wake deadline (unix secs), if any.
+fn read_next_wake(paths: &Paths) -> Option<u64> {
+    let raw = fs::read_to_string(paths.next_wake()).ok()?;
+    serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()?
+        .get("due")
+        .and_then(|v| v.as_u64())
+}
+
+/// Persist a one-shot cadence nudge as a DEADLINE, not an in-memory flag: a
+/// pulse crash during the sleep no longer loses the follow-up — the next pulse
+/// (or the next loop iteration) sees the file and re-decides once it's due.
+fn write_next_wake(paths: &Paths, due: u64) {
+    let _ = fs::write(
+        paths.next_wake(),
+        serde_json::json!({ "due": due }).to_string(),
+    );
+}
+
+/// Consume the nudge when due: returns true (and removes the file) when the
+/// deadline has passed, arming a forced re-decide this beat.
+fn consume_due_next_wake(paths: &Paths) -> bool {
+    match read_next_wake(paths) {
+        Some(due) if crate::util::now_unix() >= due => {
+            let _ = fs::remove_file(paths.next_wake());
+            true
+        }
+        _ => false,
+    }
+}
+
 /// A non-blocking exclusive `flock(2)` on an open fd. `true` = we hold it now.
 /// flock is the right primitive for single-instance: the kernel releases it when
 /// the holding process dies for ANY reason (normal exit, panic, `kill -9`, crash),
@@ -172,11 +205,18 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
     // forced beat, so a crash-restart loop can't burn unbounded AI calls.)
     let mut force = true;
     loop {
+        // A due durable nudge (written below, survives crashes) forces this
+        // beat to re-decide even over an unchanged world.
+        if consume_due_next_wake(paths) {
+            force = true;
+        }
         let outcome = tick::tick(paths, force);
         force = false;
 
-        // One-shot AI cadence nudge, handed straight back from the beat in-memory
-        // (clamped 5..3600). It also forces the next beat to re-decide.
+        // One-shot AI cadence nudge (clamped 5..3600), persisted as a DEADLINE
+        // (`.next-wake.json`) rather than carried in memory: a crash during the
+        // sleep no longer loses the follow-up, and the consume above re-arms the
+        // forced re-decide once it's due.
         let mut want = beat;
         if let Some(req) = outcome.next_interval_s {
             let req = req.clamp(5, 3600);
@@ -189,8 +229,14 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
                     ("default", serde_json::json!(beat)),
                 ],
             );
+            write_next_wake(paths, util::now_unix() + req);
             want = req;
-            force = true;
+        }
+        // Never sleep PAST a pending deadline (this beat's nudge or a leftover
+        // from a previous pulse) — cap the sleep to it.
+        if let Some(due) = read_next_wake(paths) {
+            let remaining = due.saturating_sub(util::now_unix()).max(1);
+            want = want.min(remaining);
         }
         let suffix = if outcome.acted { "acted" } else { "idle" };
         if util::is_json() {
@@ -216,6 +262,25 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn next_wake_is_durable_and_consumed_only_when_due() {
+        let p = Paths::temp();
+        assert!(!consume_due_next_wake(&p), "no file, nothing due");
+
+        // A future deadline persists across reads and does not consume.
+        let future = crate::util::now_unix() + 3600;
+        write_next_wake(&p, future);
+        assert_eq!(read_next_wake(&p), Some(future));
+        assert!(!consume_due_next_wake(&p), "not due yet");
+        assert!(p.next_wake().is_file(), "undue nudge survives (durable)");
+
+        // A passed deadline is consumed exactly once and arms the force.
+        write_next_wake(&p, crate::util::now_unix() - 1);
+        assert!(consume_due_next_wake(&p), "due nudge forces a re-decide");
+        assert!(!p.next_wake().is_file(), "consumed");
+        assert!(!consume_due_next_wake(&p), "one-shot");
+    }
 
     #[test]
     fn lock_is_exclusive_and_self_heals_after_release() {

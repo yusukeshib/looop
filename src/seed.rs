@@ -30,6 +30,7 @@ claims/
 reports/
 asks/
 answers/
+tells/
 .lock/
 .last-tick-hash
 .goal-activity.json
@@ -60,6 +61,8 @@ pub fn ensure_dirs(paths: &Paths) -> Result<()> {
         paths.runs_dir(),
         paths.goals_dir().join("archive"),
         paths.prompts_dir(),
+        paths.schedules_dir(),
+        paths.tells_dir(),
     ] {
         fs::create_dir_all(&d).with_context(|| format!("mkdir -p {}", d.display()))?;
     }

@@ -51,6 +51,10 @@ pub enum Key {
     GoalActivity,
     /// Write-ahead intent log for the in-flight non-idempotent action.
     ActionWal,
+    /// A durable time trigger (`schedules/<name>.json`) — one-shot or recurring.
+    Schedule(String),
+    /// A steering message for a running worker (`tells/<id>.json`).
+    Tell(String),
 }
 
 /// A collection of keys to enumerate.
@@ -60,13 +64,19 @@ pub enum Collection {
     Answers,
     Claims,
     Goals,
+    Schedules,
+    Tells,
 }
 
 impl Collection {
     /// The file extension the backing files carry (FileStore only).
     fn ext(self) -> &'static str {
         match self {
-            Collection::Asks | Collection::Answers | Collection::Claims => "json",
+            Collection::Asks
+            | Collection::Answers
+            | Collection::Claims
+            | Collection::Schedules
+            | Collection::Tells => "json",
             Collection::Goals => "md",
         }
     }
@@ -131,6 +141,8 @@ impl<'a> FileStore<'a> {
             Key::Sensor(name) => self.paths.sensors_dir().join(format!("{name}.sh")),
             Key::GoalActivity => self.paths.goal_activity(),
             Key::ActionWal => self.paths.action_wal(),
+            Key::Schedule(name) => self.paths.schedules_dir().join(format!("{name}.json")),
+            Key::Tell(id) => self.paths.tells_dir().join(format!("{id}.json")),
         }
     }
 
@@ -141,6 +153,8 @@ impl<'a> FileStore<'a> {
             Collection::Answers => self.paths.answers_dir(),
             Collection::Claims => self.paths.claims_dir(),
             Collection::Goals => self.paths.goals_dir(),
+            Collection::Schedules => self.paths.schedules_dir(),
+            Collection::Tells => self.paths.tells_dir(),
         }
     }
 }
