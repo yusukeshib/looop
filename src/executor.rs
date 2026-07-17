@@ -238,6 +238,18 @@ fn playbook_keep() -> usize {
 /// overwrite, then prune the history to [`playbook_keep`] generations. A
 /// missing playbook snapshots nothing; failures are best-effort (the history is
 /// a safety net, never a reason to block the write itself).
+fn next_playbook_snapshot_path(dir: &std::path::Path, stamp: &str) -> std::path::PathBuf {
+    let mut path = dir.join(format!("{stamp}.md"));
+    let mut n = 1;
+    while path.exists() {
+        // Keep collision names lexicographically chronological: pruning sorts
+        // paths, so an unpadded `-10` must not sort before `-2`.
+        path = dir.join(format!("{stamp}-{n:04}.md"));
+        n += 1;
+    }
+    path
+}
+
 fn snapshot_playbook(paths: &Paths) {
     let Ok(current) = fs::read_to_string(paths.playbook()) else {
         return; // no playbook yet — nothing to preserve
@@ -247,12 +259,7 @@ fn snapshot_playbook(paths: &Paths) {
     // One move per beat makes same-second collisions unlikely; disambiguate
     // with a numeric suffix anyway so a snapshot is never silently clobbered.
     let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
-    let mut path = dir.join(format!("{stamp}.md"));
-    let mut n = 1;
-    while path.exists() {
-        path = dir.join(format!("{stamp}-{n}.md"));
-        n += 1;
-    }
+    let path = next_playbook_snapshot_path(&dir, &stamp);
     let _ = fs::write(&path, &current);
 
     let keep = playbook_keep();
@@ -777,6 +784,25 @@ mod tests {
             fs::read_to_string(p.playbook()).unwrap(),
             "v2 rules\n",
             "the live playbook carries the new body"
+        );
+    }
+
+    #[test]
+    fn playbook_snapshot_collision_names_sort_chronologically() {
+        let p = Paths::temp();
+        fs::write(p.playbook(), "original\n").unwrap();
+        let dir = p.playbook_history_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        fs::write(dir.join(format!("{stamp}.md")), "base").unwrap();
+        for n in 1..=10 {
+            fs::write(dir.join(format!("{stamp}-{n:04}.md")), "collision").unwrap();
+        }
+
+        let next = next_playbook_snapshot_path(&dir, &stamp);
+        assert_eq!(
+            next.file_name().unwrap().to_string_lossy(),
+            format!("{stamp}-0011.md")
         );
     }
 

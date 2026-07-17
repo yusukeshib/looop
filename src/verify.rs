@@ -23,6 +23,7 @@
 //! Workers without a declared `verify` behave exactly as before.
 
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -201,7 +202,13 @@ fn run_cmd(cwd: &std::path::Path, cmd: &str, timeout: u64) -> VerifyResult {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
-            Err(_) => break None,
+            Err(_) => {
+                // A failed status probe leaves the child state unknown. Kill and
+                // reap defensively so a verifier never escapes this deadline loop.
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
         }
     };
 
@@ -228,15 +235,21 @@ fn run_cmd(cwd: &std::path::Path, cmd: &str, timeout: u64) -> VerifyResult {
 
 /// The UTF-8-safe tail of a file, capped at `max` bytes.
 fn read_tail_file(path: &std::path::Path, max: usize) -> String {
-    let combined = fs::read_to_string(path).unwrap_or_default();
-    if combined.len() <= max {
-        return combined;
+    let Ok(mut file) = fs::File::open(path) else {
+        return String::new();
+    };
+    let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+        return String::new();
+    };
+    let take = len.min(max as u64) as usize;
+    if file.seek(SeekFrom::End(-(take as i64))).is_err() {
+        return String::new();
     }
-    let mut start = combined.len() - max;
-    while !combined.is_char_boundary(start) {
-        start += 1;
+    let mut tail = Vec::with_capacity(take);
+    if file.read_to_end(&mut tail).is_err() {
+        return String::new();
     }
-    combined[start..].to_string()
+    String::from_utf8_lossy(&tail).into_owned()
 }
 
 #[cfg(test)]
@@ -312,6 +325,16 @@ mod tests {
         assert!(r.ok);
         assert_eq!(r.exit_code, Some(0));
         assert!(r.output.contains("out") && r.output.contains("err"));
+    }
+
+    #[test]
+    fn read_tail_file_is_bounded_and_lossy() {
+        let paths = Paths::temp();
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        let path = paths.data_dir.join("output");
+        fs::write(&path, b"prefix\xfftail").unwrap();
+        let tail = read_tail_file(&path, 5);
+        assert_eq!(tail, "\u{fffd}tail");
     }
 
     #[test]
