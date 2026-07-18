@@ -171,22 +171,39 @@ fn action_fingerprint(action: &Action) -> String {
     crate::util::content_hash(canon.as_bytes())
 }
 
+/// One actor's in-flight WAL record: the per-actor key it was written under
+/// and the exact serialized body, so [`clear_intent`] can compare-and-delete
+/// OUR record and never a concurrent actor's.
+struct Intent {
+    actor: String,
+    body: String,
+}
+
 /// Write the write-ahead intent record just BEFORE a non-idempotent side effect.
 /// If the process dies during the effect, this file survives and is detected by
-/// [`warn_if_interrupted`] on the next beat. Returns the exact serialized body
-/// written, so [`clear_intent`] can compare-and-delete OUR record and never a
-/// concurrent actor's.
-fn begin_intent(paths: &Paths, action: &Action) -> String {
+/// [`warn_if_interrupted`] on the next beat. PER-ACTOR (pid + process-wide
+/// nonce): with a single shared key, a concurrent manual `looop run` would
+/// silently OVERWRITE the pulse's record and erase its crash-detection
+/// guarantee — each actor now writes its own file and [`warn_if_interrupted`]
+/// scans them all.
+fn begin_intent(paths: &Paths, action: &Action) -> Intent {
+    let actor = format!("{}-{}", std::process::id(), crate::util::temp_nonce());
     let body = serde_json::json!({
         "kind": kind(action),
         "fingerprint": action_fingerprint(action),
         "ts": crate::util::now_unix(),
+        // The deadline THIS run_shell is governed by, frozen at write time:
+        // warn_if_interrupted judges corpse-ness against it, and reading the
+        // CURRENT knob instead would let an operator's post-crash
+        // LOOOP_SHELL_TIMEOUT_SECS edit skew the judgment of a record written
+        // under the old value.
+        "shell_timeout_secs": shell_timeout_secs(),
     })
     .to_string();
     // Execution still proceeds on a failed WAL write — refusing the move over
     // a bookkeeping failure would be worse — but the degraded crash guard
     // (tick.interrupted detection is OFF for this move) must not be silent.
-    if let Err(e) = FileStore::new(paths).write_atomic(&Key::ActionWal, &body) {
+    if let Err(e) = FileStore::new(paths).write_atomic(&Key::ActionWal(actor.clone()), &body) {
         crate::util::event(
             crate::util::Level::Warn,
             "tick.guard_degraded",
@@ -196,7 +213,7 @@ fn begin_intent(paths: &Paths, action: &Action) -> String {
             &[],
         );
     }
-    body
+    Intent { actor, body }
 }
 
 /// Clear the intent record once execute() has returned (Ok OR Err): reaching
@@ -208,20 +225,47 @@ fn begin_intent(paths: &Paths, action: &Action) -> String {
 /// manual `looop run` would otherwise clear EACH OTHER's intent — the old
 /// fingerprint-read-then-remove was check-then-act and could still remove a
 /// record that changed between the compare and the remove.
-fn clear_intent(paths: &Paths, wal_body: &str) {
-    let _ = FileStore::new(paths).remove_if_eq(&Key::ActionWal, wal_body);
+fn clear_intent(paths: &Paths, intent: &Intent) {
+    let _ = FileStore::new(paths).remove_if_eq(&Key::ActionWal(intent.actor.clone()), &intent.body);
 }
 
-/// At beat start: if a write-ahead intent record survived, the previous beat
-/// died mid non-idempotent side effect (run_shell) before
-/// it could commit the world hash. We do NOT auto-retry (a duplicate command is
-/// worse than a missed one); we surface it durably so a human can check whether
-/// the command actually ran. Idempotent. Returns true when an interrupted
-/// action was found and reported.
+/// The actor id encoded in a WAL file name (`.action-wal.<actor>.json`), or
+/// `None` for the LEGACY pre-per-actor single file (`.action-wal.json`).
+fn wal_actor_of(path: &std::path::Path) -> Option<String> {
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .and_then(|n| n.strip_prefix(".action-wal."))
+        .and_then(|n| n.strip_suffix(".json"))
+        .filter(|a| !a.is_empty())
+        .map(str::to_string)
+}
+
+/// At beat start: if any write-ahead intent record survived, its actor died
+/// mid non-idempotent side effect (run_shell) before it could commit the world
+/// hash. We do NOT auto-retry (a duplicate command is worse than a missed
+/// one); we surface it durably so a human can check whether the command
+/// actually ran. Scans EVERY per-actor record (plus the legacy pre-per-actor
+/// single file), so a crashed manual `looop run` and a crashed pulse are each
+/// reported independently. Idempotent. Returns true when at least one
+/// interrupted action was found and reported.
 pub fn warn_if_interrupted(paths: &Paths) -> bool {
+    let mut any = false;
+    for wal in paths.action_wals() {
+        if warn_one_interrupted(paths, &wal) {
+            any = true;
+        }
+    }
+    any
+}
+
+/// Judge ONE surviving WAL record; consume + report it when it is
+/// unambiguously a corpse. Returns true when reported.
+fn warn_one_interrupted(paths: &Paths, wal: &std::path::Path) -> bool {
     let store = FileStore::new(paths);
-    let Some(raw) = store.read(&Key::ActionWal) else {
-        return false;
+    // Read raw (not via a Key): the scan already has the concrete path, and
+    // the legacy file has no per-actor key to read through.
+    let Ok(raw) = std::fs::read_to_string(wal) else {
+        return false; // vanished (owner cleared it) or unreadable — retry next beat
     };
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
     // A YOUNG record may belong to a LIVE actor: a concurrent manual
@@ -234,7 +278,15 @@ pub fn warn_if_interrupted(paths: &Paths) -> bool {
     // can never exist on disk — an unparseable body is corrupt/foreign
     // debris, never a live actor's record caught mid-write.
     let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
-    let timeout = shell_timeout_secs();
+    // Judge against the timeout the record was WRITTEN under (begin_intent
+    // freezes it into the WAL): the writer's run_shell was bounded by THAT
+    // value, so it — not whatever the knob says now — decides when the record
+    // is unambiguously a corpse. Back-compat: an old-format WAL without the
+    // field falls back to the current knob (the pre-freeze behavior).
+    let timeout = v
+        .get("shell_timeout_secs")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(shell_timeout_secs);
     // LOOOP_SHELL_TIMEOUT_SECS=0 means "no run_shell deadline": a LIVE actor
     // can then legitimately hold its WAL for ANY length of time, so there is
     // no age at which the record is unambiguously a crash corpse. Skip the
@@ -247,7 +299,17 @@ pub fn warn_if_interrupted(paths: &Paths) -> bool {
         return false;
     }
     // One-shot report — compare-and-delete exactly the record we inspected.
-    let _ = store.remove_if_eq(&Key::ActionWal, &raw);
+    // The legacy single file predates per-actor keys: best-effort remove (its
+    // only writer is a dead pre-upgrade binary, so there is no live actor to
+    // race with).
+    match wal_actor_of(wal) {
+        Some(actor) => {
+            let _ = store.remove_if_eq(&Key::ActionWal(actor), &raw);
+        }
+        None => {
+            let _ = std::fs::remove_file(wal);
+        }
+    }
     let akind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("?");
     let fp = v.get("fingerprint").and_then(|x| x.as_str()).unwrap_or("?");
     crate::util::event(
@@ -304,27 +366,57 @@ fn denied_shell_pattern(cmd: &str) -> Option<&'static str> {
     if command_position(&tokens).any(|t| t == "sudo") {
         return Some("sudo (privilege escalation)");
     }
-    // `rm -rf` (any flag spelling carrying both r and f) aimed at the root or
-    // the home directory. `rm -rf ./build` and friends stay allowed.
-    for w in tokens.windows(3) {
-        if w[0] == "rm"
-            && w[1].starts_with('-')
-            && w[1].contains('r')
-            && w[1].contains('f')
-            && matches!(w[2], "/" | "/*" | "~" | "~/" | "$home" | "\"$home\"")
-        {
+    // `rm` carrying both recursive AND force — in ANY flag spelling — aimed at
+    // the root or the home directory. The flags are AGGREGATED across every
+    // token up to the next shell separator, so `rm -r -f /` and
+    // `rm --recursive --force /` trip exactly like `rm -rf /`, and EVERY
+    // operand is checked (`rm -rf foo /` still names `/`). `rm -rf ./build`
+    // and friends stay allowed.
+    for (i, t) in tokens.iter().enumerate() {
+        if *t != "rm" {
+            continue;
+        }
+        let (mut recursive, mut force) = (false, false);
+        let mut dangerous_target = false;
+        for arg in &tokens[i + 1..] {
+            // Stop at a shell separator: the flags of THIS rm invocation only.
+            if matches!(*arg, ";" | "&&" | "||" | "|" | "&") {
+                break;
+            }
+            match *arg {
+                "--recursive" => recursive = true,
+                "--force" => force = true,
+                a if a.starts_with('-') && !a.starts_with("--") => {
+                    recursive |= a.contains('r');
+                    force |= a.contains('f');
+                }
+                a if a.starts_with("--") => {} // other long flags (e.g. --preserve-root)
+                a => {
+                    dangerous_target |=
+                        matches!(a, "/" | "/*" | "~" | "~/" | "$home" | "\"$home\"");
+                }
+            }
+        }
+        if recursive && force && dangerous_target {
             return Some("rm -rf on / or the home directory");
         }
     }
-    // Force-pushing a protected-looking ref rewrites shared history. A force
+    // Force-pushing a protected-looking ref rewrites shared history — via the
+    // `--force`/`-f` flag OR git's per-ref force spelling, a `+`-prefixed
+    // refspec (`git push origin +main` forces with no flag at all). A force
     // push to a feature branch stays allowed.
-    if lower.contains("git push")
-        && tokens.iter().any(|t| *t == "--force" || *t == "-f")
-        && tokens.iter().any(|t| {
-            matches!(*t, "main" | "master") || t.ends_with(":main") || t.ends_with(":master")
-        })
-    {
-        return Some("git push --force to a protected-looking ref");
+    if lower.contains("git push") {
+        let protected = |t: &str| {
+            matches!(t, "main" | "master") || t.ends_with(":main") || t.ends_with(":master")
+        };
+        let flag_force = tokens.iter().any(|t| *t == "--force" || *t == "-f")
+            && tokens.iter().any(|t| protected(t));
+        let plus_force = tokens
+            .iter()
+            .any(|t| t.strip_prefix('+').is_some_and(protected));
+        if flag_force || plus_force {
+            return Some("git push --force to a protected-looking ref");
+        }
     }
     // curl/wget piped into a shell executes unreviewed remote code.
     let mut saw_fetch = false;
@@ -895,17 +987,38 @@ pub fn write_playbook(paths: &Paths, body: &[String], journal: Option<&str>) -> 
     ok(crate::contract::LocalContract::new(paths).playbook_write(&body, journal)?)
 }
 
+/// Reassemble `looop run`'s trailing argv into the ONE shell string that
+/// run_shell hands to `bash -c`.
+///
+/// A SINGLE argument passes through VERBATIM: `looop run 'a && b'` is the
+/// documented way to run intentional shell syntax, and quoting it would
+/// neuter the operators. MULTIPLE arguments are an argv, so each element is
+/// shell-quoted (via the shared [`crate::util::shell_quote`]) before joining
+/// — the old plain `join(" ")` lost the caller's quoting and re-split
+/// `looop run touch "file with spaces"` into four words instead of two.
+/// (A single element round-trips identically under either rule, so the two
+/// cases can never disagree on it.)
+fn shell_command_from_argv(words: &[String]) -> String {
+    match words {
+        [one] => one.clone(),
+        many => many
+            .iter()
+            .map(|w| crate::util::shell_quote(w))
+            .collect::<Vec<_>>()
+            .join(" "),
+    }
+}
+
 /// `looop run [--reason TEXT] <cmd…>` — one ad-hoc, REVERSIBLE shell command.
 /// The command is captured verbatim (its own `--flags` pass through), so
 /// `--reason`/`--journal` must precede it.
 ///
-/// LIMITATION: the command words are re-joined with single spaces
-/// (`args.cmd.join(" ")`), so the shell quoting of the ORIGINAL argv is lost —
-/// `looop run grep "a b" f` runs `grep a b f`. When spacing/quoting matters,
-/// pass the whole command as ONE quoted argument: `looop run 'grep "a b" f'`.
+/// QUOTING: see [`shell_command_from_argv`] — one argument is the literal
+/// shell string (operators intact); several arguments are treated as an argv
+/// whose word boundaries survive re-execution.
 pub fn cmd_run(paths: &Paths, args: &crate::cli::RunArgs) -> Result<ExitCode> {
     use crate::contract::Contract;
-    let cmd = args.cmd.join(" ");
+    let cmd = shell_command_from_argv(&args.cmd);
     if cmd.trim().is_empty() {
         eprintln!("usage: looop run [--reason TEXT] <cmd…>");
         return Ok(ExitCode::from(1));
@@ -1225,7 +1338,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            !p.action_wal().exists(),
+            p.action_wals().is_empty(),
             "the write-ahead intent is cleared once execute returns"
         );
         assert!(!warn_if_interrupted(&p), "no interrupted action to report");
@@ -1252,19 +1365,20 @@ mod tests {
         let p = Paths::temp();
         // A YOUNG intent may belong to a LIVE actor (a manual `looop run`
         // mid-run_shell) — it must be left alone, not eaten every beat.
-        begin_intent(
+        let young = begin_intent(
             &p,
             &Action::RunShell {
                 cmd: "gh pr comment 1 -b hi".into(),
                 reason: String::new(),
             },
         );
-        assert!(p.action_wal().exists(), "intent written before the effect");
+        assert_eq!(p.action_wals().len(), 1, "intent written before the effect");
         assert!(
             !warn_if_interrupted(&p),
             "a young WAL may be a live actor's — not reported"
         );
-        assert!(p.action_wal().exists(), "a young WAL is left alone");
+        assert_eq!(p.action_wals().len(), 1, "a young WAL is left alone");
+        clear_intent(&p, &young);
         // An OLD intent (past the shell deadline + slack) is a crash corpse:
         // reported once and consumed.
         let old = serde_json::json!({
@@ -1274,14 +1388,32 @@ mod tests {
         })
         .to_string();
         FileStore::new(&p)
-            .write_atomic(&Key::ActionWal, &old)
+            .write_atomic(&Key::ActionWal("999-0".into()), &old)
             .unwrap();
         assert!(
             warn_if_interrupted(&p),
             "a leftover intent is reported as an interrupted beat"
         );
-        assert!(!p.action_wal().exists(), "the report is one-shot");
+        assert!(p.action_wals().is_empty(), "the report is one-shot");
         assert!(!warn_if_interrupted(&p));
+    }
+
+    #[test]
+    fn legacy_single_file_wal_is_still_reported_after_upgrade() {
+        // A pre-per-actor binary that crashed mid run_shell left the old
+        // single-key `.action-wal.json`. The scan must still find, report,
+        // and consume it — an upgrade must not lose a pending crash report.
+        let _env = crate::util::test_env_lock();
+        let p = Paths::temp();
+        let old = serde_json::json!({
+            "kind": "run_shell",
+            "fingerprint": "fp-legacy",
+            "ts": crate::util::now_unix() - (shell_timeout_secs() + 61),
+        })
+        .to_string();
+        crate::util::write_atomic(&p.data_dir.join(".action-wal.json"), old.as_bytes()).unwrap();
+        assert!(warn_if_interrupted(&p), "the legacy corpse is reported");
+        assert!(p.action_wals().is_empty(), "…and consumed one-shot");
     }
 
     #[test]
@@ -1295,17 +1427,25 @@ mod tests {
             cmd: "echo theirs".into(),
             reason: String::new(),
         };
-        // A concurrent actor's WAL must survive OUR clear…
-        let our_body = begin_intent(&p, &ours);
-        let their_body = begin_intent(&p, &theirs); // overwrites (single key)
-        clear_intent(&p, &our_body);
-        assert!(
-            p.action_wal().exists(),
+        // Regression (single-key WAL): a second actor's begin_intent used to
+        // OVERWRITE the first record, silently erasing its crash guard. With
+        // per-actor keys both records coexist…
+        let our_intent = begin_intent(&p, &ours);
+        let their_intent = begin_intent(&p, &theirs);
+        assert_eq!(
+            p.action_wals().len(),
+            2,
+            "concurrent actors' intents coexist — no clobbering"
+        );
+        // …and OUR clear removes only our own record.
+        clear_intent(&p, &our_intent);
+        assert_eq!(
+            p.action_wals().len(),
+            1,
             "another actor's intent must not be cleared"
         );
-        // …while the record we actually wrote is cleared normally.
-        clear_intent(&p, &their_body);
-        assert!(!p.action_wal().exists(), "our own intent is cleared");
+        clear_intent(&p, &their_intent);
+        assert!(p.action_wals().is_empty(), "our own intent is cleared");
     }
 
     #[test]
@@ -1349,6 +1489,76 @@ mod tests {
     }
 
     #[test]
+    fn shell_command_from_argv_quotes_multi_arg_and_passes_single_through() {
+        // MULTI-ARG: each element is quoted, so word boundaries survive — the
+        // old join(" ") re-split "file with spaces" into three words.
+        let multi = shell_command_from_argv(&["touch".into(), "file with spaces".into()]);
+        assert_eq!(multi, "'touch' 'file with spaces'");
+        // Round-trip through a real shell: exactly TWO words come out.
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("count() {{ echo $#; }}; count {multi}"))
+            .output()
+            .unwrap();
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "2");
+
+        // SINGLE-ARG: verbatim pass-through keeps intentional shell syntax
+        // (`looop run 'a && b'`) — quoting it would neuter the operators.
+        assert_eq!(
+            shell_command_from_argv(&["echo a && echo b".into()]),
+            "echo a && echo b"
+        );
+    }
+
+    #[test]
+    fn wal_corpse_judgment_uses_the_recorded_timeout() {
+        // The knob the record was WRITTEN under governs — not the current env.
+        // No env mutation needed: both cases below discriminate the recorded
+        // value from any plausible current knob.
+        let p = Paths::temp();
+        // Recorded timeout HUGE, age 400s: the current default (300s) would
+        // judge this a corpse (400 > 300+60), but the writer's own deadline
+        // says it may still be live — left alone.
+        let young_under_recorded = serde_json::json!({
+            "kind": "run_shell",
+            "fingerprint": "fp-recorded",
+            "ts": crate::util::now_unix() - 400,
+            "shell_timeout_secs": 1_000_000u64,
+        })
+        .to_string();
+        FileStore::new(&p)
+            .write_atomic(&Key::ActionWal("111-0".into()), &young_under_recorded)
+            .unwrap();
+        assert!(
+            !warn_if_interrupted(&p),
+            "the recorded (large) timeout wins over the current knob"
+        );
+        assert_eq!(p.action_wals().len(), 1, "the possibly-live record is kept");
+
+        // Recorded timeout TINY, same age: unambiguously a corpse under the
+        // writer's deadline even though a big current knob would call it young.
+        let corpse_under_recorded = serde_json::json!({
+            "kind": "run_shell",
+            "fingerprint": "fp-corpse",
+            "ts": crate::util::now_unix() - 400,
+            "shell_timeout_secs": 1u64,
+        })
+        .to_string();
+        FileStore::new(&p)
+            .write_atomic(&Key::ActionWal("222-0".into()), &corpse_under_recorded)
+            .unwrap();
+        assert!(
+            warn_if_interrupted(&p),
+            "the recorded (tiny) timeout judges the corpse regardless of the env"
+        );
+        assert_eq!(
+            p.action_wals().len(),
+            1,
+            "only the corpse is consumed — the live record survives the scan"
+        );
+    }
+
+    #[test]
     fn fingerprint_is_stable_and_payload_sensitive() {
         let a = Action::RunShell {
             cmd: "echo a".into(),
@@ -1386,6 +1596,11 @@ mod tests {
             "true && sudo make install", // command position after a separator
             "echo done; reboot",         // …including one glued onto the word
             "env FOO=1 sudo id",         // …and after wrappers / assignments
+            "rm -r -f /",                // r and f split across tokens
+            "rm --recursive --force /",  // long-flag spelling
+            "rm -rf --preserve-root /",  // extra long flag between flags and target
+            "git push origin +main",     // `+refspec` per-ref force, no --force flag
+            "git push origin +head:master", // …including a src:dst refspec
         ] {
             assert!(denied_shell_pattern(cmd).is_some(), "must be denied: {cmd}");
         }
@@ -1408,6 +1623,11 @@ mod tests {
             "last reboot",                // reboot history, not a reboot
             "journalctl | grep shutdown", // shutdown as a grep pattern
             "dd if=/dev/sda of=/dev/null bs=1m count=1", // read benchmark: null sink
+            "rm -r ./build",              // recursive without force, safe target
+            "rm -r -f ./build",           // split flags, but a benign target
+            "rm --recursive --force target", // long flags, benign target
+            "git push origin main",       // plain push, no force of any spelling
+            "git push origin +feature-branch", // +refspec to a non-protected ref
         ] {
             assert!(
                 denied_shell_pattern(cmd).is_none(),
@@ -1501,14 +1721,15 @@ mod tests {
         })
         .to_string();
         FileStore::new(&p)
-            .write_atomic(&Key::ActionWal, &old)
+            .write_atomic(&Key::ActionWal("333-0".into()), &old)
             .unwrap();
         assert!(
             !warn_if_interrupted(&p),
             "with no shell deadline, no WAL age is unambiguously a corpse"
         );
-        assert!(
-            p.action_wal().exists(),
+        assert_eq!(
+            p.action_wals().len(),
+            1,
             "the record is left alone for the (possibly live) holder"
         );
     }

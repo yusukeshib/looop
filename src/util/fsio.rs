@@ -9,6 +9,12 @@ use std::path::{Path, PathBuf};
 /// a stale lock to reclaim and no PID-liveness guessing. This is the ONE
 /// extern-"C" flock declaration — `store.rs` (per-directory writer lock) and
 /// `run.rs` (single-instance pulse lock) both route through it.
+///
+/// EINTR: a blocking `flock(LOCK_EX)` can be interrupted by any signal the
+/// process receives (SIGCHLD from a reaped worker is routine here). Without a
+/// retry, that spurious interruption would surface as a lock-acquisition
+/// FAILURE and fail an otherwise-fine `write_atomic`/`claim` — so interrupted
+/// waits are retried until the lock is actually held or a real error occurs.
 #[cfg(unix)]
 pub(crate) fn flock_file(f: &std::fs::File, block: bool) -> bool {
     use std::os::unix::io::AsRawFd;
@@ -18,7 +24,16 @@ pub(crate) fn flock_file(f: &std::fs::File, block: bool) -> bool {
         fn flock(fd: i32, op: i32) -> i32;
     }
     let op = if block { LOCK_EX } else { LOCK_EX | LOCK_NB };
-    unsafe { flock(f.as_raw_fd(), op) == 0 }
+    loop {
+        if unsafe { flock(f.as_raw_fd(), op) } == 0 {
+            return true;
+        }
+        // Retry only the signal-interrupted case; every other errno (EWOULDBLOCK
+        // for the non-blocking path, EBADF, …) is a genuine "not acquired".
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return false;
+        }
+    }
 }
 #[cfg(not(unix))]
 pub(crate) fn flock_file(_f: &std::fs::File, _block: bool) -> bool {

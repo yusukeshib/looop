@@ -49,8 +49,10 @@ pub enum Key {
     Sensor(String),
     /// The per-goal "last acted" ledger that drives `sys-goals` fairness.
     GoalActivity,
-    /// Write-ahead intent log for the in-flight non-idempotent action.
-    ActionWal,
+    /// Write-ahead intent record for ONE actor's in-flight non-idempotent
+    /// action (`.action-wal.<actor>.json`; actor = pid-nonce, so concurrent
+    /// actors can never clobber each other's crash guard).
+    ActionWal(String),
     /// A durable time trigger (`schedules/<name>.json`) — one-shot or recurring.
     Schedule(String),
     /// A steering message for a running worker (`tells/<id>.json`).
@@ -88,8 +90,16 @@ pub trait StateStore {
     /// The stored contents of `key`, or `None` if absent.
     fn read(&self, key: &Key) -> Option<String>;
 
-    /// Whether `key` currently exists.
-    fn exists(&self, key: &Key) -> bool;
+    /// Whether `key` currently exists, distinguishing a definitive answer from
+    /// a backend failure: `Ok(false)` ONLY on proven absence (NotFound); any
+    /// other stat error (EACCES, EIO, …) is `Err`. The same discipline
+    /// `create_exclusive` applies internally (fs::metadata, not
+    /// `Path::exists()`), exposed so callers can tell "absent" from "could
+    /// not look". There is deliberately NO error-squashing `exists()`
+    /// convenience: a caller that makes a NEGATIVE decision from absence
+    /// ("no pending ask", "the record vanished") would read a transient
+    /// EACCES/EIO as "gone" and produce a wrong, destructive verdict.
+    fn exists_checked(&self, key: &Key) -> io::Result<bool>;
 
     /// Durably replace `key` with `contents`, atomically — a concurrent reader
     /// never observes a half-written value (FileStore: temp -> fsync -> rename).
@@ -119,6 +129,12 @@ pub trait StateStore {
     fn archive(&self, key: &Key) -> io::Result<()>;
 
     /// Remove `key`. Absent key is not an error (idempotent).
+    ///
+    /// UNCONDITIONAL and LOCK-FREE — deliberately OUTSIDE the serialization
+    /// contract of `write_atomic` / `create_exclusive` / `remove_if_eq`: it
+    /// offers none of the compare-and-delete guarantees and may destroy a
+    /// value published concurrently. Callers that decide "delete" from an
+    /// earlier read must use [`StateStore::remove_if_eq`] instead.
     fn remove(&self, key: &Key) -> io::Result<()>;
 
     /// COMPARE-AND-DELETE: remove `key` ONLY IF its current contents still
@@ -187,19 +203,66 @@ impl<'a> FileStore<'a> {
     }
 
     /// Map a logical key to its backing file.
+    ///
+    /// CHOKE POINT for the id → file-name conversion: every verb validates its
+    /// ids with `util::safe_segment` at the boundary, but path() is the single
+    /// place an id actually BECOMES a path segment, so it re-checks here — N
+    /// call-site checks can drift; this one cannot. The check is TRAVERSAL-only
+    /// (empty, `..`, `/`, `\`, NUL), in debug and release alike: stems scanned
+    /// back from disk by `list()` — and files a foreign tool dropped into a
+    /// collection dir — may legally violate the HYGIENE-only rules (dots,
+    /// whitespace, control chars), and those must stay readable so the reading
+    /// layers can address/escape them (the prompt escapes exotic goal ids
+    /// rather than pretending they don't exist). Full hygiene remains the
+    /// verbs' boundary duty via `safe_segment`; but building a path that
+    /// ESCAPES the collection directory is never acceptable, so that panics
+    /// with a clear message instead of touching the filesystem outside the
+    /// data dir.
     fn path(&self, key: &Key) -> std::path::PathBuf {
+        fn checked<'i>(kind: &str, id: &'i str) -> &'i str {
+            if id.is_empty()
+                || id == ".."
+                || id.contains('/')
+                || id.contains('\\')
+                || id.contains('\0')
+            {
+                panic!("FileStore::path: {kind} {id:?} would escape its collection directory");
+            }
+            id
+        }
         match key {
-            Key::Ask(id) => self.paths.asks_dir().join(format!("{id}.json")),
-            Key::Answer(id) => self.paths.answers_dir().join(format!("{id}.json")),
-            Key::Claim(name) => self.paths.claims_dir().join(format!("{name}.json")),
-            Key::Goal(id) => self.paths.goals_dir().join(format!("{id}.md")),
+            Key::Ask(id) => self
+                .paths
+                .asks_dir()
+                .join(format!("{}.json", checked("ask id", id))),
+            Key::Answer(id) => self
+                .paths
+                .answers_dir()
+                .join(format!("{}.json", checked("ask id", id))),
+            Key::Claim(name) => self
+                .paths
+                .claims_dir()
+                .join(format!("{}.json", checked("claim name", name))),
+            Key::Goal(id) => self
+                .paths
+                .goals_dir()
+                .join(format!("{}.md", checked("goal id", id))),
             Key::Playbook => self.paths.playbook(),
             Key::Journal => self.paths.journal(),
-            Key::Sensor(name) => self.paths.sensors_dir().join(format!("{name}.sh")),
+            Key::Sensor(name) => self
+                .paths
+                .sensors_dir()
+                .join(format!("{}.sh", checked("sensor name", name))),
             Key::GoalActivity => self.paths.goal_activity(),
-            Key::ActionWal => self.paths.action_wal(),
-            Key::Schedule(name) => self.paths.schedules_dir().join(format!("{name}.json")),
-            Key::Tell(id) => self.paths.tells_dir().join(format!("{id}.json")),
+            Key::ActionWal(actor) => self.paths.action_wal(checked("wal actor", actor)),
+            Key::Schedule(name) => self
+                .paths
+                .schedules_dir()
+                .join(format!("{}.json", checked("schedule name", name))),
+            Key::Tell(id) => self
+                .paths
+                .tells_dir()
+                .join(format!("{}.json", checked("tell id", id))),
         }
     }
 
@@ -235,6 +298,33 @@ fn sync_parent_dir(_path: &std::path::Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Best-effort ONE-GENERATION size rotation for an append-only log: when
+/// `path` is past `max_bytes` (0 = capping off), rename it to `<name>.1`
+/// (replacing any previous `.1`) so the live file stays bounded. Shared by
+/// the journal ([`StateStore::append_line`]) and `events.jsonl`
+/// (`events::emit`) — the discipline is identical in both and must never
+/// drift: serialize ONLY the size-check + rename with a NON-blocking flock on
+/// a sibling `.<name>.rotlock` file (kernel-managed — a crash never leaves a
+/// stale lock; contended ⇒ skip, the next append past the cap retries), and
+/// keep the append itself lock-free. All-ignore on purpose: rotation must
+/// never fail (or even slow) a write.
+pub(crate) fn rotate_at_cap(path: &std::path::Path, max_bytes: u64) {
+    let Some(name) = path.file_name().map(|s| s.to_string_lossy().to_string()) else {
+        return;
+    };
+    if max_bytes > 0
+        && let Ok(lock) = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path.with_file_name(format!(".{name}.rotlock")))
+        && crate::util::flock_file(&lock, false)
+        && fs::metadata(path).is_ok_and(|m| m.len() > max_bytes)
+    {
+        let _ = fs::rename(path, path.with_file_name(format!("{name}.1")));
+    }
+}
+
 impl StateStore for FileStore<'_> {
     fn read(&self, key: &Key) -> Option<String> {
         let path = self.path(key);
@@ -253,8 +343,16 @@ impl StateStore for FileStore<'_> {
         }
     }
 
-    fn exists(&self, key: &Key) -> bool {
-        self.path(key).is_file()
+    fn exists_checked(&self, key: &Key) -> io::Result<bool> {
+        // fs::metadata, NOT Path::exists()/is_file(): those map EVERY stat
+        // error (EACCES, EIO, …) to false — the same squash create_exclusive
+        // documents — hiding failures from callers that must tell absence
+        // from "could not look". Only a definitive NotFound is Ok(false).
+        match fs::metadata(self.path(key)) {
+            Ok(m) => Ok(m.is_file()),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     fn write_atomic(&self, key: &Key, contents: &str) -> io::Result<()> {
@@ -346,27 +444,12 @@ impl StateStore for FileStore<'_> {
         // journal.md gets the same one-generation size cap events.jsonl has
         // (`LOOOP_JOURNAL_MAX_BYTES`, default 5 MiB, 0 = off): the journal is
         // append-only with no other pruning, so without a cap it grows without
-        // bound. Same discipline as events.rs emit(): serialize ONLY the
-        // size-check + rename with a NON-blocking flock on a sibling lock file
-        // (kernel-managed — a crash never leaves a stale lock; contended ⇒
-        // skip, the next append past the cap retries), and keep the append
-        // itself lock-free. Best-effort: rotation must never fail a write.
+        // bound. The mechanics (non-blocking flock + rename, best-effort) are
+        // shared with events.rs in [`rotate_at_cap`].
         if matches!(key, Key::Journal) {
             let max_bytes: u64 =
                 crate::util::env_knob("LOOOP_JOURNAL_MAX_BYTES").unwrap_or(5 * 1024 * 1024);
-            let name = path.file_name().map(|s| s.to_string_lossy().to_string());
-            if max_bytes > 0
-                && let Some(name) = name
-                && let Ok(lock) = fs::OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .write(true)
-                    .open(path.with_file_name(format!(".{name}.rotlock")))
-                && crate::util::flock_file(&lock, false)
-                && fs::metadata(&path).is_ok_and(|m| m.len() > max_bytes)
-            {
-                let _ = fs::rename(&path, path.with_file_name(format!("{name}.1")));
-            }
+            rotate_at_cap(&path, max_bytes);
         }
         let mut f = fs::OpenOptions::new()
             .create(true)
@@ -402,7 +485,20 @@ impl StateStore for FileStore<'_> {
             let _lock = DirLock::acquire(live_dir)?;
             let mut to = dir.join(format!("{stem}.{ext}"));
             let mut n = 1;
-            while to.exists() {
+            loop {
+                match fs::metadata(&to) {
+                    // fs::metadata, NOT to.exists(): exists() maps every stat
+                    // error (EACCES, EIO, …) to "absent", which would let the
+                    // rename below OVERWRITE an archived record we merely
+                    // failed to see. Only a definitive NotFound frees a slot.
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => break,
+                    // Occupied — probe the next suffix.
+                    Ok(_) => {}
+                    // A stat failure would repeat for EVERY probe (the whole
+                    // dir is unreadable, not one slot) — surface it instead of
+                    // scanning forever or treating a slot as free.
+                    Err(e) => return Err(e),
+                }
                 to = dir.join(format!("{stem}-{n}.{ext}"));
                 n += 1;
             }
@@ -424,6 +520,14 @@ impl StateStore for FileStore<'_> {
         }
     }
 
+    /// UNCONDITIONAL remove — LOCK-FREE, and deliberately OUTSIDE the
+    /// write_atomic / create_exclusive / remove_if_eq serialization contract:
+    /// it takes no DirLock, so it provides NONE of the compare-and-delete
+    /// guarantees. A remove() racing a concurrent writer can delete a value
+    /// it never inspected (including one freshly published). Use it only
+    /// where destroying ANY current value is the intent (discard_tells, test
+    /// teardown); anything that decides "delete" from an earlier read must go
+    /// through remove_if_eq instead.
     fn remove(&self, key: &Key) -> io::Result<()> {
         match fs::remove_file(self.path(key)) {
             Ok(()) => Ok(()),
@@ -466,9 +570,23 @@ impl StateStore for FileStore<'_> {
 
     fn list(&self, collection: &Collection) -> Vec<String> {
         let ext = collection.ext();
-        let mut names: Vec<String> = fs::read_dir(self.dir(collection))
-            .into_iter()
-            .flatten()
+        let dir = self.dir(collection);
+        let entries = match fs::read_dir(&dir) {
+            Ok(it) => it,
+            // A collection dir that was never created IS an empty collection.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Vec::new(),
+            // A non-NotFound error (EACCES, EIO, …) is NOT emptiness — an
+            // "empty" answer here falsely settles wake signals (sys_asks,
+            // sys_claims) built on these listings. The Vec return type stays
+            // (mirrors read()'s Option — a trait-wide Result refactor isn't
+            // worth it), but the real cause must surface: one stderr line
+            // naming directory and error, same discipline as read().
+            Err(e) => {
+                eprintln!("looop: list {}: {e} — treating as empty", dir.display());
+                return Vec::new();
+            }
+        };
+        let mut names: Vec<String> = entries
             .flatten()
             .map(|e| e.path())
             .filter(|p| p.extension().is_some_and(|x| x == ext))
@@ -477,6 +595,59 @@ impl StateStore for FileStore<'_> {
         names.sort();
         names
     }
+}
+
+/// Restores an env var to its pre-test value on drop (panic-safe). Shared
+/// test helper: env-mutating tests in mailbox.rs and paths.rs import it from
+/// here instead of each keeping a drifting copy (`util::test_env_lock` — the
+/// guard every user of this must also hold — lives in util, but util keeps
+/// its module surface minimal, so the struct lives next to the store tests
+/// that first needed it).
+#[cfg(test)]
+pub(crate) struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+#[cfg(test)]
+impl EnvRestore {
+    pub(crate) fn set(key: &'static str, value: &str) -> Self {
+        let prev = std::env::var_os(key);
+        unsafe { std::env::set_var(key, value) };
+        EnvRestore(key, prev)
+    }
+}
+#[cfg(test)]
+impl Drop for EnvRestore {
+    fn drop(&mut self) {
+        match &self.1 {
+            Some(v) => unsafe { std::env::set_var(self.0, v) },
+            None => unsafe { std::env::remove_var(self.0) },
+        }
+    }
+}
+
+/// Restores a directory's mode to 0o755 on drop — the teardown half of
+/// [`deny_access`], so a panicking assert never strands an unreadable temp
+/// dir (which would break the temp-dir cleanup).
+#[cfg(all(test, unix))]
+pub(crate) struct AccessRestore(std::path::PathBuf);
+#[cfg(all(test, unix))]
+impl Drop for AccessRestore {
+    fn drop(&mut self) {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o755));
+    }
+}
+
+/// Make `dir` unsearchable (mode 000) and report whether the kernel actually
+/// enforces it — root (some CI containers) bypasses permission checks, in
+/// which case the caller should skip its assertions. Returns the guard that
+/// restores the mode on drop. Shared test helper (mailbox.rs's error-path
+/// tests import it), kept next to [`EnvRestore`] for the same
+/// no-drifting-copies reason.
+#[cfg(all(test, unix))]
+pub(crate) fn deny_access(dir: std::path::PathBuf) -> (bool, AccessRestore) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+    let enforced = fs::read_dir(&dir).is_err();
+    (enforced, AccessRestore(dir))
 }
 
 #[cfg(test)]
@@ -488,12 +659,12 @@ mod tests {
         let p = Paths::temp();
         let s = FileStore::new(&p);
         let k = Key::Ask("w-1".into());
-        assert!(!s.exists(&k));
+        assert!(!s.exists_checked(&k).unwrap());
         s.write_atomic(&k, "hello").unwrap();
-        assert!(s.exists(&k));
+        assert!(s.exists_checked(&k).unwrap());
         assert_eq!(s.read(&k).as_deref(), Some("hello"));
         s.remove(&k).unwrap();
-        assert!(!s.exists(&k));
+        assert!(!s.exists_checked(&k).unwrap());
         // Removing an absent key is a no-op success.
         s.remove(&k).unwrap();
     }
@@ -545,7 +716,7 @@ mod tests {
         assert_eq!(s.read(&k).as_deref(), Some("fresh"), "fresh lease survives");
         // Matching contents: the delete wins and the key is gone.
         assert!(s.remove_if_eq(&k, "fresh").unwrap());
-        assert!(!s.exists(&k));
+        assert!(!s.exists_checked(&k).unwrap());
         // Already-absent key: gone ⇒ Ok(true) (idempotent for reapers).
         assert!(s.remove_if_eq(&k, "anything").unwrap());
     }
@@ -678,24 +849,6 @@ mod tests {
         );
     }
 
-    /// Restores an env var to its pre-test value on drop (panic-safe).
-    struct EnvRestore(&'static str, Option<std::ffi::OsString>);
-    impl EnvRestore {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            EnvRestore(key, prev)
-        }
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            match &self.1 {
-                Some(v) => unsafe { std::env::set_var(self.0, v) },
-                None => unsafe { std::env::remove_var(self.0) },
-            }
-        }
-    }
-
     #[test]
     fn journal_rotates_one_generation_at_the_size_cap() {
         // set_var is process-global: serialize against other env-mutating
@@ -741,5 +894,95 @@ mod tests {
         s.write_atomic(&Key::Claim("b".into()), "{}").unwrap();
         s.write_atomic(&Key::Claim("a".into()), "{}").unwrap();
         assert_eq!(s.list(&Collection::Claims), vec!["a", "b"]);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn exists_checked_distinguishes_absence_from_stat_failure() {
+        // Regression: exists() squashes EVERY stat error to "absent", which
+        // let callers turn a transient EACCES/EIO into a destructive verdict
+        // ("no pending ask", "the ask record vanished"). exists_checked must
+        // return Ok(false) ONLY on proven absence and Err otherwise.
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        let k = Key::Claim("repo".into());
+        assert!(matches!(s.exists_checked(&k), Ok(false)), "proven absence");
+        s.write_atomic(&k, "{}").unwrap();
+        assert!(matches!(s.exists_checked(&k), Ok(true)), "proven presence");
+        let (enforced, _restore) = deny_access(p.claims_dir());
+        if !enforced {
+            return; // running as root — permissions can't simulate EACCES
+        }
+        assert!(
+            s.exists_checked(&k).is_err(),
+            "a stat failure must surface as Err, never as absence"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn list_on_an_unreadable_dir_returns_empty_without_panicking() {
+        // The Vec-returning signature can't carry the error — the fix is the
+        // stderr warning (not assertable here) plus NOT crashing the beat.
+        // This pins the fallback behavior: unreadable ⇒ empty, and a restored
+        // dir lists normally again.
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        s.write_atomic(&Key::Claim("a".into()), "{}").unwrap();
+        {
+            let (enforced, _restore) = deny_access(p.claims_dir());
+            if !enforced {
+                return; // running as root — permissions can't simulate EACCES
+            }
+            assert!(s.list(&Collection::Claims).is_empty());
+        }
+        assert_eq!(s.list(&Collection::Claims), vec!["a"], "recovers after");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn archive_never_overwrites_when_the_suffix_probe_cannot_stat() {
+        // Regression: the suffix probe used `to.exists()`, so an EACCES on the
+        // archive dir read as "slot free" and the rename OVERWROTE an existing
+        // archived record. A stat failure must abort the archive (Err) and
+        // leave both the live and the archived record intact.
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        let k = Key::Goal("triage".into());
+        s.write_atomic(&k, "first body").unwrap();
+        s.archive(&k).unwrap();
+        s.write_atomic(&k, "second body").unwrap();
+        let arch = p.goals_dir().join("archive");
+        let (enforced, _restore) = deny_access(arch.clone());
+        if !enforced {
+            return; // running as root — permissions can't simulate EACCES
+        }
+        assert!(
+            s.archive(&k).is_err(),
+            "an unstattable archive dir must fail the archive, not clobber"
+        );
+        assert_eq!(
+            s.read(&k).as_deref(),
+            Some("second body"),
+            "the live record stays put on a failed archive"
+        );
+        drop(_restore);
+        assert_eq!(
+            fs::read_to_string(arch.join("triage.md")).unwrap(),
+            "first body",
+            "the previously archived record was never overwritten"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "ask id")]
+    fn path_is_a_choke_point_against_traversal_ids() {
+        // Regression: path() used to trust its N call sites to have run
+        // safe_segment; a single missed check let an id become a traversal-
+        // capable path. The choke point must refuse `..`/`/` ids even when a
+        // caller skips validation.
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        let _ = s.read(&Key::Ask("../evil".into()));
     }
 }

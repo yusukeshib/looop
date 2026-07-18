@@ -14,10 +14,6 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
-fn env_num(var: &str, default: u64) -> u64 {
-    crate::util::env_knob(var).unwrap_or(default)
-}
-
 /// Read up to the last `max` bytes of a file as a trimmed lossy string (the
 /// stderr tail surfaced to the decider on a sensor failure). Empty when absent.
 fn read_tail(path: &Path, max: usize) -> String {
@@ -39,7 +35,7 @@ fn read_tail(path: &Path, max: usize) -> String {
 /// (negative-pid kill) so even helpers the script forked die with it — the
 /// "a hung sensor can't freeze the beat" guarantee holds on every platform.
 fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
-    let to = env_num("LOOOP_SENSOR_TIMEOUT", 60);
+    let to: u64 = crate::util::env_knob("LOOOP_SENSOR_TIMEOUT").unwrap_or(60);
 
     // The child's stdout streams into a TEMP file (`<name>.json.tmp`, same
     // dir so the final rename is same-filesystem atomic) and is PUBLISHED to
@@ -183,7 +179,7 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
     // rides in .detail — with it in the (implicit) signal, every fluctuation of
     // an oversized blob's size moved the world hash and re-woke the loop each
     // beat (self-inflicted flapping that defeats the unchanged-world skip).
-    let cap = env_num("LOOOP_SENSOR_MAX_BYTES", 8192);
+    let cap: u64 = crate::util::env_knob("LOOOP_SENSOR_MAX_BYTES").unwrap_or(8192);
     if cap != 0
         && let Ok(meta) = fs::metadata(&tmp)
     {
@@ -427,7 +423,7 @@ pub(crate) struct WorkerHealth {
 
 /// The whole fleet's health, sorted by id (order-stable for the wake hash).
 pub(crate) fn fleet_health(paths: &Paths) -> Vec<WorkerHealth> {
-    let stuck_after = env_num("LOOOP_WORKER_STUCK_SECS", 900);
+    let stuck_after: u64 = crate::util::env_knob("LOOOP_WORKER_STUCK_SECS").unwrap_or(900);
     let pending = crate::mailbox::pending(paths);
     let mut workers = session::list_workers(paths);
     workers.sort_by(|a, b| a.id.cmp(&b.id));

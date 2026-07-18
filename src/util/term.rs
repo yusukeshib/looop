@@ -83,13 +83,17 @@ pub fn clip_ansi(s: &str, max: usize) -> String {
             // literal text or inject terminal-control sequences.
             match chars.next() {
                 Some('[') => {
-                    // CSI: scan to the final byte (an ASCII letter); keep the
-                    // sequence only if it is SGR (`m`).
+                    // CSI: scan to the final byte — per ECMA-48 the final byte
+                    // of a CSI sequence is any of 0x40–0x7E (`@`…`~`), NOT just
+                    // ASCII letters (e.g. delete-char `ESC [ 3 ~` ends in `~`).
+                    // Stopping only at letters would scan past `~` and swallow
+                    // the following visible text. Keep the sequence only if it
+                    // is SGR (`m`).
                     let mut seq = String::from("\x1b[");
                     let mut final_byte = None;
                     for c2 in chars.by_ref() {
                         seq.push(c2);
-                        if c2.is_ascii_alphabetic() {
+                        if matches!(c2 as u32, 0x40..=0x7e) {
                             final_byte = Some(c2);
                             break;
                         }
@@ -212,33 +216,9 @@ impl Drop for Spinner {
     }
 }
 
-/// Sleep `secs`, showing a live one-line COUNTDOWN on the pulse's PTY stdout
-/// (`[HH:MM:SS] next beat in Ns (<suffix>)`) that repaints each second and is
-/// erased when it reaches zero, so the next beat prints clean — the idle-wait
-/// counterpart of [`Spinner`]. A no-op decoration unless color (ANSI) is on:
-/// JSON / `NO_COLOR` / non-PTY streams just sleep silently (their structured
-/// `sleep` event is emitted separately), never seeing stray carriage returns.
-pub fn sleep_countdown(secs: u64, suffix: &str) {
-    if !color_on() {
-        std::thread::sleep(std::time::Duration::from_secs(secs));
-        return;
-    }
-    // Freeze the timestamp at the start (like the spinner) so the line reads as
-    // "the beat logged at [ts], next one in Ns".
-    let ts = super::hms();
-    for remaining in (1..=secs).rev() {
-        // CR + clear-to-EOL so a shrinking count (60s → 9s) leaves no stale digit.
-        print!(
-            "\r\x1b[2K{}[{ts}] next beat in {remaining}s ({suffix}){}",
-            dim(),
-            rst()
-        );
-        let _ = std::io::Write::flush(&mut std::io::stdout());
-        std::thread::sleep(std::time::Duration::from_secs(1));
-    }
-    print!("\r\x1b[2K");
-    let _ = std::io::Write::flush(&mut std::io::stdout());
-}
+// NB: the pulse's idle-wait countdown used to live here as `sleep_countdown`;
+// it moved to `run::sleep_wake_aware`, which re-checks the wake deadline each
+// second (a plain fixed-duration countdown could not be shortened mid-sleep).
 
 #[cfg(test)]
 mod tests {
@@ -268,6 +248,10 @@ mod tests {
         assert_eq!(clip_ansi("\x1b[31mred\x1b[0m", 6), "\x1b[31mred\x1b[0m");
         // A non-SGR CSI (erase-line `ESC [ 2 K`) is dropped, not copied.
         assert_eq!(clip_ansi("\x1b[2Khello", 5), "hello");
+        // A CSI with a NON-ALPHABETIC final byte (0x40–0x7E per ECMA-48, e.g.
+        // delete-char `ESC [ 3 ~`) terminates at `~` and must not swallow the
+        // visible text after it.
+        assert_eq!(clip_ansi("\x1b[3~text", 4), "text");
         // An OSC sequence (set-title `ESC ] 0 ; t BEL`) is dropped and does
         // NOT swallow the text after it.
         assert_eq!(clip_ansi("\x1b]0;t\x07hi", 2), "hi");

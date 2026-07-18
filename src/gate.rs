@@ -170,8 +170,12 @@ pub(crate) fn unclaim(paths: &Paths, name: &str, session: Option<&str>) -> Resul
     Ok(false)
 }
 
-/// Reap claims/<name>.json whose `.session` is no longer alive. Never interprets
-/// the claim body — ownership semantics live in the PLAYBOOK.
+/// Reap claims/<name>.json whose `.session` is no longer alive. The reaper
+/// reads exactly ONE field of the claim body — `.session`, the liveness
+/// anchor (via [`holder_of`]; an unparseable body reads as an empty holder
+/// and is therefore treated as stale once past the empty-claim grace
+/// handling below). Everything else in the body is opaque here — ownership
+/// SEMANTICS (what a claim means, who should hold it) live in the PLAYBOOK.
 pub fn reap_stale_claims(paths: &Paths) {
     let store = FileStore::new(paths);
     let alive: Vec<String> = session::list(paths)

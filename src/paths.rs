@@ -94,7 +94,19 @@ impl Paths {
         // including the default one — is therefore self-contained, so session
         // ids never need a `looop-` prefix to be disambiguated from anything
         // else in a shared root.
-        let default_profile = data_dir == default_data;
+        //
+        // default_profile is a DISPLAY-ONLY hint (whether shell hints need an
+        // explicit `LOOOP_DATA_DIR=`), so this comparison only has to be
+        // best-effort: canonicalize both sides when possible so a symlinked
+        // spelling of the default dir still counts as the default profile;
+        // when either does not exist yet (fresh install — canonicalize
+        // requires the path to exist), fall back to the plain string compare.
+        // A wrong verdict here is cosmetic (a redundant LOOOP_DATA_DIR= in a
+        // hint), never behavioral.
+        let default_profile = match (data_dir.canonicalize(), default_data.canonicalize()) {
+            (Ok(a), Ok(b)) => a == b,
+            _ => data_dir == default_data,
+        };
 
         Paths {
             bin,
@@ -162,12 +174,34 @@ impl Paths {
     pub fn goal_activity(&self) -> PathBuf {
         self.data_dir.join(".goal-activity.json")
     }
-    /// Write-ahead intent log for the in-flight NON-IDEMPOTENT action
-    /// (run_shell). Written just before the side effect, removed just
-    /// after. A leftover file at beat start means the previous beat died mid
-    /// side-effect — surfaced so a half-run command isn't silently re-fired.
-    pub fn action_wal(&self) -> PathBuf {
-        self.data_dir.join(".action-wal.json")
+    /// Write-ahead intent record for ONE actor's in-flight NON-IDEMPOTENT
+    /// action (run_shell). Written just before the side effect, removed just
+    /// after. PER-ACTOR (`.action-wal.<actor>.json`, actor = pid-nonce): a
+    /// single shared file would let a concurrent manual `looop run` silently
+    /// OVERWRITE the pulse's record and erase its crash guard. A leftover file
+    /// at beat start means that actor died mid side-effect — surfaced so a
+    /// half-run command isn't silently re-fired.
+    pub fn action_wal(&self, actor: &str) -> PathBuf {
+        self.data_dir.join(format!(".action-wal.{actor}.json"))
+    }
+    /// Every surviving write-ahead intent record, any actor — including the
+    /// LEGACY single-file `.action-wal.json` a pre-per-actor binary may have
+    /// left behind after a crash (so an upgrade never loses a pending crash
+    /// report). Sorted for order-stable reporting.
+    pub fn action_wals(&self) -> Vec<PathBuf> {
+        let mut v: Vec<PathBuf> = std::fs::read_dir(&self.data_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(".action-wal") && n.ends_with(".json"))
+            })
+            .collect();
+        v.sort();
+        v
     }
     /// The previous beat's FAILURE record (`{ts,run_id,code,error}`), written on
     /// a failed decide and cleared on the next usable decision. Surfaced in the
@@ -277,5 +311,95 @@ impl Drop for Paths {
         if self.temp_cleanup {
             let _ = std::fs::remove_dir_all(&self.data_dir);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::EnvRestore;
+
+    #[test]
+    fn resolve_honors_absolute_env_overrides() {
+        // set_var is process-global: serialize against other env-mutating
+        // tests and restore every touched var even if an assert panics.
+        let _g = crate::util::test_env_lock();
+        let _d = EnvRestore::set("LOOOP_DATA_DIR", "/tmp/looop-test-profile");
+        let _c = EnvRestore::set("LOOOP_CONFIG", "/tmp/looop-test-wiring.json");
+        let p = Paths::resolve();
+        assert_eq!(p.data_dir, PathBuf::from("/tmp/looop-test-profile"));
+        assert_eq!(p.config, PathBuf::from("/tmp/looop-test-wiring.json"));
+        assert!(
+            !p.default_profile,
+            "an explicit LOOOP_DATA_DIR is not the default profile"
+        );
+    }
+
+    #[test]
+    fn resolve_absolutizes_a_relative_data_dir_against_the_cwd() {
+        // A relative LOOOP_DATA_DIR left as-is would give every process its
+        // OWN profile depending on cwd — resolve() must pin it once, here.
+        let _g = crate::util::test_env_lock();
+        let _d = EnvRestore::set("LOOOP_DATA_DIR", "rel-looop-profile");
+        // Empty ⇒ unset for resolve(): the config default derives from the
+        // (absolutized) data dir.
+        let _c = EnvRestore::set("LOOOP_CONFIG", "");
+        let p = Paths::resolve();
+        assert!(
+            p.data_dir.is_absolute(),
+            "relative LOOOP_DATA_DIR must be absolutized, got {}",
+            p.data_dir.display()
+        );
+        assert!(p.data_dir.ends_with("rel-looop-profile"));
+        assert_eq!(
+            p.data_dir,
+            std::env::current_dir().unwrap().join("rel-looop-profile"),
+            "absolutization is against the cwd"
+        );
+        assert_eq!(
+            p.config,
+            p.data_dir.join("config.json"),
+            "config defaults INSIDE the (absolutized) data dir"
+        );
+    }
+
+    #[test]
+    fn resolve_falls_back_to_the_xdg_default_when_unset() {
+        let _g = crate::util::test_env_lock();
+        let base = env::temp_dir().join(format!("looop-paths-xdg-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let _x = EnvRestore::set("XDG_STATE_HOME", base.to_str().unwrap());
+        // Empty ⇒ unset (resolve treats an empty override as absent).
+        let _d = EnvRestore::set("LOOOP_DATA_DIR", "");
+        let _c = EnvRestore::set("LOOOP_CONFIG", "");
+        let p = Paths::resolve();
+        assert_eq!(p.data_dir, base.join("looop"));
+        assert!(p.default_profile, "the XDG default IS the default profile");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn default_profile_sees_through_a_symlinked_data_dir() {
+        // Regression: default_profile was a plain string compare, so a
+        // symlinked spelling of the SAME default dir read as a custom
+        // profile. Display-only, but the hint should not lie when the paths
+        // provably coincide.
+        let _g = crate::util::test_env_lock();
+        let base = env::temp_dir().join(format!("looop-paths-link-{}", std::process::id()));
+        let real = base.join("state");
+        std::fs::create_dir_all(real.join("looop")).unwrap();
+        let link = base.join("state-link");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let _x = EnvRestore::set("XDG_STATE_HOME", real.to_str().unwrap());
+        let _d = EnvRestore::set("LOOOP_DATA_DIR", link.join("looop").to_str().unwrap());
+        let _c = EnvRestore::set("LOOOP_CONFIG", "");
+        let p = Paths::resolve();
+        assert!(
+            p.default_profile,
+            "a symlinked spelling of the default data dir is still the default profile"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

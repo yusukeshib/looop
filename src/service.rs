@@ -90,7 +90,8 @@ pub fn cmd_down(paths: &Paths) -> Result<ExitCode> {
         );
     }
 
-    if session::is_alive(paths, PULSE_SESSION) {
+    let was_alive = session::is_alive(paths, PULSE_SESSION);
+    if was_alive {
         let _ = session::kill_quiet(paths, PULSE_SESSION);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while session::is_alive(paths, PULSE_SESSION) && std::time::Instant::now() < deadline {
@@ -107,8 +108,22 @@ pub fn cmd_down(paths: &Paths) -> Result<ExitCode> {
     if session::status_exists(paths, PULSE_SESSION) {
         session::reap(paths, PULSE_SESSION);
     }
-    println!("looop: pulse stopped");
+    // Report what was OBSERVED, not assumed: "pulse stopped" only when there
+    // was a live pulse to stop — a `looop down` with nothing running used to
+    // claim a stop that never happened.
+    println!("{}", down_summary(was_alive));
     Ok(ExitCode::SUCCESS)
+}
+
+/// The `looop down` closing line, keyed on whether a live pulse was actually
+/// there to stop. A named fn (not an inline branch on a format string) so the
+/// drift-guard test below can pin BOTH messages against the clap tree.
+fn down_summary(was_alive: bool) -> &'static str {
+    if was_alive {
+        "looop: pulse stopped"
+    } else {
+        "looop: pulse not running"
+    }
 }
 
 /// `looop pulse` (internal) — the headless pulse body babysit wraps. It is the
@@ -122,7 +137,15 @@ pub fn cmd_pulse(paths: &Paths) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PULSE_NOT_OBSERVED_WARNING, PULSE_SURVIVED_WARNING};
+    use super::{PULSE_NOT_OBSERVED_WARNING, PULSE_SURVIVED_WARNING, down_summary};
+
+    /// `looop down` never claims a stop it didn't perform: with no live pulse
+    /// the summary is the observed "not running", not a fabricated "stopped".
+    #[test]
+    fn down_reports_not_running_when_nothing_was_stopped() {
+        assert_eq!(down_summary(true), "looop: pulse stopped");
+        assert_eq!(down_summary(false), "looop: pulse not running");
+    }
 
     /// Drift guard: every `looop <verb>` a user-facing message constant tells
     /// the user to run must be a REAL clap subcommand — a stale message once
@@ -131,7 +154,12 @@ mod tests {
     fn messages_reference_only_real_subcommands() {
         use clap::CommandFactory;
         let root = crate::cli::Cli::command();
-        for msg in [PULSE_SURVIVED_WARNING, PULSE_NOT_OBSERVED_WARNING] {
+        for msg in [
+            PULSE_SURVIVED_WARNING,
+            PULSE_NOT_OBSERVED_WARNING,
+            down_summary(true),
+            down_summary(false),
+        ] {
             let mut rest = msg;
             while let Some(i) = rest.find("looop ") {
                 let tail = &rest[i + "looop ".len()..];

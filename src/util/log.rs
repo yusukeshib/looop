@@ -168,15 +168,34 @@ pub fn env_knob<T: std::str::FromStr>(name: &str) -> Option<T> {
     match raw.trim().parse::<T>() {
         Ok(v) => Some(v),
         Err(_) => {
-            event(
-                Level::Warn,
-                "env.invalid",
-                &format!("ignoring {name}={raw:?} (not a valid number) — using the default"),
-                &[("var", serde_json::json!(name))],
-            );
+            // Once per key per process: env_knob is called on EVERY beat (poll
+            // intervals, size caps, TTLs), so an unconditional warning about
+            // the same dead override repeats forever — log spam that buries
+            // real signals. The bad value is durable for the process's whole
+            // life (it was set at spawn), so one line is the whole signal.
+            if warn_knob_once(name) {
+                event(
+                    Level::Warn,
+                    "env.invalid",
+                    &format!("ignoring {name}={raw:?} (not a valid number) — using the default"),
+                    &[("var", serde_json::json!(name))],
+                );
+            }
             None
         }
     }
+}
+
+/// True the FIRST time `name` is seen by this process — the dedup gate behind
+/// [`env_knob`]'s invalid-value warning. Separate + return-value-based so the
+/// once-only contract is directly testable without capturing stdout.
+fn warn_knob_once(name: &str) -> bool {
+    use std::sync::Mutex;
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(name.to_string())
 }
 
 #[cfg(test)]
@@ -203,6 +222,21 @@ mod tests {
         assert_eq!(v["msg"], "decided in 3s");
         assert_eq!(v["secs"], 3);
         assert_eq!(v["runner"], "claude");
+    }
+
+    #[test]
+    fn invalid_env_knob_warns_once_per_key_per_process() {
+        // Regression for log spam: the invalid-value warning used to fire on
+        // every env_knob call — i.e. every beat — for the same dead override.
+        assert!(warn_knob_once("LOOOP_TEST_KNOB_A"), "first sighting warns");
+        assert!(
+            !warn_knob_once("LOOOP_TEST_KNOB_A"),
+            "the same key must not warn again in this process"
+        );
+        assert!(
+            warn_knob_once("LOOOP_TEST_KNOB_B"),
+            "deduplication is per key, not global"
+        );
     }
 
     #[test]

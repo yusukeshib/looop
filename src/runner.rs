@@ -24,13 +24,9 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
-/// Single-quote `s` for safe interpolation into a `bash -c` script: close the
-/// quote, emit an escaped quote, reopen (`'\''` — the classic POSIX dance).
-/// Without this a prompt-file path containing spaces/quotes/`$` would be
-/// word-split or expanded by the shell.
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
+// Single-quoting for `bash -c` interpolation lives in `util::shell_quote`
+// (the ONE shared implementation — see its doc).
+use crate::util::shell_quote;
 
 /// Hard deadline for ONE tick runner invocation (seconds): the decide is an
 /// external LLM call, and a hung runner would otherwise stall the whole
@@ -200,6 +196,13 @@ pub fn run_streamed(
         }
     }
 
+    // A sink that OPENED fine can still fail per-write (disk full, quota) —
+    // and `let _ = writeln!` alone would drop the replay archive in silence.
+    // Warn ONCE per beat (not per line: a full disk would otherwise emit one
+    // warning per output line), same degraded-not-fatal discipline as the
+    // open failure above.
+    let mut tee_write_warned = false;
+
     // Read RAW bytes per line, then lossy-decode: read_line() would return
     // Err(InvalidData) on invalid UTF-8 (LLM CLIs can emit partial/garbage
     // bytes), and treating that as EOF would drop the reader mid-stream —
@@ -216,9 +219,11 @@ pub fn run_streamed(
                 // Archive only the rendered progress (what the old `_ fmt` pipe wrote).
                 if let Some(rendered) = fmt::format_line(line) {
                     let prefix = format!("{}[{}]{} ", util::dim(), util::hms(), util::rst());
-                    for f in &mut sinks {
-                        let _ = writeln!(f, "{prefix}{rendered}");
-                    }
+                    tee_line(
+                        &mut sinks,
+                        &mut tee_write_warned,
+                        &format!("{prefix}{rendered}"),
+                    );
                 }
             }
             Err(_) => break, // a real I/O error on the pipe, not bad UTF-8
@@ -285,9 +290,67 @@ pub fn run_streamed(
     }
 }
 
+/// Write one rendered line to every tee sink. The FIRST failed write flips
+/// `warned` and emits a single `tick.guard_degraded` event; subsequent
+/// failures stay silent (the flag is per-beat — run_streamed resets it by
+/// constructing a fresh one). Losing the replay archive is degraded, never
+/// fatal, but it must not be INVISIBLE: a disk-full beat that silently
+/// dropped every line stranded the operator exactly when a replay was needed.
+fn tee_line(sinks: &mut [File], warned: &mut bool, line: &str) {
+    for f in sinks.iter_mut() {
+        if writeln!(f, "{line}").is_err() && !*warned {
+            *warned = true;
+            util::event(
+                Level::Warn,
+                "tick.guard_degraded",
+                "a tee sink write failed (disk full?) — this beat's replay archive is \
+                 degraded; further tee write failures this beat are not repeated",
+                &[],
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tee_write_failure_warns_once_and_keeps_streaming() {
+        let dir = std::env::temp_dir().join(format!("looop-tee-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sink.log");
+        std::fs::write(&path, "").unwrap();
+        // A READ-ONLY handle: every write fails (EBADF), the portable stand-in
+        // for a disk-full sink.
+        let broken = File::open(&path).unwrap();
+        let mut sinks = vec![broken];
+        let mut warned = false;
+        tee_line(&mut sinks, &mut warned, "line one");
+        assert!(
+            warned,
+            "the first failed tee write flips the warn-once flag"
+        );
+        // Later lines keep flowing (no panic, no early return) and the flag
+        // guard keeps the warning from repeating — the old `let _ =` shape
+        // never warned at all.
+        tee_line(&mut sinks, &mut warned, "line two");
+        assert!(warned);
+
+        // A healthy sink never warns.
+        let good_path = dir.join("good.log");
+        let mut good = vec![File::create(&good_path).unwrap()];
+        let mut warned_good = false;
+        tee_line(&mut good, &mut warned_good, "payload");
+        assert!(!warned_good, "a successful write must not warn");
+        assert!(
+            std::fs::read_to_string(&good_path)
+                .unwrap()
+                .contains("payload"),
+            "the line actually landed in the sink"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn shell_quote_survives_spaces_quotes_and_dollars() {

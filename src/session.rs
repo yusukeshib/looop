@@ -10,11 +10,9 @@ use crate::seed;
 use anyhow::Result;
 use std::process::ExitCode;
 
-/// Single-quote a string for safe inclusion in a `bash -lc` command line
-/// (wraps in `'…'`, escaping embedded single quotes as `'\''`).
-fn shell_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
+// Single-quoting for `bash -lc` interpolation lives in `util::shell_quote`
+// (the ONE shared implementation — see its doc).
+use crate::util::shell_quote;
 
 /// The outcome of resolving the worker launch command.
 #[derive(Debug)]
@@ -132,7 +130,7 @@ const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
 - WORKSPACE: you start in the loop data dir (read-only context for you, save the
   meta exception above). If your task touches a code repo, provision your OWN
   sandbox FIRST and cd into it — never edit code in the data dir:
-    git -C <local-clone> worktree add /tmp/__SESSION__ -b looop/__SESSION__ && cd /tmp/__SESSION__
+    git -C <local-clone> worktree add /tmp/__ID__ -b looop/__ID__ && cd /tmp/__ID__
   (the PLAYBOOK names the repos and which to prefer.)
 - DELIVERABLES: write any report / artifact a human will read into the data dir's
   reports/ folder (e.g. reports/<id>.md). That dir PERSISTS across ticks. NEVER
@@ -165,6 +163,42 @@ impl StartOutcome {
             overridden: false,
             reason: Some(reason),
         }
+    }
+}
+
+/// Commit-phase rollback guard for [`cmd_start_session`]: undoes the side
+/// effects taken so far when a LATER commit step fails. The rollbacks used to
+/// be hand-scattered across every error return (verify clear ×2 +
+/// unarchive_pair), so adding a commit step meant remembering to extend each
+/// of them; as an RAII guard, ANY early return (or panic) rolls back
+/// automatically and only the one success path calls [`StartRollback::disarm`].
+struct StartRollback<'a> {
+    paths: &'a Paths,
+    session: &'a str,
+    /// Set once the resume pair has been archived — the step that then needs
+    /// undoing (un-archiving) if the spawn fails, so the resume signal
+    /// returns instead of being silently consumed by a worker that never ran.
+    archived_resume: Option<&'a str>,
+    armed: bool,
+}
+impl StartRollback<'_> {
+    /// The spawn succeeded — the side effects are now legitimate state.
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+impl Drop for StartRollback<'_> {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Some(ask_id) = self.archived_resume {
+            crate::mailbox::unarchive_pair(self.paths, ask_id);
+        }
+        // No stale verify for a no-show worker — it would fail the NEXT start
+        // of this id for the wrong reason. Idempotent (clear of nothing is a
+        // no-op), matching the old unconditional hand-rolled clears.
+        crate::verify::clear(self.paths, self.session);
     }
 }
 
@@ -216,7 +250,14 @@ pub fn cmd_start_session(
         return refuse("missing prompt".to_string());
     }
 
-    let cfg = Config::load(paths)?;
+    // Routed through refuse(), not `?`: a broken config is a validation
+    // failure exactly like every other check here, and only the unified
+    // refusal shape reaches the decider's LAST FAILURE (a bare Err bypassed
+    // it, leaving the failed move without its cause).
+    let cfg = match Config::load(paths) {
+        Ok(c) => c,
+        Err(e) => return refuse(format!("cannot load config: {e}")),
+    };
     let runner = cfg.runner_label();
     let Some(tmpl) = cfg.runner_cmd("worker_command") else {
         return refuse("no `worker_command` configured".to_string());
@@ -300,11 +341,22 @@ pub fn cmd_start_session(
         _ => crate::verify::clear(paths, &session),
     }
 
+    // From here on, every failure return rolls back the commit-phase side
+    // effects via this guard (see [`StartRollback`]); the success path
+    // disarms it after the spawn.
+    let mut rollback = StartRollback {
+        paths,
+        session: &session,
+        archived_resume: None,
+        armed: true,
+    };
+
     // Prompt via file (avoids quoting hell; also a record of the ask), with the
     // contract prepended.
-    let contract = CONTRACT
-        .replace("__SESSION__", &session)
-        .replace("__ID__", id);
+    // ONE placeholder: a worker's session id IS its goal id (see the `session`
+    // binding above), so the old `__SESSION__`/`__ID__` pair always expanded
+    // to the same value — two names for one thing invited them to drift apart.
+    let contract = CONTRACT.replace("__ID__", id);
     let resume_part = resume_block.as_deref().unwrap_or("");
     // Atomic write (temp + fsync + rename), not fs::write: the worker command
     // reads this file via `$(cat {{prompt_file}})`, and on an id REUSE a
@@ -314,8 +366,7 @@ pub fn cmd_start_session(
         &prompt_file,
         format!("{contract}{resume_part}{prompt}\n").as_bytes(),
     ) {
-        crate::verify::clear(paths, &session); // no stale verify for a no-show worker
-        return Err(e.into());
+        return Err(e.into()); // the guard clears the stored verify
     }
 
     // The worker runs in the DATA dir. The in-process spawner inherits the
@@ -337,6 +388,7 @@ pub fn cmd_start_session(
     // spawn FAILS we un-archive so the resume signal returns.
     if let Some(ask_id) = resume {
         crate::mailbox::archive_pair(paths, ask_id);
+        rollback.archived_resume = Some(ask_id); // now armed to un-archive too
     }
 
     // Launch the worker detached, IN-PROCESS via the babysit library (no
@@ -345,17 +397,13 @@ pub fn cmd_start_session(
     // launches against looop's inherited environment instead of re-running the
     // operator's login profile (hermetic + cheaper). The runner template itself
     // is still a shell string ($(cat ...), &&), so the shell stays.
-    if let Err(e) = spawn_detached(
+    // On Err the rollback guard un-archives the resume + clears the verify.
+    spawn_detached(
         paths,
         vec!["bash".to_string(), "-c".to_string(), launch],
         &session,
-    ) {
-        if let Some(ask_id) = resume {
-            crate::mailbox::unarchive_pair(paths, ask_id);
-        }
-        crate::verify::clear(paths, &session); // no stale verify for a no-show worker
-        return Err(e);
-    }
+    )?;
+    rollback.disarm(); // launched — the side effects are legitimate state now
 
     // Label the banner with what actually launched: the override's first
     // token when a per-worker `--command` replaced the template, else the
@@ -835,49 +883,90 @@ pub fn spawn_detached(paths: &Paths, cmd: Vec<String>, session: &str) -> anyhow:
     .map(|_code| ())
 }
 
-/// The worker side of detached spawn: looop was re-exec'd by babysit's detacher
-/// as `looop run --detached-id <id> --root <dir> [--no-tty] [--timeout <ms>]
-/// [--idle-timeout <ms>] [--size <CxR>] -- <cmd…>`. Parse that argv and hand off
-/// to the library's headless supervisor, which blocks until the wrapped command
-/// exits. The state root comes from `--root`, so the worker reconstructs THIS
-/// fleet's context without reading any environment.
-pub fn run_detached_worker(args: &[String]) -> anyhow::Result<i32> {
-    use anyhow::Context;
-    let mut id = None;
-    let mut root = None;
-    let mut no_tty = false;
-    let mut timeout = None;
-    let mut idle_timeout = None;
-    let mut size = None;
-    let mut cmd: Vec<String> = Vec::new();
-    let mut it = args.iter();
+/// The parsed shape of babysit's re-exec argv (see [`run_detached_worker`]).
+/// Split out of the runner purely so the parse is unit-testable without
+/// spawning a real headless supervisor.
+#[derive(Debug, Default, PartialEq)]
+struct DetachedArgs {
+    id: Option<String>,
+    root: Option<String>,
+    no_tty: bool,
+    timeout: Option<String>,
+    idle_timeout: Option<String>,
+    size: Option<String>,
+    cmd: Vec<String>,
+}
+
+/// Parse `--detached-id <id> --root <dir> [--no-tty] [--timeout <ms>]
+/// [--idle-timeout <ms>] [--size <CxR>] -- <cmd…>`.
+///
+/// Every VALUE-TAKING flag is an explicit match arm that consumes its value
+/// itself. FORWARD-COMPAT: babysit may re-exec us with flags a newer babysit
+/// knows and this looop build does not — those must be skipped, not fatal.
+/// An unknown flag is skipped together with its apparent value (the next
+/// token, when that token is not itself flag-like), so `--future-knob 42`
+/// can never leak `42` into the parse — and, more importantly, an unknown
+/// flag's value can never be mistaken for one of OUR flags' trigger. The one
+/// unguardable shape — an unknown flag whose value itself starts with `-` —
+/// must be spelled `--flag=value` (one token, skipped whole); this parser
+/// cannot know the arity of a flag it has never heard of.
+fn parse_detached_args(args: &[String]) -> DetachedArgs {
+    let mut out = DetachedArgs::default();
+    let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--detached-id" => id = it.next().cloned(),
-            "--root" => root = it.next().cloned(),
-            "--no-tty" => no_tty = true,
-            "--timeout" => timeout = it.next().cloned(),
-            "--idle-timeout" => idle_timeout = it.next().cloned(),
-            "--size" => size = it.next().cloned(),
+            "--detached-id" => out.id = it.next().cloned(),
+            "--root" => out.root = it.next().cloned(),
+            "--no-tty" => out.no_tty = true,
+            "--timeout" => out.timeout = it.next().cloned(),
+            "--idle-timeout" => out.idle_timeout = it.next().cloned(),
+            "--size" => out.size = it.next().cloned(),
             "--" => {
-                cmd = it.by_ref().cloned().collect();
+                out.cmd = it.cloned().collect();
                 break;
             }
-            _ => {} // ignore unknown flags (forward-compat with babysit)
+            // Unknown flag (forward-compat): skip it, and skip its apparent
+            // value too — unless that next token is flag-like (`-…`), which
+            // covers both a following real flag and the `--` separator.
+            unknown => {
+                if unknown.starts_with("--")
+                    && !unknown.contains('=')
+                    && it.peek().is_some_and(|next| !next.starts_with('-'))
+                {
+                    let _ = it.next();
+                }
+            }
         }
     }
-    let id = id.context("looop run --detached-id: missing worker id")?;
-    let root = root.context("looop run --detached-id: missing --root")?;
+    out
+}
+
+/// The worker side of detached spawn: looop was re-exec'd by babysit's detacher
+/// as `looop run --detached-id <id> --root <dir> [--no-tty] [--timeout <ms>]
+/// [--idle-timeout <ms>] [--size <CxR>] -- <cmd…>`. Parse that argv (see
+/// [`parse_detached_args`]) and hand off to the library's headless supervisor,
+/// which blocks until the wrapped command exits. The state root comes from
+/// `--root`, so the worker reconstructs THIS fleet's context without reading
+/// any environment.
+pub fn run_detached_worker(args: &[String]) -> anyhow::Result<i32> {
+    use anyhow::Context;
+    let parsed = parse_detached_args(args);
+    let id = parsed
+        .id
+        .context("looop run --detached-id: missing worker id")?;
+    let root = parsed
+        .root
+        .context("looop run --detached-id: missing --root")?;
     let bs = ::babysit::Babysit::new(root);
     rt().block_on(bs.run(
-        cmd,
+        parsed.cmd,
         None,
         false,
         Some(id),
-        no_tty,
-        timeout,
-        idle_timeout,
-        size,
+        parsed.no_tty,
+        parsed.timeout,
+        parsed.idle_timeout,
+        parsed.size,
         false,
     ))
 }
@@ -1154,6 +1243,95 @@ mod tests {
         let id = crate::mailbox::ask_detached(&p, "w", "q?", "", &[]).unwrap();
         let out = cmd_start_session(&p, "w", "brief", None, None, Some(&id)).unwrap();
         assert_eq!(out.code, ExitCode::from(1));
+    }
+
+    #[test]
+    fn start_session_routes_a_broken_config_through_the_refusal_shape() {
+        // A broken config used to escape as a bare Err (`Config::load(paths)?`),
+        // bypassing the unified refuse() shape every other validation uses —
+        // so the decider's LAST FAILURE never learned the cause. It must now
+        // come back as a refused StartOutcome carrying the reason.
+        let p = crate::paths::Paths::temp();
+        let _ = crate::seed::ensure_dirs(&p);
+        std::fs::write(&p.config, "{ not json").unwrap();
+        let out = cmd_start_session(&p, "w", "brief", None, None, None)
+            .expect("a config error is a refusal, not an Err");
+        assert_eq!(out.code, ExitCode::from(1));
+        let reason = out.reason.expect("the refusal names its cause");
+        assert!(
+            reason.contains("cannot load config"),
+            "the reason names the config as the culprit: {reason}"
+        );
+    }
+
+    #[test]
+    fn detached_argv_parse_is_explicit_about_value_taking_flags() {
+        let s = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The full known shape round-trips.
+        let got = parse_detached_args(&s(&[
+            "--detached-id",
+            "w1",
+            "--root",
+            "/data/sessions",
+            "--no-tty",
+            "--timeout",
+            "5000",
+            "--",
+            "bash",
+            "-c",
+            "true",
+        ]));
+        assert_eq!(got.id.as_deref(), Some("w1"));
+        assert_eq!(got.root.as_deref(), Some("/data/sessions"));
+        assert!(got.no_tty);
+        assert_eq!(got.timeout.as_deref(), Some("5000"));
+        assert_eq!(got.cmd, s(&["bash", "-c", "true"]));
+
+        // FORWARD-COMPAT: an unknown flag's value is skipped WITH it — it can
+        // neither leak into the parse nor shadow a known flag's slot.
+        let got = parse_detached_args(&s(&[
+            "--future-knob",
+            "42",
+            "--root",
+            "/r",
+            "--detached-id",
+            "w2",
+            "--",
+            "true",
+        ]));
+        assert_eq!(got.id.as_deref(), Some("w2"));
+        assert_eq!(got.root.as_deref(), Some("/r"));
+        assert_eq!(got.cmd, s(&["true"]));
+
+        // A value-LESS unknown followed by a known flag must not eat it…
+        let got = parse_detached_args(&s(&["--future-bool", "--no-tty", "--root", "/r"]));
+        assert!(got.no_tty, "a known flag after a bare unknown still parses");
+        assert_eq!(got.root.as_deref(), Some("/r"));
+
+        // …`--flag=value` unknowns are one token, skipped whole…
+        let got = parse_detached_args(&s(&["--future-knob=42", "--detached-id", "w3"]));
+        assert_eq!(got.id.as_deref(), Some("w3"));
+
+        // …and an unknown just before the `--` separator never consumes it.
+        let got = parse_detached_args(&s(&["--future-bool", "--", "echo", "hi"]));
+        assert_eq!(got.cmd, s(&["echo", "hi"]));
+    }
+
+    #[test]
+    fn contract_uses_the_single_id_placeholder() {
+        // Finding: `__SESSION__` and `__ID__` always expanded to the same
+        // value (a worker's session id IS its goal id) — the contract now
+        // carries exactly ONE placeholder, fully substituted.
+        assert!(
+            !CONTRACT.contains("__SESSION__"),
+            "the legacy __SESSION__ placeholder is gone"
+        );
+        assert!(CONTRACT.contains("__ID__"));
+        let rendered = CONTRACT.replace("__ID__", "triage");
+        assert!(
+            !rendered.contains("__"),
+            "substituting __ID__ leaves no unexpanded placeholder behind"
+        );
     }
 
     #[test]

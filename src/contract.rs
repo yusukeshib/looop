@@ -125,14 +125,25 @@ impl<'a> LocalContract<'a> {
     }
 }
 
+/// Best-effort layout seeding shared by every verb below: the verb itself
+/// must keep going (its own read/write surfaces the real error with context),
+/// but a mkdir failure must not be SILENT either — swallowing it used to
+/// resurface later as a confusing downstream error with the cause discarded.
+/// Warn to stderr and continue.
+fn seed_dirs_warn(paths: &Paths) {
+    if let Err(e) = crate::seed::ensure_dirs(paths) {
+        eprintln!("looop: warning — could not seed the data layout: {e}");
+    }
+}
+
 impl Contract for LocalContract<'_> {
     fn state(&self) -> Result<Value> {
-        let _ = crate::seed::ensure_dirs(self.paths);
+        seed_dirs_warn(self.paths);
         Ok(observe::state(self.paths))
     }
 
     fn wait(&self, filter: observe::WaitFilter) -> Result<Value> {
-        let _ = crate::seed::ensure_dirs(self.paths);
+        seed_dirs_warn(self.paths);
         let changed = observe::wait_for_change(self.paths, filter);
         let mut s = observe::state(self.paths);
         if let Some(obj) = s.as_object_mut() {
@@ -142,7 +153,7 @@ impl Contract for LocalContract<'_> {
     }
 
     fn asks(&self) -> Result<Vec<Ask>> {
-        let _ = crate::seed::ensure_dirs(self.paths);
+        seed_dirs_warn(self.paths);
         Ok(mailbox::pending(self.paths))
     }
 
@@ -153,7 +164,7 @@ impl Contract for LocalContract<'_> {
         // behave differently from its siblings. The steering writes
         // (goal_write … worker_start) get the same guarantee inside
         // `run_action`.
-        let _ = crate::seed::ensure_dirs(self.paths);
+        seed_dirs_warn(self.paths);
         mailbox::answer(self.paths, ask_id, text, force)
     }
 
@@ -164,7 +175,7 @@ impl Contract for LocalContract<'_> {
         reference: &str,
         options: &[String],
     ) -> Result<String> {
-        let _ = crate::seed::ensure_dirs(self.paths);
+        seed_dirs_warn(self.paths);
         mailbox::ask(self.paths, worker, prompt, reference, options)
     }
 
@@ -175,7 +186,7 @@ impl Contract for LocalContract<'_> {
         reference: &str,
         options: &[String],
     ) -> Result<String> {
-        let _ = crate::seed::ensure_dirs(self.paths);
+        seed_dirs_warn(self.paths);
         mailbox::ask_detached(self.paths, worker, prompt, reference, options)
     }
 
@@ -253,12 +264,12 @@ impl Contract for LocalContract<'_> {
     }
 
     fn claim(&self, name: &str, session: Option<&str>) -> Result<ClaimOutcome> {
-        let _ = crate::seed::ensure_dirs(self.paths);
+        seed_dirs_warn(self.paths);
         gate::claim(self.paths, name, session)
     }
 
     fn unclaim(&self, name: &str, session: Option<&str>) -> Result<bool> {
-        let _ = crate::seed::ensure_dirs(self.paths);
+        seed_dirs_warn(self.paths);
         gate::unclaim(self.paths, name, session)
     }
 }
@@ -287,6 +298,30 @@ mod tests {
             r#"{"state":"running","child_pid":null,"exit_code":null,"last_change":"2026-01-01T00:00:00Z"}"#,
         )
         .unwrap();
+    }
+
+    /// A failed layout seed WARNS (stderr) but never fails the verb: the
+    /// verb's own read/write is what surfaces a real, contextual error.
+    /// Regression for the old `let _ = ensure_dirs(…)` sites, which swallowed
+    /// the mkdir error entirely.
+    #[test]
+    fn a_failed_layout_seed_warns_but_does_not_fail_the_verb() {
+        let p = Paths::temp();
+        // Block seeding: a FILE squats where a layout dir must go.
+        std::fs::create_dir_all(&p.data_dir).unwrap();
+        std::fs::write(p.sensors_dir(), b"not a dir").unwrap();
+        assert!(
+            crate::seed::ensure_dirs(&p).is_err(),
+            "the squatting file must make seeding fail"
+        );
+        let local = LocalContract::new(&p);
+        let c: &dyn Contract = &local;
+        // The read verbs still answer (warning to stderr, not an Err).
+        assert!(
+            c.state().is_ok(),
+            "state must not hard-fail on a seed error"
+        );
+        assert!(c.asks().is_ok(), "asks must not hard-fail on a seed error");
     }
 
     /// Drive the claim verb's THREE outcomes through the [`Contract`] trait

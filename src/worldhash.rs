@@ -54,16 +54,33 @@ pub(crate) fn wake_signal(v: serde_json::Value) -> serde_json::Value {
 /// (which a failing action can cause every beat) cannot.
 pub(crate) fn policy_hash(paths: &Paths) -> String {
     let mut buf: Vec<u8> = Vec::new();
-    hash_policy_into(paths, &mut buf);
+    hash_policy_into(paths, &mut buf, None);
     util::content_hash(&buf)
 }
 
 /// Hash the POLICY half only: PLAYBOOK + goals/*.md, each behind an unambiguous
-/// path marker. Shared by [`world_hash`] and [`policy_hash`].
-fn hash_policy_into(paths: &Paths, buf: &mut Vec<u8>) {
-    let mut files = vec![paths.playbook()];
-    files.extend(util::sorted_glob(&paths.goals_dir(), "md"));
-    for f in files {
+/// path marker. Shared by [`world_view`] and [`policy_hash`]. When `items` is
+/// given, each file's ITEM view (`playbook` / `goal:<id>` → content hash or the
+/// `!unreadable` sentinel) is derived from the SAME read that fed the hash
+/// buffer — the one-pass guarantee [`world_view`] promises.
+fn hash_policy_into(
+    paths: &Paths,
+    buf: &mut Vec<u8>,
+    mut items: Option<&mut std::collections::BTreeMap<String, String>>,
+) {
+    let mut files = vec![(paths.playbook(), "playbook".to_string())];
+    files.extend(
+        util::sorted_glob(&paths.goals_dir(), "md")
+            .into_iter()
+            .map(|f| {
+                let key = format!(
+                    "goal:{}",
+                    f.file_stem().unwrap_or_default().to_string_lossy()
+                );
+                (f, key)
+            }),
+    );
+    for (f, key) in files {
         if !f.is_file() {
             continue;
         }
@@ -75,6 +92,12 @@ fn hash_policy_into(paths: &Paths, buf: &mut Vec<u8>) {
                 // unreadable would then never move the world. A sentinel
                 // section keeps the transition readable↔unreadable visible.
                 buf.extend_from_slice(format!("@@ {} !unreadable\n", rel(paths, &f)).as_bytes());
+                // The item view carries the same sentinel (silently skipping
+                // it would render as "gone" in the diff while the hash said
+                // "changed").
+                if let Some(items) = items.as_deref_mut() {
+                    items.insert(key, "!unreadable".to_string());
+                }
                 continue;
             }
         };
@@ -85,6 +108,9 @@ fn hash_policy_into(paths: &Paths, buf: &mut Vec<u8>) {
         // (harmless) "world changed" and re-decides.
         buf.extend_from_slice(format!("@@ {} {}\n", rel(paths, &f), bytes.len()).as_bytes());
         buf.extend_from_slice(&bytes);
+        if let Some(items) = items.as_deref_mut() {
+            items.insert(key, util::content_hash(&bytes));
+        }
     }
 }
 
@@ -104,72 +130,67 @@ fn hash_policy_into(paths: &Paths, buf: &mut Vec<u8>) {
 /// hash moved" and "some item differs" stay in agreement for every item kind,
 /// including the unreadable/non-JSON edge cases.
 pub fn world_items(paths: &Paths) -> std::collections::BTreeMap<String, String> {
-    let mut m = std::collections::BTreeMap::new();
-
-    // Policy items mirror hash_policy_into exactly: readable → content hash,
-    // present-but-unreadable → the sentinel (never silently skipped).
-    let policy_item = |f: &Path| -> Option<String> {
-        if !f.is_file() {
-            return None;
-        }
-        Some(match fs::read(f) {
-            Ok(bytes) => util::content_hash(&bytes),
-            Err(_) => "!unreadable".to_string(),
-        })
-    };
-    if let Some(v) = policy_item(&paths.playbook()) {
-        m.insert("playbook".to_string(), v);
-    }
-    for f in util::sorted_glob(&paths.goals_dir(), "md") {
-        if let (Some(stem), Some(v)) = (f.file_stem(), policy_item(&f)) {
-            m.insert(format!("goal:{}", stem.to_string_lossy()), v);
-        }
-    }
-    for f in util::sorted_glob(&paths.snapshots_dir(), "json") {
-        let Some(stem) = f.file_stem().map(|s| s.to_string_lossy().to_string()) else {
-            continue;
-        };
-        let raw = fs::read(&f).unwrap_or_default();
-        let val = match serde_json::from_slice::<serde_json::Value>(&raw) {
-            Ok(v) => wake_signal(v).to_string(),
-            // Content hash, not just the length: world_hash consumes the raw
-            // bytes, so the item must track the CONTENT too or same-length
-            // garbage would show "hash moved" with a useless no-op diff.
-            Err(_) => format!(
-                "(non-JSON, {} bytes, fnv {})",
-                raw.len(),
-                util::content_hash(&raw)
-            ),
-        };
-        m.insert(format!("snap:{stem}"), val);
-    }
-    m
+    world_view(paths).1
 }
 
-pub fn world_hash(paths: &Paths) -> String {
+/// The world hash AND the named items, derived from ONE pass over the world:
+/// every input file is read exactly once and BOTH views are built from those
+/// same bytes. [`crate::tick::sense`] promises (see `Sensed`) that "the hash
+/// moved" and "some item differs" describe the SAME observation — computing
+/// them as two independent passes ([`world_hash`] then [`world_items`]) left a
+/// window where a snapshot rewritten between the passes made hash and items
+/// disagree. The single-view wrappers remain for callers that need only one
+/// half and don't pair the two.
+pub fn world_view(paths: &Paths) -> (String, std::collections::BTreeMap<String, String>) {
     let mut buf: Vec<u8> = Vec::new();
+    let mut items = std::collections::BTreeMap::new();
 
-    // PLAYBOOK + goals/*.md, each behind an unambiguous path marker.
-    hash_policy_into(paths, &mut buf);
+    // PLAYBOOK + goals/*.md: one read per file feeds both the hash buffer and
+    // the item map (readable → content hash, present-but-unreadable → the
+    // sentinel — never silently skipped).
+    hash_policy_into(paths, &mut buf, Some(&mut items));
 
     // Sensor snapshots: hash only the wake SIGNAL. User sensors AND the virtual
     // system sensors (sys-sessions / sys-claims) all land here, so the fleet and
     // leases are diffed through this one loop — no bespoke per-kind hashing.
     for f in util::sorted_glob(&paths.snapshots_dir(), "json") {
+        let Some(stem) = f.file_stem().map(|s| s.to_string_lossy().to_string()) else {
+            continue;
+        };
         let raw = fs::read(&f).unwrap_or_default();
-        // Both branches end with a newline (consistent framing), and the
+        // Both the hash payload and the item value derive from this ONE read.
+        // Both hash branches end with a newline (consistent framing), and the
         // section marker is length-prefixed like the policy half (see
         // hash_policy_into) — injective even when a payload contains "@@ ".
-        let mut payload = match serde_json::from_slice::<serde_json::Value>(&raw) {
-            Ok(v) => wake_signal(v).to_string().into_bytes(),
-            Err(_) => raw, // non-JSON / error reading: raw bytes
+        let (mut payload, item) = match serde_json::from_slice::<serde_json::Value>(&raw) {
+            Ok(v) => {
+                let s = wake_signal(v).to_string();
+                (s.clone().into_bytes(), s)
+            }
+            // Item: content hash, not just the length — world_hash consumes
+            // the raw bytes, so the item must track the CONTENT too or
+            // same-length garbage would show "hash moved" with a useless
+            // no-op diff.
+            Err(_) => (
+                raw.clone(), // non-JSON / error reading: raw bytes
+                format!(
+                    "(non-JSON, {} bytes, fnv {})",
+                    raw.len(),
+                    util::content_hash(&raw)
+                ),
+            ),
         };
         payload.push(b'\n');
         buf.extend_from_slice(format!("@@ {} {}\n", rel(paths, &f), payload.len()).as_bytes());
         buf.extend_from_slice(&payload);
+        items.insert(format!("snap:{stem}"), item);
     }
 
-    util::content_hash(&buf)
+    (util::content_hash(&buf), items)
+}
+
+pub fn world_hash(paths: &Paths) -> String {
+    world_view(paths).0
 }
 
 #[cfg(test)]
@@ -222,6 +243,33 @@ mod tests {
         fs::write(&f, b"not json AAAA").unwrap();
         let a2 = world_items(&p).get("snap:sensor-raw").cloned().unwrap();
         assert_eq!(a, a2);
+    }
+
+    #[test]
+    fn world_view_agrees_with_the_single_fn_views() {
+        // Regression for the two-pass Sensed race: world_view must produce
+        // exactly the hash world_hash reports and the items world_items
+        // reports (on a quiescent world the three are interchangeable — the
+        // point of world_view is that hash AND items come from ONE read).
+        let p = Paths::temp();
+        fs::create_dir_all(p.goals_dir()).unwrap();
+        fs::create_dir_all(p.snapshots_dir()).unwrap();
+        fs::write(p.playbook(), b"rule one\n").unwrap();
+        fs::write(p.goals_dir().join("a.md"), b"goal a\n").unwrap();
+        fs::write(
+            p.snapshots_dir().join("s.json"),
+            br#"{"signal":{"n":1},"detail":{"ts":9}}"#,
+        )
+        .unwrap();
+        fs::write(p.snapshots_dir().join("raw.json"), b"not json").unwrap();
+
+        let (hash, items) = world_view(&p);
+        assert_eq!(hash, world_hash(&p));
+        assert_eq!(items, world_items(&p));
+        assert!(items.contains_key("playbook"));
+        assert!(items.contains_key("goal:a"));
+        assert!(items.contains_key("snap:s"));
+        assert!(items.contains_key("snap:raw"));
     }
 
     #[test]

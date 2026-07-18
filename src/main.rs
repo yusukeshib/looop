@@ -104,9 +104,20 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("{e}");
+            eprintln!("{}", diagnostic(&e.to_string()));
             ExitCode::from(1)
         }
+    }
+}
+
+/// Prefix a dispatch error with `looop: ` like every other diagnostic —
+/// without double-prefixing errors that already carry it (e.g. the deps
+/// preflight message starts with `looop:` itself).
+fn diagnostic(msg: &str) -> String {
+    if msg.starts_with("looop:") {
+        msg.to_string()
+    } else {
+        format!("looop: {msg}")
     }
 }
 
@@ -294,19 +305,22 @@ fn descend_help<'a>(cmd: &'a mut clap::Command, path: &[String]) -> Option<&'a m
     Some(current)
 }
 
-/// Should this argv take the PRE-CLAP detached-supervisor shortcut? True when
-/// the verb is `run` and `--detached-id` appears anywhere BEFORE a bare `--`
-/// (after `--` everything is the wrapped command's own argv, where the same
-/// token is ordinary payload). babysit hard-codes `run --detached-id <id> …`
-/// today, but it may grow/reorder flags in front of it in a future version —
-/// keying on exact position raw[1] would silently break that forward-compat
-/// promise, so any pre-`--` position counts.
+/// Should this argv take the PRE-CLAP detached-supervisor shortcut? The
+/// internal invocation has a FIXED shape — babysit's detacher re-execs
+/// `looop run --detached-id <id> [flags…] -- <cmd…>` (see
+/// `session::run_detached_worker`) — so the predicate requires exactly it:
+/// `--detached-id` must be the FIRST token after `run`, AND a bare `--` must
+/// separate the wrapped command. A loose "appears anywhere before `--`" match
+/// (the previous rule) hijacked a plain HUMAN `looop run grep --detached-id
+/// log.txt` (no bare `--`) into the supervisor path; a human argv can no
+/// longer stray into it. Flags babysit ADDS after `--detached-id <id>` still
+/// pass (run_detached_worker ignores unknown flags for forward-compat), but a
+/// reorder that moves `--detached-id` off the front is a deliberate
+/// coordinated change, not something to absorb silently.
 fn is_detached_run(raw: &[String]) -> bool {
     raw.first().map(String::as_str) == Some("run")
-        && raw[1..]
-            .iter()
-            .take_while(|a| a.as_str() != "--")
-            .any(|a| a == "--detached-id")
+        && raw.get(1).map(String::as_str) == Some("--detached-id")
+        && raw[1..].iter().any(|a| a == "--")
 }
 
 #[cfg(test)]
@@ -318,8 +332,8 @@ mod tests {
     }
 
     #[test]
-    fn detached_run_shortcut_matches_any_pre_dashdash_position() {
-        // babysit's argv today: flag right after the verb.
+    fn detached_run_shortcut_requires_the_exact_supervisor_shape() {
+        // babysit's argv: `--detached-id` right after the verb, then `--`.
         assert!(is_detached_run(&v(&[
             "run",
             "--detached-id",
@@ -327,13 +341,14 @@ mod tests {
             "--",
             "cmd"
         ])));
-        // Forward-compat: a future babysit may put flags in front of it.
+        // Flags babysit ADDS between the id and `--` still pass (the
+        // supervisor parser ignores unknown flags for forward-compat).
         assert!(is_detached_run(&v(&[
             "run",
-            "--root",
-            "/x",
             "--detached-id",
             "w1",
+            "--root",
+            "/x",
             "--",
             "cmd"
         ])));
@@ -345,5 +360,43 @@ mod tests {
         // A plain human `looop run <cmd>` stays on the clap path.
         assert!(!is_detached_run(&v(&["run", "echo", "hi"])));
         assert!(!is_detached_run(&v(&[])));
+    }
+
+    #[test]
+    fn human_run_with_detached_id_payload_is_not_hijacked() {
+        // Regression: `looop run grep --detached-id log.txt` (a human command
+        // whose PAYLOAD merely mentions the flag, no bare `--`) used to be
+        // hijacked into the detached-supervisor path. It must reach clap.
+        assert!(!is_detached_run(&v(&[
+            "run",
+            "grep",
+            "--detached-id",
+            "log.txt"
+        ])));
+        // Even in first position, a missing `--` separator is not the
+        // supervisor shape (babysit ALWAYS passes one).
+        assert!(!is_detached_run(&v(&["run", "--detached-id", "log.txt"])));
+        // And off-front positions never match, `--` or not.
+        assert!(!is_detached_run(&v(&[
+            "run",
+            "--root",
+            "/x",
+            "--detached-id",
+            "w1",
+            "--",
+            "cmd"
+        ])));
+    }
+
+    #[test]
+    fn diagnostic_prefixes_once() {
+        use super::diagnostic;
+        // A bare error gains the prefix…
+        assert_eq!(diagnostic("boom"), "looop: boom");
+        // …an already-prefixed one (e.g. the deps preflight) is untouched.
+        assert_eq!(
+            diagnostic("looop: missing required dependencies"),
+            "looop: missing required dependencies"
+        );
     }
 }
