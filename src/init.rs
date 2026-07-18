@@ -119,8 +119,8 @@ fn choose_wiring(
         ("custom".to_string(), current_tick, current_worker)
     };
 
-    let tick = prompt_value("tick(one disposable decision)", base_tick, tty)?;
-    let worker = prompt_value("worker(interactive agent)", base_worker, tty)?;
+    let tick = prompt_value("tick(one disposable decision)", base_tick)?;
+    let worker = prompt_value("worker(interactive agent)", base_worker)?;
     Some((runner, tick, worker))
 }
 
@@ -329,15 +329,13 @@ fn read_line() -> Option<String> {
 }
 
 /// Ask for a value, prefilling `current` into the editable buffer. `None` = the
-/// user aborted. Empty submission (or non-TTY) keeps `current`.
-fn prompt_value(label: &str, current: &str, tty: bool) -> Option<String> {
-    if !tty {
-        return Some(current.to_string());
-    }
+/// user aborted. Empty submission keeps `current`. Only reached on a TTY:
+/// `choose_wiring` returns early for non-interactive stdin.
+fn prompt_value(label: &str, current: &str) -> Option<String> {
     match editable(label, current) {
         Edit::Line(s) => Some(if s.is_empty() { current.to_string() } else { s }),
         Edit::Abort => None,
-        Edit::Unsupported => Some(fallback_line(label, current)),
+        Edit::Unsupported => fallback_line(label, current),
     }
 }
 
@@ -352,11 +350,43 @@ enum Edit {
     Unsupported,
 }
 
+/// Display width of one char in terminal columns, for the inline editor's
+/// cursor / horizontal-scroll math: wide East-Asian and emoji glyphs occupy
+/// TWO columns, everything else one. A hand-rolled table of the common wide
+/// ranges (CJK, Hangul, fullwidth forms, emoji) — deliberately NOT a new
+/// dependency; this covers what realistically lands in a command string
+/// (paths, prompts, model names). Combining marks / zero-width joiners are
+/// approximated as 1 column — acceptable for a config editor.
+fn char_width(c: char) -> usize {
+    let wide = matches!(c as u32,
+        0x1100..=0x115F           // Hangul Jamo (leading consonants)
+        | 0x2E80..=0x303E         // CJK radicals, Kangxi, CJK symbols/punct
+        | 0x3041..=0x33FF         // Hiragana..Katakana..CJK compat
+        | 0x3400..=0x4DBF         // CJK ext A
+        | 0x4E00..=0x9FFF         // CJK unified ideographs
+        | 0xA000..=0xA4CF         // Yi
+        | 0xAC00..=0xD7A3         // Hangul syllables
+        | 0xF900..=0xFAFF         // CJK compatibility ideographs
+        | 0xFE30..=0xFE4F         // CJK compatibility forms
+        | 0xFF00..=0xFF60         // fullwidth forms
+        | 0xFFE0..=0xFFE6         // fullwidth signs
+        | 0x1F300..=0x1FAFF       // emoji & pictographs
+        | 0x20000..=0x3FFFD       // CJK ext B and beyond
+    );
+    if wide { 2 } else { 1 }
+}
+
+/// Total display columns of a char sequence (see [`char_width`]).
+fn display_width(chars: impl Iterator<Item = char>) -> usize {
+    chars.map(char_width).sum()
+}
+
 /// A readline-style editor. Prints `label` on its own dim line, then edits the
 /// command on the line below, prefilled with `initial` (cursor at end). Long
 /// commands SCROLL HORIZONTALLY within one physical line (window = term width-1),
-/// so wrapping never confuses the cursor math. Restores cooked mode before
-/// returning.
+/// so wrapping never confuses the cursor math. All window/cursor math is in
+/// DISPLAY COLUMNS (via [`char_width`]), not chars, so CJK/emoji in the command
+/// keep the cursor aligned. Restores cooked mode before returning.
 fn editable(label: &str, initial: &str) -> Edit {
     let mut out = io::stdout();
     let Some(_raw) = RawModeGuard::new(false) else {
@@ -367,7 +397,7 @@ fn editable(label: &str, initial: &str) -> Edit {
     let label_cols = if label.is_empty() {
         0
     } else {
-        label.chars().count() as u16 + 2
+        display_width(label.chars()) as u16 + 2
     };
     let mut buf: Vec<char> = initial.chars().collect();
     let mut pos = buf.len();
@@ -376,9 +406,32 @@ fn editable(label: &str, initial: &str) -> Edit {
         // Single-line horizontal-scroll window so long commands never wrap (which
         // would break absolute-column cursor math). Keep the cursor visible.
         let cols = size().map_or(80, |(w, _)| w as usize).max(1);
+        // Window budget in DISPLAY COLUMNS (not chars): a wide glyph consumes
+        // two of them, so the math below walks char-by-char summing widths.
         let win = cols.saturating_sub(label_cols as usize + 1).max(8);
-        let start = if pos >= win { pos - win + 1 } else { 0 };
-        let end = (start + win).min(buf.len());
+        // Walk BACK from the cursor so it stays visible: reserve one column so
+        // a cursor sitting past the last visible char still fits the window.
+        let mut start = pos;
+        let mut cursor_cols = 0usize; // display width of buf[start..pos]
+        while start > 0 {
+            let w = char_width(buf[start - 1]);
+            if cursor_cols + w > win.saturating_sub(1) {
+                break;
+            }
+            cursor_cols += w;
+            start -= 1;
+        }
+        // Extend the visible slice FORWARD while it fits the column budget.
+        let mut end = start;
+        let mut used = 0usize;
+        while end < buf.len() {
+            let w = char_width(buf[end]);
+            if used + w > win {
+                break;
+            }
+            used += w;
+            end += 1;
+        }
         let visible: String = buf[start..end].iter().collect();
         if execute!(out, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine)).is_err() {
             break Edit::Unsupported;
@@ -389,7 +442,7 @@ fn editable(label: &str, initial: &str) -> Edit {
         } else {
             let _ = write!(out, "{}{label}:{} {visible}", dim(), rst());
         }
-        let _ = execute!(out, cursor::MoveToColumn(label_cols + (pos - start) as u16));
+        let _ = execute!(out, cursor::MoveToColumn(label_cols + cursor_cols as u16));
         let _ = out.flush();
 
         match event::read() {
@@ -444,14 +497,16 @@ fn editable(label: &str, initial: &str) -> Edit {
 }
 
 /// Plain-prompt fallback when raw mode is unavailable: shows the current value in
-/// brackets, Enter keeps it. Mirrors the editor's keep-or-replace semantics so
-/// init still works on terminals without raw mode.
-fn fallback_line(label: &str, current: &str) -> String {
+/// brackets, Enter keeps it, EOF (Ctrl-D / closed stdin) ABORTS — aligned with
+/// the raw-mode editor's Esc/Ctrl-C/Ctrl-D semantics, so a closed stdin never
+/// silently "accepts" a wiring the user didn't confirm.
+fn fallback_line(label: &str, current: &str) -> Option<String> {
     print!("{label} [{current}]: ");
     let _ = io::stdout().flush();
     match read_line() {
-        Some(s) if !s.is_empty() => s,
-        _ => current.to_string(),
+        Some(s) if !s.is_empty() => Some(s),
+        Some(_) => Some(current.to_string()),
+        None => None,
     }
 }
 
@@ -465,6 +520,18 @@ mod tests {
             assert_eq!(current_preset_index(p.tick, p.worker), Some(i));
             assert_eq!(infer_runner(p.tick, p.worker).as_deref(), Some(p.name));
         }
+    }
+
+    #[test]
+    fn char_width_distinguishes_wide_glyphs() {
+        assert_eq!(char_width('a'), 1);
+        assert_eq!(char_width('-'), 1);
+        assert_eq!(char_width('あ'), 2); // Hiragana
+        assert_eq!(char_width('漢'), 2); // CJK ideograph
+        assert_eq!(char_width('한'), 2); // Hangul syllable
+        assert_eq!(char_width('🎉'), 2); // emoji
+        assert_eq!(char_width('Ａ'), 2); // fullwidth A
+        assert_eq!(display_width("pi -p あ🎉".chars()), 6 + 4);
     }
 
     #[test]

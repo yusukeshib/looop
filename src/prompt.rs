@@ -299,6 +299,10 @@ fn what_changed(paths: &Paths) -> Option<String> {
 /// The `RUN_SHELL OUTPUT` section body: the output tail of the last executed
 /// `run_shell` move (`.last-shell.json`, written by the executor, consumed —
 /// removed — when the NEXT decision executes, so it is shown exactly once).
+/// The executor already tails the output to 2048 chars before persisting, but
+/// the prompt clips DEFENSIVELY too (same cap as `last_failure`) — a
+/// hand-edited or corrupt `.last-shell.json` must not be able to blow up the
+/// prompt.
 fn run_shell_output(paths: &Paths) -> Option<String> {
     let raw = fs::read_to_string(paths.last_shell()).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
@@ -313,7 +317,7 @@ fn run_shell_output(paths: &Paths) -> Option<String> {
     } else {
         output
     };
-    Some(format!("$ {cmd}\n(exit {code})\n{body}"))
+    Some(format!("$ {cmd}\n(exit {code})\n{}", clip(body, 2048)))
 }
 
 /// The `FLAPPING SENSORS` section body: snapshots whose wake signal has changed

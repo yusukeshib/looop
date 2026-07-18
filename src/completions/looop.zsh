@@ -61,6 +61,18 @@ __looop_workers() {
     (( ${#workers} )) && _describe 'worker' workers
 }
 
+__looop_schedules() {
+    local -a schedules
+    local root; root=$(__looop_data_dir)
+    if [[ -d "$root/schedules" ]]; then
+        local f
+        for f in "$root/schedules"/*.json(N.); do
+            schedules+=("${f:t:r}")
+        done
+    fi
+    (( ${#schedules} )) && _describe 'schedule' schedules
+}
+
 __looop_claims() {
     local -a claims
     local root; root=$(__looop_data_dir)
@@ -95,9 +107,13 @@ _looop() {
                 'goal:Create/replace or archive a goal'
                 'sensor:Create/replace a sensor script'
                 'playbook:Rewrite the PLAYBOOK'
+                'schedule:Durable time triggers (one-shot / recurring)'
                 'run:One ad-hoc, reversible shell command'
                 'worker:Spawn / kill / list workers'
                 'w:Spawn / kill / list workers (alias of worker)'
+                'ask:Raise a blocking ask for the human (worker self-callback)'
+                'tell:Queue a steering message into a live worker'
+                'told:Print + consume pending steering messages'
                 'screenshot:Capture a worker'"'"'s current screen'
                 'ss:Capture a worker'"'"'s screen (alias of screenshot)'
                 'kill:Kill a session by id'
@@ -136,6 +152,53 @@ _looop() {
                         _arguments '--force[Overwrite an already-given answer]'
                     fi
                     ;;
+                ask)
+                    if (( CURRENT == 2 )); then
+                        __looop_workers
+                    else
+                        _arguments \
+                            '--prompt[What you need to know from the human]:prompt:' \
+                            '--ref[A path/reference the human should look at]:reference:' \
+                            '--options[Comma-separated choices to offer]:options:' \
+                            '--detach[Write the ask and return immediately]'
+                    fi
+                    ;;
+                tell)
+                    (( CURRENT == 2 )) && __looop_workers
+                    ;;
+                told)
+                    (( CURRENT == 2 )) && __looop_workers
+                    ;;
+                run)
+                    _arguments \
+                        '--reason[Why this command is being run (recorded)]:reason:' \
+                        '--journal[One line: what you did and why]:note:'
+                    ;;
+                schedule)
+                    if (( CURRENT == 2 )); then
+                        local -a schedule_ops
+                        schedule_ops=(
+                            'write:Create or replace a schedule'
+                            'w:Create or replace a schedule (alias of write)'
+                            'rm:Remove a schedule'
+                            'list:List schedules'
+                            'ls:List schedules (alias of list)'
+                        )
+                        _describe 'schedule op' schedule_ops
+                    elif (( CURRENT == 3 )) && [[ $words[2] == (write|w|rm) ]]; then
+                        __looop_schedules
+                    elif [[ $words[2] == (list|ls) ]]; then
+                        _arguments '--json[Emit JSON]'
+                    elif [[ $words[2] == (write|w) ]]; then
+                        _arguments \
+                            '--in[One-shot: fire once, this many seconds from now]:seconds:' \
+                            '--every[Recurring: fire every N seconds (min 60)]:seconds:' \
+                            '--note[Why this trigger exists]:note:' \
+                            '--journal[One line: what you did and why]:note:'
+                    elif [[ $words[2] == rm ]]; then
+                        _arguments '--journal[One line: what you did and why]:note:'
+                    fi
+                    ;;
                 goal)
                     if (( CURRENT == 2 )); then
                         local -a goal_ops
@@ -147,6 +210,8 @@ _looop() {
                         _describe 'goal op' goal_ops
                     elif (( CURRENT == 3 )) && [[ $words[2] == (archive|write|w) ]]; then
                         __looop_goals
+                    elif [[ $words[2] == (archive|write|w) ]]; then
+                        _arguments '--journal[One line: what you did and why]:note:'
                     fi
                     ;;
                 sensor)
@@ -159,6 +224,8 @@ _looop() {
                         _describe 'sensor op' sensor_ops
                     elif (( CURRENT == 3 )) && [[ $words[2] == (write|w) ]]; then
                         __looop_sensors
+                    elif [[ $words[2] == (write|w) ]]; then
+                        _arguments '--journal[One line: what you did and why]:note:'
                     fi
                     ;;
                 playbook)
@@ -169,6 +236,8 @@ _looop() {
                             'w:Rewrite the PLAYBOOK (alias of write)'
                         )
                         _describe 'playbook op' playbook_ops
+                    elif [[ $words[2] == (write|w) ]]; then
+                        _arguments '--journal[One line: what you did and why]:note:'
                     fi
                     ;;
                 worker|w)
@@ -192,7 +261,9 @@ _looop() {
                     elif [[ $words[2] == start ]]; then
                         _arguments \
                             '--command[Full launch-command override (must contain {{prompt_file}})]:command:' \
-                            '--verify[Post-condition shell command]:command:'
+                            '--verify[Post-condition shell command]:command:' \
+                            '--resume[Resume a detached, answered ask (ask id)]:ask:' \
+                            '--journal[One line: what you did and why]:note:'
                     fi
                     ;;
                 screenshot|ss)

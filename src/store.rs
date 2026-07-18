@@ -93,6 +93,14 @@ pub trait StateStore {
 
     /// Durably replace `key` with `contents`, atomically — a concurrent reader
     /// never observes a half-written value (FileStore: temp -> fsync -> rename).
+    ///
+    /// INVARIANT: the replace is serialized against the OTHER writer
+    /// primitives (`create_exclusive`, `remove_if_eq`) — FileStore publishes
+    /// the rename under the same per-directory writer lock they take. Without
+    /// this, `remove_if_eq`'s compare-and-delete guarantee would only hold
+    /// against `create_exclusive` writers: a lock-free rename racing the
+    /// locked read→compare→remove could land its FRESH value between the
+    /// compare and the delete and have it destroyed.
     fn write_atomic(&self, key: &Key, contents: &str) -> io::Result<()>;
 
     /// Atomic create-if-absent — the mutual-exclusion primitive. Returns
@@ -139,16 +147,19 @@ pub trait StateStore {
 /// A per-directory WRITER lock: `flock(LOCK_EX)` on `<dir>/.dirlock`, released
 /// when the guard drops (or the process dies — flock is kernel-managed, so a
 /// crash never leaves a stale lock). Only the multi-step writer primitives
-/// (`create_exclusive`, `remove_if_eq`) take it; READERS never do — they rely
+/// (`write_atomic`, `create_exclusive`, `remove_if_eq`) take it; READERS never do — they rely
 /// on rename-published files, so "exists ⇒ contents complete" holds lock-free.
 /// The `.dirlock` name has no extension, so `list`/`sorted_glob` (which filter
-/// by `.json`/`.md`/…) never surface it as an entry.
-struct DirLock {
+/// by `.json`/`.md`/…) never surface it as an entry. `pub(crate)` so the
+/// mailbox's unarchive path can serialize its exists-check + rename against
+/// the same writer lock `create_exclusive` takes (closing the TOCTOU where a
+/// concurrent create of a reused ask id slips between check and rename).
+pub(crate) struct DirLock {
     _file: fs::File,
 }
 
 impl DirLock {
-    fn acquire(dir: &std::path::Path) -> io::Result<DirLock> {
+    pub(crate) fn acquire(dir: &std::path::Path) -> io::Result<DirLock> {
         fs::create_dir_all(dir)?;
         let file = fs::OpenOptions::new()
             .create(true)
@@ -205,9 +216,38 @@ impl<'a> FileStore<'a> {
     }
 }
 
+/// fsync the DIRECTORY containing `path`, so a rename that just landed in it
+/// survives a crash (the dir entry itself needs a sync, not just the data).
+/// Local replica of util's private helper — kept identical, best-effort at
+/// call sites.
+#[cfg(unix)]
+fn sync_parent_dir(path: &std::path::Path) -> io::Result<()> {
+    if let Some(dir) = path.parent() {
+        fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &std::path::Path) -> io::Result<()> {
+    Ok(())
+}
+
 impl StateStore for FileStore<'_> {
     fn read(&self, key: &Key) -> Option<String> {
-        fs::read_to_string(self.path(key)).ok()
+        let path = self.path(key);
+        match fs::read_to_string(&path) {
+            Ok(s) => Some(s),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            // A non-NotFound error (EACCES, EIO, …) is NOT absence — callers
+            // would misdiagnose it (claim() reads it as contention, pending()
+            // silently skips the record). The Option return type stays (a
+            // trait-wide Result refactor isn't worth it), but the real cause
+            // must surface somewhere: one stderr line naming path and error.
+            Err(e) => {
+                eprintln!("looop: read {}: {e} — treating as absent", path.display());
+                None
+            }
+        }
     }
 
     fn exists(&self, key: &Key) -> bool {
@@ -224,6 +264,17 @@ impl StateStore for FileStore<'_> {
         } else {
             None
         };
+        // Serialize the rename-publish against create_exclusive/remove_if_eq
+        // (see the trait invariant): util::write_atomic_mode alone renames
+        // WITHOUT the per-directory writer lock, which would let a fresh
+        // value land between remove_if_eq's compare and its delete — and be
+        // deleted. Taking the DirLock here restores the compare-and-delete
+        // guarantee for ALL writers, not just exclusive-create ones.
+        let parent = path.parent().map_or_else(
+            || std::path::PathBuf::from("."),
+            std::path::Path::to_path_buf,
+        );
+        let _lock = DirLock::acquire(&parent)?;
         crate::util::write_atomic_mode(&path, contents.as_bytes(), mode)?;
         Ok(())
     }
@@ -261,7 +312,15 @@ impl StateStore for FileStore<'_> {
             return Err(e);
         }
         match fs::rename(&tmp, &path) {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                // Durability of the rename itself (matches write_atomic_mode):
+                // fsync the parent dir so the new entry survives a crash —
+                // otherwise a claim/ask reported as created could vanish on
+                // power loss (double-lease risk). Best-effort: the contents
+                // are already synced, and durability here is defense in depth.
+                let _ = sync_parent_dir(&path);
+                Ok(true)
+            }
             Err(e) => {
                 let _ = fs::remove_file(&tmp);
                 Err(e)
@@ -279,7 +338,14 @@ impl StateStore for FileStore<'_> {
             .create(true)
             .append(true)
             .open(&path)?;
-        writeln!(f, "{line}")
+        // One write(2) for the whole line (mirrors events.rs): `writeln!` can
+        // issue the line and the trailing newline as SEPARATE writes, letting
+        // a concurrent appender (pulse + CLI journal writes race) interleave
+        // mid-line. O_APPEND + a single write_all keeps each line intact.
+        let mut buf = String::with_capacity(line.len() + 1);
+        buf.push_str(line);
+        buf.push('\n');
+        f.write_all(buf.as_bytes())
     }
 
     fn archive(&self, key: &Key) -> io::Result<()> {

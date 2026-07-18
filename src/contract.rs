@@ -147,6 +147,10 @@ impl Contract for LocalContract<'_> {
     }
 
     fn answer(&self, ask_id: &str, text: &str, force: bool) -> Result<()> {
+        // Same seeding policy as state/wait/asks: every read-side verb
+        // ensures the data layout exists so a fresh checkout can't make one
+        // contract verb behave differently from its siblings.
+        let _ = crate::seed::ensure_dirs(self.paths);
         mailbox::answer(self.paths, ask_id, text, force)
     }
 

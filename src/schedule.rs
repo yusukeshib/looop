@@ -69,9 +69,11 @@ pub fn write(
             )
         }
         (Some(0), None) => bail!("write_schedule {name:?}: in_s must be > 0"),
+        // saturating_add: a huge --in value must not overflow (panic in debug,
+        // wrap→immediately-due in release) — clamp to "the end of time".
         (Some(in_s), None) => Schedule {
             v: 1,
-            at: Some(now + in_s),
+            at: Some(now.saturating_add(in_s)),
             every_s: None,
             anchor: None,
             note: note.to_string(),
@@ -124,25 +126,29 @@ fn is_invalid(s: &Schedule) -> bool {
 
 /// All schedules, sorted by name. An unparseable file or a structurally
 /// invalid record is surfaced via a stderr warning (naming the file — stdout
-/// stays machine-clean for `--json` consumers) instead of silently skipped; invalid-but-parseable records are still RETURNED so their
-/// stable "invalid" signal reaches the world hash and the decider can fix them.
-pub fn list(paths: &Paths) -> Vec<(String, Schedule)> {
+/// stays machine-clean for `--json` consumers) instead of silently skipped;
+/// invalid-but-parseable records are still RETURNED so their stable "invalid"
+/// signal reaches the world hash, and a JSON-BROKEN file is returned as `None`
+/// so it too contributes a stable "unparseable" signal — dropping it entirely
+/// would remove it from the world hash (one wake, then invisible forever),
+/// leaving the decider no level-triggered cue to repair it.
+pub fn list(paths: &Paths) -> Vec<(String, Option<Schedule>)> {
     let store = FileStore::new(paths);
     store
         .list(&Collection::Schedules)
         .into_iter()
         .filter_map(|name| {
             let raw = store.read(&Key::Schedule(name.clone()))?;
-            let s: Schedule = match serde_json::from_str(&raw) {
-                Ok(s) => s,
+            let s: Option<Schedule> = match serde_json::from_str(&raw) {
+                Ok(s) => Some(s),
                 Err(e) => {
                     // STDERR, not stdout: list() feeds machine output
                     // (`looop state --json`) — a stdout warning would corrupt it.
                     eprintln!("schedules/{name}.json is unparseable ({e}) — it will never fire");
-                    return None;
+                    None
                 }
             };
-            if is_invalid(&s) {
+            if s.as_ref().is_some_and(is_invalid) {
                 eprintln!(
                     "schedules/{name}.json is invalid (need exactly one of `at`/`every_s`, every_s > 0) — it will never fire"
                 );
@@ -204,7 +210,17 @@ pub fn sys_schedules(paths: &Paths) -> serde_json::Value {
     let mut signal = serde_json::Map::new();
     let mut detail = serde_json::Map::new();
     for (name, s) in list(paths) {
-        let (sig, det) = reading(&s, now);
+        let (sig, det) = match &s {
+            Some(s) => reading(s, now),
+            // A JSON-broken file still contributes a STABLE "unparseable"
+            // signal (never flaps, like "invalid") so the decider gets a
+            // level-triggered cue to repair or drop it — the file must never
+            // just vanish from the world hash.
+            None => (
+                serde_json::json!("unparseable"),
+                serde_json::json!({ "kind": "unparseable" }),
+            ),
+        };
         signal.insert(name.clone(), sig);
         detail.insert(name, det);
     }
@@ -246,6 +262,8 @@ pub fn cmd_schedule(
             let now = util::now_unix();
             let all = list(paths);
             if *json {
+                // An unparseable record serializes as null — present (the human
+                // sees the name), visibly broken, machine-distinguishable.
                 let v: serde_json::Map<String, serde_json::Value> = all
                     .iter()
                     .map(|(n, s)| (n.clone(), serde_json::to_value(s).unwrap_or_default()))
@@ -255,7 +273,13 @@ pub fn cmd_schedule(
                 println!("(no schedules)");
             } else {
                 for (name, s) in &all {
-                    let (sig, det) = reading(s, now);
+                    let (sig, det) = match s {
+                        Some(s) => reading(s, now),
+                        None => (
+                            serde_json::json!("unparseable"),
+                            serde_json::json!({ "kind": "unparseable" }),
+                        ),
+                    };
                     println!("{name}\t{sig}\t{det}");
                 }
             }
@@ -365,13 +389,44 @@ mod tests {
     }
 
     #[test]
+    fn unparseable_schedule_contributes_a_stable_unparseable_signal() {
+        // A JSON-broken file must not vanish from the world hash (one wake,
+        // then invisible forever): it reads as a STABLE "unparseable" signal
+        // so the decider gets a level-triggered cue to repair or drop it.
+        let p = Paths::temp();
+        std::fs::create_dir_all(p.schedules_dir()).unwrap();
+        std::fs::write(p.schedules_dir().join("broken.json"), b"{not json").unwrap();
+        let all = list(&p);
+        assert_eq!(all.len(), 1, "unparseable entry is surfaced, not dropped");
+        assert!(all[0].1.is_none(), "unparseable entry carries no Schedule");
+        let v = sys_schedules(&p);
+        assert_eq!(v["signal"]["broken"], serde_json::json!("unparseable"));
+        assert_eq!(v["detail"]["broken"]["kind"], "unparseable");
+        // Stability: the signal is identical on the next probe (no flapping).
+        let v2 = sys_schedules(&p);
+        assert_eq!(v["signal"]["broken"], v2["signal"]["broken"]);
+    }
+
+    #[test]
+    fn write_with_a_huge_in_s_saturates_instead_of_overflowing() {
+        // `now + u64::MAX` would panic in debug / wrap to immediately-due in
+        // release; saturating_add clamps to "the end of time" (never due).
+        let p = Paths::temp();
+        write(&p, "far", Some(u64::MAX), None, "").unwrap();
+        let all = list(&p);
+        assert_eq!(all[0].1.as_ref().unwrap().at, Some(u64::MAX));
+        let v = sys_schedules(&p);
+        assert_eq!(v["signal"]["far"], serde_json::json!("pending"));
+    }
+
+    #[test]
     fn write_round_trips_and_validates() {
         let p = Paths::temp();
         // one-shot
         write(&p, "digest", Some(3600), None, "daily digest").unwrap();
         let all = list(&p);
         assert_eq!(all.len(), 1);
-        assert!(all[0].1.at.is_some());
+        assert!(all[0].1.as_ref().unwrap().at.is_some());
         // recurring
         write(&p, "poll", None, Some(600), "").unwrap();
         assert_eq!(list(&p).len(), 2);

@@ -30,8 +30,9 @@ use clap::{Args, Parser, Subcommand};
     name = "looop",
     version,
     disable_help_subcommand = true,
-    // A bare `looop` is not a command: main prints the manual. We surface our own
-    // manual rather than clap's auto help for the no-subcommand case.
+    // A bare `looop` is not a command: main prints clap's auto-generated SHORT
+    // command summary (the hand-written manual is reserved for the explicit
+    // `looop help` / top-level `--help` front door — see main.rs).
     arg_required_else_help = false
 )]
 pub struct Cli {
@@ -162,6 +163,8 @@ pub struct AnswerArgs {
     /// The ask id to answer.
     pub ask_id: String,
     /// The answer text. Omit or pass `-` to read stdin/heredoc.
+    /// A body starting with `-` needs a preceding `--` (clap would otherwise
+    /// read it as a flag) — unlike `tell`/`run`, which pass dashes through.
     pub body: Vec<String>,
     /// Overwrite an already-given answer.
     #[arg(long)]
@@ -177,6 +180,8 @@ pub struct GoalArgs {
 #[derive(Subcommand, Debug)]
 pub enum GoalOp {
     /// Create or replace a goal. Omit body or pass `-` to read stdin/heredoc.
+    /// A body starting with `-` needs a preceding `--` (clap would otherwise
+    /// read it as a flag).
     #[command(alias = "w")]
     Write {
         id: String,
@@ -201,6 +206,8 @@ pub struct SensorArgs {
 #[derive(Subcommand, Debug)]
 pub enum SensorOp {
     /// Create or replace a sensor. Omit script or pass `-` to read stdin/heredoc.
+    /// A script starting with `-` needs a preceding `--` (clap would otherwise
+    /// read it as a flag).
     #[command(alias = "w")]
     Write {
         name: String,
@@ -219,6 +226,8 @@ pub struct PlaybookArgs {
 #[derive(Subcommand, Debug)]
 pub enum PlaybookOp {
     /// Rewrite the PLAYBOOK. Omit body or pass `-` to read stdin/heredoc.
+    /// A body starting with `-` needs a preceding `--` (clap would otherwise
+    /// read it as a flag).
     #[command(alias = "w")]
     Write {
         body: Vec<String>,
@@ -303,7 +312,10 @@ pub struct AskArgs {
     /// A path/reference the human should look at.
     #[arg(long = "ref")]
     pub reference: Option<String>,
-    /// Comma-separated choices to offer.
+    /// Comma-separated choices to offer. NB: the comma is an unescapable
+    /// separator — repeating the flag APPENDS more options (each occurrence is
+    /// still comma-split), so an option containing a literal comma cannot be
+    /// expressed; rephrase it instead.
     #[arg(long, value_delimiter = ',')]
     pub options: Vec<String>,
     /// Don't block: write the ask and return immediately (prints the ask id).
@@ -343,8 +355,12 @@ pub struct ScheduleArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum ScheduleOp {
-    /// Create or replace a schedule. Exactly one of --in / --every.
-    #[command(alias = "w")]
+    /// Create or replace a schedule. Exactly one of --in / --every — enforced
+    /// by clap (the `when` ArgGroup below), so a missing/duplicate trigger is a
+    /// usage error with help, not a runtime bail. The contract path (typed
+    /// actions from the decider, which never goes through clap) keeps its own
+    /// runtime validation in schedule.rs.
+    #[command(alias = "w", group = clap::ArgGroup::new("when").required(true).multiple(false).args(["in_s", "every"]))]
     Write {
         name: String,
         /// One-shot: fire once, this many seconds from now.
@@ -411,6 +427,44 @@ mod tests {
         assert!(Cli::try_parse_from(["looop", "ss", "x", "--ansi", "--plain"]).is_err());
         assert!(Cli::try_parse_from(["looop", "ss", "x", "--json", "--plain"]).is_err());
         assert!(Cli::try_parse_from(["looop", "ss", "x", "--plain", "--no-trim"]).is_ok());
+    }
+
+    #[test]
+    fn schedule_write_requires_exactly_one_trigger() {
+        // Neither --in nor --every: clap usage error (the `when` ArgGroup).
+        assert!(Cli::try_parse_from(["looop", "schedule", "write", "x"]).is_err());
+        // Both at once: also a usage error.
+        assert!(
+            Cli::try_parse_from([
+                "looop", "schedule", "write", "x", "--in", "5", "--every", "60"
+            ])
+            .is_err()
+        );
+        // Exactly one of each parses.
+        assert!(Cli::try_parse_from(["looop", "schedule", "write", "x", "--in", "5"]).is_ok());
+        assert!(Cli::try_parse_from(["looop", "schedule", "write", "x", "--every", "60"]).is_ok());
+    }
+
+    #[test]
+    fn ask_options_repeat_appends_but_commas_always_split() {
+        // Repeating --options APPENDS; each occurrence is still comma-split, so
+        // a literal comma inside one option is NOT expressible (documented).
+        let c = Cli::try_parse_from([
+            "looop",
+            "ask",
+            "w1",
+            "--prompt",
+            "p",
+            "--options",
+            "a,b",
+            "--options",
+            "c,d",
+        ])
+        .expect("repeated --options parses");
+        let Some(Cmd::Ask(a)) = c.cmd else {
+            panic!("expected ask")
+        };
+        assert_eq!(a.options, vec!["a", "b", "c", "d"]);
     }
 
     #[test]

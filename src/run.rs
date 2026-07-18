@@ -40,15 +40,28 @@ pub(crate) fn session_ttl_secs(paths: &Paths) -> u64 {
         .unwrap_or(DEFAULT)
 }
 
-/// Resolve a cadence knob: env var > config key > fallback.
+/// Resolve a cadence knob: env var > config key > fallback. Clamped to ≥ 1s:
+/// a zero, negative, or fractional config value (e.g. `0`, `-5`, `0.5` — the
+/// `as_u64`/`as_f64→as u64` casts collapse all of them to 0) would otherwise
+/// turn the pulse into a busy spin loop of full sensing.
 fn interval(env: &str, cfg: &Config, key: &str, fallback: u64) -> u64 {
-    if let Some(n) = util::env_knob::<u64>(env) {
-        return n;
+    let v = util::env_knob::<u64>(env).unwrap_or_else(|| {
+        cfg.root
+            .get(key)
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+            .unwrap_or(fallback)
+    });
+    if v == 0 {
+        util::event(
+            Level::Warn,
+            "pulse.guard_degraded",
+            &format!(
+                "{key} resolved to 0s (would busy-spin) — clamped to 1s; set a positive integer"
+            ),
+            &[("key", serde_json::json!(key))],
+        );
     }
-    cfg.root
-        .get(key)
-        .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
-        .unwrap_or(fallback)
+    v.max(1)
 }
 
 // ---- durable cadence nudge (.next-wake.json) ---------------------------------
@@ -118,6 +131,14 @@ fn try_flock(f: &std::fs::File) -> bool {
 /// authoritative "is the loop actually running" probe (a babysit session can be
 /// alive while its inner loop has crashed): open the lock file read-only and try
 /// to take the flock; if we CAN, nobody holds it. Exercised by the lock tests.
+///
+/// KNOWN WINDOW: the probe actually TAKES the flock for the instant between
+/// the successful try and the fd drop at the end of this function. A `looop
+/// up` racing exactly into that window would see the lock held and report
+/// "already running" (a false negative for the starter — it just retries).
+/// The window is a few microseconds and the failure mode is benign, so a
+/// probe-without-acquire (which flock(2) simply doesn't offer) isn't worth
+/// the complexity.
 pub(crate) fn pulse_running(paths: &Paths) -> bool {
     let Ok(f) = std::fs::File::open(paths.lock().join("lock")) else {
         return false;
@@ -146,7 +167,7 @@ impl Drop for LockGuard {
 /// pulse already holds it. The pulse is the sole beat runner, so holding this for
 /// its lifetime guarantees no two beats ever wipe/regenerate the shared
 /// snapshots/ dir under each other (H4). A pid file is written alongside purely
-/// for human-facing messages (`looop status`, the "already running" notice).
+/// for human-facing messages (`looop state`, the "already running" notice).
 fn acquire_lock(paths: &Paths) -> Option<LockGuard> {
     let dir = paths.lock();
     let _ = fs::create_dir_all(&dir);
@@ -214,6 +235,15 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
     // forced beat, so a crash-restart loop can't burn unbounded AI calls.)
     let mut force = true;
     loop {
+        // Re-read the cadence each beat: goals, PLAYBOOK, and sensors are all
+        // re-read per beat already, so a config `interval` edit should not be
+        // the one change that needs a pulse restart. A config error mid-flight
+        // falls back to the startup value (the tick itself reports the broken
+        // config loudly — the pulse must not die on a bad edit).
+        let beat = Config::load(paths)
+            .map(|c| interval("LOOOP_INTERVAL", &c, "interval", 60))
+            .unwrap_or(beat);
+
         // A due durable nudge (written below, survives crashes) forces this
         // beat to re-decide even over an unchanged world. It is only READ here
         // — consumed after the tick, and only when a decide actually ran, so a
@@ -335,6 +365,36 @@ mod tests {
     }
 
     #[test]
+    fn interval_clamps_zero_negative_and_fractional_to_one_second() {
+        let cfg = |v: serde_json::Value| Config {
+            root: serde_json::json!({ "interval": v }),
+        };
+        // The env knob is deliberately one no test sets, so the config path is
+        // what's exercised.
+        let env = "LOOOP_TEST_INTERVAL_UNSET";
+        // 0, negative, and fractional all collapse to 0 via the casts — and
+        // must clamp to 1s instead of busy-spinning.
+        assert_eq!(interval(env, &cfg(serde_json::json!(0)), "interval", 60), 1);
+        assert_eq!(
+            interval(env, &cfg(serde_json::json!(-5)), "interval", 60),
+            1
+        );
+        assert_eq!(
+            interval(env, &cfg(serde_json::json!(0.5)), "interval", 60),
+            1
+        );
+        // Sane values pass through; an absent key uses the fallback.
+        assert_eq!(
+            interval(env, &cfg(serde_json::json!(30)), "interval", 60),
+            30
+        );
+        let empty = Config {
+            root: serde_json::json!({}),
+        };
+        assert_eq!(interval(env, &empty, "interval", 60), 60);
+    }
+
+    #[test]
     fn past_due_wake_does_not_clamp_the_sleep() {
         // No deadline: the default interval stands.
         assert_eq!(clamp_sleep_to_wake(60, None, 1_000), 60);
@@ -362,7 +422,7 @@ mod tests {
             acquire_lock(&p).is_none(),
             "second acquire blocked while held"
         );
-        // An outside observer (looop status) sees it as running.
+        // An outside observer (looop state) sees it as running.
         assert!(
             pulse_running(&p),
             "pulse_running true while the lock is held"

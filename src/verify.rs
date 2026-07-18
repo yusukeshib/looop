@@ -31,7 +31,8 @@ use crate::paths::Paths;
 
 /// Hard cap on a verify command's runtime (seconds). Verification runs inside
 /// the pulse beat, so it must be bounded — override with
-/// `LOOOP_VERIFY_TIMEOUT_SECS`.
+/// `LOOOP_VERIFY_TIMEOUT_SECS` (0 disables the deadline, matching the
+/// sensor timeout's semantics — see [`run_cmd`]).
 const DEFAULT_TIMEOUT_SECS: u64 = 60;
 
 /// Keep only this much of the verify command's combined output tail.
@@ -186,16 +187,7 @@ fn run_one(paths: &Paths, cmd_file: &std::path::Path) -> VerifyResult {
 /// keep the beat's resources busy past the deadline. libc-free: raw kill(2)
 /// via the same extern-"C" technique the flock helper uses.
 fn kill_group(child: &mut std::process::Child) {
-    #[cfg(unix)]
-    {
-        unsafe extern "C" {
-            fn kill(pid: i32, sig: i32) -> i32;
-        }
-        const SIGKILL: i32 = 9;
-        unsafe {
-            let _ = kill(-(child.id() as i32), SIGKILL);
-        }
-    }
+    crate::util::kill_process_group(child.id());
     let _ = child.kill(); // belt-and-braces (and the non-unix path)
     let _ = child.wait(); // reap; kill is racy but wait is not
 }
@@ -207,8 +199,12 @@ fn kill_group(child: &mut std::process::Child) {
 /// file (not a pipe) so a chatty command can never dead-lock the beat on a
 /// full pipe buffer; we poll `try_wait` and kill the whole process GROUP on
 /// deadline (the child is its own group leader via `process_group(0)`).
-/// `timeout_env` names the knob in the timeout message. Shared with the
-/// executor's run_shell path (same bounded-shell semantics).
+/// `timeout_env` names the knob in the timeout message. `timeout == 0`
+/// DISABLES the deadline (same semantics as LOOOP_SENSOR_TIMEOUT — it used to
+/// mean "kill immediately" here, silently failing every verify), and an
+/// absurd value that would overflow `Instant + Duration` also means "no
+/// deadline" instead of panicking. Shared with the executor's run_shell path
+/// (same bounded-shell semantics).
 pub(crate) fn run_cmd(
     cwd: &std::path::Path,
     cmd: &str,
@@ -226,16 +222,43 @@ pub(crate) fn run_cmd(
     // stdout+stderr merged into one temp file, in order. The name carries a
     // process-wide counter, not just a timestamp — two runs in the same second
     // (parallel tests, back-to-back verifies) must never share a capture file.
+    // Opened with create_new (O_EXCL): the shared temp_dir + a predictable
+    // name means a plain File::create would FOLLOW a pre-planted symlink and
+    // overwrite whatever it points at (any file the looop user can write) —
+    // O_EXCL refuses both the symlink and any pre-existing file. On collision
+    // retry with a clock-derived randomized suffix; give up after a few tries
+    // rather than loop forever against an adversary squatting the namespace.
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let out_path = std::env::temp_dir().join(format!(
-        "looop-verify-{}-{}.out",
+    let base = format!(
+        "looop-verify-{}-{}",
         std::process::id(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-    ));
-    let Ok(out_file) = fs::File::create(&out_path) else {
-        return fail("verify: cannot create output capture file".into());
+    );
+    let mut out_path = std::env::temp_dir().join(format!("{base}.out"));
+    let out_file = 'open: {
+        for _ in 0..8 {
+            match fs::File::options()
+                .write(true)
+                .create_new(true)
+                .open(&out_path)
+            {
+                Ok(f) => break 'open f,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    let nonce = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.subsec_nanos());
+                    out_path = std::env::temp_dir()
+                        .join(format!("{base}-{nonce}-{}.out", crate::util::temp_nonce()));
+                }
+                Err(_) => {
+                    return fail("verify: cannot create output capture file".into());
+                }
+            }
+        }
+        return fail("verify: cannot create output capture file (name collisions)".into());
     };
     let Ok(err_file) = out_file.try_clone() else {
+        let _ = fs::remove_file(&out_path);
         return fail("verify: cannot clone output capture file".into());
     };
 
@@ -262,12 +285,21 @@ pub(crate) fn run_cmd(
         }
     };
 
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    // checked_add: an absurd knob value (u64::MAX) would overflow
+    // Instant + Duration and panic — overflow means "no deadline", exactly
+    // like sensor.rs. `timeout == 0` also disables the deadline.
+    let deadline = if timeout == 0 {
+        None
+    } else {
+        std::time::Instant::now().checked_add(std::time::Duration::from_secs(timeout))
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
-                if std::time::Instant::now() >= deadline {
+                if let Some(d) = deadline
+                    && std::time::Instant::now() >= d
+                {
                     kill_group(&mut child);
                     break None;
                 }
@@ -391,6 +423,32 @@ mod tests {
         assert_eq!(r.exit_code, None, "a killed command has no exit code");
         assert!(r.output.contains("before"), "pre-kill output is kept");
         assert!(r.output.contains("timed out after 1s"));
+    }
+
+    #[test]
+    fn run_cmd_timeout_zero_disables_the_deadline() {
+        // 0 used to mean "kill immediately" here while the sensor timeout
+        // treats 0 as "no deadline" — the semantics are now aligned: the
+        // command must run to completion.
+        let paths = Paths::temp();
+        let r = run_cmd(&paths.data_dir, "echo done", 0, "LOOOP_VERIFY_TIMEOUT_SECS");
+        assert!(r.ok, "timeout 0 must not kill the command: {:?}", r.output);
+        assert_eq!(r.exit_code, Some(0));
+        assert!(r.output.contains("done"));
+    }
+
+    #[test]
+    fn run_cmd_survives_an_absurd_timeout_without_panicking() {
+        // u64::MAX seconds overflows Instant + Duration — checked_add must
+        // turn that into "no deadline", not a panic mid-beat.
+        let paths = Paths::temp();
+        let r = run_cmd(
+            &paths.data_dir,
+            "true",
+            u64::MAX,
+            "LOOOP_VERIFY_TIMEOUT_SECS",
+        );
+        assert!(r.ok);
     }
 
     #[test]

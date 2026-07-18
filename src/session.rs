@@ -151,17 +151,30 @@ const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
 pub struct StartOutcome {
     pub code: ExitCode,
     pub overridden: bool,
+    /// WHY the start was refused, when it was (`code != SUCCESS`). Carried
+    /// back to the executor so the failed move's LAST FAILURE feedback names
+    /// the cause (fleet cap, duplicate id, bad template, …) instead of a
+    /// generic "failed" — without it the decider repeats the same refused
+    /// move blind. The CLI stderr line stays alongside for the human path.
+    pub reason: Option<String>,
 }
 
 impl StartOutcome {
-    fn failed() -> Self {
+    fn refused(reason: String) -> Self {
         StartOutcome {
             code: ExitCode::from(1),
             overridden: false,
+            reason: Some(reason),
         }
     }
 }
 
+/// Start one worker session. Structured as VALIDATE-THEN-COMMIT: every check
+/// (resume context, id, prompt, config, fleet cap, duplicate id, launch
+/// command) runs BEFORE the first side effect, so a refusal never leaves a
+/// half-started worker behind (in particular: no stale verify record from a
+/// start that failed a later step — the old shape stored the verify before
+/// resolving the launch command).
 pub fn cmd_start_session(
     paths: &Paths,
     id: &str,
@@ -172,6 +185,15 @@ pub fn cmd_start_session(
 ) -> Result<StartOutcome> {
     seed::ensure_dirs(paths)?;
 
+    // One shape for every refusal: stderr for the human, the same text in the
+    // outcome for the executor (whose bail! feeds record_failure).
+    let refuse = |msg: String| {
+        eprintln!("start-session: {msg}");
+        Ok(StartOutcome::refused(msg))
+    };
+
+    // ---- VALIDATION PHASE (no side effects) --------------------------------
+
     // Resolve the RESUME context FIRST: an unknown / not-yet-answered ask id
     // is a decider mistake and must fail the move loudly (LAST FAILURE names
     // it) before anything is spawned. The pair is ARCHIVED just before the
@@ -180,10 +202,7 @@ pub fn cmd_start_session(
     let resume_block = match resume {
         Some(ask_id) => match crate::mailbox::resume_context(paths, ask_id) {
             Ok(block) => Some(block),
-            Err(e) => {
-                eprintln!("start-session: {e}");
-                return Ok(StartOutcome::failed());
-            }
+            Err(e) => return refuse(e.to_string()),
         },
         None => None,
     };
@@ -192,27 +211,23 @@ pub fn cmd_start_session(
     // so reject traversal/dotfile/separator ids up front — the same guard the
     // executor applies to goal/sensor ids.
     if let Err(e) = crate::util::safe_segment("worker id", id) {
-        eprintln!("start-session: {e}");
-        return Ok(StartOutcome::failed());
+        return refuse(e.to_string());
     }
     if prompt.is_empty() {
-        eprintln!("missing prompt");
-        return Ok(StartOutcome::failed());
+        return refuse("missing prompt".to_string());
     }
 
     let cfg = Config::load(paths)?;
     let runner = cfg.runner_label();
     let Some(tmpl) = cfg.runner_cmd("worker_command") else {
-        eprintln!("start-session: no `worker_command` configured");
-        return Ok(StartOutcome::failed());
+        return refuse("no `worker_command` configured".to_string());
     };
 
     // The worker's session id IS the goal id (no prefix — the fleet root is
     // looop-exclusive). `pulse` is reserved for the control loop, so a worker
     // can never collide with the pulse.
     if id == PULSE_SESSION {
-        eprintln!("start-session: '{id}' is reserved for the pulse; pick another id");
-        return Ok(StartOutcome::failed());
+        return refuse(format!("'{id}' is reserved for the pulse; pick another id"));
     }
     let session = id.to_string();
 
@@ -220,7 +235,8 @@ pub fn cmd_start_session(
     // per beat bounds the spawn RATE but not the standing fleet — without this,
     // a pathological goal/playbook can accumulate a heavy agent per beat
     // indefinitely. The refusal reaches the decider as a failed move (LAST
-    // FAILURE names it), so it can kill or wait instead of piling on.
+    // FAILURE names the cap via `StartOutcome.reason`), so it can kill or wait
+    // instead of piling on.
     let cap: usize = crate::util::env_knob("LOOOP_MAX_WORKERS").unwrap_or(8);
     if cap != 0 {
         // Check-then-spawn is a TOCTOU race in principle (two concurrent
@@ -229,28 +245,45 @@ pub fn cmd_start_session(
         // a lock.
         let live = list_workers(paths).iter().filter(|w| w.alive).count();
         if live >= cap {
-            eprintln!(
-                "start-session: {live} live workers — at the fleet cap (LOOOP_MAX_WORKERS={cap}); \
+            return refuse(format!(
+                "{live} live workers — at the fleet cap (LOOOP_MAX_WORKERS={cap}); \
                  kill or wait out an existing worker first"
-            );
-            return Ok(StartOutcome::failed());
+            ));
         }
     }
 
-    // Check-then-act (exists → alive → reap) races a concurrent start of the
-    // same id in principle; the single-decider dispatch model makes it benign
-    // (the spawn below would fail loudly on a true collision).
-    if status_exists(paths, &session) {
-        if is_alive(paths, &session) {
-            eprintln!("start-session: session {session} is already running");
-            return Ok(StartOutcome::failed());
-        }
+    // Check-then-act (exists → alive → reap-in-commit-phase) races a
+    // concurrent start of the same id in principle; the single-decider
+    // dispatch model makes it benign (the spawn below would fail loudly on a
+    // true collision).
+    let id_taken = status_exists(paths, &session);
+    if id_taken && is_alive(paths, &session) {
+        return refuse(format!("session {session} is already running"));
+    }
+
+    // Resolve the launch command LAST among the checks (it needs only the
+    // prompt file's PATH, not its contents): a per-worker `--command` override
+    // replaces the template wholesale; otherwise the template. Only
+    // `{{prompt_file}}` is substituted (looop has no runner vocabulary).
+    let prompt_file = paths.prompts_dir().join(format!("{session}.md"));
+    let expanded = match build_worker_cmd(&tmpl, command, &prompt_file.to_string_lossy()) {
+        Ok(e) => e,
+        Err(msg) => return refuse(msg),
+    };
+    let cmd = expanded.cmd;
+
+    // ---- COMMIT PHASE (side effects; all checks passed) ---------------------
+
+    if id_taken {
         reap(paths, &session); // reuse the id held by a dead corpse (targeted)
     }
 
     // Persist the post-condition BEFORE the spawn: a verify declared for a
     // worker that dies instantly must still be checked on the next beat. No
     // verify ⇒ clear any stale one left by a prior corpse with this id.
+    // Rolled back (cleared) below if a later commit step fails — a stale
+    // verify record for a worker that never launched would fail the NEXT
+    // start of this id for the wrong reason.
     match verify {
         Some(v) if !v.trim().is_empty() => crate::verify::store(paths, &session, v)?,
         _ => crate::verify::clear(paths, &session),
@@ -258,24 +291,14 @@ pub fn cmd_start_session(
 
     // Prompt via file (avoids quoting hell; also a record of the ask), with the
     // contract prepended.
-    let prompt_file = paths.prompts_dir().join(format!("{session}.md"));
     let contract = CONTRACT
         .replace("__SESSION__", &session)
         .replace("__ID__", id);
     let resume_part = resume_block.as_deref().unwrap_or("");
-    fs::write(&prompt_file, format!("{contract}{resume_part}{prompt}\n"))?;
-
-    // Resolve the launch command: a per-worker `--command` override replaces
-    // the template wholesale; otherwise the template. Only `{{prompt_file}}`
-    // is substituted (looop has no runner vocabulary).
-    let expanded = match build_worker_cmd(&tmpl, command, &prompt_file.to_string_lossy()) {
-        Ok(e) => e,
-        Err(msg) => {
-            eprintln!("start-session: {msg}");
-            return Ok(StartOutcome::failed());
-        }
-    };
-    let cmd = expanded.cmd;
+    if let Err(e) = fs::write(&prompt_file, format!("{contract}{resume_part}{prompt}\n")) {
+        crate::verify::clear(paths, &session); // no stale verify for a no-show worker
+        return Err(e.into());
+    }
 
     // The worker runs in the DATA dir. The in-process spawner inherits the
     // current process cwd (babysit's Pane uses `std::env::current_dir`), so we
@@ -312,6 +335,7 @@ pub fn cmd_start_session(
         if let Some(ask_id) = resume {
             crate::mailbox::unarchive_pair(paths, ask_id);
         }
+        crate::verify::clear(paths, &session); // no stale verify for a no-show worker
         return Err(e);
     }
 
@@ -336,15 +360,22 @@ pub fn cmd_start_session(
     Ok(StartOutcome {
         code: ExitCode::SUCCESS,
         overridden: expanded.overridden,
+        reason: None,
     })
 }
 
 /// Normalize a user-supplied worker id to its full session id. Accepts both the
-/// short goal id (`triage`) and the full session id (`looop-triage`).
-fn full_session(id: &str) -> String {
+/// short goal id (`triage`) and the legacy full session id (`looop-triage`).
+fn full_session(paths: &Paths, id: &str) -> String {
     // The fleet root is looop-exclusive, so a session id is just the goal id
-    // (or `pulse`). Strip a legacy `looop-` prefix for back-compat with old
-    // muscle memory / scripts.
+    // (or `pulse`). A literally-named session always wins: only when NO
+    // session exists under the raw id do we strip a legacy `looop-` prefix
+    // (back-compat with old muscle memory / scripts) — stripping first would
+    // make a worker legitimately named `looop-x` unreachable (kill/screenshot
+    // would target a nonexistent `x`).
+    if status_exists(paths, id) {
+        return id.to_string();
+    }
     id.strip_prefix("looop-").unwrap_or(id).to_string()
 }
 
@@ -521,7 +552,7 @@ fn fmt_dur(secs: Option<u64>) -> String {
 }
 
 pub fn cmd_kill(paths: &Paths, id: &str) -> Result<ExitCode> {
-    let session = full_session(id);
+    let session = full_session(paths, id);
     if reject_pulse(&session, "kill") {
         return Ok(ExitCode::from(1));
     }
@@ -550,7 +581,7 @@ pub fn cmd_screenshot(paths: &Paths, args: &crate::cli::ScreenshotArgs) -> Resul
         eprintln!("usage: looop screenshot <id> [--ansi|--json] [--no-trim]");
         return Ok(ExitCode::from(1));
     };
-    let session = full_session(id);
+    let session = full_session(paths, id);
     rt().block_on(paths.sessions().screenshot(Some(session), format, trim))?;
     Ok(ExitCode::SUCCESS)
 }
@@ -633,7 +664,7 @@ fn project(info: ::babysit::SessionInfo) -> Session {
 pub fn output_idle_secs(paths: &Paths, id: &str) -> Option<u64> {
     let log = paths
         .sessions()
-        .session_dir(&full_session(id))
+        .session_dir(&full_session(paths, id))
         .join("output.log");
     std::fs::metadata(log)
         .ok()?

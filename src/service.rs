@@ -8,6 +8,13 @@
 
 use crate::config;
 use crate::paths::Paths;
+
+/// The `looop down` survivor warning. A named constant (not an inline format
+/// string) so the test below can verify every `looop <verb>` it mentions is a
+/// REAL clap subcommand — a past version pointed users at a `looop status`
+/// that never existed.
+const PULSE_SURVIVED_WARNING: &str = "looop: WARNING — the pulse survived the kill (still alive after 2s); \
+     not reaped — retry `looop down` or inspect it with `looop state` / `looop worker list -a`";
 use crate::run;
 use crate::session::{self, PULSE_SESSION};
 use anyhow::Result;
@@ -80,10 +87,7 @@ pub fn cmd_down(paths: &Paths) -> Result<ExitCode> {
         // kill past the deadline, do NOT reap its status (that would erase the
         // evidence a live pulse still exists) and do NOT print "pulse stopped".
         if session::is_alive(paths, PULSE_SESSION) {
-            eprintln!(
-                "looop: WARNING — the pulse survived the kill (still alive after 2s); \
-                 not reaped — retry `looop down` or inspect it with `looop status`"
-            );
+            eprintln!("{PULSE_SURVIVED_WARNING}");
             return Ok(ExitCode::from(1));
         }
     }
@@ -101,4 +105,37 @@ pub fn cmd_down(paths: &Paths) -> Result<ExitCode> {
 /// spawns it.
 pub fn cmd_pulse(paths: &Paths) -> Result<ExitCode> {
     run::cmd_run(paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PULSE_SURVIVED_WARNING;
+
+    /// Drift guard: every `looop <verb>` a user-facing message constant tells
+    /// the user to run must be a REAL clap subcommand — a stale message once
+    /// pointed at a nonexistent `looop status`.
+    #[test]
+    fn messages_reference_only_real_subcommands() {
+        use clap::CommandFactory;
+        let root = crate::cli::Cli::command();
+        for msg in [PULSE_SURVIVED_WARNING] {
+            let mut rest = msg;
+            while let Some(i) = rest.find("looop ") {
+                let tail = &rest[i + "looop ".len()..];
+                let verb: String = tail
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                    .collect();
+                // Skip non-verb prose (`looop: …`, `looop — …`) — only check
+                // tokens that look like a subcommand word.
+                if !verb.is_empty() {
+                    assert!(
+                        root.find_subcommand(&verb).is_some(),
+                        "message references nonexistent subcommand `looop {verb}` in: {msg}"
+                    );
+                }
+                rest = tail;
+            }
+        }
+    }
 }

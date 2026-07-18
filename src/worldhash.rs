@@ -80,26 +80,39 @@ fn hash_policy_into(paths: &Paths, buf: &mut Vec<u8>) {
 
 /// The world broken into NAMED items, for the prompt's `WHAT CHANGED` diff:
 ///   * `playbook` / `goal:<id>` → a short content hash (policy files — the diff
-///     names WHICH file moved; the decider re-reads the live body anyway),
+///     names WHICH file moved; the decider re-reads the live body anyway), or
+///     the same `!unreadable` sentinel [`world_hash`] uses when the file is
+///     present but unreadable (silently skipping it would render as "gone" in
+///     the diff while the hash said "changed"),
 ///   * `snap:<name>` → the canonical wake-signal JSON itself (small by design —
-///     the diff can show old → new inline).
+///     the diff can show old → new inline). A non-JSON snapshot contributes a
+///     hash of its raw bytes — the same bytes [`world_hash`] consumes — so two
+///     same-length garbage snapshots still diff as distinct items (a
+///     length-only representation could not).
 ///
-/// Uses the SAME inputs and signal-reduction as [`world_hash`], so "the hash
-/// moved" and "some item differs" can never disagree.
+/// Uses the SAME inputs and per-item reductions as [`world_hash`], so "the
+/// hash moved" and "some item differs" stay in agreement for every item kind,
+/// including the unreadable/non-JSON edge cases.
 pub fn world_items(paths: &Paths) -> std::collections::BTreeMap<String, String> {
     let mut m = std::collections::BTreeMap::new();
 
-    if paths.playbook().is_file()
-        && let Ok(bytes) = fs::read(paths.playbook())
-    {
-        m.insert("playbook".to_string(), util::content_hash(&bytes));
+    // Policy items mirror hash_policy_into exactly: readable → content hash,
+    // present-but-unreadable → the sentinel (never silently skipped).
+    let policy_item = |f: &Path| -> Option<String> {
+        if !f.is_file() {
+            return None;
+        }
+        Some(match fs::read(f) {
+            Ok(bytes) => util::content_hash(&bytes),
+            Err(_) => "!unreadable".to_string(),
+        })
+    };
+    if let Some(v) = policy_item(&paths.playbook()) {
+        m.insert("playbook".to_string(), v);
     }
     for f in util::sorted_glob(&paths.goals_dir(), "md") {
-        if let (Some(stem), Ok(bytes)) = (f.file_stem(), fs::read(&f)) {
-            m.insert(
-                format!("goal:{}", stem.to_string_lossy()),
-                util::content_hash(&bytes),
-            );
+        if let (Some(stem), Some(v)) = (f.file_stem(), policy_item(&f)) {
+            m.insert(format!("goal:{}", stem.to_string_lossy()), v);
         }
     }
     for f in util::sorted_glob(&paths.snapshots_dir(), "json") {
@@ -109,7 +122,14 @@ pub fn world_items(paths: &Paths) -> std::collections::BTreeMap<String, String> 
         let raw = fs::read(&f).unwrap_or_default();
         let val = match serde_json::from_slice::<serde_json::Value>(&raw) {
             Ok(v) => wake_signal(v).to_string(),
-            Err(_) => format!("(non-JSON, {} bytes)", raw.len()),
+            // Content hash, not just the length: world_hash consumes the raw
+            // bytes, so the item must track the CONTENT too or same-length
+            // garbage would show "hash moved" with a useless no-op diff.
+            Err(_) => format!(
+                "(non-JSON, {} bytes, fnv {})",
+                raw.len(),
+                util::content_hash(&raw)
+            ),
         };
         m.insert(format!("snap:{stem}"), val);
     }
@@ -171,6 +191,27 @@ mod tests {
         let a = json!({ "signal": { "open": 3 }, "detail": { "ts": 1 } });
         let b = json!({ "signal": { "open": 3 }, "detail": { "ts": 999 } });
         assert_eq!(wake_signal(a), wake_signal(b));
+    }
+
+    #[test]
+    fn world_items_distinguish_same_length_non_json_snapshots() {
+        // world_hash consumes a non-JSON snapshot's raw bytes; the item view
+        // must move with the CONTENT too, not just the length — otherwise the
+        // hash says "changed" while WHAT CHANGED shows an identical value.
+        let p = Paths::temp();
+        fs::create_dir_all(p.snapshots_dir()).unwrap();
+        let f = p.snapshots_dir().join("sensor-raw.json");
+
+        fs::write(&f, b"not json AAAA").unwrap();
+        let a = world_items(&p).get("snap:sensor-raw").cloned().unwrap();
+        fs::write(&f, b"not json BBBB").unwrap();
+        let b = world_items(&p).get("snap:sensor-raw").cloned().unwrap();
+        assert_ne!(a, b, "same-length different-content must differ");
+
+        // And identical content stays stable.
+        fs::write(&f, b"not json AAAA").unwrap();
+        let a2 = world_items(&p).get("snap:sensor-raw").cloned().unwrap();
+        assert_eq!(a, a2);
     }
 
     #[test]

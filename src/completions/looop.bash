@@ -57,6 +57,17 @@ __looop_workers_list() {
     echo "$out"
 }
 
+__looop_schedules_list() {
+    local root; root=$(__looop_data_dir)
+    local out="" f
+    if [[ -d "$root/schedules" ]]; then
+        for f in "$root/schedules"/*.json; do
+            [[ -f "$f" ]] && out+=" $(basename "$f" .json)"
+        done
+    fi
+    echo "$out"
+}
+
 __looop_claims_list() {
     local root; root=$(__looop_data_dir)
     local out="" f
@@ -72,7 +83,7 @@ _looop() {
     local cur prev words cword
     _init_completion || return
 
-    local subcommands="init up down state wait asks answer goal sensor playbook run worker w screenshot ss kill claim unclaim config version help"
+    local subcommands="init up down state wait asks answer goal sensor playbook schedule run worker w ask tell told screenshot ss kill claim unclaim config version help"
 
     if [[ $cword -eq 1 ]]; then
         COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
@@ -101,21 +112,67 @@ _looop() {
             fi
             ;;
         goal)
-            if [[ $cword -eq 2 ]]; then
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "--journal" -- "$cur"))
+            elif [[ $cword -eq 2 ]]; then
                 COMPREPLY=($(compgen -W "write w archive" -- "$cur"))
             elif [[ $cword -eq 3 ]]; then
                 COMPREPLY=($(compgen -W "$(__looop_goals_list)" -- "$cur"))
             fi
             ;;
         sensor)
-            if [[ $cword -eq 2 ]]; then
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "--journal" -- "$cur"))
+            elif [[ $cword -eq 2 ]]; then
                 COMPREPLY=($(compgen -W "write w" -- "$cur"))
             elif [[ $cword -eq 3 && ( "${words[2]}" == write || "${words[2]}" == w ) ]]; then
                 COMPREPLY=($(compgen -W "$(__looop_sensors_list)" -- "$cur"))
             fi
             ;;
         playbook)
-            [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "write w" -- "$cur"))
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "--journal" -- "$cur"))
+            elif [[ $cword -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "write w" -- "$cur"))
+            fi
+            ;;
+        schedule)
+            if [[ $cword -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "write w rm list ls" -- "$cur"))
+                return
+            fi
+            case "${words[2]}" in
+                write|w)
+                    if [[ "$cur" == -* ]]; then
+                        COMPREPLY=($(compgen -W "--in --every --note --journal" -- "$cur"))
+                    elif [[ $cword -eq 3 ]]; then
+                        COMPREPLY=($(compgen -W "$(__looop_schedules_list)" -- "$cur"))
+                    fi
+                    ;;
+                rm)
+                    if [[ "$cur" == -* ]]; then
+                        COMPREPLY=($(compgen -W "--journal" -- "$cur"))
+                    elif [[ $cword -eq 3 ]]; then
+                        COMPREPLY=($(compgen -W "$(__looop_schedules_list)" -- "$cur"))
+                    fi
+                    ;;
+                list|ls)
+                    [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--json" -- "$cur"))
+                    ;;
+            esac
+            ;;
+        run)
+            [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--reason --journal" -- "$cur"))
+            ;;
+        ask)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "--prompt --ref --options --detach" -- "$cur"))
+            elif [[ $cword -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "$(__looop_workers_list)" -- "$cur"))
+            fi
+            ;;
+        tell|told)
+            [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "$(__looop_workers_list)" -- "$cur"))
             ;;
         worker|w)
             if [[ $cword -eq 2 ]]; then
@@ -130,7 +187,7 @@ _looop() {
                     [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--json --all -a --watch -w --interval" -- "$cur"))
                     ;;
                 start)
-                    [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--command --verify" -- "$cur"))
+                    [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--command --verify --resume --journal" -- "$cur"))
                     ;;
             esac
             ;;
