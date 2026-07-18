@@ -129,6 +129,12 @@ fn hash_policy_into(
 /// Uses the SAME inputs and per-item reductions as [`world_hash`], so "the
 /// hash moved" and "some item differs" stay in agreement for every item kind,
 /// including the unreadable/non-JSON edge cases.
+///
+/// Test-only in practice since the prompt learned to take `Sensed.items` as a
+/// parameter (the one-pass invariant now runs through the prompt boundary, so
+/// no production caller re-derives the items) — kept for tests that simulate
+/// the sense half of a beat.
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn world_items(paths: &Paths) -> std::collections::BTreeMap<String, String> {
     world_view(paths).1
 }

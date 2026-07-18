@@ -16,10 +16,13 @@ use std::time::{Duration, Instant, SystemTime};
 
 /// Read up to the last `max` bytes of a file as a trimmed lossy string (the
 /// stderr tail surfaced to the decider on a sensor failure). Empty when absent.
+/// Delegates to verify.rs's SEEK-based tail read: the `.err` file has no size
+/// cap (only stdout is capped via LOOOP_SENSOR_MAX_BYTES), so a whole-file
+/// `fs::read` here let a stderr-spewing sensor balloon the pulse's memory to
+/// the file's full size before the tail was taken — the same class the stdout
+/// path was hardened against. Only the tail bytes may ever be loaded.
 fn read_tail(path: &Path, max: usize) -> String {
-    let bytes = fs::read(path).unwrap_or_default();
-    let start = bytes.len().saturating_sub(max);
-    String::from_utf8_lossy(&bytes[start..]).trim().to_string()
+    crate::verify::read_tail_file(path, max).trim().to_string()
 }
 
 /// Run ONE sensor with an IN-PROCESS timeout + size cap. Returns its exit
@@ -1155,5 +1158,32 @@ mod tests {
         assert!(r.ok);
         assert_eq!(r.name, "sys-claims");
         assert!(snap.join("sys-claims.json").is_file());
+    }
+
+    #[test]
+    fn read_tail_is_bounded_on_an_oversized_err_file() {
+        // Regression: read_tail used to fs::read the WHOLE file before taking
+        // the tail — the `.err` file has no size cap (only stdout is capped),
+        // so a stderr-spewing sensor ballooned the pulse's memory to the file's
+        // full size. It now delegates to verify.rs's seek-based tail read;
+        // assert the tail semantics survive on a file far over the cap.
+        let p = Paths::temp();
+        fs::create_dir_all(&p.data_dir).unwrap();
+        let f = p.data_dir.join("big.err");
+        let mut blob = vec![b'x'; 64 * 1024];
+        blob.extend_from_slice(b"TAIL-SENTINEL  \n");
+        fs::write(&f, &blob).unwrap();
+        let tail = read_tail(&f, 1024);
+        assert!(
+            tail.len() <= 1024,
+            "the tail is bounded: {} bytes",
+            tail.len()
+        );
+        assert!(
+            tail.ends_with("TAIL-SENTINEL"),
+            "the LAST bytes are kept (trimmed): {tail:?}"
+        );
+        // Absent file → empty, same contract as before the delegation.
+        assert_eq!(read_tail(&p.data_dir.join("missing.err"), 16), "");
     }
 }

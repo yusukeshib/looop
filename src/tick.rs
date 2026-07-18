@@ -180,8 +180,11 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
         return idle;
     }
 
-    // 3. hand everything to the AI for one move.
-    let Some(run) = run_decider(paths) else {
+    // 3. hand everything to the AI for one move. The sensed items ride along
+    // so the prompt's WHAT CHANGED diffs the SAME observation the hash gated
+    // on and the baseline will commit — not a live re-read of the world (see
+    // [`Sensed`] and prompt::build_prompt).
+    let Some(run) = run_decider(paths, &items) else {
         return TickOutcome::idle();
     };
 
@@ -324,8 +327,13 @@ struct DecideRun {
 /// One decide attempt: build the run dir + prompt, launch the runner (its
 /// chatter teed to the replay archive, a spinner on the pulse's stdout), and
 /// consume its decision. `None` when the beat idles out before the runner ever
-/// launches (config error / no tick command).
-fn run_decider(paths: &Paths) -> Option<DecideRun> {
+/// launches (config error / no tick command). `sensed_items` is this beat's
+/// [`Sensed::items`], threaded into the prompt so its WHAT CHANGED diff
+/// describes the observation the beat actually hashed.
+fn run_decider(
+    paths: &Paths,
+    sensed_items: &std::collections::BTreeMap<String, String>,
+) -> Option<DecideRun> {
     let cfg = match Config::load(paths) {
         Ok(c) => c,
         Err(e) => {
@@ -364,7 +372,10 @@ fn run_decider(paths: &Paths) -> Option<DecideRun> {
     // empty/missing prompt would decide with zero context and could emit any
     // action. Idling here spends no budget (record_decide comes later) and the
     // next beat simply retries.
-    if let Err(e) = fs::write(&prompt_file, prompt::build_prompt(paths, &snap)) {
+    if let Err(e) = fs::write(
+        &prompt_file,
+        prompt::build_prompt(paths, &snap, sensed_items),
+    ) {
         util::event(
             Level::Error,
             "tick.error",

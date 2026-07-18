@@ -21,6 +21,11 @@ const PULSE_SURVIVED_WARNING: &str = "looop: WARNING — the pulse survived the 
 /// alive", and we never report a start we didn't see.
 const PULSE_NOT_OBSERVED_WARNING: &str = "looop: WARNING — the pulse was spawned but not yet observed alive (5s); \
      inspect it with `looop worker list -a` or retry `looop up`";
+
+/// The `looop down` worker-survivor warning — the sweep's counterpart of
+/// [`PULSE_SURVIVED_WARNING`], and a named constant for the same drift guard.
+const WORKERS_SURVIVED_WARNING: &str = "looop: WARNING — some workers survived the sweep (still alive after 2s); \
+     retry `looop down` or inspect them with `looop worker list -a`";
 use crate::run;
 use crate::session::{self, PULSE_SESSION};
 use anyhow::Result;
@@ -46,17 +51,41 @@ pub fn cmd_up(paths: &Paths, json: bool) -> Result<ExitCode> {
     // (the same gate the plumbing verbs get via dispatch, run here after the init
     // check so the messages surface in the right order).
     crate::deps::require_deps(paths)?;
-    if session::is_alive(paths, PULSE_SESSION) {
+    // Enumerate the fleet ONCE, failing CLOSED: the lenient `is_alive` maps
+    // an enumeration error to "no pulse", and spawning on that reading boots
+    // a SECOND pulse whose inner loop then loses the flock race — a confusing
+    // half-started state. Refuse instead and say why.
+    let fleet = match session::try_list(paths) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("looop: cannot enumerate the fleet ({e}) — refusing to start the pulse");
+            return Ok(ExitCode::from(1));
+        }
+    };
+    if fleet.iter().any(|s| s.id == PULSE_SESSION && s.alive) {
         println!("looop: pulse already running");
     } else {
-        if session::status_exists(paths, PULSE_SESSION) {
+        if fleet.iter().any(|s| s.id == PULSE_SESSION) {
             session::reap(paths, PULSE_SESSION);
         }
-        if json {
-            unsafe { std::env::set_var("LOOOP_LOG_FORMAT", "json") };
-        }
         let bin = paths.bin.to_string_lossy().to_string();
-        session::spawn_detached(paths, vec![bin, "pulse".to_string()], PULSE_SESSION)?;
+        // The JSON flag travels to the CHILD through its own environment (an
+        // argv `env`-wrapper), NEVER via `set_var` on this process: the fleet
+        // probe above already built the multi-thread tokio runtime, and
+        // mutating `environ` while other threads may call getenv (libstd's
+        // spawn paths, babysit, any dependency) is a data race / UB on Unix —
+        // the safety condition `set_var` demands cannot be upheld here.
+        let cmd = if json {
+            vec![
+                "env".to_string(),
+                "LOOOP_LOG_FORMAT=json".to_string(),
+                bin,
+                "pulse".to_string(),
+            ]
+        } else {
+            vec![bin, "pulse".to_string()]
+        };
+        session::spawn_detached(paths, cmd, PULSE_SESSION)?;
         // Never report a start we didn't observe: the spawn is detached and
         // asynchronous, so only an is-alive sighting within the grace window
         // earns the success line — mirroring `looop down`, which refuses to
@@ -70,27 +99,29 @@ pub fn cmd_up(paths: &Paths, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// `looop down` — stop every live worker and the pulse, then reap the pulse
+/// `looop down` — stop the pulse, then every live worker, then reap the pulse
 /// corpse so a re-`looop up` starts clean.
+///
+/// KILL ORDER: pulse FIRST, workers second. The pulse is the sole autonomous
+/// spawner — sweeping workers while it is still alive (possibly mid-beat)
+/// races its current beat: a `StartWorker` executed after the sweep's
+/// snapshot but before the pulse died would silently survive `looop down`.
+/// With the pulse confirmed dead first, the worker list can no longer grow
+/// under the sweep.
 pub fn cmd_down(paths: &Paths) -> Result<ExitCode> {
-    let live: Vec<String> = session::list_workers(paths)
-        .into_iter()
-        .filter(|s| s.alive)
-        .map(|s| s.id)
-        .collect();
-    for id in &live {
-        let _ = session::kill_quiet(paths, id);
-    }
-    if !live.is_empty() {
-        println!(
-            "looop: stopped {} worker{} ({})",
-            live.len(),
-            if live.len() == 1 { "" } else { "s" },
-            live.join(", ")
-        );
-    }
-
-    let was_alive = session::is_alive(paths, PULSE_SESSION);
+    // Fail CLOSED on enumeration: the lenient `is_alive` reads an I/O error
+    // as "not running", and `down` would then exit 0 claiming a clean stop
+    // while the whole fleet is still up.
+    let was_alive = match session::try_is_alive(paths, PULSE_SESSION) {
+        Ok(alive) => alive,
+        Err(e) => {
+            eprintln!(
+                "looop: cannot enumerate the fleet ({e}) — cannot tell what is running; \
+                 retry `looop down`"
+            );
+            return Ok(ExitCode::from(1));
+        }
+    };
     if was_alive {
         let _ = session::kill_quiet(paths, PULSE_SESSION);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -105,6 +136,63 @@ pub fn cmd_down(paths: &Paths) -> Result<ExitCode> {
             return Ok(ExitCode::from(1));
         }
     }
+
+    // The sole spawner is dead — NOW sweep the workers. Same fail-closed
+    // stance: an error-to-empty read here would kill nothing and print a
+    // clean summary over a live fleet.
+    let live: Vec<String> = match session::try_list(paths) {
+        Ok(fleet) => fleet
+            .into_iter()
+            .filter(|s| !s.is_pulse() && s.alive)
+            .map(|s| s.id)
+            .collect(),
+        Err(e) => {
+            eprintln!(
+                "looop: cannot enumerate the fleet ({e}) — workers were NOT swept; \
+                 retry `looop down`"
+            );
+            return Ok(ExitCode::from(1));
+        }
+    };
+    for id in &live {
+        let _ = session::kill_quiet(paths, id);
+    }
+    if !live.is_empty() {
+        println!(
+            "looop: stopped {} worker{} ({})",
+            live.len(),
+            if live.len() == 1 { "" } else { "s" },
+            live.join(", ")
+        );
+        // Final audit: give the kills the same grace the pulse gets, then
+        // warn (and fail) if anything outlived the sweep — mirroring the
+        // never-report-a-stop-that-didn't-happen rule above. Same fail-closed
+        // stance as the enumerations above: the lenient `list_workers` reads
+        // an enumeration error as "no survivors", and the audit would then
+        // exit 0 claiming a clean stop over a possibly-live fleet.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let survivors = match session::try_list(paths) {
+                Ok(fleet) => fleet.iter().any(|s| !s.is_pulse() && s.alive),
+                Err(e) => {
+                    eprintln!(
+                        "looop: cannot enumerate the fleet ({e}) — cannot confirm the \
+                         worker sweep; retry `looop down`"
+                    );
+                    return Ok(ExitCode::from(1));
+                }
+            };
+            if !survivors {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                eprintln!("{WORKERS_SURVIVED_WARNING}");
+                return Ok(ExitCode::from(1));
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
     if session::status_exists(paths, PULSE_SESSION) {
         session::reap(paths, PULSE_SESSION);
     }
@@ -137,7 +225,9 @@ pub fn cmd_pulse(paths: &Paths) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod tests {
-    use super::{PULSE_NOT_OBSERVED_WARNING, PULSE_SURVIVED_WARNING, down_summary};
+    use super::{
+        PULSE_NOT_OBSERVED_WARNING, PULSE_SURVIVED_WARNING, WORKERS_SURVIVED_WARNING, down_summary,
+    };
 
     /// `looop down` never claims a stop it didn't perform: with no live pulse
     /// the summary is the observed "not running", not a fabricated "stopped".
@@ -145,6 +235,20 @@ mod tests {
     fn down_reports_not_running_when_nothing_was_stopped() {
         assert_eq!(down_summary(true), "looop: pulse stopped");
         assert_eq!(down_summary(false), "looop: pulse not running");
+    }
+
+    /// `looop down` fails CLOSED when the fleet can't be enumerated: the old
+    /// error-to-empty read killed nothing, saw no pulse, printed a clean
+    /// "pulse not running", and exited 0 — while the whole fleet could still
+    /// be up. An unreadable fleet must be exit 1, not a fabricated stop.
+    #[test]
+    fn down_fails_closed_when_the_fleet_cannot_be_enumerated() {
+        let p = crate::paths::Paths::temp();
+        // A regular FILE where babysit's sessions dir belongs makes its
+        // read_dir fail — the shape of any transient enumeration error.
+        std::fs::write(p.data_dir.join("sessions"), "not a dir").unwrap();
+        let code = super::cmd_down(&p).unwrap();
+        assert_eq!(code, std::process::ExitCode::from(1));
     }
 
     /// Drift guard: every `looop <verb>` a user-facing message constant tells
@@ -157,6 +261,7 @@ mod tests {
         for msg in [
             PULSE_SURVIVED_WARNING,
             PULSE_NOT_OBSERVED_WARNING,
+            WORKERS_SURVIVED_WARNING,
             down_summary(true),
             down_summary(false),
         ] {

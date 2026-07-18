@@ -149,6 +149,18 @@ pub trait StateStore {
     /// `DELETE … WHERE contents = ?`.
     fn remove_if_eq(&self, key: &Key, expected: &str) -> io::Result<bool>;
 
+    /// COMPARE-AND-SWAP: replace `key` with `contents` ONLY IF its current
+    /// contents still equal `expected`. Returns `Ok(true)` when the swap
+    /// happened, `Ok(false)` when the key is absent or its contents changed
+    /// underneath us (the caller lost — re-inspect). The read + compare +
+    /// rename-publish run under the same per-directory writer lock the other
+    /// writer primitives take, so the key is NEVER observably absent during
+    /// the swap — unlike a remove_if_eq + create_exclusive pair, which opens
+    /// a window where a third racer's exclusive create wins against a value
+    /// the caller was merely refreshing. A DB backend would use
+    /// `UPDATE … SET contents = ? WHERE contents = ?`.
+    fn replace_if_eq(&self, key: &Key, expected: &str, contents: &str) -> io::Result<bool>;
+
     /// Seconds since `key` was last written, or `None` when absent (or the
     /// backend cannot tell). Coarse — used only for staleness horizons (e.g.
     /// "is this empty claim file older than the in-flight grace period?").
@@ -208,7 +220,8 @@ impl<'a> FileStore<'a> {
     /// ids with `util::safe_segment` at the boundary, but path() is the single
     /// place an id actually BECOMES a path segment, so it re-checks here — N
     /// call-site checks can drift; this one cannot. The check is TRAVERSAL-only
-    /// (empty, `..`, `/`, `\`, NUL), in debug and release alike: stems scanned
+    /// (empty, `/`, NUL — plus `\` where the host treats it as a separator),
+    /// in debug and release alike: stems scanned
     /// back from disk by `list()` — and files a foreign tool dropped into a
     /// collection dir — may legally violate the HYGIENE-only rules (dots,
     /// whitespace, control chars), and those must stay readable so the reading
@@ -226,7 +239,17 @@ impl<'a> FileStore<'a> {
             // `list()` legally scans that stem back from a foreign `...json`
             // debris file, which must stay readable/addressable instead of
             // panicking the pulse into a crash loop every beat.
-            if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains('\0') {
+            //
+            // `\` is rejected only where the HOST kernel treats it as a path
+            // separator (Windows). On unix it is a legal file-name byte, and
+            // `list()` scans it back as a stem from a foreign debris file
+            // (`touch 'asks/foo\bar.json'`) — rejecting it here turned that
+            // one unix-legal file into the same panic-per-beat crash loop the
+            // `..` carve-out above defuses. Full hygiene (which does ban `\`
+            // everywhere) remains the verbs' boundary duty via `safe_segment`;
+            // this choke point only refuses what can actually ESCAPE.
+            let escapes = |c: char| c == '/' || c == '\0' || (cfg!(windows) && c == '\\');
+            if id.is_empty() || id.contains(escapes) {
                 panic!("FileStore::path: {kind} {id:?} would escape its collection directory");
             }
             id
@@ -561,6 +584,38 @@ impl StateStore for FileStore<'_> {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
             Err(e) => Err(e),
         }
+    }
+
+    fn replace_if_eq(&self, key: &Key, expected: &str, contents: &str) -> io::Result<bool> {
+        let path = self.path(key);
+        let parent = path.parent().map_or_else(
+            || std::path::PathBuf::from("."),
+            std::path::Path::to_path_buf,
+        );
+        // Read + compare + rename-publish under the per-directory writer lock
+        // (same discipline as remove_if_eq): the swap is atomic against every
+        // other locked writer, and lock-free readers only ever observe the
+        // old complete value or the new complete value — never absence.
+        let _lock = DirLock::acquire(&parent)?;
+        match fs::read_to_string(&path) {
+            Ok(s) if s == expected => {}
+            Ok(_) => return Ok(false), // a FRESH value landed — the caller lost
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false), // vanished
+            Err(e) => return Err(e),
+        }
+        // util::write_atomic_mode directly (NOT self.write_atomic): that
+        // method acquires the same DirLock and flock does not nest across
+        // fds within one process — calling it here would deadlock. Same mode
+        // selection as write_atomic, though: a sensor's content is a script
+        // the runtime execs, so a hardcoded None here would silently strip
+        // the exec bit if a compare-and-swap is ever used for Key::Sensor.
+        let mode = if matches!(key, Key::Sensor(_)) {
+            Some(0o755)
+        } else {
+            None
+        };
+        crate::util::write_atomic_mode(&path, contents.as_bytes(), mode)?;
+        Ok(true)
     }
 
     fn age_secs(&self, key: &Key) -> Option<u64> {
@@ -989,6 +1044,46 @@ mod tests {
         std::fs::write(p.asks_dir().join("...json"), "{}").unwrap();
         assert_eq!(s.list(&Collection::Asks), vec![".."]);
         assert_eq!(s.read(&Key::Ask("..".into())).as_deref(), Some("{}"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backslash_debris_stays_addressable_without_a_panic() {
+        // Regression: `\` is a legal file-name byte on unix, and `list()`
+        // scans a foreign `foo\bar.json` file back as the stem `foo\bar` —
+        // the choke point rejecting `\` unconditionally turned that one
+        // debris file (e.g. `touch 'asks/foo\bar.json'`) into a
+        // panic-per-beat crash loop, the exact failure mode the `..` test
+        // above defuses. `\` is not a separator here, so the key must stay
+        // readable; the rejection is Windows-only.
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        std::fs::create_dir_all(p.asks_dir()).unwrap();
+        std::fs::write(p.asks_dir().join("foo\\bar.json"), "{}").unwrap();
+        assert_eq!(s.list(&Collection::Asks), vec!["foo\\bar"]);
+        assert_eq!(s.read(&Key::Ask("foo\\bar".into())).as_deref(), Some("{}"));
+    }
+
+    #[test]
+    fn replace_if_eq_is_a_compare_and_swap() {
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        let key = Key::Claim("cas".into());
+        // Absent key: nothing to swap.
+        assert!(!s.replace_if_eq(&key, "old", "new").unwrap());
+        assert!(
+            s.read(&key).is_none(),
+            "a losing swap must not create the key"
+        );
+        // Matched expectation: the swap lands.
+        s.write_atomic(&key, "old").unwrap();
+        assert!(s.replace_if_eq(&key, "old", "new").unwrap());
+        assert_eq!(s.read(&key).as_deref(), Some("new"));
+        // Stale expectation: the swap loses and the fresh value survives —
+        // this is what lets the gate refresh a lease it owns without ever
+        // clobbering one a third racer published meanwhile.
+        assert!(!s.replace_if_eq(&key, "old", "stomp").unwrap());
+        assert_eq!(s.read(&key).as_deref(), Some("new"));
     }
 
     #[test]
