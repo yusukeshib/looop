@@ -1233,6 +1233,22 @@ mod tests {
 
     #[test]
     fn warn_if_interrupted_detects_and_clears_a_stale_intent() {
+        // Serialize with the env-mutating tests (shell_timeout_zero_disables_*,
+        // run_shell_times_out_*): shell_timeout_secs() reads
+        // LOOOP_SHELL_TIMEOUT_SECS, and a sibling setting it to 0 mid-test
+        // would make warn_if_interrupted take the "no deadline" early-return
+        // and false-fail every assertion below. Hold the shared env lock for
+        // the whole body and pin the knob to its default so no concurrent
+        // test can poison the age math.
+        let _env = crate::util::test_env_lock();
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("LOOOP_SHELL_TIMEOUT_SECS") };
+            }
+        }
+        let _restore = Restore;
+        unsafe { std::env::remove_var("LOOOP_SHELL_TIMEOUT_SECS") };
         let p = Paths::temp();
         // A YOUNG intent may belong to a LIVE actor (a manual `looop run`
         // mid-run_shell) — it must be left alone, not eaten every beat.
