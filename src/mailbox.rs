@@ -198,6 +198,9 @@ fn read_answer(store: &impl StateStore, ask_id: &str) -> AnswerState {
     let Some(raw) = store.read(&Key::Answer(ask_id.to_string())) else {
         return AnswerState::Missing;
     };
+    // Same forward-compat signal as asks/tells — answers are records too, and
+    // a v2 answer read as v1 would otherwise be misinterpreted silently.
+    warn_future_v("answers", ask_id, &raw);
     // Deduplicated via warn_once: read_answer runs every beat (pending) and
     // every poll second (ask), so a durable corruption would otherwise warn
     // hundreds of times for one broken file.

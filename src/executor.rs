@@ -229,17 +229,6 @@ fn clear_intent(paths: &Paths, intent: &Intent) {
     let _ = FileStore::new(paths).remove_if_eq(&Key::ActionWal(intent.actor.clone()), &intent.body);
 }
 
-/// The actor id encoded in a WAL file name (`.action-wal.<actor>.json`), or
-/// `None` for the LEGACY pre-per-actor single file (`.action-wal.json`).
-fn wal_actor_of(path: &std::path::Path) -> Option<String> {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .and_then(|n| n.strip_prefix(".action-wal."))
-        .and_then(|n| n.strip_suffix(".json"))
-        .filter(|a| !a.is_empty())
-        .map(str::to_string)
-}
-
 /// At beat start: if any write-ahead intent record survived, its actor died
 /// mid non-idempotent side effect (run_shell) before it could commit the world
 /// hash. We do NOT auto-retry (a duplicate command is worse than a missed
@@ -261,9 +250,10 @@ pub fn warn_if_interrupted(paths: &Paths) -> bool {
 /// Judge ONE surviving WAL record; consume + report it when it is
 /// unambiguously a corpse. Returns true when reported.
 fn warn_one_interrupted(paths: &Paths, wal: &std::path::Path) -> bool {
-    let store = FileStore::new(paths);
-    // Read raw (not via a Key): the scan already has the concrete path, and
-    // the legacy file has no per-actor key to read through.
+    // Operate on the concrete path throughout (never reconstruct a Key from
+    // the file name): a foreign/debris name like `.action-wal....json` would
+    // decode to an actor the Key layer rejects, turning debris into a
+    // panic-per-beat crash loop. The scan already holds the real path — use it.
     let Ok(raw) = std::fs::read_to_string(wal) else {
         return false; // vanished (owner cleared it) or unreadable — retry next beat
     };
@@ -298,18 +288,13 @@ fn warn_one_interrupted(paths: &Paths, wal: &std::path::Path) -> bool {
     if crate::util::now_unix().saturating_sub(ts) < timeout + 60 {
         return false;
     }
-    // One-shot report — compare-and-delete exactly the record we inspected.
-    // The legacy single file predates per-actor keys: best-effort remove (its
-    // only writer is a dead pre-upgrade binary, so there is no live actor to
-    // race with).
-    match wal_actor_of(wal) {
-        Some(actor) => {
-            let _ = store.remove_if_eq(&Key::ActionWal(actor), &raw);
-        }
-        None => {
-            let _ = std::fs::remove_file(wal);
-        }
-    }
+    // One-shot report — plain remove, no compare-and-delete: the record's
+    // writer is judged DEAD by its own recorded deadline (a live holder never
+    // reaches this line), so there is no owner left to race with. The only
+    // concurrent party is another reaper, and the worst outcome of that race
+    // is a duplicate report — the same as the CAS path's, without needing to
+    // reconstruct a per-actor Key from an (untrusted) file name.
+    let _ = std::fs::remove_file(wal);
     let akind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("?");
     let fp = v.get("fingerprint").and_then(|x| x.as_str()).unwrap_or("?");
     crate::util::event(

@@ -206,6 +206,15 @@ extern "C" fn on_shutdown_signal(_sig: i32) {
 /// and `cmd_run` returns normally — the guard drops and the pid file is
 /// removed.
 ///
+/// SCOPE: direct SIGTERM/Ctrl-C only — DELIBERATELY not `looop down`, whose
+/// babysit kill path delivers SIGHUP (and expects the pulse gone within its
+/// 2s deadline; a graceful beat-completion can take up to the tick timeout,
+/// minutes). `down` stays an immediate stop: hard death is safe BY DESIGN
+/// here — state is level-triggered plain files, the flock dies with the
+/// process, and the WAL guard reports any torn non-idempotent action — so
+/// graceful exit is a nicety for operator signals, not a correctness
+/// requirement.
+///
 /// libc-free via the same extern-"C" technique as [`util::kill_process_group`]
 /// / `flock_file`. `signal(2)` rather than `sigaction(2)` deliberately: the
 /// sigaction struct's layout is platform-specific (padding, field order differ

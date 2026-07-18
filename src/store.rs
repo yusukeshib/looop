@@ -220,12 +220,13 @@ impl<'a> FileStore<'a> {
     /// data dir.
     fn path(&self, key: &Key) -> std::path::PathBuf {
         fn checked<'i>(kind: &str, id: &'i str) -> &'i str {
-            if id.is_empty()
-                || id == ".."
-                || id.contains('/')
-                || id.contains('\\')
-                || id.contains('\0')
-            {
+            // NB: a bare `..` id is deliberately NOT rejected: every arm below
+            // appends an extension (`{id}.json`/`.md`/`.sh`), so it lands as a
+            // plain sibling file (`...json`), never a directory step — and
+            // `list()` legally scans that stem back from a foreign `...json`
+            // debris file, which must stay readable/addressable instead of
+            // panicking the pulse into a crash loop every beat.
+            if id.is_empty() || id.contains('/') || id.contains('\\') || id.contains('\0') {
                 panic!("FileStore::path: {kind} {id:?} would escape its collection directory");
             }
             id
@@ -972,6 +973,22 @@ mod tests {
             "first body",
             "the previously archived record was never overwritten"
         );
+    }
+
+    #[test]
+    fn dotdot_debris_stays_addressable_without_a_panic() {
+        // Regression: `list()` scans a foreign `...json` file back as the
+        // stem `..`, and readers feed that straight into `Key::Ask` — the
+        // choke point rejecting a bare `..` turned one debris file into a
+        // panic-per-beat crash loop. Extension suffixing defuses it (the key
+        // lands on the sibling `...json`, never a directory step), so it must
+        // read fine.
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        std::fs::create_dir_all(p.asks_dir()).unwrap();
+        std::fs::write(p.asks_dir().join("...json"), "{}").unwrap();
+        assert_eq!(s.list(&Collection::Asks), vec![".."]);
+        assert_eq!(s.read(&Key::Ask("..".into())).as_deref(), Some("{}"));
     }
 
     #[test]

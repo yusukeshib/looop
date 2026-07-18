@@ -195,9 +195,13 @@ impl Paths {
             .flatten()
             .map(|e| e.path())
             .filter(|p| {
-                p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with(".action-wal") && n.ends_with(".json"))
+                p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    // Per-actor records + the exact legacy name — NOT a bare
+                    // `.action-wal` prefix, which would also match unrelated
+                    // debris like `.action-walfoo.json`.
+                    (n.starts_with(".action-wal.") && n.ends_with(".json"))
+                        || n == ".action-wal.json"
+                })
             })
             .collect();
         v.sort();

@@ -104,7 +104,10 @@ fn main() -> ExitCode {
     match result {
         Ok(code) => code,
         Err(e) => {
-            eprintln!("{}", diagnostic(&e.to_string()));
+            // `{e:#}` renders the WHOLE anyhow cause chain ("open failed:
+            // permission denied"), not just the top message — the chain is
+            // where the actionable detail usually lives.
+            eprintln!("{}", diagnostic(&format!("{e:#}")));
             ExitCode::from(1)
         }
     }
