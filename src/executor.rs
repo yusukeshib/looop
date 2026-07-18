@@ -183,7 +183,19 @@ fn begin_intent(paths: &Paths, action: &Action) -> String {
         "ts": crate::util::now_unix(),
     })
     .to_string();
-    let _ = FileStore::new(paths).write_atomic(&Key::ActionWal, &body);
+    // Execution still proceeds on a failed WAL write — refusing the move over
+    // a bookkeeping failure would be worse — but the degraded crash guard
+    // (tick.interrupted detection is OFF for this move) must not be silent.
+    if let Err(e) = FileStore::new(paths).write_atomic(&Key::ActionWal, &body) {
+        crate::util::event(
+            crate::util::Level::Warn,
+            "tick.guard_degraded",
+            &format!(
+                "failed to write the action WAL (a crash during this move would go undetected): {e}"
+            ),
+            &[],
+        );
+    }
     body
 }
 
@@ -443,7 +455,16 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
                 resume.as_deref(),
             )?;
             if outcome.code != std::process::ExitCode::SUCCESS {
-                bail!("start_worker {id:?} failed");
+                // Carry the refusal REASON (fleet cap, duplicate id, bad
+                // template, …) into the error: record_failure persists this
+                // message, so the next decide prompt's LAST FAILURE section
+                // names the cause and the decider can change course instead of
+                // repeating the same refused move blind.
+                let why = outcome
+                    .reason
+                    .as_deref()
+                    .unwrap_or("refused for an unspecified reason");
+                bail!("start_worker {id:?} failed: {why}");
             }
             // Flag a command override / resume in the journal (auditable).
             let mut note = format!("start-worker {id}");
@@ -558,8 +579,23 @@ pub fn consume_decision(paths: &Paths) -> Option<Result<Decided>> {
         // it is shown exactly once (a run_shell below re-creates it fresh).
         // Deliberately HERE and not in run_action: a manual CLI verb executed
         // between two beats must not eat the output before the decider sees it.
+        // Snapshot the record first: if the move below FAILS, the retry prompt
+        // must still carry the RUN_SHELL OUTPUT that informed it — restore it,
+        // UNLESS the failing move was itself a run_shell that already wrote a
+        // fresh record (the fresh failure output is the more useful one).
+        let prev_shell = fs::read_to_string(paths.last_shell()).ok();
         let _ = fs::remove_file(paths.last_shell());
-        let summary = run_action(paths, &decision.action, journal)?;
+        let summary = match run_action(paths, &decision.action, journal) {
+            Ok(s) => s,
+            Err(e) => {
+                if !paths.last_shell().exists()
+                    && let Some(prev) = prev_shell
+                {
+                    let _ = crate::util::write_atomic(&paths.last_shell(), prev.as_bytes());
+                }
+                return Err(e);
+            }
+        };
         let journal_line = if decision.journal.trim().is_empty() {
             summary.clone()
         } else {
@@ -599,7 +635,20 @@ pub fn run_action(paths: &Paths, action: &Action, journal: Option<&str>) -> Resu
         Some(j) if !j.trim().is_empty() => j.trim().to_string(),
         _ => summary.clone(),
     };
-    append_journal(paths, &line)?;
+    // The journal is an AUDIT log, not a commit precondition: the side effect
+    // above already happened, so failing the beat here would arm backoff and
+    // leave the world hash uncommitted — the same (possibly non-idempotent)
+    // move could be re-issued just because the audit line didn't land.
+    // Degrade to a warning and report success.
+    if let Err(e) = append_journal(paths, &line) {
+        crate::util::event(
+            crate::util::Level::Warn,
+            "tick.guard_degraded",
+            &format!("executed ok but failed to append the journal line (audit-trail gap): {e}"),
+            &[],
+        );
+        eprintln!("looop: failed to append the journal line (audit-trail gap): {e}");
+    }
     Ok(summary)
 }
 
@@ -902,6 +951,38 @@ mod tests {
         .unwrap();
         consume_decision(&p).unwrap().unwrap();
         assert!(!p.last_shell().is_file(), "consumed by the next decision");
+    }
+
+    #[test]
+    fn failed_decision_restores_the_run_shell_output_for_the_retry_prompt() {
+        let p = Paths::temp();
+        // A previous beat's run_shell output is on record.
+        crate::util::write_atomic(
+            &p.last_shell(),
+            br#"{"v":1,"cmd":"echo x","exit_code":0,"output":"query-result"}"#,
+        )
+        .unwrap();
+        // This decision FAILS to execute (traversal id is refused): the retry
+        // prompt must still carry the RUN_SHELL OUTPUT that informed it.
+        fs::write(
+            p.data_dir.join(DECISION_FILE),
+            r#"{"action":"write_goal","id":"../evil","body":"x","journal":"bad"}"#,
+        )
+        .unwrap();
+        consume_decision(&p).unwrap().unwrap_err();
+        let raw = fs::read_to_string(p.last_shell()).expect("record restored on failure");
+        assert!(raw.contains("query-result"));
+
+        // But a failing run_shell decision writes a FRESH record — the fresh
+        // failure output wins over the stale restore.
+        fs::write(
+            p.data_dir.join(DECISION_FILE),
+            r#"{"action":"run_shell","cmd":"echo fresh; exit 7","journal":"probe"}"#,
+        )
+        .unwrap();
+        consume_decision(&p).unwrap().unwrap_err();
+        let raw = fs::read_to_string(p.last_shell()).unwrap();
+        assert!(raw.contains("fresh"), "the fresh record is kept: {raw}");
     }
 
     #[test]

@@ -39,8 +39,28 @@ fn read_tail(path: &Path, max: usize) -> String {
 fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
     let to = env_num("LOOOP_SENSOR_TIMEOUT", 60);
 
-    let (Ok(of), Ok(ef)) = (File::create(out), File::create(err)) else {
-        return 1;
+    // Any failure BEFORE the script even runs (capture-file create, spawn)
+    // must land as the same normalized {signal,detail} error blob a non-zero
+    // exit gets. File::create(out) TRUNCATES the previous snapshot first, so
+    // an early return here used to leave an EMPTY snapshot behind — the
+    // decider saw an unexplained blank world instead of the failure. Routing
+    // spawn failures (missing exec bit, bogus shebang) through the blob keeps
+    // the failure visible in the prompt AND the wake hash.
+    let fail_blob = |rc: i32, msg: String| -> i32 {
+        let blob = serde_json::json!({
+            "signal": { "error": true, "exit_code": rc },
+            "detail": { "message": msg, "stderr": read_tail(err, 1024) },
+        });
+        let _ = fs::write(out, format!("{blob}\n"));
+        rc
+    };
+
+    let (of, ef) = match (File::create(out), File::create(err)) {
+        (Ok(of), Ok(ef)) => (of, ef),
+        // Best-effort: if the snapshot itself is uncreatable the blob write
+        // below likely fails too, but a failing .err file alone must not
+        // silently blank the snapshot.
+        _ => return fail_blob(1, "cannot create sensor capture files".to_string()),
     };
 
     let mut cmd = Command::new(script);
@@ -54,7 +74,12 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,
-        Err(_) => return 1,
+        Err(e) => {
+            return fail_blob(
+                1,
+                format!("spawn failed: {e} — check the script's exec bit and shebang"),
+            );
+        }
     };
     // checked_add: an absurd LOOOP_SENSOR_TIMEOUT (u64::MAX) would overflow
     // Instant + Duration and panic — overflow means "no deadline". `to == 0`
@@ -71,11 +96,11 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
                 if let Some(d) = deadline
                     && Instant::now() >= d
                 {
-                    kill_group(child.id());
-                    // Portable fallback: kill_group shells out to `kill(1)`
-                    // (unix); if that ever fails or is a no-op, killing the
-                    // direct child keeps wait() from blocking forever
-                    // (redundant ESRCH on the happy path is harmless).
+                    util::kill_process_group(child.id());
+                    // Portable fallback: if the group kill ever fails or is a
+                    // no-op (non-unix), killing the direct child keeps wait()
+                    // from blocking forever (redundant ESRCH on the happy
+                    // path is harmless).
                     let _ = child.kill();
                     let _ = child.wait();
                     break 124;
@@ -86,7 +111,7 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
                 // Same blast radius as the timeout path: the sensor owns its
                 // process GROUP, so kill the group, not just the direct child
                 // (helpers it forked must die with it).
-                kill_group(child.id());
+                util::kill_process_group(child.id());
                 let _ = child.kill(); // same portable fallback as the timeout path
                 let _ = child.wait();
                 break 1;
@@ -108,17 +133,15 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
         } else {
             "sensor exited non-zero — fix the script or its environment".to_string()
         };
-        let blob = serde_json::json!({
-            "signal": { "error": true, "exit_code": rc },
-            "detail": { "message": msg, "stderr": read_tail(err, 1024) },
-        });
-        let _ = fs::write(out, format!("{blob}\n"));
-        return rc;
+        return fail_blob(rc, msg);
     }
 
     // Context backpressure: a successful reading over the cap is replaced with a
     // tiny error object so the pulse stops paying for the blob and the AI sees
-    // the misbehavior.
+    // the misbehavior. Normalized {signal,detail}: the SIZE-VOLATILE byte count
+    // rides in .detail — with it in the (implicit) signal, every fluctuation of
+    // an oversized blob's size moved the world hash and re-woke the loop each
+    // beat (self-inflicted flapping that defeats the unchanged-world skip).
     let cap = env_num("LOOOP_SENSOR_MAX_BYTES", 8192);
     if cap != 0
         && let Ok(meta) = fs::metadata(out)
@@ -126,28 +149,17 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
         let sz = meta.len();
         if sz > cap {
             let blob = serde_json::json!({
-                "error": "sensor output too large — emit a small normalized {signal,detail} snapshot, not a raw dump",
-                "bytes": sz,
-                "cap": cap,
+                "signal": { "error": "too-large", "cap": cap },
+                "detail": {
+                    "bytes": sz,
+                    "message": "sensor output too large — emit a small normalized {signal,detail} snapshot, not a raw dump",
+                },
             });
             let _ = fs::write(out, format!("{blob}\n"));
         }
     }
     rc
 }
-
-/// SIGKILL the sensor's whole process group (negative-pid kill — the same
-/// technique the session supervisor uses). Shelled out to `kill` via sh so we
-/// need no libc binding; a timed-out sensor gets no grace — the beat must move on.
-#[cfg(unix)]
-fn kill_group(pid: u32) {
-    let _ = Command::new("/bin/sh")
-        .arg("-c")
-        .arg(format!("kill -9 -- -{pid} 2>/dev/null"))
-        .status();
-}
-#[cfg(not(unix))]
-fn kill_group(_pid: u32) {}
 
 /// A virtual system sensor: an in-process probe of looop's OWN state that
 /// returns one `{signal,detail}` snapshot value.
@@ -815,6 +827,92 @@ mod tests {
         assert_eq!(
             crate::worldhash::wake_signal(v.clone()),
             serde_json::json!({ "error": true, "exit_code": 3 })
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn unspawnable_sensor_leaves_an_error_snapshot_not_an_empty_one() {
+        // File::create(out) truncates the PREVIOUS snapshot before spawn — a
+        // spawn failure (no exec bit here; a bogus shebang behaves the same)
+        // must therefore write the normalized error blob, never early-return
+        // with an empty snapshot the decider can't explain.
+        let p = Paths::temp();
+        let snap = p.snapshots_dir();
+        fs::create_dir_all(&snap).unwrap();
+        fs::create_dir_all(p.sensors_dir()).unwrap();
+        let script = p.sensors_dir().join("noexec.sh");
+        fs::write(&script, "#!/bin/sh\necho '{}'\n").unwrap();
+        // Deliberately NOT executable.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        // A previous beat's healthy snapshot that must not survive as-is
+        // (stale) nor be silently blanked (empty).
+        let out = snap.join("sensor-noexec.json");
+        fs::write(&out, "{\"signal\":{\"ok\":true}}\n").unwrap();
+
+        let r = Sensor::User(script).sense(&p, &snap);
+        assert!(!r.ok, "an unspawnable sensor is a failure");
+        let body = fs::read_to_string(&out).unwrap();
+        assert!(!body.trim().is_empty(), "snapshot must never be left empty");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["signal"]["error"], serde_json::json!(true));
+        assert_eq!(v["signal"]["exit_code"], serde_json::json!(1));
+        assert!(
+            v["detail"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("spawn failed"),
+            "the spawn failure reaches the prompt: {body}"
+        );
+    }
+
+    #[test]
+    fn oversized_sensor_output_has_a_size_stable_wake_signal() {
+        // The over-cap replacement blob must not carry the VOLATILE byte count
+        // in its wake signal: two oversized readings of different sizes must
+        // produce the SAME signal, or the world hash flaps on every beat.
+        let p = Paths::temp();
+        let snap = p.snapshots_dir();
+        fs::create_dir_all(&snap).unwrap();
+        fs::create_dir_all(p.sensors_dir()).unwrap();
+
+        let _g = crate::util::test_env_lock();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => unsafe { std::env::set_var("LOOOP_SENSOR_MAX_BYTES", v) },
+                    None => unsafe { std::env::remove_var("LOOOP_SENSOR_MAX_BYTES") },
+                }
+            }
+        }
+        let _r = Restore(std::env::var_os("LOOOP_SENSOR_MAX_BYTES"));
+        unsafe { std::env::set_var("LOOOP_SENSOR_MAX_BYTES", "16") };
+
+        let mut signals = Vec::new();
+        for (name, n) in [("big-a", 100usize), ("big-b", 5000usize)] {
+            let script = p.sensors_dir().join(format!("{name}.sh"));
+            fs::write(&script, format!("#!/bin/sh\nprintf 'x%.0s' $(seq {n})\n")).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let r = Sensor::User(script).sense(&p, &snap);
+            assert!(r.ok, "over-cap is a normalized reading, not a failure");
+            let body = fs::read_to_string(snap.join(format!("sensor-{name}.json"))).unwrap();
+            let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+            // Volatile size lives in .detail only.
+            assert!(v["detail"]["bytes"].as_u64().unwrap() > 16);
+            assert_eq!(v["signal"]["error"], serde_json::json!("too-large"));
+            signals.push(crate::worldhash::wake_signal(v).to_string());
+        }
+        assert_eq!(
+            signals[0], signals[1],
+            "differing oversizes must not move the wake signal"
         );
     }
 

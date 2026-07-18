@@ -32,6 +32,31 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Hard deadline for ONE tick runner invocation (seconds): the decide is an
+/// external LLM call, and a hung runner would otherwise stall the whole
+/// single-instance pulse silently forever (no other beat can run while this
+/// one never returns). `LOOOP_TICK_TIMEOUT_SECS`; 0 disables; default 30min —
+/// generous for a slow model, tiny next to "forever".
+fn tick_timeout_secs() -> u64 {
+    crate::util::env_knob("LOOOP_TICK_TIMEOUT_SECS").unwrap_or(1800)
+}
+
+/// SIGKILL a whole process GROUP by pgid (the runner is spawned with
+/// `process_group(0)`, so its pid IS the pgid). Killing only the `bash`
+/// leader would orphan grandchildren (the actual LLM CLI), which keep the
+/// beat's resources busy past the deadline. Modeled on `verify::kill_group`;
+/// libc-free: raw kill(2) via the same extern-"C" technique.
+#[cfg(unix)]
+fn kill_pgid(pgid: i32) {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    unsafe {
+        let _ = kill(-pgid, SIGKILL);
+    }
+}
+
 /// Substitute `{{prompt_file}}` into a command template with shell quoting,
 /// WITHOUT double-quoting configs that already wrapped the placeholder in
 /// quotes (`"{{prompt_file}}"` / `'{{prompt_file}}'` worked before quoting was
@@ -53,8 +78,23 @@ pub(crate) fn substitute_prompt_file(template: &str, path: &str) -> String {
 /// `@file`, symmetric with `worker_command`); otherwise the file is piped in as
 /// stdin (the original, zero-config path). stdout+stderr are merged; each line
 /// is rendered via `fmt::format_line`, stamped, and written to every `tee` file
-/// (the replay archive). Returns whether the runner exited successfully.
-pub fn run_streamed(paths: &Paths, tick_cmd: &str, prompt_file: &Path, tee: &[PathBuf]) -> bool {
+/// (the replay archive). `Ok(())` when the runner exited successfully; `Err`
+/// carries the CAUSE (unreadable prompt, spawn failure, deadline kill, nonzero
+/// exit) so the caller can record it into the failure feedback instead of
+/// flying blind on a bare `false`.
+///
+/// Bounded: the runner is spawned in its own process GROUP and the whole group
+/// is SIGKILLed once `LOOOP_TICK_TIMEOUT_SECS` elapses (a watchdog thread —
+/// this thread is blocked streaming the runner's output, so it cannot poll).
+/// Killing the group closes the pipe, the streaming loop sees EOF, and the
+/// beat fails like any other runner crash (backoff arms, the failure is
+/// recorded) instead of stalling the single-instance pulse forever.
+pub fn run_streamed(
+    paths: &Paths,
+    tick_cmd: &str,
+    prompt_file: &Path,
+    tee: &[PathBuf],
+) -> Result<(), String> {
     // When the operator references the prompt explicitly via `{{prompt_file}}`
     // (the same placeholder `worker_command` uses), substitute the path and
     // leave stdin alone. Otherwise fall back to feeding the file via stdin.
@@ -75,20 +115,56 @@ pub fn run_streamed(paths: &Paths, tick_cmd: &str, prompt_file: &Path, tee: &[Pa
         .stdout(Stdio::piped());
 
     if !has_placeholder {
-        let stdin = match File::open(prompt_file) {
-            Ok(f) => f,
-            Err(_) => return false,
-        };
+        let stdin = File::open(prompt_file).map_err(|e| {
+            format!(
+                "cannot open the tick prompt {}: {e}",
+                prompt_file.display()
+            )
+        })?;
         cmd.stdin(Stdio::from(stdin));
     }
 
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
+    // Make the runner its own process-group leader so a deadline kill can take
+    // out the WHOLE pipeline (grandchildren included), not just bash — the
+    // same discipline as verify::run_cmd.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to spawn the tick runner: {e}"))?;
     let Some(out) = child.stdout.take() else {
-        return false;
+        // Never leak a zombie: kill + reap before reporting the (should-be
+        // impossible — stdout was piped) missing pipe.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("no stdout pipe from the tick runner".into());
     };
+
+    // Deadline watchdog: this thread is about to block streaming the runner's
+    // output, so a separate thread owns the timeout. It sleeps on a channel;
+    // a send (after wait() below) cancels it, and only an actual TIMEOUT (not
+    // a disconnect) kills the group. Returns whether it fired.
+    let timeout = tick_timeout_secs();
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+    let pgid = child.id() as i32;
+    let watchdog = (timeout > 0).then(|| {
+        std::thread::spawn(move || {
+            match cancel_rx.recv_timeout(std::time::Duration::from_secs(timeout)) {
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    #[cfg(unix)]
+                    kill_pgid(pgid);
+                    #[cfg(not(unix))]
+                    let _ = pgid;
+                    true
+                }
+                _ => false, // cancelled: the runner finished in time
+            }
+        })
+    });
 
     // File::create truncates — intentional: tick.log carries the LAST beat
     // only (see the module comment); runs/<id>/output.log is per-beat anyway.
@@ -118,5 +194,20 @@ pub fn run_streamed(paths: &Paths, tick_cmd: &str, prompt_file: &Path, tee: &[Pa
     // would deadlock both sides on a full pipe buffer.
     drop(reader);
 
-    child.wait().is_ok_and(|s| s.success())
+    let status = child.wait();
+    // Cancel the watchdog (harmless if it already fired) and learn whether the
+    // deadline was the reason the stream ended — a group-killed runner exits
+    // nonzero anyway, but the timeout message names the ACTUAL cause.
+    let _ = cancel_tx.send(());
+    let timed_out = watchdog.is_some_and(|h| h.join().unwrap_or(false));
+    if timed_out {
+        return Err(format!(
+            "timed out after {timeout}s (LOOOP_TICK_TIMEOUT_SECS) — process group killed"
+        ));
+    }
+    match status {
+        Ok(s) if s.success() => Ok(()),
+        Ok(s) => Err(format!("the tick runner exited nonzero ({s})")),
+        Err(e) => Err(format!("failed to reap the tick runner: {e}")),
+    }
 }

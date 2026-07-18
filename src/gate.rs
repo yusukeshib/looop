@@ -201,6 +201,15 @@ pub fn reap_stale_claims(paths: &Paths) {
         }
         let sess = holder_of(&raw);
         if sess.is_empty() || !alive.iter().any(|a| a == &sess) {
+            // The `alive` snapshot was taken ONCE, before this sweep: a worker
+            // that started and claimed DURING the sweep would be misjudged
+            // dead and its LIVE lease reaped. Re-check this holder's liveness
+            // individually, immediately before removal — the same per-claim
+            // check claim() itself uses — so the snapshot is only a cheap
+            // first-pass filter, never the final verdict.
+            if !sess.is_empty() && session::is_alive(paths, &sess) {
+                continue;
+            }
             // Compare-and-delete: never reap a lease that was freshly re-
             // acquired between our read and this delete.
             if !store.remove_if_eq(&key, &raw).unwrap_or(false) {

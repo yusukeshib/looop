@@ -36,6 +36,9 @@ Usage:
 
   STEER (the contract — driven by you or any client; looop does NOT need these to act):
   looop state [--json] | wait [--json] [--only-asks|--actionable]  read state
+                                (`wait` exits 2 on a `pulse-down` wake — the loop
+                                is not running — so a shell client can branch on
+                                the exit code without parsing stdout)
   looop asks [--json]                      pending asks only (a client's narrow view)
   looop answer <ask_id> "<text>"|- [--force]  resolve a worker's ask (`-`/empty = stdin; --force to re-answer)
   looop goal write <id> [body|-] | goal archive <id>     (`-`/omit = stdin/heredoc)
@@ -49,6 +52,9 @@ Usage:
                                 when due it WAKES the loop (survives restarts —
                                 unlike next_interval_s there is no 3600s cap)
   looop schedule rm <name> | schedule list [--json]
+  looop run [--reason "…"] <cmd…>   one ad-hoc, REVERSIBLE shell command (recorded);
+                                the command's own flags pass through verbatim — put
+                                --reason/--journal BEFORE the command (or use `--`)
   looop tell <worker> "<msg>"   queue steering INTO a live worker — it picks the
                                 message up at its next `told` check or along with
                                 its next ask answer
@@ -66,11 +72,16 @@ Usage:
 
   Shorthands: `worker`=`w`, `worker ls` / `w ls` = `worker list`, `screenshot`=`ss`,
   and `write`=`w` (`goal w` / `sensor w` / `playbook w` / `schedule w`).
+  A body/script that STARTS with `-` needs a preceding `--` (e.g.
+  `looop answer id-1 -- --yes`); only `tell` and `run` pass leading dashes through.
 
   WORKER self-callbacks (auto-injected CONTRACT — not for humans):
-  looop ask <id> --prompt "…" [--ref P] [--options a,b]   ask + block for answer
+  looop ask <id> --prompt "…" [--ref P] [--options a,b] [--detach]   ask + block
+                                for answer (--detach: write the ask, print its id
+                                and return immediately — checkpoint + exit; the
+                                answer arrives via `worker start --resume`)
   looop told [id]               print + consume pending steering messages
-  looop kill <id> | claim <name> | unclaim <name>
+  looop kill <id> | claim <name> [--session ID] | unclaim <name> [--session ID]
 
 Paths (override via env LOOOP_CONFIG / LOOOP_DATA_DIR):
   config    {config}
@@ -99,34 +110,46 @@ dir; `git init` it yourself for history.)"#,
 mod tests {
     use super::*;
 
-    /// Drift guard: every long flag clap defines for `screenshot`,
-    /// `worker start` and `worker list` must appear in the hand-written usage
-    /// text (and the short -a/-w spellings for worker list stay documented).
+    /// Drift guard: every long flag clap defines on EVERY top-level subcommand
+    /// (recursing into nested ops like `worker start` / `schedule write`) must
+    /// appear in the hand-written usage text, so a future flag can't silently
+    /// vanish from `looop help`. Exclusions are explicit and justified.
     #[test]
-    fn usage_covers_every_clap_flag_for_screenshot_and_worker() {
+    fn usage_covers_every_clap_flag() {
         use clap::CommandFactory;
         let text = usage_text(&Paths::temp());
 
-        let root = crate::cli::Cli::command();
-        let screenshot = root.find_subcommand("screenshot").expect("screenshot");
-        let worker = root.find_subcommand("worker").expect("worker");
-        let start = worker.find_subcommand("start").expect("worker start");
-        let list = worker.find_subcommand("list").expect("worker list");
+        // Flags intentionally NOT in the usage tail:
+        //   help    — clap-injected on every verb;
+        //   journal — the shared cross-verb note flag (JournalOpt), documented
+        //             as a convention rather than repeated on every line.
+        const EXCLUDED_FLAGS: &[&str] = &["help", "journal"];
+        // Verbs with no human-facing usage line at all:
+        //   pulse — looop's own detached spawn target, never typed by a human.
+        const EXCLUDED_SUBS: &[&str] = &["pulse"];
 
-        for sub in [screenshot, start, list] {
-            for a in sub.get_arguments() {
+        fn walk(cmd: &clap::Command, text: &str) {
+            for a in cmd.get_arguments() {
                 let Some(long) = a.get_long() else { continue };
-                // `help` is clap-injected; `journal` is the shared cross-verb
-                // note flag, documented via the action verbs, not per-verb.
-                if long == "help" || long == "journal" {
+                if EXCLUDED_FLAGS.contains(&long) {
                     continue;
                 }
                 assert!(
                     text.contains(&format!("--{long}")),
                     "help drift: --{long} (from `{}`) missing from usage",
-                    sub.get_name()
+                    cmd.get_name()
                 );
             }
+            for sub in cmd.get_subcommands() {
+                walk(sub, text);
+            }
+        }
+
+        for sub in crate::cli::Cli::command().get_subcommands() {
+            if EXCLUDED_SUBS.contains(&sub.get_name()) {
+                continue;
+            }
+            walk(sub, &text);
         }
 
         // The worker-list short flags are part of the documented surface.

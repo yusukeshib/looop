@@ -28,6 +28,14 @@ fn dep_hint(cmd: &str) -> &'static str {
 /// Quote-aware: a token opening with `'` or `"` yields the QUOTED SPAN
 /// (`'/path/with spaces/claude' -p` → `/path/with spaces/claude`), so quoted
 /// binaries resolve on PATH instead of failing the preflight.
+///
+/// This is deliberately NOT a shell parser: tokens that need real shell
+/// quoting rules — backslash escapes (`path\ with\ spaces`, `"a\"b"`),
+/// embedded/unterminated quotes — return `None`, which SKIPS the preflight
+/// check for that command (the same treatment `require_deps` gives
+/// `$VAR` binaries). A naive parse of those tokens produced FALSE "missing
+/// dependency" reports, which hard-gate every verb; skipping is the safe
+/// failure mode for a preflight.
 fn command_bin(cmd: &str) -> Option<&str> {
     let mut rest = cmd.trim_start();
     while !rest.is_empty() {
@@ -37,13 +45,26 @@ fn command_bin(cmd: &str) -> Option<&str> {
             rest = rest[end..].trim_start();
             continue;
         }
+        // Backslashes mean shell escaping we do not model — unparseable.
+        if tok.contains('\\') {
+            return None;
+        }
         // Peel surrounding quotes: the binary is the quoted span (which may
-        // contain whitespace), or the bare token when unterminated.
+        // contain whitespace). An unterminated quote or an escaped span is
+        // unparseable.
         let first = tok.as_bytes()[0];
-        if (first == b'\'' || first == b'"')
-            && let Some(close) = rest[1..].find(first as char)
-        {
-            return Some(&rest[1..1 + close]);
+        if first == b'\'' || first == b'"' {
+            let close = rest[1..].find(first as char)?;
+            let span = &rest[1..1 + close];
+            if span.contains('\\') {
+                return None;
+            }
+            return Some(span);
+        }
+        // A quote EMBEDDED mid-token (`foo"bar"`) needs concatenation rules
+        // we do not model — unparseable.
+        if tok.contains('\'') || tok.contains('"') {
+            return None;
         }
         return Some(tok);
     }
@@ -131,8 +152,36 @@ mod tests {
         // Shell variables come back verbatim — require_deps skips them.
         assert_eq!(command_bin("\"$LOOOP_BIN\" -p"), Some("$LOOOP_BIN"));
         assert_eq!(command_bin("$LOOOP_BIN -p"), Some("$LOOOP_BIN"));
-        // Unterminated quote: fall back to the bare token.
-        assert_eq!(command_bin("'claude -p"), Some("'claude"));
+        // Unterminated quote: unparseable — skip rather than misreport.
+        assert_eq!(command_bin("'claude -p"), None);
+    }
+
+    #[test]
+    fn command_bin_skips_unparseable_complex_tokens() {
+        // Escaped quote inside a quoted span: a naive close-quote scan would
+        // stop at the `\"` and misdetect the binary — skip instead.
+        assert_eq!(command_bin("\"a\\\"b\" -p"), None);
+        // Backslash-escaped spaces: the shell sees ONE path token, a
+        // whitespace split sees two — skip instead of reporting `/my\` missing.
+        assert_eq!(command_bin("/my\\ tools/claude -p"), None);
+        assert_eq!(command_bin("FOO=1 path\\ with\\ spaces/bin -p"), None);
+        // Quote embedded mid-token (shell concatenation): skip.
+        assert_eq!(command_bin("foo\"bar\" -p"), None);
+        // Env assignments before a complex token are still peeled first.
+        assert_eq!(command_bin("FOO=1 claude -p"), Some("claude"));
+    }
+
+    #[test]
+    fn preflight_skips_unparseable_complex_binaries() {
+        let p = crate::paths::Paths::temp();
+        // Backslash-escaped paths and escaped quotes cannot be resolved
+        // statically — the preflight must NOT hard-gate on a false "missing".
+        crate::config::write(
+            &p,
+            &crate::config::wiring_json("/no\\ such/claude -p", "\"a\\\"b\" {{prompt_file}}"),
+        )
+        .unwrap();
+        assert!(require_deps(&p).is_ok());
     }
 
     #[test]

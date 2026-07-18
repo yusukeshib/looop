@@ -69,11 +69,42 @@ pub fn term_cols() -> Option<usize> {
         .map(|(cols, _rows)| cols as usize)
 }
 
+/// Display columns one char occupies in a terminal: 2 for East Asian
+/// Wide/Fullwidth ranges (CJK, Hangul, kana, fullwidth forms, common emoji),
+/// 1 for everything else. `safe_segment` allows non-ASCII ids, so worker names
+/// CAN be CJK — assuming 1 column per char would break the `worker list
+/// --watch` clip/repaint arithmetic on those rows. This is a deliberately
+/// small inline table (the big East Asian Width ranges), NOT a full
+/// unicode-width dependency: an occasional 1-vs-2 miss on an exotic codepoint
+/// costs one slightly-short row, which the repaint tolerates.
+fn char_cols(c: char) -> usize {
+    let cp = c as u32;
+    let wide = matches!(cp,
+        0x1100..=0x115F        // Hangul Jamo (leading consonants)
+        | 0x2E80..=0x303E      // CJK radicals … CJK symbols/punctuation
+        | 0x3041..=0x33FF      // kana, kanbun, enclosed CJK, compat
+        | 0x3400..=0x4DBF      // CJK ext A
+        | 0x4E00..=0x9FFF      // CJK unified
+        | 0xA000..=0xA4CF      // Yi
+        | 0xAC00..=0xD7A3      // Hangul syllables
+        | 0xF900..=0xFAFF      // CJK compat ideographs
+        | 0xFE30..=0xFE4F      // CJK compat forms
+        | 0xFF00..=0xFF60      // fullwidth forms
+        | 0xFFE0..=0xFFE6      // fullwidth signs
+        | 0x1F300..=0x1F64F    // common emoji
+        | 0x1F900..=0x1F9FF    // supplemental emoji
+        | 0x20000..=0x3FFFD    // CJK ext B+
+    );
+    if wide { 2 } else { 1 }
+}
+
 /// Clip `s` to at most `max` visible columns, treating ANSI escape sequences
 /// as zero-width (they are copied through, never split). If the cut happens
 /// after any escape was emitted, a reset is appended so a clipped colored cell
-/// can't bleed its color into the rest of the screen. Assumes 1 column per
-/// char (our tables are ASCII).
+/// can't bleed its color into the rest of the screen. Width-aware: CJK and
+/// other East Asian Wide chars count as 2 columns (see [`char_cols`]) —
+/// `safe_segment` allows non-ASCII ids, so 1-column-per-char is NOT a safe
+/// assumption here.
 pub fn clip_ansi(s: &str, max: usize) -> String {
     let mut out = String::with_capacity(s.len());
     let mut width = 0usize;
@@ -93,12 +124,13 @@ pub fn clip_ansi(s: &str, max: usize) -> String {
             }
             continue;
         }
-        if width >= max {
+        let w = char_cols(c);
+        if width + w > max {
             truncated = true;
             break;
         }
         out.push(c);
-        width += 1;
+        width += w;
     }
     if truncated && saw_esc {
         out.push_str("\x1b[0m");
@@ -274,12 +306,14 @@ pub fn now_unix() -> u64 {
 /// from the old shell tools, so the first beat after upgrading sees one
 /// (harmless) "world changed".
 ///
-/// NB: FNV-1a is NOT cryptographic — collisions are only "astronomically
-/// unlikely", not adversary-proof. That is a deliberate trade: the inputs
-/// (sensor signals, goals, PLAYBOOK) come from the operator's own loop, not an
-/// attacker, and a collision's worst case is one wrongly-skipped beat that the
-/// noop TTL revisit later repairs. Do not reuse this hash anywhere integrity
-/// against hostile input matters.
+/// NB: FNV-1a is NOT cryptographic — collisions against it are CONSTRUCTIBLE
+/// by anyone who controls the input bytes. And the inputs are not purely the
+/// operator's own: sensors routinely ingest EXTERNAL data (GitHub issue
+/// bodies, inbound email, API responses) into their signals, so an adversary
+/// can in principle craft a colliding world. The trade is still acceptable
+/// because the blast radius is tiny — a collision's worst case is one wrongly
+/// skipped beat, which the noop TTL revisit later repairs. Do not reuse this
+/// hash anywhere integrity against hostile input actually matters.
 pub fn content_hash(input: &[u8]) -> String {
     // FNV-1a, 128-bit (offset basis + prime per the FNV spec).
     const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
@@ -437,8 +471,17 @@ pub fn sorted_glob(dir: &Path, ext: &str) -> Vec<PathBuf> {
     v
 }
 
-/// `command -v <cmd>` — true if found and executable on $PATH.
+/// `command -v <cmd>` — true if found and executable on $PATH. A command
+/// containing '/' bypasses PATH lookup entirely (shell semantics): it is
+/// checked directly, resolved against the CWD when relative. Without this
+/// explicit branch, absolute paths only worked by a `Path::join` replacement
+/// quirk, and relative paths like `bin/claude` were wrongly joined onto every
+/// PATH entry instead of the CWD.
 pub fn on_path(cmd: &str) -> bool {
+    if cmd.contains('/') {
+        let p = Path::new(cmd);
+        return p.is_file() && is_executable(p);
+    }
     let Some(path) = std::env::var_os("PATH") else {
         return false;
     };
@@ -447,6 +490,25 @@ pub fn on_path(cmd: &str) -> bool {
         p.is_file() && is_executable(&p)
     })
 }
+
+/// SIGKILL an entire process GROUP by pgid (negative-pid `kill(2)`), libc-free
+/// via the same extern-"C" technique as [`flock_file`]. The ONE shared group
+/// killer: the sensor timeout and the verify/run_shell deadline both route
+/// here, so neither depends on a `kill(1)` binary being on $PATH (RULE 2 — no
+/// hidden PATH dependencies). Callers spawned the child with
+/// `process_group(0)`, so its pid IS the pgid.
+#[cfg(unix)]
+pub(crate) fn kill_process_group(pgid: u32) {
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    unsafe {
+        let _ = kill(-(pgid as i32), SIGKILL);
+    }
+}
+#[cfg(not(unix))]
+pub(crate) fn kill_process_group(_pgid: u32) {}
 
 #[cfg(unix)]
 fn is_executable(p: &std::path::Path) -> bool {
@@ -569,6 +631,30 @@ mod tests {
         );
         // A cut after a color start appends a reset so color can't bleed.
         assert_eq!(clip_ansi("\x1b[31mredredred", 3), "\x1b[31mred\x1b[0m");
+    }
+
+    #[test]
+    fn clip_ansi_counts_cjk_as_two_columns() {
+        // safe_segment allows non-ASCII ids, so CJK worker names reach the
+        // watch table — each ideograph occupies 2 terminal columns.
+        assert_eq!(clip_ansi("日本語", 6), "日本語");
+        assert_eq!(clip_ansi("日本語", 4), "日本");
+        // A wide char that would OVERSHOOT the budget is dropped whole, never
+        // half-counted (5 columns fit 日本 = 4, not 日本語 = 6).
+        assert_eq!(clip_ansi("日本語", 5), "日本");
+        // Mixed-width rows: "w1-日本" = 3 + 4 columns.
+        assert_eq!(clip_ansi("w1-日本", 5), "w1-日");
+    }
+
+    #[test]
+    fn on_path_handles_slash_commands_directly() {
+        // Absolute path to a real executable: found without PATH scanning.
+        assert!(on_path("/bin/sh"));
+        // Absolute path to nothing: not found (and never PATH-joined).
+        assert!(!on_path("/no/such/looop-binary"));
+        // Relative path with '/': resolved against the CWD like a shell would,
+        // not against PATH entries.
+        assert!(!on_path("no-such-dir/looop-binary"));
     }
 
     #[test]

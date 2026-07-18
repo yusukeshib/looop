@@ -282,6 +282,14 @@ fn fmt_ago(ts: u64) -> String {
     }
 }
 
+/// The width to clip summary lines to: the live terminal width when one is
+/// attached (crossterm via ratatui's re-export — no extra dependency), else
+/// 100 (piped/redirected output, tests). Floored at 40 so a tiny window never
+/// clips prompts into unreadable stubs.
+fn clip_width() -> usize {
+    ratatui::crossterm::terminal::size().map_or(100, |(w, _)| (w as usize).max(40))
+}
+
 /// First line of `s`, trimmed and clipped to `max` chars (… suffix when cut), so
 /// a multi-line ask prompt collapses to a single readable summary line.
 fn one_line(s: &str, max: usize) -> String {
@@ -352,7 +360,7 @@ pub(crate) fn render_state(s: &serde_json::Value, json: bool) -> Result<ExitCode
             a["id"].as_str().unwrap_or("?"),
             a["worker"].as_str().unwrap_or("?"),
             fmt_ago(a["ts"].as_u64().unwrap_or(0)),
-            one_line(a["prompt"].as_str().unwrap_or(""), 100),
+            one_line(a["prompt"].as_str().unwrap_or(""), clip_width()),
         );
         if let Some(r) = a["reference"].as_str().filter(|r| !r.is_empty()) {
             head.push_str(&format!("\n      ref: {r}"));
@@ -372,7 +380,7 @@ pub(crate) fn render_state(s: &serde_json::Value, json: bool) -> Result<ExitCode
         println!("sensors:");
         for (k, v) in &snaps {
             let signal = crate::worldhash::wake_signal(v.clone());
-            println!("  {k}: {}", one_line(&signal.to_string(), 100));
+            println!("  {k}: {}", one_line(&signal.to_string(), clip_width()));
         }
     }
 
@@ -426,9 +434,14 @@ pub fn cmd_state(paths: &Paths, json: bool) -> Result<ExitCode> {
 ///
 /// It also wakes — regardless of filter — with `changed: [pulse-down]` if the
 /// autonomous loop isn't running, so a blocked client is never left hanging on a
-/// dead pulse (nothing would ever change the files to wake it otherwise).
+/// dead pulse (nothing would ever change the files to wake it otherwise). That
+/// wake exits 2 (vs 0 for a normal change), so a shell client can branch on the
+/// exit code without parsing stdout.
+///
+/// No seeding here: first-run seeding lives at the contract layer
+/// (`LocalContract::wait`, same as `state`), keeping this transport a pure
+/// render — the two verbs stay symmetric and observe.rs stays side-effect-free.
 pub fn cmd_wait(paths: &Paths, args: &crate::cli::WaitArgs) -> Result<ExitCode> {
-    let _ = crate::seed::ensure_dirs(paths);
     use crate::contract::Contract;
     let filter = if args.only_asks {
         WaitFilter::Asks
@@ -438,7 +451,15 @@ pub fn cmd_wait(paths: &Paths, args: &crate::cli::WaitArgs) -> Result<ExitCode> 
         WaitFilter::Any
     };
     let s = crate::contract::LocalContract::new(paths).wait(filter)?;
-    render_state(&s, args.json)
+    let code = render_state(&s, args.json)?;
+    // Distinct exit code for the pulse-down wake (documented in help/manual):
+    // "the loop is dead" is critical and must be distinguishable by a shell
+    // client (`looop wait || …`) without parsing the printed state.
+    let pulse_down = s
+        .get("changed")
+        .and_then(|c| c.as_array())
+        .is_some_and(|ch| ch.iter().any(|c| c.as_str() == Some("pulse-down")));
+    Ok(if pulse_down { ExitCode::from(2) } else { code })
 }
 
 #[cfg(test)]

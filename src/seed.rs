@@ -22,6 +22,9 @@ const SEED_SENSOR_TODAY: &str = include_str!("seed/today.sh");
 const SEED_SETUP_ASK_ID: &str = "setup-1";
 const SEED_SETUP_ASK_PROMPT: &str = "First-run setup: looop is unconfigured. Please have your concierge interview you about goals, sensors, irreversible actions, repos/workspaces, and recurring cadences, then write the real PLAYBOOK/goals/sensors and archive the setup goal.";
 
+// Runtime scratch only — durable POLICY stays tracked on purpose: schedules/
+// (durable time triggers) and playbook.d/ (PLAYBOOK history) are part of the
+// steering record a user would want in git, so they are NOT listed here.
 const GITIGNORE: &str = "\
 snapshots/
 prompts/
@@ -31,8 +34,11 @@ reports/
 asks/
 answers/
 tells/
+sessions/
+verify/
 .lock/
 .last-tick-hash
+.tick-backoff
 .goal-activity.json
 .last-world.json
 .last-shell.json

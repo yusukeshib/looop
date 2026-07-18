@@ -108,11 +108,57 @@ fn write_new_record(
     bail!("mailbox: could not allocate an id for {worker:?} after 20 attempts (contention)")
 }
 
-/// Read the answer text for an ask id, if it has been answered.
-fn read_answer(store: &impl StateStore, ask_id: &str) -> Option<String> {
-    let raw = store.read(&Key::Answer(ask_id.to_string()))?;
-    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
-    v.get("answer").and_then(|x| x.as_str()).map(str::to_owned)
+/// The state of an ask's answer record. `Missing` and `Corrupt` are distinct
+/// on purpose: collapsing a corrupt/truncated `answers/<id>.json` into "no
+/// answer" made the blocking worker wait FOREVER while the ask re-listed as
+/// unanswered — yet re-answering was refused without `--force` and the
+/// corruption surfaced nowhere.
+enum AnswerState {
+    /// No `answers/<id>.json` — still waiting on the human.
+    Missing,
+    /// The record exists but is unreadable (truncated / bad JSON / no `answer`
+    /// field). A stderr warning naming the file has already been printed.
+    Corrupt,
+    /// The parsed answer text.
+    Ready(String),
+}
+
+impl AnswerState {
+    /// The answer text when ready (test convenience).
+    #[cfg(test)]
+    fn text(&self) -> Option<&str> {
+        match self {
+            AnswerState::Ready(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// Read the answer record for an ask id. A parse failure warns on STDERR
+/// (naming the file, mirroring the unparseable-ask warning in [`pending`]) —
+/// stdout stays machine-clean for `--json` consumers.
+fn read_answer(store: &impl StateStore, ask_id: &str) -> AnswerState {
+    let Some(raw) = store.read(&Key::Answer(ask_id.to_string())) else {
+        return AnswerState::Missing;
+    };
+    let v: serde_json::Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "answers/{ask_id}.json is unparseable ({e}) — re-answer with `looop answer {ask_id} --force …`"
+            );
+            return AnswerState::Corrupt;
+        }
+    };
+    match v.get("answer").and_then(|x| x.as_str()) {
+        Some(text) => AnswerState::Ready(text.to_owned()),
+        None => {
+            eprintln!(
+                "answers/{ask_id}.json has no string `answer` field — re-answer with `looop answer {ask_id} --force …`"
+            );
+            AnswerState::Corrupt
+        }
+    }
 }
 
 /// All asks that have NO matching answer yet. Read-only; used by `state` and
@@ -127,7 +173,10 @@ pub fn pending(paths: &Paths) -> Vec<Ask> {
         };
         match serde_json::from_str::<Ask>(&raw) {
             Ok(ask) => {
-                if read_answer(&store, &ask.id).is_none() {
+                // A CORRUPT answer keeps the ask listed (the human must see
+                // it's unresolved) — read_answer has already warned on stderr
+                // naming the broken file, so the fix (--force) is visible.
+                if !matches!(read_answer(&store, &ask.id), AnswerState::Ready(_)) {
                     out.push(ask);
                 }
             }
@@ -158,7 +207,7 @@ pub fn answered_detached(paths: &Paths) -> Vec<(Ask, String)> {
         if let Some(raw) = store.read(&Key::Ask(id.clone()))
             && let Ok(ask) = serde_json::from_str::<Ask>(&raw)
             && ask.detach
-            && let Some(answer) = read_answer(&store, &ask.id)
+            && let AnswerState::Ready(answer) = read_answer(&store, &ask.id)
         {
             out.push((ask, answer));
         }
@@ -189,8 +238,15 @@ pub fn resume_context(paths: &Paths, ask_id: &str) -> Result<String> {
              resume only detached asks"
         );
     }
-    let answer = read_answer(&store, ask_id)
-        .with_context(|| format!("resume: ask {ask_id:?} has no answer yet"))?;
+    let answer = match read_answer(&store, ask_id) {
+        AnswerState::Ready(a) => a,
+        AnswerState::Missing => bail!("resume: ask {ask_id:?} has no answer yet"),
+        // Resuming against a corrupt answer would inject garbage into a fresh
+        // worker's brief — fail loudly (the file was already named on stderr).
+        AnswerState::Corrupt => bail!(
+            "resume: answers/{ask_id}.json is unreadable — re-answer with --force first"
+        ),
+    };
     let reference = if ask.reference.is_empty() {
         "(none — look for reports/ left by the previous worker)".to_string()
     } else {
@@ -256,6 +312,19 @@ pub fn unarchive_pair(paths: &Paths, ask_id: &str) {
     if util::safe_segment("ask id", ask_id).is_err() {
         return;
     }
+    // Hold BOTH per-directory writer locks (fixed order: asks then answers —
+    // no other path takes both, so no deadlock) for the whole check+restore:
+    // exists()-then-rename without the lock was a TOCTOU — a concurrent
+    // create_exclusive of a REUSED id between the check and the rename would
+    // attach the old answer to a brand-new ask. create_exclusive takes the
+    // same locks, so under them the guard below is race-free. Best-effort
+    // (like the rest of this path): if a lock cannot be taken, restore nothing.
+    let Ok(_asks_lock) = crate::store::DirLock::acquire(&paths.asks_dir()) else {
+        return;
+    };
+    let Ok(_answers_lock) = crate::store::DirLock::acquire(&paths.answers_dir()) else {
+        return;
+    };
     // Pairwise guard: a live ask with this id means the id was REUSED by a new
     // ask — restore nothing (never attach the old answer to the new question).
     if paths.asks_dir().join(format!("{ask_id}.json")).exists() {
@@ -271,7 +340,10 @@ pub fn unarchive_pair(paths: &Paths, ask_id: &str) {
 /// Move the MOST RECENTLY archived `<ask_id>` record in `dir/archive/` back to
 /// `dir/<ask_id>.json`. Returns true when the live record exists afterwards
 /// (already present, or restored); false when there was nothing to restore or
-/// the rename failed.
+/// the rename failed. CALLER HOLDS `dir`'s writer lock ([`unarchive_pair`]):
+/// the exists-check doubles as the no-clobber guard — under the lock no
+/// create_exclusive/write_atomic can land a destination between the check and
+/// the rename, so an existing live record is never silently overwritten.
 fn restore_newest_archived(dir: &std::path::Path, ask_id: &str) -> bool {
     let live = dir.join(format!("{ask_id}.json"));
     if live.exists() {
@@ -483,19 +555,30 @@ pub(crate) fn ask(
     let deadline = crate::util::env_knob::<u64>("LOOOP_ASK_TIMEOUT_S")
         .and_then(|s| std::time::Instant::now().checked_add(Duration::from_secs(s)));
     loop {
-        if let Some(answer) = read_answer(&store, &id) {
-            // Piggyback any steering the human sent while this worker was
-            // blocked (`looop tell`): the ask's return is the one moment we KNOW
-            // the worker is reading, so undelivered tells ride along with the
-            // answer instead of waiting for a `told` poll that may never come.
-            let tells = drain_tells(paths, worker);
-            if tells.is_empty() {
-                return Ok(answer);
+        match read_answer(&store, &id) {
+            AnswerState::Ready(answer) => {
+                // Piggyback any steering the human sent while this worker was
+                // blocked (`looop tell`): the ask's return is the one moment we KNOW
+                // the worker is reading, so undelivered tells ride along with the
+                // answer instead of waiting for a `told` poll that may never come.
+                let tells = drain_tells(paths, worker);
+                if tells.is_empty() {
+                    return Ok(answer);
+                }
+                return Ok(format!(
+                    "[steering from the human while you waited — obey alongside the answer]\n{}\n---\n{answer}",
+                    tells.join("\n")
+                ));
             }
-            return Ok(format!(
-                "[steering from the human while you waited — obey alongside the answer]\n{}\n---\n{answer}",
-                tells.join("\n")
-            ));
+            // A CORRUPT answer record can never resolve by waiting — spinning
+            // silently would block this worker forever while the ask re-lists
+            // as unanswered (and a re-answer is refused without --force).
+            // Error out loudly so the failure is actionable, not invisible.
+            AnswerState::Corrupt => bail!(
+                "ask {id}: answers/{id}.json exists but is unreadable — \
+                 have the human re-answer with `looop answer {id} --force …`"
+            ),
+            AnswerState::Missing => {}
         }
         // Escape hatches so a worker can never block FOREVER on a dead ask:
         // (a) the ask record itself vanished (deleted / archived out from
@@ -682,14 +765,20 @@ pub(crate) fn answer(paths: &Paths, ask_id: &str, text: &str, force: bool) -> Re
     // Answers are durable: refuse to clobber one already given unless `--force`.
     // A worker that has already read its answer has moved on, so a stray re-answer
     // is almost always a misfire — fail loudly instead of silently overwriting.
-    if store.exists(&Key::Answer(ask_id.to_string())) && !force {
+    // The first answer goes through create_exclusive (an atomic test-and-set),
+    // NOT exists()-then-write: two humans answering simultaneously must not
+    // BOTH succeed with one answer silently lost — exactly one create wins and
+    // the loser gets the already-answered error. `--force` keeps the atomic
+    // overwrite path (deliberate replacement, e.g. of a corrupt record).
+    let body = serde_json::to_string_pretty(&serde_json::json!({
+        "answer": text,
+        "ts": util::now_unix(),
+    }))?;
+    if force {
+        store.write_atomic(&Key::Answer(ask_id.to_string()), &body)?;
+    } else if !store.create_exclusive(&Key::Answer(ask_id.to_string()), &body)? {
         bail!("answer: {ask_id:?} is already answered (pass --force to overwrite)");
     }
-    let body = serde_json::json!({ "answer": text, "ts": util::now_unix() });
-    store.write_atomic(
-        &Key::Answer(ask_id.to_string()),
-        &serde_json::to_string_pretty(&body)?,
-    )?;
     Ok(())
 }
 
@@ -732,6 +821,17 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// A temp profile with the FIRST-RUN SEED suppressed: contract verbs
+    /// (`cmd_answer` → `LocalContract`) run `seed::ensure_dirs`, which on a
+    /// PLAYBOOK-less data dir plants the `setup-1` starter ask — noise for
+    /// tests asserting exact pending/resume sets. A pre-existing PLAYBOOK
+    /// marks the profile as already seeded.
+    fn temp_seeded() -> Paths {
+        let p = Paths::temp();
+        fs::write(p.playbook(), "# test playbook\n").unwrap();
+        p
+    }
+
     /// Build an `AnswerArgs` the way clap would after parsing
     /// `answer <id> <text…> [--force]`.
     fn ans(id: &str, text: &str, force: bool) -> crate::cli::AnswerArgs {
@@ -744,7 +844,7 @@ mod tests {
 
     #[test]
     fn ask_ids_increment_and_pending_excludes_answered() {
-        let p = Paths::temp();
+        let p = temp_seeded();
         let store = FileStore::new(&p);
         fs::create_dir_all(p.asks_dir()).unwrap();
         fs::create_dir_all(p.answers_dir()).unwrap();
@@ -777,7 +877,7 @@ mod tests {
         // Answering it removes it from pending but keeps the id reserved.
         cmd_answer(&p, &ans("triage-1", "yes", false)).unwrap();
         assert!(pending(&p).is_empty(), "answered ask is not pending");
-        assert_eq!(read_answer(&store, "triage-1").as_deref(), Some("yes"));
+        assert_eq!(read_answer(&store, "triage-1").text(), Some("yes"));
         assert_eq!(
             next_seq_id(&store, &[Collection::Asks, Collection::Answers], "triage"),
             "triage-2"
@@ -878,15 +978,82 @@ mod tests {
         // A bare re-answer is refused (a stray re-answer is almost always a misfire).
         assert!(cmd_answer(&p, &ans("w-1", "second", false)).is_err());
         assert_eq!(
-            read_answer(&FileStore::new(&p), "w-1").as_deref(),
+            read_answer(&FileStore::new(&p), "w-1").text(),
             Some("first")
         );
         // `--force` lets the human deliberately recover from a bad answer.
         cmd_answer(&p, &ans("w-1", "second", true)).unwrap();
         assert_eq!(
-            read_answer(&FileStore::new(&p), "w-1").as_deref(),
+            read_answer(&FileStore::new(&p), "w-1").text(),
             Some("second")
         );
+    }
+
+    #[test]
+    fn concurrent_first_answers_let_exactly_one_win() {
+        // Two humans answering the same ask simultaneously: the first answer
+        // is an atomic test-and-set (create_exclusive), so exactly one wins
+        // and the loser gets the already-answered error — no answer is ever
+        // silently lost to an exists()-then-write race.
+        let p = Paths::temp();
+        fs::create_dir_all(p.asks_dir()).unwrap();
+        fs::write(
+            p.asks_dir().join("w-1.json"),
+            serde_json::json!({"id":"w-1","worker":"w","prompt":"ok?","ts":1}).to_string(),
+        )
+        .unwrap();
+        let wins: usize = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|i| {
+                    let p = &p;
+                    s.spawn(move || answer(p, "w-1", &format!("answer-{i}"), false).is_ok())
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|&won| won)
+                .count()
+        });
+        assert_eq!(wins, 1, "exactly one first answer must win");
+        // The surviving record is the winner's, intact.
+        assert!(
+            read_answer(&FileStore::new(&p), "w-1")
+                .text()
+                .is_some_and(|t| t.starts_with("answer-")),
+            "the winning answer is readable and complete"
+        );
+    }
+
+    #[test]
+    fn corrupt_answer_keeps_ask_pending_and_fails_resume_loudly() {
+        // A truncated/corrupt answers/<id>.json is NOT "no answer": the ask
+        // stays visible (pending), and a resume against it fails loudly
+        // instead of injecting garbage — the fix (--force re-answer) works.
+        let p = Paths::temp();
+        fs::create_dir_all(p.asks_dir()).unwrap();
+        fs::create_dir_all(p.answers_dir()).unwrap();
+        fs::write(
+            p.asks_dir().join("w-1.json"),
+            serde_json::json!({"id":"w-1","worker":"w","prompt":"ok?","detach":true,"ts":1})
+                .to_string(),
+        )
+        .unwrap();
+        fs::write(p.answers_dir().join("w-1.json"), b"{truncat").unwrap();
+        assert!(matches!(
+            read_answer(&FileStore::new(&p), "w-1"),
+            AnswerState::Corrupt
+        ));
+        assert_eq!(pending(&p).len(), 1, "corrupt answer keeps the ask listed");
+        assert!(
+            answered_detached(&p).is_empty(),
+            "a corrupt answer never counts as answered"
+        );
+        assert!(resume_context(&p, "w-1").is_err(), "resume fails loudly");
+        // --force re-answer repairs the record and resolves the ask.
+        answer(&p, "w-1", "repaired", true).unwrap();
+        assert!(pending(&p).is_empty());
+        assert_eq!(answered_detached(&p).len(), 1);
     }
 
     #[test]
@@ -917,7 +1084,7 @@ mod tests {
 
     #[test]
     fn detached_ask_returns_id_and_resumes_through_the_pair_lifecycle() {
-        let p = Paths::temp();
+        let p = temp_seeded();
         // Raise: returns the id immediately (no blocking), pending shows it.
         let id = ask_detached(&p, "triage", "merge or split?", "reports/cp.md", &[]).unwrap();
         assert_eq!(id, "triage-1");
@@ -961,7 +1128,7 @@ mod tests {
 
     #[test]
     fn sys_asks_signal_tracks_the_ask_lifecycle() {
-        let p = Paths::temp();
+        let p = temp_seeded();
         let v = sys_asks(&p);
         assert_eq!(v["signal"]["pending"], serde_json::json!([]));
         assert_eq!(v["signal"]["resume"], serde_json::json!([]));
@@ -1053,7 +1220,7 @@ mod tests {
 
     #[test]
     fn asks_lists_only_pending() {
-        let p = Paths::temp();
+        let p = temp_seeded();
         fs::create_dir_all(p.asks_dir()).unwrap();
         fs::create_dir_all(p.answers_dir()).unwrap();
         fs::write(

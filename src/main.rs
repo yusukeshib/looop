@@ -34,6 +34,7 @@ mod session;
 mod shellinit;
 mod store;
 mod tick;
+mod tick_guards;
 mod util;
 mod verify;
 mod worldhash;
@@ -134,12 +135,28 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
         Cmd::Help { topic } => {
             if topic.is_empty() {
                 help::print(paths);
-            } else {
-                // `looop help worker` used to be a clap error; be a front door
-                // instead and route to the subcommand's own help.
-                println!("see: looop {} --help", topic.join(" "));
+                return Ok(ExitCode::SUCCESS);
             }
-            Ok(ExitCode::SUCCESS)
+            // `looop help worker` used to be a clap error; be a front door
+            // instead: a KNOWN topic renders that subcommand's own help right
+            // here (not just a pointer the user must re-type); an unknown one
+            // lists the real topics instead of suggesting a command that would
+            // itself error.
+            use clap::CommandFactory;
+            let mut root = cli::Cli::command();
+            let name = topic[0].as_str();
+            if let Some(sub) = root.find_subcommand_mut(name) {
+                let _ = sub.print_help();
+                Ok(ExitCode::SUCCESS)
+            } else {
+                let topics: Vec<String> = cli::Cli::command()
+                    .get_subcommands()
+                    .map(|s| s.get_name().to_string())
+                    .collect();
+                eprintln!("looop help: unknown topic `{name}`");
+                eprintln!("topics: {}", topics.join(", "));
+                Ok(ExitCode::from(1))
+            }
         }
         Cmd::Version => {
             println!("looop {}", env!("CARGO_PKG_VERSION"));
@@ -219,7 +236,7 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
 }
 
 /// Rust sets SIGPIPE to SIG_IGN at startup, which turns a closed pipe (e.g.
-/// `looop status | head`) into a panic on the next write. Restore the default
+/// `looop state | head`) into a panic on the next write. Restore the default
 /// so we exit quietly on a broken pipe (same fix babysit makes).
 #[cfg(unix)]
 fn restore_sigpipe() {

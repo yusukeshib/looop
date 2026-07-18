@@ -54,7 +54,17 @@ impl Paths {
 
         let default_data = xdg("XDG_STATE_HOME", ".local/state").join("looop");
         let data_dir = match env::var_os("LOOOP_DATA_DIR") {
-            Some(v) if !v.is_empty() => PathBuf::from(v),
+            // Absolutize a relative LOOOP_DATA_DIR against the cwd ONCE, here:
+            // the pulse, workers, and CLI invocations all run from different
+            // directories, so a relative value left as-is would silently give
+            // each process its OWN profile depending on cwd — the loop's state
+            // would fragment invisibly. `std::path::absolute` (no symlink
+            // resolution, no fs access) is enough; if even that fails (cwd
+            // gone), keep the raw value rather than crash path resolution.
+            Some(v) if !v.is_empty() => {
+                let p = PathBuf::from(v);
+                std::path::absolute(&p).unwrap_or(p)
+            }
             _ => default_data.clone(),
         };
 

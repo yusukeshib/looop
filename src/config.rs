@@ -107,12 +107,15 @@ impl Config {
         Ok(Config { root })
     }
 
-    /// A short label for the configured runner — the first token of the tick
-    /// command (e.g. `pi`, `claude`). For log lines only.
+    /// A short label for the configured runner — the first REAL command token
+    /// of the tick command (e.g. `pi`, `claude`). Leading `KEY=VAL` env
+    /// assignments and a leading `env` (plus its flags) are skipped, so
+    /// `FOO=1 claude …` and `env -i claude …` both label as `claude`.
+    /// For log lines only.
     pub fn runner_label(&self) -> String {
         self.runner_cmd("tick_command")
             .or_else(|| self.runner_cmd("worker_command"))
-            .and_then(|c| c.split_whitespace().next().map(str::to_owned))
+            .and_then(|c| first_command_token(&c))
             .unwrap_or_else(|| "runner".into())
     }
 
@@ -138,6 +141,38 @@ impl Config {
     }
 }
 
+/// First real command token of a shell command line: skips leading `KEY=VAL`
+/// env assignments and a leading `env` (with its flags), so an env-prefixed
+/// wiring labels as the actual program, not `FOO=1`/`env`. Whitespace-token
+/// based (best effort): a quoted `env -S "FOO=1 claude …"` splits on spaces
+/// like everything else here — acceptable for a log-only label.
+fn first_command_token(cmd: &str) -> Option<String> {
+    let mut after_env = false;
+    for tok in cmd.split_whitespace() {
+        // KEY=VAL assignment (identifier before the `=`): env prefix, skip.
+        if let Some((key, _)) = tok.split_once('=')
+            && !key.is_empty()
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            continue;
+        }
+        if tok == "env" {
+            after_env = true;
+            continue;
+        }
+        // `env`'s own flags (e.g. `-i`, `-S`, `--split-string`) are not the
+        // command either — but only AFTER an `env`, so a real command's flags
+        // (there are none before the command token) never match.
+        if after_env && tok.starts_with('-') {
+            continue;
+        }
+        return Some(tok.to_string());
+    }
+    None
+}
+
 /// Strip a trailing `| <bin> _ fmt` (or `_fmt`) seam from a runner command.
 ///
 /// Tick output formatting moved in-process (`runner::run_streamed`), so
@@ -148,6 +183,9 @@ impl Config {
 /// `"$LOOOP_BIN"` the old seed used) followed by a `fmt`/`_fmt` verb — an
 /// unrelated user pipeline (e.g. `… | grep looop_fmt`) is left untouched.
 fn strip_fmt_seam(cmd: &str) -> String {
+    // KNOWN LIMITATION: rfind('|') is quote-blind — if the seam text appears
+    // QUOTED inside the command (e.g. `echo '… | looop _ fmt'`), the cut lands
+    // inside the string literal. Accepted: no real wiring quotes the old seam.
     if let Some(idx) = cmd.rfind('|') {
         let toks: Vec<&str> = cmd[idx + 1..].split_whitespace().collect();
         if let Some(first) = toks.first() {
@@ -187,7 +225,30 @@ pub fn write(paths: &Paths, contents: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_fmt_seam;
+    use super::{first_command_token, strip_fmt_seam};
+
+    #[test]
+    fn runner_label_skips_env_prefixes() {
+        // Plain command: first token wins (unchanged behavior).
+        assert_eq!(first_command_token("claude -p --model sonnet").unwrap(), "claude");
+        // KEY=VAL prefixes are skipped…
+        assert_eq!(first_command_token("FOO=1 BAR=2 claude -p").unwrap(), "claude");
+        // …as is a leading `env` and its flags.
+        assert_eq!(first_command_token("env FOO=1 claude -p").unwrap(), "claude");
+        assert_eq!(first_command_token("env -i claude -p").unwrap(), "claude");
+        // A $VAR-invoked binary still labels as the token (log-only).
+        assert_eq!(
+            first_command_token("\"$LOOOP_TICK_BIN\" -p").unwrap(),
+            "\"$LOOOP_TICK_BIN\""
+        );
+        // Nothing but assignments → no label (caller falls back to "runner").
+        assert_eq!(first_command_token("FOO=1"), None);
+
+        let cfg = super::Config {
+            root: serde_json::json!({ "tick_command": "RUST_LOG=debug env -i pi -p" }),
+        };
+        assert_eq!(cfg.runner_label(), "pi");
+    }
 
     #[test]
     fn strips_trailing_fmt_seam() {

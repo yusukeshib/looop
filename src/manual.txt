@@ -84,7 +84,9 @@ embedded DB, or anything else. A client does FOUR things:
      `wait` prints state + a `changed: […]` diff, so ONE call tells you WHAT
      moved — no follow-up `tail` / `jq` needed. If the pulse is DOWN it wakes
      immediately with `changed: [pulse-down]` (and state shows `pulse: DOWN`)
-     instead of blocking forever on a loop that will never move the files.
+     instead of blocking forever on a loop that will never move the files;
+     that wake EXITS 2 (a normal change exits 0), so a shell client can branch
+     on the exit code without parsing stdout.
      ⚠ TWO WAKES THAT MUST NOT BE RE-ARMED BLINDLY (both return instantly,
      so a subscribe-handle-resubscribe loop becomes a tight busy-loop):
        • pulse-down — nothing will move until the pulse is restarted; tell
@@ -120,6 +122,11 @@ embedded DB, or anything else. A client does FOUR things:
        looop goal write <id> [body|-]   |   looop goal archive <id>
        looop playbook write [body|-]
        looop sensor write <name> [script|-]
+       looop schedule write <name> --in S | --every S [--note …]   durable time
+         trigger (one-shot / recurring, min 60s) that WAKES the loop when due;
+         looop schedule rm <name> | schedule list [--json]
+       looop tell <worker> "<msg>"      queue steering INTO a live worker — it
+         picks the message up at its next `told` check or with its next answer
      These are the supported steering surface: validated, journaled, and
      single-writer-safe. (The backend also keeps goals/PLAYBOOK/sensors as plain
      files you can git + inspect; editing those files directly works and is seen
@@ -218,6 +225,7 @@ ENVIRONMENT KNOBS (all optional; unset = the default shown; an unparseable
     LOOOP_NOOP_TTL              re-decide an aged noop (secs)  default: 21600 (0 = off)
     LOOOP_FLAP_STREAK           beats before "flapping" flag   default: 5 (0 = off)
   timeouts & limits
+    LOOOP_TICK_TIMEOUT_SECS     decide-runner deadline         default: 1800 (0 = off)
     LOOOP_SHELL_TIMEOUT_SECS    run_shell action deadline      default: 300
     LOOOP_SENSOR_TIMEOUT        per-sensor deadline (secs)     default: 60
     LOOOP_SENSOR_MAX_BYTES      per-snapshot size cap          default: 8192
@@ -236,6 +244,11 @@ ENVIRONMENT KNOBS (all optional; unset = the default shown; an unparseable
     LOOOP_ASK_POLL_MS           blocking-ask poll interval     default: 1000
     LOOOP_ASK_TIMEOUT_S         blocking-ask wall clock        default: none (waits forever)
   deps preflight
-    LOOOP_TICK_BIN / LOOOP_WORKER_BIN  referenced from config.json commands so
-                                one wiring can point tick/worker at different
-                                binaries; resolved by `looop init`.
+    LOOOP_TICK_BIN / LOOOP_WORKER_BIN  conventional names for env vars YOU may
+                                reference from config.json commands (e.g.
+                                tick_command: '"$LOOOP_TICK_BIN" -p') so one
+                                wiring can point tick/worker at different
+                                binaries. looop sets neither — your shell/env
+                                does; the shell expands them at run time, and
+                                the deps preflight skips (never hard-gates on)
+                                commands invoked through a variable.
