@@ -840,7 +840,6 @@ pub(crate) fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
     use std::os::unix::io::AsRawFd;
     unsafe extern "C" {
         fn dup2(a: i32, b: i32) -> i32;
-        fn close(fd: i32) -> i32;
     }
     if SUPPRESS_DEPTH.with(Cell::get) > 0 {
         return f();
@@ -852,22 +851,38 @@ pub(crate) fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = std::io::stdout().flush();
-    unsafe {
-        // Close-on-exec so the detached worker `f` spawns never inherits this
-        // copy of our stdout (see the doc comment above).
-        let saved = dup_cloexec(1);
-        if saved < 0 {
-            return f();
-        }
-        dup2(devnull.as_raw_fd(), 1);
-        SUPPRESS_DEPTH.with(|d| d.set(d.get() + 1));
-        let out = f();
-        SUPPRESS_DEPTH.with(|d| d.set(d.get() - 1));
-        let _ = std::io::stdout().flush();
-        dup2(saved, 1);
-        close(saved);
-        out
+    // Close-on-exec so the detached worker `f` spawns never inherits this
+    // copy of our stdout (see the doc comment above).
+    let saved = unsafe { dup_cloexec(1) };
+    if saved < 0 {
+        return f();
     }
+
+    /// RAII restore: puts the saved fd back on 1 and decrements the depth on
+    /// DROP, so even a PANICKING action unwinds with stdout restored — without
+    /// this, a panic inside `f` would leave the whole process silenced on
+    /// /dev/null (and the depth counter stuck). Declared AFTER `_swap`, so it
+    /// drops FIRST: fd 1 is restored while the swap lock is still held.
+    struct Restore(i32);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            unsafe extern "C" {
+                fn dup2(a: i32, b: i32) -> i32;
+                fn close(fd: i32) -> i32;
+            }
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+            unsafe {
+                dup2(self.0, 1);
+                close(self.0);
+            }
+            SUPPRESS_DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+
+    unsafe { dup2(devnull.as_raw_fd(), 1) };
+    SUPPRESS_DEPTH.with(|d| d.set(d.get() + 1));
+    let _restore = Restore(saved);
+    f()
 }
 
 /// fd 1 is PROCESS-GLOBAL state: two threads swapping it concurrently could
@@ -981,21 +996,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn suppress_stdout_is_reentrant_and_race_free() {
-        use std::os::fd::BorrowedFd;
-        use std::os::unix::fs::MetadataExt;
-        // Observe fd 1 while HOLDING the swap lock: another parallel test may
-        // legitimately be inside its own suppression window right now, and an
-        // unsynchronized peek would see its temporary /dev/null.
-        let ident = || {
-            let _swap = STDOUT_SWAP
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let fd = unsafe { BorrowedFd::borrow_raw(1) };
-            let f = std::fs::File::from(fd.try_clone_to_owned().unwrap());
-            let m = f.metadata().unwrap();
-            (m.dev(), m.ino(), m.rdev())
-        };
-        let before = ident();
+        let before = stdout_ident();
         // Nested on one thread: pass-through, not a self-deadlock.
         assert_eq!(suppress_stdout(|| suppress_stdout(|| 42)), 42);
         // Hammer the swap from two threads at once.
@@ -1009,10 +1010,44 @@ mod tests {
             }
         });
         assert_eq!(
-            ident(),
+            stdout_ident(),
             before,
             "stdout identity must survive concurrent suppression windows"
         );
+    }
+
+    /// Observe fd 1 while HOLDING the swap lock: another parallel test may
+    /// legitimately be inside its own suppression window right now, and an
+    /// unsynchronized peek would see its temporary /dev/null.
+    #[cfg(unix)]
+    fn stdout_ident() -> (u64, u64, u64) {
+        use std::os::fd::BorrowedFd;
+        use std::os::unix::fs::MetadataExt;
+        let _swap = STDOUT_SWAP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fd = unsafe { BorrowedFd::borrow_raw(1) };
+        let f = std::fs::File::from(fd.try_clone_to_owned().unwrap());
+        let m = f.metadata().unwrap();
+        (m.dev(), m.ino(), m.rdev())
+    }
+
+    // Regression: a PANICKING action must not leave the process silenced — the
+    // RAII guard restores fd 1 and the depth counter during unwinding.
+    #[cfg(unix)]
+    #[test]
+    fn suppress_stdout_restores_fd1_when_the_action_panics() {
+        let before = stdout_ident();
+        let unwound = std::panic::catch_unwind(|| suppress_stdout(|| panic!("boom")));
+        assert!(unwound.is_err(), "the panic propagates");
+        assert_eq!(
+            stdout_ident(),
+            before,
+            "fd 1 restored during unwinding — the process is not left on /dev/null"
+        );
+        // Depth was decremented too: a later suppression still round-trips.
+        assert_eq!(suppress_stdout(|| 7), 7);
+        assert_eq!(stdout_ident(), before);
     }
 
     // Regression: the fd we dup inside suppress_stdout MUST be close-on-exec.

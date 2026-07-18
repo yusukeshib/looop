@@ -22,14 +22,13 @@ use std::process::ExitCode;
 /// or non-JSON files are skipped). The pulse refreshes these each beat.
 fn snapshots(paths: &Paths) -> serde_json::Map<String, serde_json::Value> {
     let mut out = serde_json::Map::new();
-    for e in fs::read_dir(paths.snapshots_dir())
-        .into_iter()
-        .flatten()
-        .flatten()
-    {
-        let p = e.path();
-        if p.extension().is_some_and(|x| x == "json")
-            && let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string())
+    // sorted_glob (not raw read_dir): serde_json::Map is currently a BTreeMap
+    // (sorted on its own), but it flips to insertion-ordered the moment ANY
+    // dependency enables serde_json's `preserve_order` feature — and consumers
+    // ([`fingerprints`], [`state`]) iterate this map, so insertion order must
+    // be deterministic regardless of which Map implementation we end up with.
+    for p in util::sorted_glob(&paths.snapshots_dir(), "json") {
+        if let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string())
             && let Ok(raw) = fs::read_to_string(&p)
             && let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw)
         {
@@ -247,8 +246,18 @@ fn probe_stamp(paths: &Paths) -> String {
         paths.asks_dir(),
         paths.answers_dir(),
     ] {
-        for e in fs::read_dir(dir).into_iter().flatten().flatten() {
-            stamp_file(&e.path());
+        // read_dir order is filesystem-dependent and NOT guaranteed stable
+        // between polls; an order shuffle over unchanged files would move the
+        // stamp and waste a full fingerprint recompute. Sort before stamping.
+        let mut entries: Vec<_> = fs::read_dir(dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        entries.sort();
+        for p in entries {
+            stamp_file(&p);
         }
     }
     util::content_hash(buf.as_bytes())
