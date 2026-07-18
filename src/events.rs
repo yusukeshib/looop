@@ -14,9 +14,19 @@ use std::io::Write;
 /// Best-effort: observability must never fail a beat.
 pub fn emit(paths: &Paths, event: &str, fields: serde_json::Value) {
     let mut obj = serde_json::Map::new();
+    // Millisecond precision (RFC3339-compatible, so any consumer that parsed
+    // the old second-precision form still parses this): events are appended by
+    // CONCURRENT processes (pulse + CLI invocations), and at second precision
+    // two near-simultaneous events sort non-deterministically for a tailing
+    // reader. No in-repo consumer parses this field — it exists for external
+    // watchers — so the widening is safe.
     obj.insert(
         "ts".into(),
-        serde_json::Value::String(chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()),
+        serde_json::Value::String(
+            chrono::Utc::now()
+                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                .to_string(),
+        ),
     );
     obj.insert("event".into(), serde_json::Value::String(event.to_string()));
     if let serde_json::Value::Object(extra) = fields {
@@ -43,7 +53,10 @@ pub fn emit(paths: &Paths, event: &str, fields: serde_json::Value) {
     // flock on a small sibling lock file: kernel-managed like DirLock, so a
     // crash never leaves a stale lock. The append itself stays lock-free
     // (O_APPEND + single write_all is already interleave-safe). Best-effort:
-    // if the lock can't be taken, skip rotation rather than fail the beat.
+    // if the lock can't be taken, skip rotation rather than fail the beat —
+    // hence the NON-blocking flock below: a blocking acquire would make a
+    // contended rotation stall the beat instead of skipping (the next emit
+    // past the cap retries anyway).
     let max_bytes: u64 = crate::util::env_knob("LOOOP_EVENTS_MAX_BYTES").unwrap_or(5 * 1024 * 1024);
     if max_bytes > 0
         && let Ok(lock) = OpenOptions::new()
@@ -51,7 +64,7 @@ pub fn emit(paths: &Paths, event: &str, fields: serde_json::Value) {
             .truncate(false)
             .write(true)
             .open(paths.data_dir.join(".events.rotlock"))
-        && crate::util::flock_file(&lock, true)
+        && crate::util::flock_file(&lock, false)
         && std::fs::metadata(&path).is_ok_and(|m| m.len() > max_bytes)
     {
         let _ = std::fs::rename(&path, paths.data_dir.join("events.jsonl.1"));

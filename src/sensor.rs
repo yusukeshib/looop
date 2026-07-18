@@ -27,8 +27,10 @@ fn read_tail(path: &Path, max: usize) -> String {
 }
 
 /// Run ONE sensor with an IN-PROCESS timeout + size cap. Returns its exit
-/// status (124 = timed out, matching the coreutils convention). `out`/`err`
-/// receive stdout/stderr (written directly by the child — no pipe to drain).
+/// status (124 = timed out, matching the coreutils convention; 128+signo for
+/// a signal death). `out`/`err` receive stdout/stderr — stdout streams into a
+/// sibling temp file (no pipe to drain) and is rename-published to `out` only
+/// on success, so watchers never observe a partial snapshot.
 ///
 /// The timeout deliberately depends on NO external `timeout`/`gtimeout`
 /// binary (plain macOS ships neither): the child runs in its own process
@@ -39,27 +41,43 @@ fn read_tail(path: &Path, max: usize) -> String {
 fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
     let to = env_num("LOOOP_SENSOR_TIMEOUT", 60);
 
-    // Any failure BEFORE the script even runs (capture-file create, spawn)
-    // must land as the same normalized {signal,detail} error blob a non-zero
-    // exit gets. File::create(out) TRUNCATES the previous snapshot first, so
-    // an early return here used to leave an EMPTY snapshot behind — the
-    // decider saw an unexplained blank world instead of the failure. Routing
-    // spawn failures (missing exec bit, bogus shebang) through the blob keeps
-    // the failure visible in the prompt AND the wake hash.
+    // The child's stdout streams into a TEMP file (`<name>.json.tmp`, same
+    // dir so the final rename is same-filesystem atomic) and is PUBLISHED to
+    // the snapshot path only once the sensor succeeds. Streaming straight
+    // into the snapshot violated observe.rs probe_stamp's invariant that all
+    // watched writes are rename-published — a concurrent reader (state /
+    // wait / the prompt) could see partial JSON and wake spuriously. The tmp
+    // has a non-`json` extension, so the prompt's `sorted_glob(_, "json")`
+    // never picks it up, and run_all's ownership prune clears any tmp a
+    // crashed run left behind.
+    let tmp = {
+        let mut name = out
+            .file_name()
+            .map(|n| n.to_os_string())
+            .unwrap_or_default();
+        name.push(".tmp");
+        out.with_file_name(name)
+    };
+
+    // Any failure (capture-file create, spawn, non-zero exit) must land as the
+    // same normalized {signal,detail} error blob — rename-published via
+    // write_atomic, never a torn plain write — so the decider sees the failure
+    // instead of an unexplained blank/partial world. The dead tmp is dropped.
     let fail_blob = |rc: i32, msg: String| -> i32 {
         let blob = serde_json::json!({
             "signal": { "error": true, "exit_code": rc },
             "detail": { "message": msg, "stderr": read_tail(err, 1024) },
         });
-        let _ = fs::write(out, format!("{blob}\n"));
+        let _ = util::write_atomic(out, format!("{blob}\n").as_bytes());
+        let _ = fs::remove_file(&tmp);
         rc
     };
 
-    let (of, ef) = match (File::create(out), File::create(err)) {
+    let (of, ef) = match (File::create(&tmp), File::create(err)) {
         (Ok(of), Ok(ef)) => (of, ef),
-        // Best-effort: if the snapshot itself is uncreatable the blob write
-        // below likely fails too, but a failing .err file alone must not
-        // silently blank the snapshot.
+        // Best-effort: if the capture file itself is uncreatable the blob
+        // write below likely fails too, but a failing .err file alone must
+        // not silently blank the snapshot.
         _ => return fail_blob(1, "cannot create sensor capture files".to_string()),
     };
 
@@ -89,9 +107,28 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
     } else {
         Instant::now().checked_add(Duration::from_secs(to))
     };
+    // Set ONLY when the child actually died to a signal (never inferred from
+    // the numeric rc): a script that itself `exit 130`s must not be reported
+    // as "killed by signal 2".
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut killed_by_signal: Option<i32> = None;
     let rc = loop {
         match child.try_wait() {
-            Ok(Some(status)) => break status.code().unwrap_or(1),
+            Ok(Some(status)) => {
+                // A signal death has no exit code — report the conventional
+                // 128+signo instead of a generic 1, so the error blob can say
+                // "killed by signal N" (OOM kill, external TERM) rather than
+                // masquerade as an ordinary script failure.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::process::ExitStatusExt;
+                    if let Some(sig) = status.signal() {
+                        killed_by_signal = Some(sig);
+                        break 128 + sig;
+                    }
+                }
+                break status.code().unwrap_or(1);
+            }
             Ok(None) => {
                 if let Some(d) = deadline
                     && Instant::now() >= d
@@ -130,6 +167,10 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
     if rc != 0 {
         let msg = if rc == 124 {
             format!("sensor timed out after {to}s (LOOOP_SENSOR_TIMEOUT)")
+        } else if let Some(sig) = killed_by_signal {
+            format!(
+                "sensor killed by signal {sig} — an external kill (OOM, TERM), not a script bug"
+            )
         } else {
             "sensor exited non-zero — fix the script or its environment".to_string()
         };
@@ -144,7 +185,7 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
     // beat (self-inflicted flapping that defeats the unchanged-world skip).
     let cap = env_num("LOOOP_SENSOR_MAX_BYTES", 8192);
     if cap != 0
-        && let Ok(meta) = fs::metadata(out)
+        && let Ok(meta) = fs::metadata(&tmp)
     {
         let sz = meta.len();
         if sz > cap {
@@ -155,8 +196,19 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
                     "message": "sensor output too large — emit a small normalized {signal,detail} snapshot, not a raw dump",
                 },
             });
-            let _ = fs::write(out, format!("{blob}\n"));
+            let _ = util::write_atomic(out, format!("{blob}\n").as_bytes());
+            let _ = fs::remove_file(&tmp);
+            return rc;
         }
+    }
+    // Publish the successful reading: rename(2) is atomic on the same
+    // filesystem, so a concurrent reader sees the old snapshot or the new one
+    // — never a torn write (the invariant probe_stamp documents and relies on).
+    if fs::rename(&tmp, out).is_err() {
+        return fail_blob(
+            1,
+            "cannot publish the sensor snapshot (rename failed)".to_string(),
+        );
     }
     rc
 }
@@ -281,7 +333,12 @@ impl Sensor {
             // Virtual: a probe can't fail or hang, so there's no timeout/err path.
             Sensor::System { probe, .. } => {
                 let body = probe(paths);
-                let _ = fs::write(snap_dir.join(format!("{name}.json")), format!("{body}\n"));
+                // Rename-published like every watched write (probe_stamp's
+                // invariant): a concurrent reader must never see partial JSON.
+                let _ = util::write_atomic(
+                    &snap_dir.join(format!("{name}.json")),
+                    format!("{body}\n").as_bytes(),
+                );
                 true
             }
         };
@@ -957,6 +1014,101 @@ mod tests {
                 .unwrap()
                 .contains("timed out"),
             "timeout reaches the prompt via the snapshot: {body}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn signal_killed_sensor_reports_128_plus_signo() {
+        let p = Paths::temp();
+        let snap = p.snapshots_dir();
+        fs::create_dir_all(&snap).unwrap();
+        fs::create_dir_all(p.sensors_dir()).unwrap();
+        let script = p.sensors_dir().join("suicide.sh");
+        // The script kills ITSELF with SIGTERM — a stand-in for an external
+        // kill (OOM, operator TERM) that leaves no exit code.
+        fs::write(&script, "#!/usr/bin/env bash\nkill -TERM $$\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let r = Sensor::User(script).sense(&p, &snap);
+        assert!(!r.ok, "a signal death is a failure");
+        let body = fs::read_to_string(snap.join("sensor-suicide.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        // SIGTERM is 15 on every unix we target → 128+15.
+        assert_eq!(
+            v["signal"]["exit_code"],
+            serde_json::json!(143),
+            "signal deaths report the conventional 128+signo, not a generic 1: {body}"
+        );
+        assert!(
+            v["detail"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("killed by signal 15"),
+            "the blob names the signal so the decider can tell an external kill \
+             from a script bug: {body}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn plain_exit_above_128_is_not_misreported_as_a_signal_death() {
+        // A script that itself `exit 130`s has a real exit CODE — the blob
+        // must not claim "killed by signal 2" just because 130 > 128.
+        let p = Paths::temp();
+        let snap = p.snapshots_dir();
+        fs::create_dir_all(&snap).unwrap();
+        fs::create_dir_all(p.sensors_dir()).unwrap();
+        let script = p.sensors_dir().join("exit130.sh");
+        fs::write(&script, "#!/usr/bin/env bash\nexit 130\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let r = Sensor::User(script).sense(&p, &snap);
+        assert!(!r.ok);
+        let body = fs::read_to_string(snap.join("sensor-exit130.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["signal"]["exit_code"], serde_json::json!(130));
+        assert!(
+            !v["detail"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("killed by signal"),
+            "an ordinary exit code above 128 is a script failure, not a signal death: {body}"
+        );
+    }
+
+    #[test]
+    fn successful_sensor_is_rename_published_leaving_no_tmp() {
+        let p = Paths::temp();
+        let snap = p.snapshots_dir();
+        fs::create_dir_all(&snap).unwrap();
+        fs::create_dir_all(p.sensors_dir()).unwrap();
+        let script = p.sensors_dir().join("ok.sh");
+        fs::write(
+            &script,
+            "#!/usr/bin/env bash\necho '{\"signal\":{\"n\":1}}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let r = Sensor::User(script).sense(&p, &snap);
+        assert!(r.ok);
+        let body = fs::read_to_string(snap.join("sensor-ok.json")).unwrap();
+        serde_json::from_str::<serde_json::Value>(&body).expect("published snapshot is whole JSON");
+        assert!(
+            !snap.join("sensor-ok.json.tmp").exists(),
+            "the capture temp is consumed by the publishing rename — watchers \
+             only ever see the snapshot appear atomically"
         );
     }
 

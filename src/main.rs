@@ -66,9 +66,7 @@ fn main() -> ExitCode {
     // `run` verb and may pass flags THIS version doesn't know; that argv must
     // tolerate unknown flags (forward-compat), the opposite of clap's strict
     // rejection — so it never reaches clap. No deps check, no pulse.
-    if raw.first().map(String::as_str) == Some("run")
-        && raw.get(1).map(String::as_str) == Some("--detached-id")
-    {
+    if is_detached_run(&raw) {
         return match session::run_detached_worker(&raw[1..]) {
             Ok(c) => ExitCode::from(c.clamp(0, 255) as u8),
             Err(e) => {
@@ -143,37 +141,29 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
             // lists the real topics instead of suggesting a command that would
             // itself error.
             use clap::CommandFactory;
-            // Walk the full topic chain: `looop help worker start` descends
-            // into the `worker` subcommand and then its `start` subcommand,
-            // matching the `trailing_var_arg` the CLI accepts (the old code
-            // only looked at topic[0], dropping nested topics). The
-            // immutable pass validates the path; the mutable pass re-traverses
-            // to call print_help (which needs &mut). A helper fn avoids the
-            // borrow-checker's overlapping-&mut rejection on inline loops.
-            let root = cli::Cli::command();
-            let mut found = true;
-            let mut probe = &root;
-            for name in &topic {
-                probe = match probe.find_subcommand(name) {
-                    Some(sub) => sub,
-                    None => {
-                        found = false;
-                        break;
-                    }
-                };
-            }
-            if found {
-                let mut root = cli::Cli::command();
-                let _ = descend_help(&mut root, &topic).print_help();
-                Ok(ExitCode::SUCCESS)
-            } else {
-                let topics: Vec<String> = cli::Cli::command()
-                    .get_subcommands()
-                    .map(|s| s.get_name().to_string())
-                    .collect();
-                eprintln!("looop help: unknown topic `{}`", topic.join(" "));
-                eprintln!("topics: {}", topics.join(", "));
-                Ok(ExitCode::from(1))
+            // Walk the full topic chain in ONE pass: `looop help worker start`
+            // descends into the `worker` subcommand and then its `start`
+            // subcommand, matching the `trailing_var_arg` the CLI accepts (the
+            // old code only looked at topic[0], dropping nested topics). The
+            // helper fn does the whole traversal mutably — returning `None` on
+            // an unknown step — so there is no validate-then-expect double
+            // walk. (A fn also sidesteps the borrow-checker's overlapping-&mut
+            // rejection on inline loops, E0499.)
+            let mut root = cli::Cli::command();
+            match descend_help(&mut root, &topic) {
+                Some(cmd) => {
+                    let _ = cmd.print_help();
+                    Ok(ExitCode::SUCCESS)
+                }
+                None => {
+                    let topics: Vec<String> = cli::Cli::command()
+                        .get_subcommands()
+                        .map(|s| s.get_name().to_string())
+                        .collect();
+                    eprintln!("looop help: unknown topic `{}`", topic.join(" "));
+                    eprintln!("topics: {}", topics.join(", "));
+                    Ok(ExitCode::from(1))
+                }
             }
         }
         Cmd::Version => {
@@ -291,14 +281,69 @@ fn export_env(paths: &Paths) {
 }
 
 /// Descend a subcommand path (e.g. `["worker", "start"]`) returning the
-/// deepest subcommand. The caller has already validated via the immutable
-/// `find_subcommand` pass that every step resolves, so `unwrap` here is safe.
-/// Wrapped in a fn so the borrow checker accepts the chained `&mut` traversal
-/// (inline loops that reuse the `&mut` result trip E0499).
-fn descend_help<'a>(cmd: &'a mut clap::Command, path: &[String]) -> &'a mut clap::Command {
+/// deepest subcommand, or `None` when any step doesn't resolve — the single
+/// traversal that both VALIDATES the topic chain and yields the `&mut` that
+/// `print_help` needs (no separate immutable pre-pass, no `expect`). Wrapped
+/// in a fn so the borrow checker accepts the chained `&mut` traversal (inline
+/// loops that reuse the `&mut` result trip E0499).
+fn descend_help<'a>(cmd: &'a mut clap::Command, path: &[String]) -> Option<&'a mut clap::Command> {
     let mut current = cmd;
     for name in path {
-        current = current.find_subcommand_mut(name).expect("validated above");
+        current = current.find_subcommand_mut(name)?;
     }
-    current
+    Some(current)
+}
+
+/// Should this argv take the PRE-CLAP detached-supervisor shortcut? True when
+/// the verb is `run` and `--detached-id` appears anywhere BEFORE a bare `--`
+/// (after `--` everything is the wrapped command's own argv, where the same
+/// token is ordinary payload). babysit hard-codes `run --detached-id <id> …`
+/// today, but it may grow/reorder flags in front of it in a future version —
+/// keying on exact position raw[1] would silently break that forward-compat
+/// promise, so any pre-`--` position counts.
+fn is_detached_run(raw: &[String]) -> bool {
+    raw.first().map(String::as_str) == Some("run")
+        && raw[1..]
+            .iter()
+            .take_while(|a| a.as_str() != "--")
+            .any(|a| a == "--detached-id")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_detached_run;
+
+    fn v(args: &[&str]) -> Vec<String> {
+        args.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn detached_run_shortcut_matches_any_pre_dashdash_position() {
+        // babysit's argv today: flag right after the verb.
+        assert!(is_detached_run(&v(&[
+            "run",
+            "--detached-id",
+            "w1",
+            "--",
+            "cmd"
+        ])));
+        // Forward-compat: a future babysit may put flags in front of it.
+        assert!(is_detached_run(&v(&[
+            "run",
+            "--root",
+            "/x",
+            "--detached-id",
+            "w1",
+            "--",
+            "cmd"
+        ])));
+        // Not the `run` verb: never shortcut.
+        assert!(!is_detached_run(&v(&["worker", "--detached-id", "w1"])));
+        // `--detached-id` only AFTER a bare `--` is the wrapped command's own
+        // argv, not ours — clap must see this one.
+        assert!(!is_detached_run(&v(&["run", "--", "cmd", "--detached-id"])));
+        // A plain human `looop run <cmd>` stays on the clap path.
+        assert!(!is_detached_run(&v(&["run", "echo", "hi"])));
+        assert!(!is_detached_run(&v(&[])));
+    }
 }

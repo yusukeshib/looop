@@ -8,7 +8,6 @@ use crate::config::Config;
 use crate::paths::Paths;
 use crate::seed;
 use anyhow::Result;
-use std::fs;
 use std::process::ExitCode;
 
 /// Single-quote a string for safe inclusion in a `bash -lc` command line
@@ -278,6 +277,18 @@ pub fn cmd_start_session(
         reap(paths, &session); // reuse the id held by a dead corpse (targeted)
     }
 
+    // GENERATION BOUNDARY for tells: a worker id is its goal id and gets
+    // reused, and a tell can only be queued for a LIVE worker (cmd_tell
+    // refuses corpses) — so any tell still pending here was addressed to the
+    // PREVIOUS, now-dead worker under this id. Discard before the spawn:
+    // delivering it to the new generation (via `told` or an ask-answer
+    // piggyback) would apply stale steering to a worker with a different
+    // brief. reap/prune/kill also discard (hygiene), but this pre-spawn point
+    // holds even when the corpse was removed by some other path — and it is
+    // race-safe: cmd_tell can't queue for this id until the worker is alive,
+    // i.e. after the spawn below.
+    crate::mailbox::discard_tells(paths, &session);
+
     // Persist the post-condition BEFORE the spawn: a verify declared for a
     // worker that dies instantly must still be checked on the next beat. No
     // verify ⇒ clear any stale one left by a prior corpse with this id.
@@ -295,7 +306,14 @@ pub fn cmd_start_session(
         .replace("__SESSION__", &session)
         .replace("__ID__", id);
     let resume_part = resume_block.as_deref().unwrap_or("");
-    if let Err(e) = fs::write(&prompt_file, format!("{contract}{resume_part}{prompt}\n")) {
+    // Atomic write (temp + fsync + rename), not fs::write: the worker command
+    // reads this file via `$(cat {{prompt_file}})`, and on an id REUSE a
+    // truncate-then-write could expose a torn brief to a concurrent reader —
+    // rename-publish means the path only ever holds a complete prompt.
+    if let Err(e) = crate::util::write_atomic(
+        &prompt_file,
+        format!("{contract}{resume_part}{prompt}\n").as_bytes(),
+    ) {
         crate::verify::clear(paths, &session); // no stale verify for a no-show worker
         return Err(e.into());
     }
@@ -557,6 +575,9 @@ pub fn cmd_kill(paths: &Paths, id: &str) -> Result<ExitCode> {
         return Ok(ExitCode::from(1));
     }
     kill(paths, &session)?;
+    // The worker is dead by fiat: any tell it never drained is now addressed
+    // to a corpse and must not linger for a future worker reusing the id.
+    crate::mailbox::discard_tells(paths, &session);
     Ok(ExitCode::SUCCESS)
 }
 
@@ -743,6 +764,9 @@ pub fn prune_aged(paths: &Paths, max_age: std::time::Duration) {
             if old {
                 let _ = tokio::fs::remove_dir_all(&dir).await;
                 crate::verify::clear(paths, &id);
+                // Same generation hygiene as reap(): a pruned corpse must not
+                // leave tells behind for a future worker reusing its id.
+                crate::mailbox::discard_tells(paths, &id);
             }
         }
     });
@@ -764,6 +788,10 @@ pub fn reap(paths: &Paths, session: &str) {
         if corpse_dead(status.as_ref().map(|s| s.state), alive) {
             let _ = tokio::fs::remove_dir_all(bs.session_dir(session)).await;
             crate::verify::clear(paths, session);
+            // A removed corpse's id is about to be REUSED — drop any tell
+            // still addressed to the dead generation (see cmd_start_session's
+            // generation-boundary discard for the full reasoning).
+            crate::mailbox::discard_tells(paths, session);
         }
     });
 }

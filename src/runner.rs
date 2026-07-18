@@ -18,7 +18,7 @@
 
 use crate::fmt;
 use crate::paths::Paths;
-use crate::util;
+use crate::util::{self, Level};
 use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -141,10 +141,15 @@ pub fn run_streamed(
     };
 
     // Deadline watchdog: this thread is about to block streaming the runner's
-    // output, so a separate thread owns the timeout. It sleeps on a channel;
-    // a send (after wait() below) cancels it, and only an actual TIMEOUT (not
-    // a disconnect) kills the group. Returns whether it fired.
+    // output, so a separate thread owns the timeout WHILE WE STREAM. It sleeps
+    // on a channel; a send (after the stream ends below, BEFORE the child is
+    // reaped) cancels it, and only an actual TIMEOUT (not a disconnect) kills
+    // the group. Returns whether it fired. Once the stream ends, THIS thread
+    // takes the deadline back (see the reap loop below) — the watchdog never
+    // outlives the un-reaped child, so its group kill can never hit a
+    // recycled pgid.
     let timeout = tick_timeout_secs();
+    let started = std::time::Instant::now();
     let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
     let pgid = child.id() as i32;
     let watchdog = (timeout > 0).then(|| {
@@ -176,15 +181,37 @@ pub fn run_streamed(
 
     // File::create truncates — intentional: tick.log carries the LAST beat
     // only (see the module comment); runs/<id>/output.log is per-beat anyway.
-    let mut sinks: Vec<File> = tee.iter().filter_map(|p| File::create(p).ok()).collect();
+    // A sink that fails to open degrades the REPLAY archive, not the beat —
+    // but silently losing it would strand the operator when a beat needs
+    // replaying, so name it (same discipline as the guard_degraded events).
+    let mut sinks: Vec<File> = Vec::new();
+    for p in tee {
+        match File::create(p) {
+            Ok(f) => sinks.push(f),
+            Err(e) => util::event(
+                Level::Warn,
+                "tick.guard_degraded",
+                &format!(
+                    "cannot create the tee sink {} (this beat's replay archive is degraded): {e}",
+                    p.display()
+                ),
+                &[],
+            ),
+        }
+    }
 
+    // Read RAW bytes per line, then lossy-decode: read_line() would return
+    // Err(InvalidData) on invalid UTF-8 (LLM CLIs can emit partial/garbage
+    // bytes), and treating that as EOF would drop the reader mid-stream —
+    // SIGPIPE-ing a live child and mislabeling the beat as a runner failure.
     let mut reader = BufReader::new(out);
-    let mut line = String::new();
+    let mut buf: Vec<u8> = Vec::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => break, // EOF
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) => break, // EOF: every writer closed the pipe
             Ok(_) => {
+                let line = String::from_utf8_lossy(&buf);
                 let line = line.trim_end_matches(['\n', '\r']);
                 // Archive only the rendered progress (what the old `_ fmt` pipe wrote).
                 if let Some(rendered) = fmt::format_line(line) {
@@ -194,7 +221,7 @@ pub fn run_streamed(
                     }
                 }
             }
-            Err(_) => break,
+            Err(_) => break, // a real I/O error on the pipe, not bad UTF-8
         }
     }
     // Drop our end of the pipe BEFORE waiting: after a read error above the
@@ -202,20 +229,136 @@ pub fn run_streamed(
     // would deadlock both sides on a full pipe buffer.
     drop(reader);
 
-    let status = child.wait();
-    // Cancel the watchdog (harmless if it already fired) and learn whether the
-    // deadline was the reason the stream ended — a group-killed runner exits
-    // nonzero anyway, but the timeout message names the ACTUAL cause.
+    // Take the deadline back from the watchdog BEFORE reaping: joining first
+    // guarantees the watchdog's group kill can never fire AFTER wait() has
+    // reaped the child — which could hit a recycled pgid belonging to someone
+    // else. But the stream ending does NOT prove the child is exiting: EOF
+    // only means every writer closed the pipe (a runner can close its stdout
+    // and keep running), and after a read error the child is definitely still
+    // alive — so a plain wait() here could hang the single-instance pulse
+    // forever with the watchdog gone. Instead, reap with the ORIGINAL
+    // deadline: poll try_wait() and kill the group ourselves if it expires.
+    // Killing here is race-free where the watchdog was not: the child is
+    // still un-reaped, so its pgid cannot have been recycled.
     let _ = cancel_tx.send(());
-    let timed_out = watchdog.is_some_and(|h| h.join().unwrap_or(false));
-    if timed_out {
-        return Err(format!(
-            "timed out after {timeout}s (LOOOP_TICK_TIMEOUT_SECS) — process group killed"
-        ));
-    }
+    // (cfg_attr: only the Unix arm below can set it — non-Unix would warn.)
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut timed_out = watchdog.is_some_and(|h| h.join().unwrap_or(false));
+    let status = if timeout == 0 {
+        child.wait() // deadline disabled by the operator — wait indefinitely
+    } else {
+        let deadline = started + std::time::Duration::from_secs(timeout);
+        loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break Ok(s),
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    // Same outcome as the watchdog firing mid-stream, minus
+                    // the post-reap race: kill the group, then reap for real.
+                    // (On non-Unix nothing can kill the group — fall through
+                    // to a plain wait without claiming a kill happened,
+                    // matching the watchdog's non-Unix behavior.)
+                    #[cfg(unix)]
+                    {
+                        kill_pgid(pgid);
+                        timed_out = true;
+                    }
+                    break child.wait();
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(e) => break Err(e),
+            }
+        }
+    };
     match status {
+        // A clean zero exit WINS over a racing timeout flag: if the runner
+        // finished its work, reporting "timed out · killed" would be a lie
+        // (the kill hit an already-exiting group, or nothing at all).
         Ok(s) if s.success() => Ok(()),
+        Ok(_) if timed_out => Err(format!(
+            "timed out after {timeout}s (LOOOP_TICK_TIMEOUT_SECS) — process group killed"
+        )),
         Ok(s) => Err(format!("the tick runner exited nonzero ({s})")),
+        Err(_) if timed_out => Err(format!(
+            "timed out after {timeout}s (LOOOP_TICK_TIMEOUT_SECS) — process group killed"
+        )),
         Err(e) => Err(format!("failed to reap the tick runner: {e}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_quote_survives_spaces_quotes_and_dollars() {
+        assert_eq!(shell_quote("plain"), "'plain'");
+        assert_eq!(shell_quote("with space"), "'with space'");
+        // `$` inside single quotes is literal — no expansion.
+        assert_eq!(shell_quote("$HOME"), "'$HOME'");
+        // The classic POSIX dance: close, escaped quote, reopen.
+        assert_eq!(shell_quote("it's"), "'it'\\''s'");
+        // Round-trip through a REAL shell: the quoted form must reproduce the
+        // exact original bytes as one word.
+        let tricky = "a b'c$d\"e";
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("printf %s {}", shell_quote(tricky)))
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            tricky,
+            "the shell must hand the exact original string back"
+        );
+    }
+
+    #[test]
+    fn substitute_prompt_file_quotes_once_never_twice() {
+        let path = "/tmp/prompt file's.md";
+        let quoted = shell_quote(path);
+        // A bare placeholder gets quoted.
+        assert_eq!(
+            substitute_prompt_file("cat {{prompt_file}}", path),
+            format!("cat {quoted}")
+        );
+        // A config that already wrapped the placeholder in quotes (either
+        // style) must NOT be double-quoted — nesting would hand the shell a
+        // literal-quote path.
+        assert_eq!(
+            substitute_prompt_file("cat \"{{prompt_file}}\"", path),
+            format!("cat {quoted}"),
+            "pre-double-quoted placeholder is replaced whole"
+        );
+        assert_eq!(
+            substitute_prompt_file("cat '{{prompt_file}}'", path),
+            format!("cat {quoted}"),
+            "pre-single-quoted placeholder is replaced whole"
+        );
+        // Every occurrence is substituted; unrelated text is untouched.
+        assert_eq!(
+            substitute_prompt_file("a {{prompt_file}} b '{{prompt_file}}' c", path),
+            format!("a {quoted} b {quoted} c")
+        );
+    }
+
+    #[test]
+    fn substitute_prompt_file_path_roundtrips_through_bash() {
+        // A path with a space, a single quote, and a `$` must reach the
+        // command as ONE argument carrying the exact original bytes.
+        let p = crate::paths::Paths::temp();
+        let path = p.data_dir.join("we ird'$x.md");
+        std::fs::write(&path, "hello").unwrap();
+        let cmd = substitute_prompt_file("cat {{prompt_file}}", &path.to_string_lossy());
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&cmd)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "bash must resolve the tricky path: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "hello");
     }
 }

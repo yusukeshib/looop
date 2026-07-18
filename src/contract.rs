@@ -147,9 +147,12 @@ impl Contract for LocalContract<'_> {
     }
 
     fn answer(&self, ask_id: &str, text: &str, force: bool) -> Result<()> {
-        // Same seeding policy as state/wait/asks: every read-side verb
-        // ensures the data layout exists so a fresh checkout can't make one
-        // contract verb behave differently from its siblings.
+        // Same seeding policy as EVERY verb that touches the data layout
+        // directly (state/wait/asks/ask/claim/…): ensure the layout exists
+        // (cheap, idempotent) so a fresh checkout can't make one contract verb
+        // behave differently from its siblings. The steering writes
+        // (goal_write … worker_start) get the same guarantee inside
+        // `run_action`.
         let _ = crate::seed::ensure_dirs(self.paths);
         mailbox::answer(self.paths, ask_id, text, force)
     }
@@ -161,6 +164,7 @@ impl Contract for LocalContract<'_> {
         reference: &str,
         options: &[String],
     ) -> Result<String> {
+        let _ = crate::seed::ensure_dirs(self.paths);
         mailbox::ask(self.paths, worker, prompt, reference, options)
     }
 
@@ -171,6 +175,7 @@ impl Contract for LocalContract<'_> {
         reference: &str,
         options: &[String],
     ) -> Result<String> {
+        let _ = crate::seed::ensure_dirs(self.paths);
         mailbox::ask_detached(self.paths, worker, prompt, reference, options)
     }
 
@@ -248,10 +253,83 @@ impl Contract for LocalContract<'_> {
     }
 
     fn claim(&self, name: &str, session: Option<&str>) -> Result<ClaimOutcome> {
+        let _ = crate::seed::ensure_dirs(self.paths);
         gate::claim(self.paths, name, session)
     }
 
     fn unclaim(&self, name: &str, session: Option<&str>) -> Result<bool> {
+        let _ = crate::seed::ensure_dirs(self.paths);
         gate::unclaim(self.paths, name, session)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fake a LIVE babysit session by writing the meta/status pair the library
+    /// reads, with OUR OWN pid as the owner — the test process is alive by
+    /// definition, so `session::is_alive` sees a genuinely live holder without
+    /// spawning anything.
+    fn fake_live_session(paths: &Paths, id: &str) {
+        let dir = paths.data_dir.join("sessions").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("meta.json"),
+            format!(
+                r#"{{"id":"{id}","cmd":["x"],"babysit_pid":{},"started_at":"2026-01-01T00:00:00Z"}}"#,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("status.json"),
+            r#"{"state":"running","child_pid":null,"exit_code":null,"last_change":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+    }
+
+    /// Drive the claim verb's THREE outcomes through the [`Contract`] trait
+    /// object (not the gate module directly), so the transport-agnostic seam
+    /// itself is what's under test — a future HTTP impl must reproduce
+    /// exactly this mapping.
+    #[test]
+    fn claim_outcomes_three_way_through_the_contract_trait() {
+        let p = Paths::temp();
+        let local = LocalContract::new(&p);
+        let c: &dyn Contract = &local;
+
+        // 1) A fresh name is WON.
+        assert_eq!(c.claim("repo-x", Some("w1")).unwrap(), ClaimOutcome::Won);
+        // …and the same session re-claiming is the idempotent ALREADY-OWNED,
+        // never an error (a worker may re-announce ownership mid-task).
+        assert_eq!(
+            c.claim("repo-x", Some("w1")).unwrap(),
+            ClaimOutcome::AlreadyOwned
+        );
+
+        // 2) A DEAD holder (no live session backs "w1") is stale: a different
+        // session reclaims and WINS rather than being locked out forever.
+        assert_eq!(c.claim("repo-x", Some("w2")).unwrap(), ClaimOutcome::Won);
+
+        // 3) A LIVE holder blocks everyone else: HELD-BY-LIVE names the
+        // holder so the caller can report who owns the lease.
+        fake_live_session(&p, "live-1");
+        assert_eq!(
+            c.claim("repo-y", Some("live-1")).unwrap(),
+            ClaimOutcome::Won
+        );
+        match c.claim("repo-y", Some("w9")).unwrap() {
+            ClaimOutcome::HeldByLive(holder) => assert_eq!(
+                holder, "live-1",
+                "the live holder is named so the caller can surface it"
+            ),
+            other => panic!("a live holder must block the claim, got {other:?}"),
+        }
+
+        // unclaim mirrors the same liveness rule: a non-holder is refused
+        // (Ok(false)) while the live holder releases cleanly (Ok(true)).
+        assert!(!c.unclaim("repo-y", Some("w9")).unwrap());
+        assert!(c.unclaim("repo-y", Some("live-1")).unwrap());
     }
 }

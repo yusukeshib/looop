@@ -85,6 +85,40 @@ __looop_claims() {
     (( ${#claims} )) && _describe 'lease' claims
 }
 
+# The one subcommand list — shared by top-level completion and `help <topic>`,
+# so the two can never drift apart.
+__looop_subcommands() {
+    local -a subcmds
+    subcmds=(
+        'init:Interactive setup: choose the agent runner'
+        'up:Bring the autonomous pulse up'
+        'down:Tear the pulse (and workers) down'
+        'state:Full world snapshot: goals, sensors, fleet, asks'
+        'wait:Block until the world changes, then print state'
+        'asks:Just the pending asks'
+        'answer:Answer a pending ask'
+        'goal:Create/replace or archive a goal'
+        'sensor:Create/replace a sensor script'
+        'playbook:Rewrite the PLAYBOOK'
+        'schedule:Durable time triggers (one-shot / recurring)'
+        'run:One ad-hoc, reversible shell command'
+        'worker:Spawn / kill / list workers'
+        'w:Spawn / kill / list workers (alias of worker)'
+        'ask:Raise a blocking ask for the human (worker self-callback)'
+        'tell:Queue a steering message into a live worker'
+        'told:Print + consume pending steering messages'
+        'screenshot:Capture a worker'"'"'s current screen'
+        'ss:Capture a worker'"'"'s screen (alias of screenshot)'
+        'kill:Kill a session by id'
+        'claim:Atomically claim a named lease'
+        'unclaim:Release a named lease'
+        'config:Output shell configuration'
+        'version:Print the version'
+        'help:Show the manual'
+    )
+    _describe 'subcommand' subcmds
+}
+
 _looop() {
     local curcontext="$curcontext" state line
     typeset -A opt_args
@@ -95,35 +129,7 @@ _looop() {
 
     case $state in
         subcmd)
-            local -a subcmds
-            subcmds=(
-                'init:Interactive setup: choose the agent runner'
-                'up:Bring the autonomous pulse up'
-                'down:Tear the pulse (and workers) down'
-                'state:Full world snapshot: goals, sensors, fleet, asks'
-                'wait:Block until the world changes, then print state'
-                'asks:Just the pending asks'
-                'answer:Answer a pending ask'
-                'goal:Create/replace or archive a goal'
-                'sensor:Create/replace a sensor script'
-                'playbook:Rewrite the PLAYBOOK'
-                'schedule:Durable time triggers (one-shot / recurring)'
-                'run:One ad-hoc, reversible shell command'
-                'worker:Spawn / kill / list workers'
-                'w:Spawn / kill / list workers (alias of worker)'
-                'ask:Raise a blocking ask for the human (worker self-callback)'
-                'tell:Queue a steering message into a live worker'
-                'told:Print + consume pending steering messages'
-                'screenshot:Capture a worker'"'"'s current screen'
-                'ss:Capture a worker'"'"'s screen (alias of screenshot)'
-                'kill:Kill a session by id'
-                'claim:Atomically claim a named lease'
-                'unclaim:Release a named lease'
-                'config:Output shell configuration'
-                'version:Print the version'
-                'help:Show the manual'
-            )
-            _describe 'subcommand' subcmds
+            __looop_subcommands
             ;;
         args)
             # The `*::` spec above re-scopes $words/$CURRENT to the subcommand:
@@ -281,7 +287,15 @@ _looop() {
                     (( CURRENT == 2 )) && __looop_workers
                     ;;
                 claim|unclaim)
-                    (( CURRENT == 2 )) && __looop_claims
+                    if (( CURRENT == 2 )); then
+                        __looop_claims
+                    else
+                        _arguments '--session[Holding session id (defaults to $LOOOP_SESSION_ID)]:session:'
+                    fi
+                    ;;
+                help)
+                    # `looop help <topic>` takes a subcommand name — reuse the list.
+                    (( CURRENT == 2 )) && __looop_subcommands
                     ;;
                 config)
                     if (( CURRENT == 2 )); then

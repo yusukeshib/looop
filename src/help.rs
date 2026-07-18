@@ -158,4 +158,58 @@ mod tests {
         // And the corrected list shorthand.
         assert!(text.contains("`worker ls` / `w ls`"));
     }
+
+    /// The REVERSE drift guard: every `--xxx` token the hand-written usage
+    /// text mentions must be a long flag clap actually defines SOMEWHERE in
+    /// the command tree — so the help can't keep advertising a flag that was
+    /// renamed or removed (the mirror image of `usage_covers_every_clap_flag`).
+    #[test]
+    fn usage_mentions_only_real_clap_flags() {
+        use clap::CommandFactory;
+        let text = usage_text(&Paths::temp());
+
+        // Every long flag anywhere in the clap tree (recursive walk).
+        fn collect(cmd: &clap::Command, into: &mut std::collections::BTreeSet<String>) {
+            for a in cmd.get_arguments() {
+                if let Some(long) = a.get_long() {
+                    into.insert(long.to_string());
+                }
+            }
+            for sub in cmd.get_subcommands() {
+                collect(sub, into);
+            }
+        }
+        let mut defined = std::collections::BTreeSet::new();
+        collect(&crate::cli::Cli::command(), &mut defined);
+
+        // Tokens that LOOK like flags but are documented examples of
+        // user-provided VALUES, not looop flags — each exclusion justified:
+        //   yes — `looop answer id-1 -- --yes` demonstrates answering with a
+        //         body that starts with a dash; `--yes` is the answer text.
+        const EXAMPLE_VALUES: &[&str] = &["yes"];
+
+        // Extract each `--xxx` token from the usage text. A bare `--` (the
+        // end-of-options convention the text documents) yields an empty name
+        // and is skipped — it is a shell convention, not a flag.
+        let mut rest = text.as_str();
+        let mut checked = 0usize;
+        while let Some(i) = rest.find("--") {
+            let tail = &rest[i + 2..];
+            let name: String = tail
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '-')
+                .collect();
+            if !name.is_empty() && !EXAMPLE_VALUES.contains(&name.as_str()) {
+                assert!(
+                    defined.contains(&name),
+                    "help drift: usage mentions --{name}, which no clap command defines"
+                );
+                checked += 1;
+            }
+            rest = tail;
+        }
+        // The scan itself must have teeth — an extraction bug that finds no
+        // tokens would green-light any drift.
+        assert!(checked > 10, "only {checked} --flags found in usage text");
+    }
 }

@@ -162,13 +162,27 @@ impl Drop for LockGuard {
     }
 }
 
+/// Why [`acquire_lock`] did not hand back the lock. The two cases are
+/// OPPOSITE diagnoses — "another pulse is live" vs "this pulse can't even
+/// open the lock file (permissions, disk full)" — so collapsing them into one
+/// `None` (the old shape) made an I/O failure masquerade as "already running".
+#[derive(Debug)]
+enum LockDenied {
+    /// A live pulse holds the flock (kernel-managed, no PID guess).
+    Held,
+    /// The lock file itself could not be created/opened — report the real
+    /// error, do NOT claim another pulse is running.
+    Io(std::io::Error),
+}
+
 /// Acquire the single-instance lock via `flock(2)` on `<data>/.lock/lock`.
-/// Returns the guard (lock held for its lifetime) on success, or `None` if a LIVE
-/// pulse already holds it. The pulse is the sole beat runner, so holding this for
-/// its lifetime guarantees no two beats ever wipe/regenerate the shared
-/// snapshots/ dir under each other (H4). A pid file is written alongside purely
-/// for human-facing messages (`looop state`, the "already running" notice).
-fn acquire_lock(paths: &Paths) -> Option<LockGuard> {
+/// Returns the guard (lock held for its lifetime) on success, or the reason
+/// it was denied (see [`LockDenied`]). The pulse is the sole beat runner, so
+/// holding this for its lifetime guarantees no two beats ever wipe/regenerate
+/// the shared snapshots/ dir under each other (H4). A pid file is written
+/// alongside purely for human-facing messages (`looop state`, the "already
+/// running" notice).
+fn acquire_lock(paths: &Paths) -> Result<LockGuard, LockDenied> {
     let dir = paths.lock();
     let _ = fs::create_dir_all(&dir);
     let file = fs::OpenOptions::new()
@@ -176,12 +190,12 @@ fn acquire_lock(paths: &Paths) -> Option<LockGuard> {
         .truncate(false)
         .write(true)
         .open(dir.join("lock"))
-        .ok()?;
+        .map_err(LockDenied::Io)?;
     if !try_flock(&file) {
-        return None; // a live pulse holds the flock (kernel-managed, no PID guess)
+        return Err(LockDenied::Held); // a live pulse holds the flock
     }
     let _ = fs::write(dir.join("pid"), format!("{}\n", std::process::id()));
-    Some(LockGuard {
+    Ok(LockGuard {
         path: dir,
         _file: file,
     })
@@ -193,10 +207,21 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
     let beat = interval("LOOOP_INTERVAL", &cfg, "interval", 60);
 
     // Single-instance lock (flock-based; released by the kernel on exit/crash).
-    let Some(_guard) = acquire_lock(paths) else {
-        let oldpid = fs::read_to_string(paths.lock().join("pid")).unwrap_or_default();
-        eprintln!("looop: already running (pid {})", oldpid.trim());
-        return Ok(ExitCode::from(1));
+    let _guard = match acquire_lock(paths) {
+        Ok(g) => g,
+        Err(LockDenied::Held) => {
+            let oldpid = fs::read_to_string(paths.lock().join("pid")).unwrap_or_default();
+            eprintln!("looop: already running (pid {})", oldpid.trim());
+            return Ok(ExitCode::from(1));
+        }
+        // An unopenable lock file is NOT "already running" — surface the real
+        // I/O error (permissions, disk full) so the operator fixes the cause.
+        Err(LockDenied::Io(e)) => {
+            return Err(anyhow::anyhow!(
+                "cannot open the pulse lock file {}: {e}",
+                paths.lock().join("lock").display()
+            ));
+        }
     };
 
     let runner_name = cfg.runner_label();
@@ -417,9 +442,10 @@ mod tests {
         assert!(!pulse_running(&p), "no pulse before any acquire");
 
         let g = acquire_lock(&p).expect("first acquire succeeds");
-        // A second acquire (separate fd, even same process) is denied by flock.
+        // A second acquire (separate fd, even same process) is denied by flock
+        // — and is diagnosed as HELD, not as an I/O failure.
         assert!(
-            acquire_lock(&p).is_none(),
+            matches!(acquire_lock(&p), Err(LockDenied::Held)),
             "second acquire blocked while held"
         );
         // An outside observer (looop state) sees it as running.
@@ -430,7 +456,19 @@ mod tests {
 
         // Releasing the guard releases the flock; the next start re-acquires with
         // no stale-lock reclaim and no PID-liveness guessing.
+        //
+        // Poll with a short deadline instead of asserting immediately: flock is
+        // held by the OPEN FILE DESCRIPTION, and a fork duplicates every fd —
+        // so a sibling test spawning a child in the fork→exec window (before
+        // CLOEXEC strips inherited fds) briefly co-owns the lock. The kernel
+        // releases it as soon as that transient duplicate closes; production
+        // never cares about this microsecond staleness, but a parallel test
+        // harness hits the window often enough to flake an instant assert.
         drop(g);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pulse_running(&p) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(!pulse_running(&p), "not running once released");
         let g2 = acquire_lock(&p).expect("re-acquire after release");
         drop(g2);

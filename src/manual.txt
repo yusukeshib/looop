@@ -227,6 +227,7 @@ ENVIRONMENT KNOBS (all optional; unset = the default shown; an unparseable
   timeouts & limits
     LOOOP_TICK_TIMEOUT_SECS     decide-runner deadline         default: 1800 (0 = off)
     LOOOP_SHELL_TIMEOUT_SECS    run_shell action deadline      default: 300
+    LOOOP_SHELL_ALLOW_DANGEROUS=1  bypass run_shell deny-list  default: off
     LOOOP_SENSOR_TIMEOUT        per-sensor deadline (secs)     default: 60
     LOOOP_SENSOR_MAX_BYTES      per-snapshot size cap          default: 8192
     LOOOP_VERIFY_TIMEOUT_SECS   per-verify deadline            default: 60
@@ -239,6 +240,7 @@ ENVIRONMENT KNOBS (all optional; unset = the default shown; an unparseable
     LOOOP_SESSION_TTL           session corpse TTL (secs)      default: 259200
                                                                (or config `session_ttl`)
     LOOOP_EVENTS_MAX_BYTES      events.jsonl rotate size       default: 5242880 (0 = off)
+    LOOOP_JOURNAL_MAX_BYTES     journal.md rotate size         default: 5242880 (0 = off)
   client polling
     LOOOP_WAIT_POLL_MS          `looop wait` poll interval     default: 1000
     LOOOP_ASK_POLL_MS           blocking-ask poll interval     default: 1000

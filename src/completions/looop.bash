@@ -202,10 +202,18 @@ _looop() {
             [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "$(__looop_workers_list)" -- "$cur"))
             ;;
         claim|unclaim)
-            [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "$(__looop_claims_list)" -- "$cur"))
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "--session" -- "$cur"))
+            elif [[ $cword -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "$(__looop_claims_list)" -- "$cur"))
+            fi
             ;;
         config)
             [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "zsh bash" -- "$cur"))
+            ;;
+        help)
+            # `looop help <topic>` takes a subcommand name — reuse the verb list.
+            [[ $cword -eq 2 ]] && COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
             ;;
     esac
 }

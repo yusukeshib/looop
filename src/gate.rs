@@ -73,6 +73,16 @@ pub(crate) fn claim(
     use crate::contract::ClaimOutcome;
     util::safe_segment("claim name", name)?;
     let session = session_or_env(session);
+    // An EMPTY owner would void the mutual exclusion silently: the lease's
+    // holder can never be judged alive, so anyone (including the reaper)
+    // instantly reclaims it — both racers "win". Refuse instead of granting a
+    // lock that locks nothing.
+    if session.is_empty() {
+        bail!(
+            "claim {name}: no session id — pass --session <id> or run inside a \
+             worker (where $LOOOP_SESSION_ID is exported)"
+        );
+    }
     let store = FileStore::new(paths);
     let key = Key::Claim(name.to_string());
     let body = serde_json::json!({ "session": session, "name": name }).to_string();
@@ -396,6 +406,37 @@ mod tests {
         assert!(
             !path2.exists(),
             "the reaper removes empty crash debris past the grace window"
+        );
+    }
+
+    #[test]
+    fn claim_with_an_empty_session_is_refused() {
+        // No --session and no $LOOOP_SESSION_ID: the lease would have an empty
+        // holder that is never "alive", so anyone could instantly reclaim it —
+        // mutual exclusion silently void. Refuse loudly instead.
+        let _env = crate::util::test_env_lock();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => unsafe { std::env::set_var("LOOOP_SESSION_ID", v) },
+                    None => unsafe { std::env::remove_var("LOOOP_SESSION_ID") },
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("LOOOP_SESSION_ID"));
+        unsafe { std::env::remove_var("LOOOP_SESSION_ID") };
+        let p = Paths::temp();
+        for sess in [None, Some("")] {
+            let err = claim(&p, "repo-anon", sess).unwrap_err();
+            assert!(
+                err.to_string().contains("--session"),
+                "the refusal tells the user how to fix it: {err}"
+            );
+        }
+        assert!(
+            !p.claims_dir().join("repo-anon.json").exists(),
+            "no empty-holder lease is ever written"
         );
     }
 

@@ -2,8 +2,11 @@
 //! spend and surfaces pathological states, extracted from `tick.rs` (which
 //! orchestrates ONE beat) so each guard is readable and testable on its own:
 //!
-//!   * failure BACKOFF (H1) — exponential wait after consecutive failed beats
-//!     at the same world state.
+//!   * failure BACKOFF (H1) — exponential wait after consecutive failed beats.
+//!     Only a SUCCESSFUL beat resets the counter; a moving world hash does not
+//!     (a failing action can move the world every beat). A human steering edit
+//!     (PLAYBOOK/goals — the policy hash) cuts the WAIT short without touching
+//!     the counter.
 //!   * noop TTL — a wrong noop must not park a world state forever; the skip
 //!     gate is bypassed once the committed noop ages past the TTL.
 //!   * FLAPPING-sensor detection — a volatile `.signal` silently defeats both
@@ -27,7 +30,7 @@ use std::path::PathBuf;
 const BACKOFF_BASE_SECS: u64 = 60;
 const BACKOFF_CAP_SECS: u64 = 3600;
 
-/// Backoff window after `fails` consecutive failures at the SAME world state:
+/// Backoff window after `fails` consecutive failed beats:
 /// base·2^(fails-1), capped. `fails == 0` => no wait.
 pub(crate) fn backoff_delay(fails: u32) -> u64 {
     if fails == 0 {
@@ -43,7 +46,9 @@ fn backoff_path(paths: &Paths) -> PathBuf {
     paths.data_dir.join(".tick-backoff")
 }
 
-/// Read backoff state as `(world_hash, consecutive_fails, last_fail_unix)`.
+/// Read backoff state as `(policy_hash, consecutive_fails, last_fail_unix)`.
+/// The stored hash is the POLICY hash (PLAYBOOK + goals) as of the last failed
+/// beat — a change there means the human steered and the wait may be cut short.
 /// `None` when absent/unparseable (no backoff in effect).
 pub(crate) fn read_backoff(paths: &Paths) -> Option<(String, u32, u64)> {
     let v: serde_json::Value =
@@ -64,13 +69,15 @@ pub(crate) fn clear_backoff(paths: &Paths) {
 /// Record a failed attempt; returns the new CONSECUTIVE-fail count. The counter
 /// increments on EVERY failure regardless of how the world hash moved — a failing
 /// action that mutates the world each beat would otherwise look "new" forever and
-/// reset the count, defeating the backoff. Only a SUCCESS ([`clear_backoff`]) — or
-/// the world moving off the failing state (the gate in [`crate::tick::tick`]) —
-/// resets it.
-pub(crate) fn record_backoff(paths: &Paths, hash: &str) -> u32 {
-    let fails = read_backoff(paths).map_or(1, |(_, n, _)| n + 1);
-    let body = serde_json::json!({ "v": 1, "hash": hash, "fails": fails, "ts": util::now_unix() })
-        .to_string();
+/// reset the count, defeating the backoff. Only a SUCCESS ([`clear_backoff`])
+/// resets it. `policy` is the current POLICY hash ([`worldhash::policy_hash`]):
+/// the wait gate in [`crate::tick`] compares it to the live one so a steering
+/// edit (PLAYBOOK/goals) retries promptly, without resetting the counter.
+pub(crate) fn record_backoff(paths: &Paths, policy: &str) -> u32 {
+    let fails = read_backoff(paths).map_or(1, |(_, n, _)| n.saturating_add(1));
+    let body =
+        serde_json::json!({ "v": 1, "hash": policy, "fails": fails, "ts": util::now_unix() })
+            .to_string();
     if let Err(e) = util::write_atomic(&backoff_path(paths), body.as_bytes()) {
         util::event(
             Level::Warn,
@@ -136,9 +143,9 @@ fn flap_streak_threshold() -> u32 {
 /// WHY THIS EXISTS: the loop's entire cost model — "an unchanged world costs no
 /// AI call" — hinges on sensor authors correctly splitting volatile fields into
 /// `.detail`. A sensor that leaks a timestamp/counter into `.signal` silently
-/// defeats BOTH the skip gate and the failure backoff (the world hash never
-/// settles, and a moving hash clears backoff), turning a quiet loop into one
-/// decide per beat forever. Nothing else in the system detects that mistake, so
+/// defeats the skip gate (the world hash never settles), turning a quiet loop
+/// into one decide per beat forever — only the failure backoff and the hourly
+/// cap still bound the spend. Nothing else in the system detects that mistake, so
 /// the beat tracks it mechanically: a signal that has changed on N consecutive
 /// beats is surfaced in the prompt (`FLAPPING SENSORS`) for the decider to fix
 /// (move the volatile fields to `.detail`) and warned once when crossing the

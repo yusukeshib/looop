@@ -105,8 +105,9 @@ pub fn write(
     })
 }
 
-/// Remove `schedules/<name>.json` (idempotent).
-pub fn drop(paths: &Paths, name: &str) -> Result<String> {
+/// Remove `schedules/<name>.json` (idempotent). Named `remove`, not `drop`
+/// (which would shadow `std::mem::drop` for readers of this module).
+pub fn remove(paths: &Paths, name: &str) -> Result<String> {
     util::safe_segment("schedule name", name)?;
     FileStore::new(paths).remove(&Key::Schedule(name.to_string()))?;
     Ok(format!("drop-schedule {name}"))
@@ -115,7 +116,8 @@ pub fn drop(paths: &Paths, name: &str) -> Result<String> {
 /// Whether a parsed schedule is structurally INVALID: both or neither of
 /// `at`/`every_s`, or a recurring period of 0 (which would bump the world hash
 /// every second — a flapping signal). Invalid entries are surfaced (stable
-/// "invalid" signal + a stderr warning from [`list`]), never silently dropped.
+/// "invalid" signal, plus a warning from the human-facing `schedule list`),
+/// never silently dropped.
 fn is_invalid(s: &Schedule) -> bool {
     match (s.at, s.every_s) {
         (Some(_), None) => false,
@@ -124,14 +126,15 @@ fn is_invalid(s: &Schedule) -> bool {
     }
 }
 
-/// All schedules, sorted by name. An unparseable file or a structurally
-/// invalid record is surfaced via a stderr warning (naming the file — stdout
-/// stays machine-clean for `--json` consumers) instead of silently skipped;
+/// All schedules, sorted by name. This runs on EVERY beat (via the
+/// `sys-schedules` sensor), so it never warns — a broken file would otherwise
+/// spam stderr forever. Instead the breakage is carried in-band:
 /// invalid-but-parseable records are still RETURNED so their stable "invalid"
 /// signal reaches the world hash, and a JSON-BROKEN file is returned as `None`
 /// so it too contributes a stable "unparseable" signal — dropping it entirely
 /// would remove it from the world hash (one wake, then invisible forever),
-/// leaving the decider no level-triggered cue to repair it.
+/// leaving the decider no level-triggered cue to repair it. The one-time
+/// human-facing warning lives in `looop schedule list` ([`warn_broken`]).
 pub fn list(paths: &Paths) -> Vec<(String, Option<Schedule>)> {
     let store = FileStore::new(paths);
     store
@@ -139,23 +142,26 @@ pub fn list(paths: &Paths) -> Vec<(String, Option<Schedule>)> {
         .into_iter()
         .filter_map(|name| {
             let raw = store.read(&Key::Schedule(name.clone()))?;
-            let s: Option<Schedule> = match serde_json::from_str(&raw) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    // STDERR, not stdout: list() feeds machine output
-                    // (`looop state --json`) — a stdout warning would corrupt it.
-                    eprintln!("schedules/{name}.json is unparseable ({e}) — it will never fire");
-                    None
-                }
-            };
-            if s.as_ref().is_some_and(is_invalid) {
-                eprintln!(
-                    "schedules/{name}.json is invalid (need exactly one of `at`/`every_s`, every_s > 0) — it will never fire"
-                );
-            }
+            let s: Option<Schedule> = serde_json::from_str(&raw).ok();
             Some((name, s))
         })
         .collect()
+}
+
+/// Warn (stderr — stdout stays machine-clean for `--json` consumers) about
+/// broken schedule entries. Only the human-facing `schedule list` calls this:
+/// the per-beat sensor path stays silent and signals the breakage through the
+/// stable "invalid"/"unparseable" wake signals instead (see [`list`]).
+fn warn_broken(all: &[(String, Option<Schedule>)]) {
+    for (name, s) in all {
+        match s {
+            None => eprintln!("schedules/{name}.json is unparseable — it will never fire"),
+            Some(s) if is_invalid(s) => eprintln!(
+                "schedules/{name}.json is invalid (need exactly one of `at`/`every_s`, every_s > 0) — it will never fire"
+            ),
+            Some(_) => {}
+        }
+    }
 }
 
 /// The wake-signal value of one schedule at `now`, plus its human detail.
@@ -261,6 +267,9 @@ pub fn cmd_schedule(
         ScheduleOp::List { json } => {
             let now = util::now_unix();
             let all = list(paths);
+            // The human-facing list is where broken files get their warning —
+            // the per-beat sensor path would repeat it forever (see list()).
+            warn_broken(&all);
             if *json {
                 // An unparseable record serializes as null — present (the human
                 // sees the name), visibly broken, machine-distinguishable.
@@ -435,9 +444,9 @@ mod tests {
         assert!(write(&p, "bad", None, None, "").is_err());
         assert!(write(&p, "bad", None, Some(5), "").is_err());
         assert!(write(&p, "../evil", Some(1), None, "").is_err());
-        // drop is idempotent
-        drop(&p, "digest").unwrap();
-        drop(&p, "digest").unwrap();
+        // remove is idempotent
+        remove(&p, "digest").unwrap();
+        remove(&p, "digest").unwrap();
         assert_eq!(list(&p).len(), 1);
     }
 

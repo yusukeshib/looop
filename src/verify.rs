@@ -78,7 +78,9 @@ pub struct VerifyResult {
 /// result left by a previous corpse that reused the id).
 pub fn store(paths: &Paths, id: &str, cmd: &str) -> anyhow::Result<()> {
     fs::create_dir_all(dir(paths))?;
-    fs::write(cmd_path(paths, id), cmd)?;
+    // Rename-published: a torn plain write here would later EXECUTE a
+    // truncated command (reconcile runs whatever bytes it finds).
+    crate::util::write_atomic(&cmd_path(paths, id), cmd.as_bytes())?;
     let _ = fs::remove_file(result_path(paths, id));
     Ok(())
 }
@@ -154,7 +156,9 @@ pub fn reconcile(paths: &Paths) {
         }
         let outcome = run_one(paths, &p);
         let json = serde_json::to_string(&outcome).unwrap_or_else(|_| "{}".into());
-        let _ = fs::write(result_path(paths, &id), json);
+        // Rename-published: a torn result would be unparseable, look like "no
+        // result yet", and re-run the (once-only) verify command next beat.
+        let _ = crate::util::write_atomic(&result_path(paths, &id), json.as_bytes());
         crate::util::event(
             if outcome.ok {
                 crate::util::Level::Info
@@ -357,6 +361,134 @@ fn read_tail_file(path: &std::path::Path, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fabricate a babysit session on disk in `state` — the same file layout
+    /// the library reads back (meta.json + status.json) — so reconcile's
+    /// alive/dead judgment can be exercised without spawning real processes.
+    fn fake_worker(paths: &Paths, id: &str, state: &str) {
+        let dir = paths.data_dir.join("sessions").join(id);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("meta.json"),
+            format!(
+                r#"{{"id":"{id}","cmd":["true"],"babysit_pid":4194000,"started_at":"2020-01-01T00:00:00Z"}}"#
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("status.json"),
+            format!(
+                r#"{{"state":"{state}","child_pid":null,"exit_code":0,"last_change":"2020-01-01T00:00:01Z"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn reconcile_judges_a_dead_worker_once() {
+        let paths = Paths::temp();
+        fake_worker(&paths, "w-dead", "exited");
+        store(&paths, "w-dead", "echo verified-ok").unwrap();
+        reconcile(&paths);
+        let r = result(&paths, "w-dead").expect("a dead worker with a stored command is verified");
+        assert!(r.ok, "the passing postcondition records ok");
+        assert!(
+            r.output.contains("verified-ok"),
+            "the command's output is captured for diagnosis: {}",
+            r.output
+        );
+        // Once per lifetime: a second beat must not re-run the command.
+        let first_ts_file = fs::read_to_string(result_path(&paths, "w-dead")).unwrap();
+        reconcile(&paths);
+        assert_eq!(
+            fs::read_to_string(result_path(&paths, "w-dead")).unwrap(),
+            first_ts_file,
+            "an already-recorded verdict is never re-judged"
+        );
+    }
+
+    #[test]
+    fn reconcile_skips_a_live_worker() {
+        let paths = Paths::temp();
+        // `running` state + a dead babysit pid reads as NOT alive — use our own
+        // live pid so is_owner_alive holds and the worker counts as running.
+        let dir = paths.data_dir.join("sessions").join("w-live");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("meta.json"),
+            format!(
+                r#"{{"id":"w-live","cmd":["true"],"babysit_pid":{},"started_at":"2020-01-01T00:00:00Z"}}"#,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            dir.join("status.json"),
+            r#"{"state":"running","child_pid":null,"exit_code":null,"last_change":"2020-01-01T00:00:01Z"}"#,
+        )
+        .unwrap();
+        store(&paths, "w-live", "echo too-early").unwrap();
+        reconcile(&paths);
+        assert!(
+            result(&paths, "w-live").is_none(),
+            "a still-running worker is never verified early"
+        );
+        assert!(
+            cmd_path(&paths, "w-live").exists(),
+            "its stored command is kept for the eventual death"
+        );
+    }
+
+    #[test]
+    fn reconcile_defers_when_the_beat_budget_is_exhausted() {
+        // Serialize with other env-mutating tests; restore even on panic.
+        let _env = crate::util::test_env_lock();
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("LOOOP_VERIFY_BEAT_BUDGET_SECS") };
+            }
+        }
+        let _restore = Restore;
+        let paths = Paths::temp();
+        fake_worker(&paths, "w-deferred", "exited");
+        store(&paths, "w-deferred", "echo should-not-run-yet").unwrap();
+        // Budget 0: already exhausted before the first verify would run.
+        unsafe { std::env::set_var("LOOOP_VERIFY_BEAT_BUDGET_SECS", "0") };
+        reconcile(&paths);
+        assert!(
+            result(&paths, "w-deferred").is_none(),
+            "a budget-deferred verify records no verdict"
+        );
+        assert!(
+            cmd_path(&paths, "w-deferred").exists(),
+            "deferred state is untouched so the next beat retries"
+        );
+        // With the budget restored, the next beat picks it up.
+        unsafe { std::env::remove_var("LOOOP_VERIFY_BEAT_BUDGET_SECS") };
+        reconcile(&paths);
+        assert!(
+            result(&paths, "w-deferred").is_some(),
+            "the deferred verify runs on the next beat"
+        );
+    }
+
+    #[test]
+    fn reconcile_clears_a_vanished_sessions_state() {
+        let paths = Paths::temp();
+        // A stored command whose session was reaped (no sessions/<id>/ at all):
+        // its verdict would be unattributable, so the state is dropped.
+        store(&paths, "w-ghost", "echo unattributable").unwrap();
+        reconcile(&paths);
+        assert!(
+            !cmd_path(&paths, "w-ghost").exists(),
+            "a vanished session's verify command is cleared"
+        );
+        assert!(
+            result(&paths, "w-ghost").is_none(),
+            "no verdict is fabricated for a vanished session"
+        );
+    }
 
     #[test]
     fn store_result_round_trip() {
