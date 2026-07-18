@@ -70,22 +70,30 @@ fn read_next_wake(paths: &Paths) -> Option<u64> {
 /// pulse crash during the sleep no longer loses the follow-up — the next pulse
 /// (or the next loop iteration) sees the file and re-decides once it's due.
 fn write_next_wake(paths: &Paths, due: u64) {
-    let _ = fs::write(
-        paths.next_wake(),
-        serde_json::json!({ "v": 1, "due": due }).to_string(),
-    );
+    let body = serde_json::json!({ "v": 1, "due": due }).to_string();
+    if let Err(e) = util::write_atomic(&paths.next_wake(), body.as_bytes()) {
+        util::event(
+            Level::Warn,
+            "pulse.guard_degraded",
+            &format!("failed to persist the next-wake deadline (timed nudge may be lost): {e}"),
+            &[],
+        );
+    }
 }
 
-/// Consume the nudge when due: returns true (and removes the file) when the
-/// deadline has passed, arming a forced re-decide this beat.
-fn consume_due_next_wake(paths: &Paths) -> bool {
-    match read_next_wake(paths) {
-        Some(due) if crate::util::now_unix() >= due => {
-            let _ = fs::remove_file(paths.next_wake());
-            true
-        }
-        _ => false,
-    }
+/// Whether the pending nudge is DUE. Read-only — it deliberately does NOT
+/// delete the file: consuming before the tick runs would lose the timed nudge
+/// forever if the beat idles out (backoff / budget / config error) before
+/// deciding. The pulse loop consumes it ([`consume_next_wake`]) only AFTER a
+/// tick that actually attempted a decide.
+fn next_wake_due(paths: &Paths) -> bool {
+    matches!(read_next_wake(paths), Some(due) if crate::util::now_unix() >= due)
+}
+
+/// Consume the nudge — called once a due wake has been HONORED (a decide was
+/// actually attempted this beat, success or failure alike).
+fn consume_next_wake(paths: &Paths) {
+    let _ = fs::remove_file(paths.next_wake());
 }
 
 /// A non-blocking exclusive `flock(2)` on an open fd. `true` = we hold it now.
@@ -120,15 +128,18 @@ pub(crate) fn pulse_running(paths: &Paths) -> bool {
 }
 
 /// Holds the lock file open for the pulse's lifetime; the flock is released by the
-/// kernel when `_file` is dropped (or the process dies). The lock DIR is removed
-/// on a clean exit for tidiness, but correctness no longer depends on that.
+/// kernel when `_file` is dropped (or the process dies). Only the PID file is
+/// removed on a clean exit — the lock FILE itself is deliberately NEVER deleted:
+/// flock(2) is per-inode, so unlinking it would let the next pulse open a FRESH
+/// inode and "acquire" a lock a still-live pulse holds on the old one (two
+/// pulses both believing they own the singleton).
 struct LockGuard {
     path: PathBuf,
     _file: std::fs::File,
 }
 impl Drop for LockGuard {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        let _ = fs::remove_file(self.path.join("pid"));
     }
 }
 
@@ -206,12 +217,19 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
     let mut force = true;
     loop {
         // A due durable nudge (written below, survives crashes) forces this
-        // beat to re-decide even over an unchanged world.
-        if consume_due_next_wake(paths) {
+        // beat to re-decide even over an unchanged world. It is only READ here
+        // — consumed after the tick, and only when a decide actually ran, so a
+        // beat that idles out (backoff / budget / config error) leaves the
+        // timed follow-up armed for the next beat instead of losing it.
+        let wake_due = next_wake_due(paths);
+        if wake_due {
             force = true;
         }
         let outcome = tick::tick(paths, force);
         force = false;
+        if wake_due && outcome.decided_or_failed {
+            consume_next_wake(paths);
+        }
 
         // One-shot AI cadence nudge (clamped 5..3600), persisted as a DEADLINE
         // (`.next-wake.json`) rather than carried in memory: a crash during the
@@ -264,22 +282,60 @@ mod tests {
     use super::*;
 
     #[test]
-    fn next_wake_is_durable_and_consumed_only_when_due() {
+    fn next_wake_is_durable_and_due_ness_is_a_pure_read() {
         let p = Paths::temp();
-        assert!(!consume_due_next_wake(&p), "no file, nothing due");
+        assert!(!next_wake_due(&p), "no file, nothing due");
 
-        // A future deadline persists across reads and does not consume.
+        // A future deadline persists across reads.
         let future = crate::util::now_unix() + 3600;
         write_next_wake(&p, future);
         assert_eq!(read_next_wake(&p), Some(future));
-        assert!(!consume_due_next_wake(&p), "not due yet");
+        assert!(!next_wake_due(&p), "not due yet");
         assert!(p.next_wake().is_file(), "undue nudge survives (durable)");
 
-        // A passed deadline is consumed exactly once and arms the force.
+        // A passed deadline is due — and READING due-ness never deletes it.
         write_next_wake(&p, crate::util::now_unix() - 1);
-        assert!(consume_due_next_wake(&p), "due nudge forces a re-decide");
+        assert!(next_wake_due(&p), "due nudge forces a re-decide");
+        assert!(next_wake_due(&p), "due-ness is a pure read (not consumed)");
+        assert!(p.next_wake().is_file());
+
+        // Explicit consume removes it exactly once.
+        consume_next_wake(&p);
         assert!(!p.next_wake().is_file(), "consumed");
-        assert!(!consume_due_next_wake(&p), "one-shot");
+        assert!(!next_wake_due(&p), "one-shot");
+    }
+
+    #[test]
+    fn next_wake_survives_an_idle_beat_and_falls_after_a_decide_attempt() {
+        let p = Paths::temp();
+        let _ = crate::seed::ensure_dirs(&p);
+        write_next_wake(&p, crate::util::now_unix() - 1);
+        assert!(next_wake_due(&p));
+
+        // An IDLE beat (unparseable config — tick bails before deciding) must
+        // leave the timed nudge armed: the pulse loop consumes it only when
+        // `decided_or_failed` is true.
+        fs::write(&p.config, "{ not json").unwrap();
+        let idle = crate::tick::tick(&p, true);
+        assert!(!idle.decided_or_failed, "config error idles the beat out");
+        assert!(next_wake_due(&p), "the timed nudge survives an idle beat");
+
+        // A beat that actually LAUNCHES the runner (even a failing one) counts
+        // as a decide attempt — the pulse loop then consumes the wake.
+        fs::write(
+            &p.config,
+            serde_json::json!({
+                "tick_command": "false",
+                "worker_command": "true {{prompt_file}}"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let attempted = crate::tick::tick(&p, true);
+        assert!(attempted.decided_or_failed, "the runner was launched");
+        consume_next_wake(&p); // what the pulse loop does on decided_or_failed
+        assert!(!next_wake_due(&p));
+        assert!(!p.next_wake().is_file());
     }
 
     #[test]

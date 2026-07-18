@@ -222,6 +222,10 @@ pub fn cmd_start_session(
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(8);
     if cap != 0 {
+        // Check-then-spawn is a TOCTOU race in principle (two concurrent
+        // starts could both pass the count), but starts are issued by the
+        // single decider one-move-per-beat, so the race is benign — not worth
+        // a lock.
         let live = list_workers(paths).iter().filter(|w| w.alive).count();
         if live >= cap {
             eprintln!(
@@ -232,6 +236,9 @@ pub fn cmd_start_session(
         }
     }
 
+    // Check-then-act (exists → alive → reap) races a concurrent start of the
+    // same id in principle; the single-decider dispatch model makes it benign
+    // (the spawn below would fail loudly on a true collision).
     if status_exists(paths, &session) {
         if is_alive(paths, &session) {
             eprintln!("start-session: session {session} is already running");
@@ -280,17 +287,32 @@ pub fn cmd_start_session(
         shell_quote(&paths.data_dir.to_string_lossy())
     );
 
+    // ARCHIVE-THEN-SPAWN: consume the answered resume pair BEFORE launching.
+    // The old order (spawn, then archive) re-dispatched the same resume when a
+    // crash landed between the two — the sys-asks resume signal stayed hot with
+    // a worker already running. Archiving first makes a crash lose at most one
+    // dispatch (recoverable: the record stays under asks/archive/); if the
+    // spawn FAILS we un-archive so the resume signal returns.
+    if let Some(ask_id) = resume {
+        crate::mailbox::archive_pair(paths, ask_id);
+    }
+
     // Launch the worker detached, IN-PROCESS via the babysit library (no
     // `babysit` binary). babysit re-execs looop as the headless supervisor.
     // `-c`, not `-lc`: a non-login shell sources no rc files, so the worker
     // launches against looop's inherited environment instead of re-running the
     // operator's login profile (hermetic + cheaper). The runner template itself
     // is still a shell string ($(cat ...), &&), so the shell stays.
-    spawn_detached(
+    if let Err(e) = spawn_detached(
         paths,
         vec!["bash".to_string(), "-c".to_string(), launch],
         &session,
-    )?;
+    ) {
+        if let Some(ask_id) = resume {
+            crate::mailbox::unarchive_pair(paths, ask_id);
+        }
+        return Err(e);
+    }
 
     // Label the banner with what actually launched: the override's first
     // token when a per-worker `--command` replaced the template, else the
@@ -305,12 +327,6 @@ pub fn cmd_start_session(
     } else {
         (runner, "")
     };
-    // The worker is launched: the resume pair is consumed — archive it so the
-    // sys-asks resume signal settles (the record stays under asks/archive/).
-    if let Some(ask_id) = resume {
-        crate::mailbox::archive_pair(paths, ask_id);
-    }
-
     println!(
         "started {session} (runner: {runner}{override_note}, cwd: {})",
         paths.data_dir.display()
@@ -847,8 +863,12 @@ pub(crate) fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
 
 /// `dup(fd)` that returns a close-on-exec copy, so it is not inherited across a
 /// later `exec`/spawn. Returns a negative value on failure (caller falls back).
-/// F_SETFD / FD_CLOEXEC are 2 / 1 on both macOS and Linux, so we avoid pulling
-/// in libc as a direct dependency.
+///
+/// Hand-written FFI is deliberate: replacing it would require the `libc` (or
+/// `nix`) crate as a new dependency, which this project avoids. The constants
+/// are safe to hardcode — F_SETFD / FD_CLOEXEC are POSIX-stable and are 2 / 1
+/// on both macOS and Linux (verified by the `dup_cloexec_sets_close_on_exec`
+/// test, which round-trips through F_GETFD).
 #[cfg(unix)]
 unsafe fn dup_cloexec(fd: i32) -> i32 {
     unsafe extern "C" {

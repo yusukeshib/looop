@@ -57,10 +57,14 @@ fn hash_policy_into(paths: &Paths, buf: &mut Vec<u8>) {
         if !f.is_file() {
             continue;
         }
-        buf.extend_from_slice(format!("@@ {}\n", rel(paths, &f)).as_bytes());
-        if let Ok(bytes) = fs::read(&f) {
-            buf.extend_from_slice(&bytes);
-        }
+        let Ok(bytes) = fs::read(&f) else { continue };
+        // Length-prefixed section marker: a bare "@@ path\n" separator is
+        // ambiguous when a file's CONTENT contains "@@ " lines; prefixing the
+        // payload length makes the framing injective. NOTE: this changed the
+        // hash input format, so the first beat after upgrading sees one
+        // (harmless) "world changed" and re-decides.
+        buf.extend_from_slice(format!("@@ {} {}\n", rel(paths, &f), bytes.len()).as_bytes());
+        buf.extend_from_slice(&bytes);
     }
 }
 
@@ -112,15 +116,17 @@ pub fn world_hash(paths: &Paths) -> String {
     // system sensors (sys-sessions / sys-claims) all land here, so the fleet and
     // leases are diffed through this one loop — no bespoke per-kind hashing.
     for f in util::sorted_glob(&paths.snapshots_dir(), "json") {
-        buf.extend_from_slice(format!("@@ {}\n", rel(paths, &f)).as_bytes());
         let raw = fs::read(&f).unwrap_or_default();
-        match serde_json::from_slice::<serde_json::Value>(&raw) {
-            Ok(v) => {
-                buf.extend_from_slice(wake_signal(v).to_string().as_bytes());
-                buf.push(b'\n');
-            }
-            Err(_) => buf.extend_from_slice(&raw), // non-JSON / error reading: raw bytes
-        }
+        // Both branches end with a newline (consistent framing), and the
+        // section marker is length-prefixed like the policy half (see
+        // hash_policy_into) — injective even when a payload contains "@@ ".
+        let mut payload = match serde_json::from_slice::<serde_json::Value>(&raw) {
+            Ok(v) => wake_signal(v).to_string().into_bytes(),
+            Err(_) => raw, // non-JSON / error reading: raw bytes
+        };
+        payload.push(b'\n');
+        buf.extend_from_slice(format!("@@ {} {}\n", rel(paths, &f), payload.len()).as_bytes());
+        buf.extend_from_slice(&payload);
     }
 
     util::content_hash(&buf)

@@ -60,11 +60,20 @@ use std::fs;
 /// (MAX_ARG_STRLEN) — a healthy data dir can exceed that, and the failure mode
 /// (E2BIG on every beat) is silent backoff churn. Workers still take the
 /// placeholder: their stdin is the live attach TTY, and their briefs are small.
-pub const DEFAULT_CONFIG: &str = r#"{
-  "tick_command": "claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model sonnet",
-  "worker_command": "claude --dangerously-skip-permissions --model opus \"$(cat {{prompt_file}})\""
-}
-"#;
+pub static DEFAULT_CONFIG: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| wiring_json(CLAUDE_TICK_COMMAND, CLAUDE_WORKER_COMMAND));
+
+/// The claude tick wiring — SINGLE SOURCE for both `DEFAULT_CONFIG` and the
+/// `looop init` claude preset (init.rs), so the two can never drift apart.
+/// Tick prompt via STDIN (no `{{prompt_file}}`): a single argv string is
+/// capped at 128KiB on Linux (MAX_ARG_STRLEN) and the tick prompt can exceed it.
+pub const CLAUDE_TICK_COMMAND: &str =
+    "claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model sonnet";
+
+/// The claude worker wiring (see `CLAUDE_TICK_COMMAND`). Workers keep the
+/// `{{prompt_file}}` placeholder — their stdin is the live attach TTY.
+pub const CLAUDE_WORKER_COMMAND: &str =
+    "claude --dangerously-skip-permissions --model opus \"$(cat {{prompt_file}})\"";
 
 /// Assemble the wiring JSON from the two command strings the user supplied to
 /// `looop init`. Pure serialization — NO per-runner knowledge lives here; the
@@ -91,7 +100,7 @@ impl Config {
             fs::read_to_string(&paths.config)
                 .with_context(|| format!("reading config {}", paths.config.display()))?
         } else {
-            DEFAULT_CONFIG.to_string()
+            DEFAULT_CONFIG.clone()
         };
         let root: serde_json::Value =
             serde_json::from_str(&text).context("parsing looop config JSON")?;
@@ -134,19 +143,24 @@ impl Config {
 /// Tick output formatting moved in-process (`runner::run_streamed`), so
 /// the old external pipe is dead. Older configs still carry it; rather
 /// than force a re-seed (which would clobber user edits) we drop the seam on load.
-/// Only the LAST pipe segment is inspected, and only when it is recognisably the
-/// fmt seam (mentions the looop binary and ends in `_ fmt`/`_fmt`) — any other
-/// user pipeline is left untouched.
+/// Only the LAST pipe segment is inspected, and only when its FIRST token is
+/// recognisably the looop binary itself (`looop`, `…/looop`, or the
+/// `"$LOOOP_BIN"` the old seed used) followed by a `fmt`/`_fmt` verb — an
+/// unrelated user pipeline (e.g. `… | grep looop_fmt`) is left untouched.
 fn strip_fmt_seam(cmd: &str) -> String {
     if let Some(idx) = cmd.rfind('|') {
-        let tail: String = cmd[idx + 1..]
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        let is_fmt = (tail.ends_with("_ fmt") || tail.ends_with("_fmt"))
-            && (tail.contains("LOOOP_BIN") || tail.contains("looop"));
-        if is_fmt {
-            return cmd[..idx].trim_end().to_string();
+        let toks: Vec<&str> = cmd[idx + 1..].split_whitespace().collect();
+        if let Some(first) = toks.first() {
+            // The invoked binary, with shell quoting peeled off.
+            let bin = first.trim_matches(|c| c == '"' || c == '\'');
+            let is_looop_bin = bin == "looop"
+                || bin.ends_with("/looop")
+                || bin == "$LOOOP_BIN"
+                || bin == "${LOOOP_BIN}";
+            let has_fmt_verb = toks[1..].iter().any(|t| *t == "fmt" || *t == "_fmt");
+            if is_looop_bin && has_fmt_verb {
+                return cmd[..idx].trim_end().to_string();
+            }
         }
     }
     cmd.to_string()
@@ -194,6 +208,17 @@ mod tests {
         // A trailing pipe that is not the fmt seam stays put.
         let other = "claude -p | tee out.log";
         assert_eq!(strip_fmt_seam(other), other);
+        // A user pipeline that merely MENTIONS looop + fmt is NOT the seam:
+        // the first tail token must be the looop binary itself.
+        let grep = "claude -p | grep looop_fmt";
+        assert_eq!(strip_fmt_seam(grep), grep);
+        let awk = "claude -p | awk '/looop/ {print}' # _fmt";
+        assert_eq!(strip_fmt_seam(awk), awk);
+        // Path-qualified looop binary still counts as the seam.
+        assert_eq!(
+            strip_fmt_seam("claude -p | /usr/local/bin/looop _ fmt"),
+            "claude -p"
+        );
     }
 
     #[test]
@@ -205,7 +230,7 @@ mod tests {
     #[test]
     fn default_config_is_valid_claude_wiring() {
         let cfg = super::Config {
-            root: serde_json::from_str(super::DEFAULT_CONFIG).expect("default config parses"),
+            root: serde_json::from_str(&super::DEFAULT_CONFIG).expect("default config parses"),
         };
         assert_eq!(cfg.runner_label(), "claude");
         let worker = cfg.runner_cmd("worker_command").unwrap();

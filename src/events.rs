@@ -24,12 +24,28 @@ pub fn emit(paths: &Paths, event: &str, fields: serde_json::Value) {
             obj.insert(k, v);
         }
     }
-    let line = serde_json::Value::Object(obj).to_string();
-    if let Ok(mut f) = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(paths.data_dir.join("events.jsonl"))
+    // One write(2) for the whole line: `writeln!` can split the line and the
+    // trailing newline into separate writes, which lets a concurrent appender
+    // interleave mid-line. O_APPEND + a single write_all keeps each event line
+    // intact.
+    let mut line = serde_json::Value::Object(obj).to_string();
+    line.push('\n');
+    let path = paths.data_dir.join("events.jsonl");
+    // Size-based rotation: past `LOOOP_EVENTS_MAX_BYTES` (default 5 MiB) the
+    // current file rolls to `events.jsonl.1` (replacing any previous .1) before
+    // this append, so the live file stays bounded at ~one generation.
+    let max_bytes: u64 = std::env::var("LOOOP_EVENTS_MAX_BYTES")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(5 * 1024 * 1024);
+    if max_bytes > 0
+        && std::fs::metadata(&path)
+            .map(|m| m.len() > max_bytes)
+            .unwrap_or(false)
     {
-        let _ = writeln!(f, "{line}");
+        let _ = std::fs::rename(&path, paths.data_dir.join("events.jsonl.1"));
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = f.write_all(line.as_bytes());
     }
 }

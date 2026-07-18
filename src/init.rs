@@ -36,9 +36,6 @@ use std::process::ExitCode;
 
 /// `looop init` — choose the agent runner and write its wiring.
 pub fn cmd_init(paths: &Paths) -> Result<ExitCode> {
-    // Lay down the data dir + starter PLAYBOOK/goals (config is written below).
-    seed::ensure_dirs(paths)?;
-
     let tty = io::stdin().is_terminal() && io::stdout().is_terminal();
 
     // Re-running init always overwrites (the config is small + easy to redo);
@@ -56,6 +53,12 @@ pub fn cmd_init(paths: &Paths) -> Result<ExitCode> {
     let Some((runner, tick, worker)) = choose_wiring(&current_tick, &current_worker, tty) else {
         return aborted();
     };
+
+    // Lay down the data dir + starter PLAYBOOK/goals only AFTER the picker:
+    // aborting init (Esc / Ctrl-C above) must leave no side effects. Nothing
+    // before this point reads the data dir (Config::load only touches the
+    // config file / inline default).
+    seed::ensure_dirs(paths)?;
 
     let json = config::wiring_json(&tick, &worker);
     config::write(paths, &json)?;
@@ -75,11 +78,10 @@ struct RunnerPreset {
 const PRESETS: &[RunnerPreset] = &[
     RunnerPreset {
         name: "claude",
-        // Tick prompt via STDIN (no {{prompt_file}}): a single argv string is
-        // capped at 128KiB on Linux (MAX_ARG_STRLEN) and the tick prompt can
-        // exceed it. Workers keep the placeholder (stdin is their attach TTY).
-        tick: "claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model sonnet",
-        worker: "claude --dangerously-skip-permissions --model opus \"$(cat {{prompt_file}})\"",
+        // Single-sourced from config.rs (also builds DEFAULT_CONFIG), so the
+        // preset and the inline default can never drift apart.
+        tick: config::CLAUDE_TICK_COMMAND,
+        worker: config::CLAUDE_WORKER_COMMAND,
     },
     RunnerPreset {
         name: "codex",
@@ -150,12 +152,41 @@ enum Menu {
     Unsupported,
 }
 
+/// RAII terminal guard: raw mode (and optionally the hidden cursor) is
+/// restored on EVERY exit path — early return, `?`, panic — replacing the
+/// scattered `disable_raw_mode()` / `cursor::Show` cleanup calls.
+struct RawModeGuard {
+    hid_cursor: bool,
+}
+
+impl RawModeGuard {
+    /// Enter raw mode (optionally hiding the cursor). `None` when the terminal
+    /// doesn't support raw mode — callers fall back to a plain line prompt.
+    fn new(hide_cursor: bool) -> Option<Self> {
+        enable_raw_mode().ok()?;
+        if hide_cursor {
+            let _ = execute!(io::stdout(), cursor::Hide);
+        }
+        Some(RawModeGuard {
+            hid_cursor: hide_cursor,
+        })
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+        if self.hid_cursor {
+            let _ = execute!(io::stdout(), cursor::Show);
+        }
+    }
+}
+
 fn prompt_runner_tui(default: usize) -> Menu {
     let mut out = io::stdout();
-    if enable_raw_mode().is_err() {
+    let Some(_raw) = RawModeGuard::new(true) else {
         return Menu::Unsupported;
-    }
-    let _ = execute!(out, cursor::Hide);
+    };
 
     let mut selected = default;
     let rows = PRESETS.len() + 1; // choices
@@ -211,10 +242,9 @@ fn prompt_runner_tui(default: usize) -> Menu {
             }
         }
     }
-    let _ = disable_raw_mode();
-    let _ = execute!(out, cursor::Show);
     let _ = out.flush();
     result
+    // _raw drops here: raw mode off, cursor shown — on every path.
 }
 
 fn draw_runner_menu(out: &mut io::Stdout, selected: usize) -> io::Result<()> {
@@ -267,9 +297,16 @@ fn prompt_runner_line(default: usize) -> Option<usize> {
 /// the human should actually make, so the next step is unmissable.
 fn print_next_steps(runner: &str) {
     let (b, d, r) = (b(), dim(), rst());
+    // Only a known preset is safely called "an agent": a custom wiring's label
+    // is just the tick command's first token and may be any program.
+    let is_agent = PRESETS.iter().any(|p| p.name == runner);
     println!();
     println!("{b}Next — start your concierge to drive the first-run setup:{r}");
-    println!("  {d}launch an agent (e.g.{r} {b}{runner}{r}{d}) and tell it:{r}");
+    if is_agent {
+        println!("  {d}launch an agent (e.g.{r} {b}{runner}{r}{d}) and tell it:{r}");
+    } else {
+        println!("  {d}launch your runner ({r}{b}{runner}{r}{d}) and tell it:{r}");
+    }
     println!("    {b}\"be my looop concierge: run `looop up`, then relay the setup{r}");
     println!("    {b} goal and interview me to write my goals + sensors + PLAYBOOK\".{r}");
     println!("  {d}A fresh data dir already has a pending `setup` ask for the concierge.{r}");
@@ -322,9 +359,9 @@ enum Edit {
 /// returning.
 fn editable(label: &str, initial: &str) -> Edit {
     let mut out = io::stdout();
-    if enable_raw_mode().is_err() {
+    let Some(_raw) = RawModeGuard::new(false) else {
         return Edit::Unsupported;
-    }
+    };
     // Optional "label: " (gray) prefix; the command (normal) is edited after it,
     // scrolling horizontally so it never wraps. `+2` = the ": " suffix.
     let label_cols = if label.is_empty() {
@@ -397,13 +434,13 @@ fn editable(label: &str, initial: &str) -> Edit {
         }
     };
 
-    let _ = disable_raw_mode();
     let _ = write!(out, "\r\n");
     let _ = out.flush();
     match result {
         Edit::Line(s) => Edit::Line(s.trim().to_string()),
         other => other,
     }
+    // _raw drops here: raw mode restored on every path (incl. panics).
 }
 
 /// Plain-prompt fallback when raw mode is unavailable: shows the current value in

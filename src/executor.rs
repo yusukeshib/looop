@@ -133,6 +133,10 @@ fn goal_of(action: &Action) -> Option<String> {
 /// Stamp `id` as acted-on "now" in the goal-activity ledger (goal id -> unix
 /// secs). Best-effort: a write failure just means the staleness reading is a
 /// beat stale.
+///
+/// NOTE: this is a lossy read-modify-write — a concurrent pulse beat and a
+/// manual `looop` verb can race, and the last writer wins (one stamp may be
+/// dropped). Acceptable: the ledger only feeds an advisory staleness reading.
 fn record_goal_activity(paths: &Paths, id: &str) {
     let store = FileStore::new(paths);
     let mut map: serde_json::Map<String, serde_json::Value> = store
@@ -183,8 +187,25 @@ fn begin_intent(paths: &Paths, action: &Action) {
 /// Clear the intent record once execute() has returned (Ok OR Err): reaching
 /// this line proves the process did not die DURING the side effect, so there is
 /// nothing to recover. Only an actual crash between begin/clear leaves it.
-fn clear_intent(paths: &Paths) {
-    let _ = FileStore::new(paths).remove(&Key::ActionWal);
+///
+/// Fingerprint-guarded: the WAL is a single global key, and a concurrent pulse
+/// beat + manual `looop run` would otherwise clear EACH OTHER's intent. Only
+/// remove the record when the stored fingerprint is OUR action's.
+fn clear_intent(paths: &Paths, action: &Action) {
+    let store = FileStore::new(paths);
+    let ours = action_fingerprint(action);
+    let matches = store
+        .read(&Key::ActionWal)
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|v| {
+            v.get("fingerprint")
+                .and_then(|f| f.as_str())
+                .map(|f| f == ours)
+        })
+        .unwrap_or(false);
+    if matches {
+        let _ = store.remove(&Key::ActionWal);
+    }
 }
 
 /// At beat start: if a write-ahead intent record survived, the previous beat
@@ -220,6 +241,16 @@ pub fn warn_if_interrupted(paths: &Paths) -> bool {
         serde_json::json!({ "action": akind, "fingerprint": fp }),
     );
     true
+}
+
+/// Hard cap on a run_shell command's runtime (seconds): the escape hatch runs
+/// inside the pulse beat, so it must be bounded like a verify command.
+/// `LOOOP_SHELL_TIMEOUT_SECS`, default 300.
+fn shell_timeout_secs() -> u64 {
+    std::env::var("LOOOP_SHELL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(300)
 }
 
 /// The last `max` chars of `s` (UTF-8 safe).
@@ -314,22 +345,25 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
             // rc files, so the command runs against looop's inherited environment
             // rather than re-running the operator's login profile every beat
             // (hermetic + cheaper).
-            let out = std::process::Command::new("bash")
-                .arg("-c")
-                .arg(cmd)
-                .current_dir(&paths.data_dir)
-                .output()
-                .with_context(|| format!("run_shell: {cmd}"))?;
-            let code = out.status.code().unwrap_or(-1);
+            //
+            // Bounded: the command runs through the shared native-timeout path
+            // (`verify::run_cmd`) — spawned in its own process group and the
+            // WHOLE group killed on deadline — so one hung command can never
+            // wedge the pulse forever. `LOOOP_SHELL_TIMEOUT_SECS`, default 300.
+            let res = crate::verify::run_cmd(
+                &paths.data_dir,
+                cmd,
+                shell_timeout_secs(),
+                "LOOOP_SHELL_TIMEOUT_SECS",
+            );
+            let code = res.exit_code.unwrap_or(-1);
             // Capture the output TAIL and persist it for the NEXT decide prompt
             // (`RUN_SHELL OUTPUT`). Without this the stdout of a "query" move
             // went nowhere — the decider could ask the world a question but
             // never hear the answer. The tick arms a short cadence nudge after
             // a run_shell so the follow-up beat actually happens (the command's
             // output alone does not move the world hash).
-            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-            combined.push_str(&String::from_utf8_lossy(&out.stderr));
-            let tail = tail_chars(&combined, 2048);
+            let tail = tail_chars(&res.output, 2048);
             let body = serde_json::json!({
                 "v": 1,
                 "ts": crate::util::now_unix(),
@@ -339,14 +373,14 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
             });
             let _ = fs::write(paths.last_shell(), body.to_string());
             let why = if reason.is_empty() { cmd } else { reason };
-            if out.status.success() {
+            if res.ok {
                 Ok(format!("run-shell · {why}"))
             } else {
                 // Surface the tail in the error too, so LAST FAILURE names the
                 // actual cause instead of just the exit code.
                 bail!(
                     "run_shell exited {code}: {why}\n{}",
-                    tail_chars(&combined, 512)
+                    tail_chars(&res.output, 512)
                 );
             }
         }
@@ -546,7 +580,7 @@ pub fn run_action(paths: &Paths, action: &Action, journal: Option<&str>) -> Resu
     }
     let exec_result = execute(paths, action);
     if guarded {
-        clear_intent(paths);
+        clear_intent(paths, action);
     }
     let summary = exec_result?;
     if let Some(id) = goal_of(action) {
@@ -935,6 +969,61 @@ mod tests {
         );
         assert!(!p.action_wal().exists(), "the report is one-shot");
         assert!(!warn_if_interrupted(&p));
+    }
+
+    #[test]
+    fn clear_intent_only_removes_a_matching_fingerprint() {
+        let p = Paths::temp();
+        let ours = Action::RunShell {
+            cmd: "echo ours".into(),
+            reason: String::new(),
+        };
+        let theirs = Action::RunShell {
+            cmd: "echo theirs".into(),
+            reason: String::new(),
+        };
+        // A concurrent actor's WAL must survive OUR clear…
+        begin_intent(&p, &theirs);
+        clear_intent(&p, &ours);
+        assert!(
+            p.action_wal().exists(),
+            "another actor's intent must not be cleared"
+        );
+        // …while our own is cleared normally.
+        begin_intent(&p, &ours);
+        clear_intent(&p, &ours);
+        assert!(!p.action_wal().exists(), "our own intent is cleared");
+    }
+
+    #[test]
+    fn run_shell_times_out_and_kills_the_command() {
+        let p = Paths::temp();
+        // Short native timeout via the env override the run_shell path reads.
+        unsafe { std::env::set_var("LOOOP_SHELL_TIMEOUT_SECS", "1") };
+        let t0 = std::time::Instant::now();
+        let err = run_action(
+            &p,
+            &Action::RunShell {
+                cmd: "echo pre; sleep 30".into(),
+                reason: String::new(),
+            },
+            None,
+        )
+        .unwrap_err();
+        unsafe { std::env::remove_var("LOOOP_SHELL_TIMEOUT_SECS") };
+        assert!(
+            t0.elapsed().as_secs() < 10,
+            "must not wait out the 30s sleep"
+        );
+        assert!(
+            err.to_string().contains("timed out after 1s"),
+            "error names the timeout: {err}"
+        );
+        // The captured record carries the timeout diagnosis for the next prompt.
+        let raw = fs::read_to_string(p.last_shell()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["exit_code"], -1, "a killed command has no exit code");
+        assert!(v["output"].as_str().unwrap().contains("timed out after 1s"));
     }
 
     #[test]

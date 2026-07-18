@@ -76,6 +76,16 @@ pub fn cmd_down(paths: &Paths) -> Result<ExitCode> {
         while session::is_alive(paths, PULSE_SESSION) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
         }
+        // Never report a stop that didn't happen: if the pulse outlived the
+        // kill past the deadline, do NOT reap its status (that would erase the
+        // evidence a live pulse still exists) and do NOT print "pulse stopped".
+        if session::is_alive(paths, PULSE_SESSION) {
+            eprintln!(
+                "looop: WARNING — the pulse survived the kill (still alive after 2s); \
+                 not reaped — retry `looop down` or inspect it with `looop status`"
+            );
+            return Ok(ExitCode::from(1));
+        }
     }
     if session::status_exists(paths, PULSE_SESSION) {
         session::reap(paths, PULSE_SESSION);

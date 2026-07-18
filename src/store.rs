@@ -112,6 +112,16 @@ pub trait StateStore {
     /// Remove `key`. Absent key is not an error (idempotent).
     fn remove(&self, key: &Key) -> io::Result<()>;
 
+    /// COMPARE-AND-DELETE: remove `key` ONLY IF its current contents still
+    /// equal `expected`. Returns `Ok(true)` when the key is now gone (we
+    /// removed it, or it was already absent), `Ok(false)` when the contents
+    /// changed underneath us and the key remains. This is what lets a stale-
+    /// lease reclaim never delete a lease that was FRESHLY re-acquired between
+    /// the caller's read and its delete (two racers can't both win: FileStore
+    /// uses an atomic rename-aside, and only one rename of the same source
+    /// succeeds). A DB backend would use `DELETE … WHERE contents = ?`.
+    fn remove_if_eq(&self, key: &Key, expected: &str) -> io::Result<bool>;
+
     /// The names present in `collection` (the `<name>` part of each key), in
     /// sorted order. For `Asks`/`Answers` that is the ask id; for `Claims` the
     /// claim name.
@@ -170,37 +180,54 @@ impl StateStore for FileStore<'_> {
 
     fn write_atomic(&self, key: &Key, contents: &str) -> io::Result<()> {
         let path = self.path(key);
-        crate::util::write_atomic(&path, contents.as_bytes())?;
         // A sensor's content is a script the runtime execs, so the backing file
-        // must be executable. The exec bit is a FileStore detail, not a caller's.
-        #[cfg(unix)]
-        if matches!(key, Key::Sensor(_)) {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = fs::metadata(&path)?.permissions();
-            perm.set_mode(0o755);
-            fs::set_permissions(&path, perm)?;
-        }
+        // must be executable. The exec bit is set on the TEMP file BEFORE the
+        // rename, so a concurrent exec never observes a non-executable window.
+        let mode = if matches!(key, Key::Sensor(_)) {
+            Some(0o755)
+        } else {
+            None
+        };
+        crate::util::write_atomic_mode(&path, contents.as_bytes(), mode)?;
         Ok(())
     }
 
     fn create_exclusive(&self, key: &Key, contents: &str) -> io::Result<bool> {
         let path = self.path(key);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        let parent = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        fs::create_dir_all(&parent)?;
+        // "Exists ⇒ contents complete" must hold: a create_new-then-write would
+        // expose an EMPTY file between the two syscalls, and the gate treats a
+        // holderless lease as stale — a live lease could be stolen mid-write.
+        // So: write + fsync the FULL contents to a sibling temp file, then use
+        // hard_link(temp, final) as the atomic exclusive-create (hard_link
+        // fails with AlreadyExists when final exists), then drop the temp.
+        let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("key");
+        let tmp = parent.join(format!(
+            ".{stem}.{}.{}.excl.tmp",
+            std::process::id(),
+            crate::util::temp_nonce()
+        ));
+        let write = (|| -> io::Result<()> {
+            use io::Write;
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(contents.as_bytes())?;
+            f.sync_all()
+        })();
+        if let Err(e) = write {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
         }
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut f) => {
-                use io::Write;
-                f.write_all(contents.as_bytes())?;
-                Ok(true)
-            }
+        let res = match fs::hard_link(&tmp, &path) {
+            Ok(()) => Ok(true),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
             Err(e) => Err(e),
-        }
+        };
+        let _ = fs::remove_file(&tmp);
+        res
     }
 
     fn append_line(&self, key: &Key, line: &str) -> io::Result<()> {
@@ -235,12 +262,10 @@ impl StateStore for FileStore<'_> {
             fs::rename(&from, to)
         }
         match key {
-            Key::Goal(id) => {
-                let from = self.paths.goals_dir().join(format!("{id}.md"));
-                let archive = self.paths.goals_dir().join("archive");
-                fs::create_dir_all(&archive)?;
-                fs::rename(&from, archive.join(format!("{id}.md")))
-            }
+            // A goal id can be recreated after archiving, so the archive must
+            // suffix on collision like the mailbox does — a plain rename to a
+            // fixed path would silently clobber the previous archived record.
+            Key::Goal(id) => into_archive(self.path(key), id, "md"),
             // A consumed ask/answer pair (resumed detached ask) moves aside so
             // the sys-asks wake signal settles while the record stays auditable.
             Key::Ask(id) => into_archive(self.path(key), id, "json"),
@@ -258,6 +283,40 @@ impl StateStore for FileStore<'_> {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    fn remove_if_eq(&self, key: &Key, expected: &str) -> io::Result<bool> {
+        let path = self.path(key);
+        let parent = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("key");
+        let tmp = parent.join(format!(
+            ".{stem}.{}.{}.cad.tmp",
+            std::process::id(),
+            crate::util::temp_nonce()
+        ));
+        // Take the file aside atomically: rename(2) of the same source succeeds
+        // for exactly ONE racer, so two concurrent reclaims can never both
+        // proceed past this point with the same lease.
+        match fs::rename(&path, &tmp) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(true), // already gone
+            Err(e) => return Err(e),
+        }
+        let actual = fs::read_to_string(&tmp).unwrap_or_default();
+        if actual == expected {
+            let _ = fs::remove_file(&tmp);
+            return Ok(true);
+        }
+        // The contents changed between the caller's read and our rename — a
+        // FRESH value landed. Put it back WITHOUT clobbering any newer value
+        // (hard_link fails if the final path re-appeared); either way the temp
+        // is dropped and the caller learns it lost.
+        let _ = fs::hard_link(&tmp, &path);
+        let _ = fs::remove_file(&tmp);
+        Ok(false)
     }
 
     fn list(&self, collection: &Collection) -> Vec<String> {
@@ -305,6 +364,68 @@ mod tests {
             "second sees it already exists"
         );
         assert_eq!(s.read(&k).as_deref(), Some("first"), "loser never clobbers");
+    }
+
+    #[test]
+    fn create_exclusive_never_exposes_an_empty_file() {
+        // "Exists ⇒ contents complete": after Ok(true) the file is fully
+        // written (the hard-link publish happens only after write+fsync), and
+        // no temp siblings are left behind.
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        let k = Key::Claim("lease".into());
+        assert!(s.create_exclusive(&k, r#"{"session":"w1"}"#).unwrap());
+        let body = s.read(&k).unwrap();
+        assert!(!body.is_empty(), "created key must never read back empty");
+        assert_eq!(body, r#"{"session":"w1"}"#);
+        let leftovers: Vec<_> = fs::read_dir(p.claims_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn remove_if_eq_is_a_compare_and_delete() {
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        let k = Key::Claim("repo".into());
+        s.write_atomic(&k, "stale").unwrap();
+        let observed = s.read(&k).unwrap();
+        // A FRESH lease lands between the read and the reclaim …
+        s.write_atomic(&k, "fresh").unwrap();
+        // … so the compare-and-delete must LOSE and leave the fresh lease.
+        assert!(!s.remove_if_eq(&k, &observed).unwrap());
+        assert_eq!(s.read(&k).as_deref(), Some("fresh"), "fresh lease survives");
+        // Matching contents: the delete wins and the key is gone.
+        assert!(s.remove_if_eq(&k, "fresh").unwrap());
+        assert!(!s.exists(&k));
+        // Already-absent key: gone ⇒ Ok(true) (idempotent for reapers).
+        assert!(s.remove_if_eq(&k, "anything").unwrap());
+    }
+
+    #[test]
+    fn goal_archive_suffixes_instead_of_overwriting() {
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        let k = Key::Goal("triage".into());
+        s.write_atomic(&k, "first body").unwrap();
+        s.archive(&k).unwrap();
+        // The id is reused, then archived again — must NOT clobber the first.
+        s.write_atomic(&k, "second body").unwrap();
+        s.archive(&k).unwrap();
+        let dir = p.goals_dir().join("archive");
+        assert!(dir.join("triage.md").is_file());
+        assert!(dir.join("triage-1.md").is_file());
+        assert_eq!(
+            fs::read_to_string(dir.join("triage.md")).unwrap(),
+            "first body"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("triage-1.md")).unwrap(),
+            "second body"
+        );
     }
 
     #[test]

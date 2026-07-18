@@ -23,22 +23,44 @@ fn dep_hint(cmd: &str) -> &'static str {
     }
 }
 
+/// The binary a command line actually invokes: the first token that is not a
+/// leading `VAR=value` environment assignment (`FOO=1 claude -p` → `claude`).
+fn command_bin(cmd: &str) -> Option<&str> {
+    cmd.split_whitespace().find(|t| !is_env_assign(t))
+}
+
+/// True for a shell `NAME=value` prefix token (NAME = [A-Za-z_][A-Za-z0-9_]*).
+fn is_env_assign(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
 /// Verify hard prerequisites; bail with install hints listing everything
 /// missing at once (so the user fixes it in one pass).
 pub fn require_deps(paths: &Paths) -> Result<()> {
     let mut missing: Vec<(String, &'static str)> = Vec::new();
 
-    // looop runs its per-beat decide + launches workers through the configured
-    // runner's `worker_command`, so a missing runner binary is a hard prereq.
-    // Resolve from $LOOOP_CONFIG when present, else the inline default, and check
-    // its first token.
-    if let Ok(cfg) = Config::load(paths)
-        && let Some(cmd) = cfg.runner_cmd("worker_command")
-        && let Some(bin) = cmd.split_whitespace().next()
-        && !bin.is_empty()
-        && !crate::util::on_path(bin)
-    {
-        missing.push((bin.to_string(), dep_hint(bin)));
+    // looop runs its per-beat decide through `tick_command` AND launches
+    // workers through `worker_command`, so a missing binary in EITHER is a
+    // hard prereq. Resolve from $LOOOP_CONFIG when present, else the inline
+    // default, and check each command's real binary token (skipping any
+    // leading VAR=value environment assignments).
+    if let Ok(cfg) = Config::load(paths) {
+        for key in ["tick_command", "worker_command"] {
+            if let Some(cmd) = cfg.runner_cmd(key)
+                && let Some(bin) = command_bin(&cmd)
+                && !crate::util::on_path(bin)
+                && !missing.iter().any(|(b, _)| b == bin)
+            {
+                missing.push((bin.to_string(), dep_hint(bin)));
+            }
+        }
     }
 
     if missing.is_empty() {
@@ -52,4 +74,59 @@ pub fn require_deps(paths: &Paths) -> Result<()> {
     msg.push_str("\nInstall the above, then re-run looop.\n");
     msg.push_str("Or run `looop init` to choose a different runner.");
     bail!(msg);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn command_bin_skips_leading_env_assignments() {
+        assert_eq!(command_bin("claude -p"), Some("claude"));
+        assert_eq!(command_bin("FOO=1 BAR=x_y claude -p"), Some("claude"));
+        // Not an assignment: `9X=1` has a digit-leading name; `a b=c` is fine.
+        assert_eq!(command_bin("9X=1"), Some("9X=1"));
+        assert_eq!(command_bin(""), None);
+        assert_eq!(command_bin("FOO=only assignments=no"), None);
+    }
+
+    #[test]
+    fn preflight_checks_both_tick_and_worker_commands() {
+        let p = crate::paths::Paths::temp();
+        // tick binary missing (behind env assignments), worker binary present.
+        crate::config::write(
+            &p,
+            &crate::config::wiring_json(
+                "FOO=1 no-such-looop-tick-bin -p",
+                "sh -c 'true {{prompt_file}}'",
+            ),
+        )
+        .unwrap();
+        let err = require_deps(&p).unwrap_err().to_string();
+        assert!(
+            err.contains("no-such-looop-tick-bin"),
+            "tick command's binary must be preflighted: {err}"
+        );
+
+        // Worker binary missing too → listed as well (everything in one pass).
+        crate::config::write(
+            &p,
+            &crate::config::wiring_json(
+                "no-such-looop-tick-bin -p",
+                "no-such-looop-worker-bin {{prompt_file}}",
+            ),
+        )
+        .unwrap();
+        let err = require_deps(&p).unwrap_err().to_string();
+        assert!(err.contains("no-such-looop-tick-bin"));
+        assert!(err.contains("no-such-looop-worker-bin"));
+
+        // Both present → ok.
+        crate::config::write(
+            &p,
+            &crate::config::wiring_json("sh -c tick", "sh {{prompt_file}}"),
+        )
+        .unwrap();
+        assert!(require_deps(&p).is_ok());
+    }
 }

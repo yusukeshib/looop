@@ -34,6 +34,13 @@ tells/
 .lock/
 .last-tick-hash
 .goal-activity.json
+.last-world.json
+.last-shell.json
+.last-failure.json
+.signal-flap.json
+.decide-ledger.json
+.noop-at.json
+.next-wake.json
 tick.log
 events.jsonl
 # worker scratch that can land in the data dir

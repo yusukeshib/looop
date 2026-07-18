@@ -264,26 +264,75 @@ pub fn content_hash(input: &[u8]) -> String {
     format!("{h:032x}")
 }
 
+/// A process-wide monotonic nonce for temp-file names. `now_unix()` alone is
+/// second-precision, so two atomic writes to the SAME target within one second
+/// (easy under test or a busy mailbox) could collide on the temp name; the
+/// counter makes every temp name unique within the process, and the pid keeps
+/// processes apart.
+pub fn temp_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+/// fsync the DIRECTORY containing `path`, so the rename that just landed in it
+/// is durable (a crash after rename can otherwise lose the directory entry).
+/// Unix-only (opening a directory read-only works there); a failure is ignored
+/// by callers that treat durability as best-effort.
+#[cfg(unix)]
+fn sync_parent_dir(path: &std::path::Path) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+#[cfg(not(unix))]
+fn sync_parent_dir(_path: &std::path::Path) -> std::io::Result<()> {
+    Ok(())
+}
+
 /// Atomically write `contents` to `path`: write a sibling temp file, fsync, then
 /// `rename` over the target. `rename(2)` on the same filesystem is atomic, so a
 /// concurrent reader (the pulse re-sensing each beat) never sees a half-written
 /// goal/PLAYBOOK/sensor — it sees either the old bytes or the new, never a torn
 /// truncation. This is what lets the contract's STEER verbs promise atomic
-/// writes that a raw `fs::write` (truncate-then-write) cannot.
+/// writes that a raw `fs::write` (truncate-then-write) cannot. After the rename
+/// the parent directory is fsync'd too, so the new entry survives a crash.
 pub fn write_atomic(path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+    write_atomic_mode(path, contents, None)
+}
+
+/// [`write_atomic`] with an optional unix permission mode applied to the TEMP
+/// file BEFORE the rename, so the target is never observable with the wrong
+/// mode (e.g. a sensor script must never be visible non-executable).
+pub fn write_atomic_mode(
+    path: &std::path::Path,
+    contents: &[u8],
+    #[cfg_attr(not(unix), allow(unused_variables))] mode: Option<u32>,
+) -> std::io::Result<()> {
     use std::io::Write;
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     std::fs::create_dir_all(dir)?;
     // Unique temp name in the SAME dir (so rename stays on one filesystem).
+    // pid + second + process-wide counter: unique across processes AND within
+    // the same second in one process.
     let pid = std::process::id();
-    let nonce = now_unix();
     let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("tmp");
-    let tmp = dir.join(format!(".{stem}.{pid}.{nonce}.tmp"));
+    let tmp = dir.join(format!(".{stem}.{pid}.{}.{}.tmp", now_unix(), temp_nonce()));
     let res = (|| {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(contents)?;
         f.sync_all()?;
-        std::fs::rename(&tmp, path)
+        #[cfg(unix)]
+        if let Some(mode) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+        }
+        std::fs::rename(&tmp, path)?;
+        // Durability of the rename itself: fsync the parent dir so the entry
+        // survives a crash. Best-effort — the data bytes are already synced.
+        let _ = sync_parent_dir(path);
+        Ok(())
     })();
     if res.is_err() {
         let _ = std::fs::remove_file(&tmp);

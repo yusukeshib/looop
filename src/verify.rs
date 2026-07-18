@@ -44,6 +44,18 @@ fn timeout_secs() -> u64 {
         .unwrap_or(DEFAULT_TIMEOUT_SECS)
 }
 
+/// Total wall-clock budget for ALL verifications in one beat (seconds). N
+/// workers dying in the same beat used to cost up to N×timeout sequentially;
+/// once the budget is spent the remaining verifies are DEFERRED (their state
+/// untouched, so the next beat picks them up). `LOOOP_VERIFY_BEAT_BUDGET_SECS`,
+/// default 120.
+fn beat_budget_secs() -> u64 {
+    std::env::var("LOOOP_VERIFY_BEAT_BUDGET_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(120)
+}
+
 fn dir(paths: &Paths) -> PathBuf {
     paths.data_dir.join("verify")
 }
@@ -97,6 +109,8 @@ pub fn reconcile(paths: &Paths) {
         return;
     };
     let workers = crate::session::list_workers(paths);
+    let started = std::time::Instant::now();
+    let budget = std::time::Duration::from_secs(beat_budget_secs());
     for entry in entries.flatten() {
         let p = entry.path();
         if p.extension().and_then(|e| e.to_str()) != Some("cmd") {
@@ -107,6 +121,21 @@ pub fn reconcile(paths: &Paths) {
         };
         if result(paths, &id).is_some() {
             continue; // already verified once
+        }
+        // Per-beat budget: N dead workers must not cost N×timeout in one beat.
+        // Defer what's left (state untouched — next beat retries) once spent.
+        if started.elapsed() >= budget {
+            crate::util::event(
+                crate::util::Level::Warn,
+                "worker.verify_deferred",
+                &format!(
+                    "per-beat verify budget exhausted (LOOOP_VERIFY_BEAT_BUDGET_SECS={}s) — \
+                     deferring {id} (and any remaining) to the next beat",
+                    beat_budget_secs()
+                ),
+                &[("worker", serde_json::json!(id))],
+            );
+            break;
         }
         // Only verify a session we still know about AND that is dead. A
         // vanished session (reaped corpse) is dropped — its verdict would be
@@ -140,7 +169,32 @@ pub fn reconcile(paths: &Paths) {
 
 fn run_one(paths: &Paths, cmd_file: &std::path::Path) -> VerifyResult {
     let cmd = fs::read_to_string(cmd_file).unwrap_or_default();
-    run_cmd(&paths.data_dir, &cmd, timeout_secs())
+    run_cmd(
+        &paths.data_dir,
+        &cmd,
+        timeout_secs(),
+        "LOOOP_VERIFY_TIMEOUT_SECS",
+    )
+}
+
+/// SIGKILL a child's whole process GROUP (the child was spawned with
+/// `process_group(0)`, so its pid IS the pgid), then reap it. Killing only the
+/// `bash` leader would orphan grandchildren (`bash -c 'slow | slower'`), which
+/// keep the beat's resources busy past the deadline. libc-free: raw kill(2)
+/// via the same extern-"C" technique the flock helper uses.
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn kill(pid: i32, sig: i32) -> i32;
+        }
+        const SIGKILL: i32 = 9;
+        unsafe {
+            let _ = kill(-(child.id() as i32), SIGKILL);
+        }
+    }
+    let _ = child.kill(); // belt-and-braces (and the non-unix path)
+    let _ = child.wait(); // reap; kill is racy but wait is not
 }
 
 /// Run `cmd` under `bash -c` in `cwd` with a NATIVE timeout. No `timeout(1)`
@@ -148,8 +202,16 @@ fn run_one(paths: &Paths, cmd_file: &std::path::Path) -> VerifyResult {
 /// make every declared verify fail with "spawn failed" — the exact silent
 /// half-wiring the deps preflight exists to prevent. Output goes to a temp
 /// file (not a pipe) so a chatty command can never dead-lock the beat on a
-/// full pipe buffer; we poll `try_wait` and kill on deadline.
-fn run_cmd(cwd: &std::path::Path, cmd: &str, timeout: u64) -> VerifyResult {
+/// full pipe buffer; we poll `try_wait` and kill the whole process GROUP on
+/// deadline (the child is its own group leader via `process_group(0)`).
+/// `timeout_env` names the knob in the timeout message. Shared with the
+/// executor's run_shell path (same bounded-shell semantics).
+pub(crate) fn run_cmd(
+    cwd: &std::path::Path,
+    cmd: &str,
+    timeout: u64,
+    timeout_env: &str,
+) -> VerifyResult {
     let now = || crate::util::now_unix();
     let fail = |output: String| VerifyResult {
         ok: false,
@@ -174,15 +236,22 @@ fn run_cmd(cwd: &std::path::Path, cmd: &str, timeout: u64) -> VerifyResult {
         return fail("verify: cannot clone output capture file".into());
     };
 
-    let child = Command::new("bash")
+    let mut command = Command::new("bash");
+    command
         .arg("-c")
         .arg(cmd)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(out_file)
-        .stderr(err_file)
-        .spawn();
-    let mut child = match child {
+        .stderr(err_file);
+    // Make the child its own process-group leader so a deadline kill can take
+    // out the WHOLE pipeline (grandchildren included), not just bash.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(e) => {
             let _ = fs::remove_file(&out_path);
@@ -196,8 +265,7 @@ fn run_cmd(cwd: &std::path::Path, cmd: &str, timeout: u64) -> VerifyResult {
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait(); // reap; kill is racy but wait is not
+                    kill_group(&mut child);
                     break None;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
@@ -205,8 +273,7 @@ fn run_cmd(cwd: &std::path::Path, cmd: &str, timeout: u64) -> VerifyResult {
             Err(_) => {
                 // A failed status probe leaves the child state unknown. Kill and
                 // reap defensively so a verifier never escapes this deadline loop.
-                let _ = child.kill();
-                let _ = child.wait();
+                kill_group(&mut child);
                 break None;
             }
         }
@@ -226,7 +293,7 @@ fn run_cmd(cwd: &std::path::Path, cmd: &str, timeout: u64) -> VerifyResult {
                 tail.push('\n');
             }
             tail.push_str(&format!(
-                "verify timed out after {timeout}s (LOOOP_VERIFY_TIMEOUT_SECS) — killed"
+                "timed out after {timeout}s ({timeout_env}) — process group killed"
             ));
             fail(tail)
         }
@@ -310,7 +377,12 @@ mod tests {
         // marked failed, with the timeout named in the output.
         let paths = Paths::temp();
         let t0 = std::time::Instant::now();
-        let r = run_cmd(&paths.data_dir, "echo before; sleep 30", 1);
+        let r = run_cmd(
+            &paths.data_dir,
+            "echo before; sleep 30",
+            1,
+            "LOOOP_VERIFY_TIMEOUT_SECS",
+        );
         assert!(t0.elapsed().as_secs() < 10, "must not wait out the sleep");
         assert!(!r.ok);
         assert_eq!(r.exit_code, None, "a killed command has no exit code");
@@ -321,7 +393,12 @@ mod tests {
     #[test]
     fn run_cmd_merges_stdout_and_stderr_and_succeeds() {
         let paths = Paths::temp();
-        let r = run_cmd(&paths.data_dir, "echo out; echo err >&2", 10);
+        let r = run_cmd(
+            &paths.data_dir,
+            "echo out; echo err >&2",
+            10,
+            "LOOOP_VERIFY_TIMEOUT_SECS",
+        );
         assert!(r.ok);
         assert_eq!(r.exit_code, Some(0));
         assert!(r.output.contains("out") && r.output.contains("err"));

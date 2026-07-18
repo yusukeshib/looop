@@ -1,7 +1,7 @@
 //! SENSE — run every `sensors/*.sh`, each printing one JSON snapshot of the
 //! world. Two guardrails keep a misbehaving sensor from harming the pulse:
-//!   * a portable timeout (LOOOP_SENSOR_TIMEOUT, default 60s) so a hung sensor
-//!     can't freeze the beat;
+//!   * an in-process timeout (LOOOP_SENSOR_TIMEOUT, default 60s — no external
+//!     `timeout`/`gtimeout` binary needed) so a hung sensor can't freeze the beat;
 //!   * a size cap (LOOOP_SENSOR_MAX_BYTES, default 8192) so an oversized blob
 //!     can't silently inflate prompt context + LLM cost on every beat.
 
@@ -12,7 +12,7 @@ use crate::util::{self, Level};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 
 fn env_num(var: &str, default: u64) -> u64 {
     std::env::var(var)
@@ -29,38 +29,54 @@ fn read_tail(path: &Path, max: usize) -> String {
     String::from_utf8_lossy(&bytes[start..]).trim().to_string()
 }
 
-/// Run ONE sensor with a portable timeout + size cap. Returns its exit status
-/// (124 = timed out, per coreutils). `out`/`err` receive stdout/stderr.
+/// Run ONE sensor with an IN-PROCESS timeout + size cap. Returns its exit
+/// status (124 = timed out, matching the coreutils convention). `out`/`err`
+/// receive stdout/stderr (written directly by the child — no pipe to drain).
+///
+/// The timeout deliberately depends on NO external `timeout`/`gtimeout`
+/// binary (plain macOS ships neither): the child runs in its own process
+/// group (`process_group(0)`), `try_wait` is polled against the
+/// LOOOP_SENSOR_TIMEOUT budget, and on expiry the WHOLE group is killed
+/// (negative-pid kill) so even helpers the script forked die with it — the
+/// "a hung sensor can't freeze the beat" guarantee holds on every platform.
 fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
     let to = env_num("LOOOP_SENSOR_TIMEOUT", 60);
-    let tbin = if to != 0 {
-        if util::on_path("timeout") {
-            Some("timeout")
-        } else if util::on_path("gtimeout") {
-            Some("gtimeout")
-        } else {
-            None
-        }
-    } else {
-        None
-    };
 
     let (Ok(of), Ok(ef)) = (File::create(out), File::create(err)) else {
         return 1;
     };
 
-    let mut cmd = match tbin {
-        Some(t) => {
-            let mut c = Command::new(t);
-            c.arg(to.to_string()).arg(script);
-            c
-        }
-        None => Command::new(script),
+    let mut cmd = Command::new(script);
+    cmd.stdout(of).stderr(ef);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // Own process group (pgid == child pid) so the timeout can kill the
+        // sensor AND anything it spawned in one shot.
+        cmd.process_group(0);
+    }
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(_) => return 1,
     };
-    let status = cmd.stdout(of).stderr(ef).status();
-    let rc = match status {
-        Ok(s) => s.code().unwrap_or(1),
-        Err(_) => 1,
+    let deadline = Instant::now() + Duration::from_secs(to);
+    let rc = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code().unwrap_or(1),
+            Ok(None) => {
+                if to != 0 && Instant::now() >= deadline {
+                    kill_group(child.id());
+                    let _ = child.wait();
+                    break 124;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break 1;
+            }
+        }
     };
 
     // A FAILED sensor (non-zero exit, incl. rc 124 = timed out) otherwise leaves
@@ -104,6 +120,19 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
     }
     rc
 }
+
+/// SIGKILL the sensor's whole process group (negative-pid kill — the same
+/// technique the session supervisor uses). Shelled out to `kill` via sh so we
+/// need no libc binding; a timed-out sensor gets no grace — the beat must move on.
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    let _ = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(format!("kill -9 -- -{pid} 2>/dev/null"))
+        .status();
+}
+#[cfg(not(unix))]
+fn kill_group(_pid: u32) {}
 
 /// A virtual system sensor: an in-process probe of looop's OWN state that
 /// returns one `{signal,detail}` snapshot value.
@@ -165,10 +194,12 @@ fn declared_interval(script: &Path) -> Option<u64> {
     None
 }
 
-/// Age of `path` in seconds via mtime; `None` when absent/unreadable.
-fn file_age_secs(path: &Path) -> Option<u64> {
-    let m = fs::metadata(path).ok()?.modified().ok()?;
-    m.elapsed().ok().map(|d| d.as_secs())
+/// Modification time of `path`; `None` when absent/unreadable. Freshness
+/// checks compare these `SystemTime`s DIRECTLY: an age-based comparison
+/// (`modified().elapsed()`) fails on a future mtime (clock skew) and would
+/// silently misread it as "old".
+fn mtime(path: &Path) -> Option<SystemTime> {
+    fs::metadata(path).ok()?.modified().ok()
 }
 
 impl Sensor {
@@ -194,26 +225,26 @@ impl Sensor {
                 // Declared cadence: keep the existing snapshot while it's fresh
                 // — unless the SCRIPT was edited after the snapshot was taken
                 // (an edited observer takes effect immediately, not after the
-                // stale snapshot ages out).
-                if let (Some(iv), Some(age)) = (declared_interval(script), file_age_secs(&out))
-                    && age < iv
-                    && file_age_secs(script).is_none_or(|script_age| script_age >= age)
-                {
-                    return Reading {
-                        name,
-                        ok: true,
-                        secs: 0,
-                        skipped: true,
-                    };
+                // stale snapshot ages out). mtimes are compared DIRECTLY
+                // (script_mtime > snapshot_mtime ⇒ rerun): age arithmetic
+                // breaks on future mtimes (clock skew). A future SNAPSHOT
+                // mtime counts as fresh (age 0).
+                if let (Some(iv), Some(snap_m)) = (declared_interval(script), mtime(&out)) {
+                    let fresh = snap_m.elapsed().map(|d| d.as_secs() < iv).unwrap_or(true);
+                    let edited = mtime(script).is_some_and(|m| m > snap_m);
+                    if fresh && !edited {
+                        return Reading {
+                            name,
+                            ok: true,
+                            secs: 0,
+                            skipped: true,
+                        };
+                    }
                 }
                 let rc = exec_sensor(script, &out, &err);
-                if rc == 124 {
-                    let to = env_num("LOOOP_SENSOR_TIMEOUT", 60);
-                    let _ = fs::OpenOptions::new().append(true).open(&err).map(|mut f| {
-                        use std::io::Write;
-                        let _ = writeln!(f, "sensor timed out after {to}s (LOOOP_SENSOR_TIMEOUT)");
-                    });
-                }
+                // (A timed-out sensor — rc 124 — already carries its timeout
+                // message in the normalized error snapshot written by
+                // exec_sensor; nothing extra to append here.)
                 // Drop the empty .err a successful sensor leaves behind.
                 if fs::metadata(&err).map(|m| m.len() == 0).unwrap_or(false) {
                     let _ = fs::remove_file(&err);
@@ -769,6 +800,72 @@ mod tests {
         assert_eq!(
             crate::worldhash::wake_signal(v.clone()),
             serde_json::json!({ "error": true, "exit_code": 3 })
+        );
+    }
+
+    #[test]
+    fn hung_sensor_is_killed_by_the_in_process_timeout() {
+        let p = Paths::temp();
+        let snap = p.snapshots_dir();
+        fs::create_dir_all(&snap).unwrap();
+        fs::create_dir_all(p.sensors_dir()).unwrap();
+        let script = p.sensors_dir().join("hang.sh");
+        fs::write(&script, "#!/bin/sh\nsleep 30\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        // 1s budget — no external `timeout`/`gtimeout` binary involved.
+        unsafe { std::env::set_var("LOOOP_SENSOR_TIMEOUT", "1") };
+        let r = Sensor::User(script).sense(&p, &snap);
+        unsafe { std::env::remove_var("LOOOP_SENSOR_TIMEOUT") };
+
+        assert!(!r.ok, "a timed-out sensor is a failure");
+        let body = fs::read_to_string(snap.join("sensor-hang.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["signal"]["exit_code"], serde_json::json!(124));
+        assert!(
+            v["detail"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("timed out"),
+            "timeout reaches the prompt via the snapshot: {body}"
+        );
+    }
+
+    #[test]
+    fn future_snapshot_mtime_still_counts_as_fresh() {
+        let p = Paths::temp();
+        fs::create_dir_all(p.sensors_dir()).unwrap();
+        fs::create_dir_all(p.snapshots_dir()).unwrap();
+        let script = p.sensors_dir().join("skewed.sh");
+        fs::write(
+            &script,
+            "#!/bin/sh\n# looop:interval=3600\necho '{\"signal\":{}}'\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let sensor = Sensor::User(script);
+        let out = p.snapshots_dir().join("sensor-skewed.json");
+        let r1 = sensor.sense(&p, &p.snapshots_dir());
+        assert!(r1.ok && !r1.skipped);
+
+        // Clock skew: snapshot mtime 2 minutes in the FUTURE. An age-based
+        // check would see "no age" and re-run; the mtime comparison keeps it.
+        let f = fs::File::options().write(true).open(&out).unwrap();
+        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120))
+            .unwrap();
+        drop(f);
+        let r2 = sensor.sense(&p, &p.snapshots_dir());
+        assert!(
+            r2.ok && r2.skipped,
+            "future snapshot mtime must read as fresh, not as stale"
         );
     }
 

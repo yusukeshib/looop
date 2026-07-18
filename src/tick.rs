@@ -99,7 +99,14 @@ fn record_backoff(paths: &Paths, hash: &str) -> u32 {
     let fails = read_backoff(paths).map(|(_, n, _)| n + 1).unwrap_or(1);
     let body = serde_json::json!({ "v": 1, "hash": hash, "fails": fails, "ts": util::now_unix() })
         .to_string();
-    let _ = fs::write(backoff_path(paths), body);
+    if let Err(e) = util::write_atomic(&backoff_path(paths), body.as_bytes()) {
+        util::event(
+            Level::Warn,
+            "tick.guard_degraded",
+            &format!("failed to persist backoff state (retry guard degraded): {e}"),
+            &[],
+        );
+    }
     fails
 }
 
@@ -128,7 +135,7 @@ fn noop_ttl_secs() -> u64 {
 fn record_noop(paths: &Paths, kind: &str, hash: &str) {
     if kind == "noop" {
         let body = serde_json::json!({ "v": 1, "ts": util::now_unix(), "hash": hash }).to_string();
-        let _ = fs::write(paths.noop_at(), body);
+        let _ = util::write_atomic(&paths.noop_at(), body.as_bytes());
     } else {
         let _ = fs::remove_file(paths.noop_at());
     }
@@ -315,7 +322,14 @@ fn record_decide(paths: &Paths) {
     ts.retain(|t| now.saturating_sub(*t) < 3600);
     ts.push(now);
     let body = serde_json::json!({ "v": 1, "ts": ts }).to_string();
-    let _ = fs::write(paths.decide_ledger(), body);
+    if let Err(e) = util::write_atomic(&paths.decide_ledger(), body.as_bytes()) {
+        util::event(
+            Level::Warn,
+            "tick.guard_degraded",
+            &format!("failed to persist the decide ledger (spend guard degraded): {e}"),
+            &[],
+        );
+    }
 }
 
 // ---- last-failure feedback ------------------------------------------------------
@@ -342,6 +356,13 @@ fn record_failure(paths: &Paths, run_id: &str, code: &str, error: &str, fails: u
 pub struct TickOutcome {
     pub acted: bool,
     pub next_interval_s: Option<u64>,
+    /// True when a decide was actually ATTEMPTED this beat (the runner was
+    /// launched) — success or failure alike. False when the beat idled out
+    /// before deciding (skip, backoff, budget, config error). The pulse uses
+    /// this to know when a durable next-wake nudge has been honored (see
+    /// `run.rs`): a nudge must survive idle beats and be consumed only once a
+    /// decide actually ran.
+    pub decided_or_failed: bool,
 }
 
 impl TickOutcome {
@@ -349,8 +370,15 @@ impl TickOutcome {
         TickOutcome {
             acted: false,
             next_interval_s: None,
+            decided_or_failed: false,
         }
     }
+}
+
+/// The committed last-beat world hash lives here (single definition — the
+/// literal used to appear at both the read and the commit site).
+fn last_tick_hash_path(paths: &Paths) -> PathBuf {
+    paths.data_dir.join(".last-tick-hash")
 }
 
 /// Run one beat. `force` bypasses the unchanged-world skip once (see [`can_skip`]).
@@ -363,16 +391,37 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
     // streaks naturally — an unchanged world means unchanged signals).
     let _ = update_flap(paths);
 
+    // 2..2c. gates that may idle the beat out before any AI spend.
+    if let Some(idle) = should_decide(paths, &hash, force) {
+        return idle;
+    }
+
+    // 3. hand everything to the AI for one move.
+    let Some(run) = run_decider(paths) else {
+        return TickOutcome::idle();
+    };
+
+    // 4. commit the outcome (or arm backoff) and prune the replay archive.
+    let outcome = commit_outcome(paths, &hash, run);
+    prune_runs(paths);
+    outcome
+}
+
+/// Gate one beat BEFORE any AI spend: the unchanged-world skip (with the
+/// noop-TTL revisit bypass), failure backoff, and the hourly decide budget.
+/// Returns `Some(idle)` when the beat must idle out here without deciding;
+/// `None` when the decide should run.
+fn should_decide(paths: &Paths, hash: &str, force: bool) -> Option<TickOutcome> {
     // 2. skip if the world is unchanged (no AI call).
-    let last = fs::read_to_string(paths.data_dir.join(".last-tick-hash"))
+    let last = fs::read_to_string(last_tick_hash_path(paths))
         .unwrap_or_default()
         .trim()
         .to_string();
-    if can_skip(&hash, &last, force) {
+    if can_skip(hash, &last, force) {
         // Noop TTL: an unchanged world normally skips, but if the decision that
         // committed this hash was a NOOP and it has aged past the TTL, re-decide
         // — one wrong noop must not park this world state forever.
-        if noop_revisit_due(paths, &hash) {
+        if noop_revisit_due(paths, hash) {
             util::event(
                 Level::Info,
                 "tick.revisit",
@@ -388,7 +437,7 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
                 &[],
             );
             events::emit(paths, "world_unchanged", serde_json::json!({}));
-            return TickOutcome::idle();
+            return Some(TickOutcome::idle());
         }
     }
     if hash == last && force {
@@ -430,7 +479,7 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
                     "tick_backoff",
                     serde_json::json!({ "fails": fails, "retry_in_s": remain }),
                 );
-                return TickOutcome::idle();
+                return Some(TickOutcome::idle());
             }
         }
     }
@@ -459,15 +508,31 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
             "tick_capped",
             serde_json::json!({ "retry_in_s": retry_in }),
         );
-        return TickOutcome::idle();
+        return Some(TickOutcome::idle());
     }
+    None
+}
 
-    // 3. hand everything to the AI for one move.
+/// One decide attempt's raw result, handed from [`run_decider`] to
+/// [`commit_outcome`].
+struct DecideRun {
+    run_id: String,
+    run_dir: PathBuf,
+    secs: u64,
+    runner_ok: bool,
+    outcome: Option<Result<executor::Decided>>,
+}
+
+/// One decide attempt: build the run dir + prompt, launch the runner (its
+/// chatter teed to the replay archive, a spinner on the pulse's stdout), and
+/// consume its decision. `None` when the beat idles out before the runner ever
+/// launches (config error / no tick command).
+fn run_decider(paths: &Paths) -> Option<DecideRun> {
     let cfg = match Config::load(paths) {
         Ok(c) => c,
         Err(e) => {
             util::event(Level::Error, "tick.error", &format!("config: {e}"), &[]);
-            return TickOutcome::idle();
+            return None;
         }
     };
     let runner_name = cfg.runner_label();
@@ -478,11 +543,21 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
             "no `tick` command configured",
             &[("runner", serde_json::json!(runner_name))],
         );
-        return TickOutcome::idle();
+        return None;
     };
 
-    let run_id = format!("tick-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
-    let run_dir = paths.runs_dir().join(&run_id);
+    // run_id is second-resolution: on a collision (two decides within the same
+    // second — e.g. fast test beats) suffix -2, -3, … so a beat never shares
+    // another beat's run dir.
+    let base = format!("tick-{}", chrono::Local::now().format("%Y%m%d-%H%M%S"));
+    let mut run_id = base.clone();
+    let mut run_dir = paths.runs_dir().join(&run_id);
+    let mut n = 2u32;
+    while run_dir.exists() {
+        run_id = format!("{base}-{n}");
+        run_dir = paths.runs_dir().join(&run_id);
+        n += 1;
+    }
     let _ = fs::create_dir_all(&run_dir);
     let prompt_file = run_dir.join("prompt.md");
     let snap = paths.snapshots_dir();
@@ -518,6 +593,21 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
     // against the hourly budget whether or not they produce a decision.
     record_decide(paths);
 
+    // Never execute a STALE decision: if a previous beat's runner wrote
+    // .decision.json and then FAILED (exited nonzero), the file was never
+    // consumed — left in place it would be executed as if THIS beat's runner
+    // produced it. Clear it right before launching.
+    let stale = paths.data_dir.join(executor::DECISION_FILE);
+    if stale.exists() {
+        let _ = fs::remove_file(&stale);
+        util::event(
+            Level::Warn,
+            "tick.stale_decision",
+            "removed a stale .decision.json left by a previous failed beat before deciding",
+            &[],
+        );
+    }
+
     let runner_ok = {
         // Show a live "working" indicator on the pulse's stdout while the runner
         // streams (its chatter is teed to the replay archive, not echoed here).
@@ -532,25 +622,42 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
     } else {
         None
     };
+    Some(DecideRun {
+        run_id,
+        run_dir,
+        secs,
+        runner_ok,
+        outcome,
+    })
+}
 
-    // A beat SUCCEEDS only when a usable decision was produced: commit the world
-    // hash, clear backoff, journal the move. Every other outcome arms backoff and
-    // leaves the hash uncommitted so a transient issue retries.
+/// Commit one decide attempt: a beat SUCCEEDS only when a usable decision was
+/// produced — commit the world hash, clear backoff, journal the move. Every
+/// other outcome arms backoff and leaves the hash uncommitted so a transient
+/// issue retries.
+fn commit_outcome(paths: &Paths, hash: &str, run: DecideRun) -> TickOutcome {
+    let DecideRun {
+        run_id,
+        run_dir,
+        secs,
+        runner_ok,
+        outcome,
+    } = run;
     let (acted, next_interval_s) = match (runner_ok, outcome) {
         (true, Some(Ok(d))) => {
-            let _ = fs::write(paths.data_dir.join(".last-tick-hash"), format!("{hash}\n"));
+            let _ = util::write_atomic(&last_tick_hash_path(paths), format!("{hash}\n").as_bytes());
             // Commit the WHAT-CHANGED baseline alongside the hash: the next
             // decide prompt diffs the live world against the world THIS decision
             // saw. A failed beat leaves both uncommitted, so the same diff is
             // re-reported until a decision lands.
             if let Ok(items) = serde_json::to_string(&crate::worldhash::world_items(paths)) {
-                let _ = fs::write(paths.last_world(), items);
+                let _ = util::write_atomic(&paths.last_world(), items.as_bytes());
             }
             clear_backoff(paths);
             // This decision consumed the previous failure (if any): the decider
             // saw it in the prompt and moved past it.
             let _ = fs::remove_file(paths.last_failure());
-            record_noop(paths, d.kind, &hash);
+            record_noop(paths, d.kind, hash);
             // A run_shell's output tail is persisted for the NEXT prompt
             // (`RUN_SHELL OUTPUT`), but the command's output alone never moves
             // the world hash — without a nudge the next beat would skip and the
@@ -582,7 +689,7 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
             (d.kind != "noop", next_interval_s)
         }
         failure => {
-            let fails = record_backoff(paths, &hash);
+            let fails = record_backoff(paths, hash);
             let replay = run_dir.display().to_string();
             let mut fields = vec![
                 ("secs", serde_json::json!(secs)),
@@ -634,11 +741,10 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
             (false, None)
         }
     };
-
-    prune_runs(paths);
     TickOutcome {
         acted,
         next_interval_s,
+        decided_or_failed: true,
     }
 }
 
@@ -829,6 +935,14 @@ pub(crate) fn wait_for_change(paths: &Paths, filter: WaitFilter) -> Vec<String> 
     }
     let baseline = fingerprints(paths);
     loop {
+        // Re-check the mailbox DIRECTLY every poll: an ask that lands between
+        // the pre-loop pending check and the baseline snapshot above gets baked
+        // into the baseline and would never register as a fingerprint diff.
+        // A pending ask is actionable for every filter, so it is an absolute
+        // wake condition, not a diff.
+        if !mailbox::pending(paths).is_empty() {
+            return vec!["asks".to_string()];
+        }
         // The pulse is the only thing that drives autonomous change; if it isn't
         // running, these files will never move, so don't block forever — wake the
         // caller with a distinct `pulse-down` signal (filter-independent: a dead
@@ -1195,6 +1309,40 @@ mod tests {
         // An unchanged beat resets the streak — a settled sensor is forgiven.
         assert!(update_flap(&p).is_empty());
         assert!(flapping_sensors(&p).is_empty());
+    }
+
+    #[test]
+    fn stale_decision_from_a_failed_beat_is_never_executed() {
+        let p = Paths::temp();
+        fs::write(p.data_dir.join("PLAYBOOK.md"), "be good\n").unwrap();
+        // A previous beat's runner wrote a decision, then FAILED: the file was
+        // left behind. This beat's runner writes NOTHING — the stale decision
+        // must be cleared before the runner launches, never executed.
+        fs::write(
+            p.data_dir.join(executor::DECISION_FILE),
+            r#"{"action":"write_goal","id":"stale","body":"boom","journal":"stale"}"#,
+        )
+        .unwrap();
+        fs::write(
+            &p.config,
+            serde_json::json!({
+                "tick_command": "true",
+                "worker_command": "true {{prompt_file}}"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let out = tick(&p, true);
+        assert!(out.decided_or_failed, "the runner was launched");
+        assert!(
+            !p.goals_dir().join("stale.md").exists(),
+            "the stale decision must not execute"
+        );
+        assert!(
+            !p.data_dir.join(executor::DECISION_FILE).exists(),
+            "the stale file was cleared before the runner ran"
+        );
     }
 
     #[test]
