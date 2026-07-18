@@ -136,23 +136,15 @@ pub fn list(paths: &Paths) -> Vec<(String, Schedule)> {
             let s: Schedule = match serde_json::from_str(&raw) {
                 Ok(s) => s,
                 Err(e) => {
-                    util::event(
-                        util::Level::Warn,
-                        "schedule.unparseable",
-                        &format!("schedules/{name}.json is unparseable ({e}) — it will never fire"),
-                        &[("schedule", serde_json::json!(name))],
-                    );
+                    // STDERR, not stdout: list() feeds machine output
+                    // (`looop state --json`) — a stdout warning would corrupt it.
+                    eprintln!("schedules/{name}.json is unparseable ({e}) — it will never fire");
                     return None;
                 }
             };
             if is_invalid(&s) {
-                util::event(
-                    util::Level::Warn,
-                    "schedule.invalid",
-                    &format!(
-                        "schedules/{name}.json is invalid (need exactly one of `at`/`every_s`, every_s > 0) — it will never fire"
-                    ),
-                    &[("schedule", serde_json::json!(name))],
+                eprintln!(
+                    "schedules/{name}.json is invalid (need exactly one of `at`/`every_s`, every_s > 0) — it will never fire"
                 );
             }
             Some((name, s))

@@ -345,6 +345,17 @@ pub fn write_atomic_mode(
 /// (ask ids), the executor (goal/sensor ids) and the gate (claim names) all
 /// route here so the guard can never drift between call sites. `kind` names the
 /// segment for the error (e.g. "ask id", "claim name", "goal id").
+/// Serializes tests that mutate process-global env vars (`std::env::set_var`
+/// is unsafe under the default multi-threaded test harness: concurrent getenv
+/// is UB on some platforms, and a leaked knob poisons sibling tests). Every
+/// env-mutating test must hold this for its whole body and restore the var
+/// before dropping the guard.
+#[cfg(test)]
+pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 pub fn safe_segment(kind: &str, seg: &str) -> anyhow::Result<()> {
     if seg.is_empty()
         || seg.contains('/')

@@ -132,13 +132,12 @@ pub fn pending(paths: &Paths) -> Vec<Ask> {
                 }
             }
             // A record we cannot parse is a VISIBLE problem, not a silent drop
-            // — a worker may be blocked on it forever.
-            Err(e) => util::event(
-                util::Level::Warn,
-                "ask.unparseable",
-                &format!("asks/{id}.json is unparseable ({e}) — record ignored"),
-                &[("ask_id", serde_json::json!(id))],
-            ),
+            // — a worker may be blocked on it forever. STDERR, not stdout:
+            // pending() feeds machine output (`looop asks --json`,
+            // `looop state --json`) and stdout must stay clean for it.
+            Err(e) => {
+                eprintln!("asks/{id}.json is unparseable ({e}) — record ignored");
+            }
         }
     }
     out.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
@@ -180,6 +179,16 @@ pub fn resume_context(paths: &Paths, ask_id: &str) -> Result<String> {
         .read(&Key::Ask(ask_id.to_string()))
         .with_context(|| format!("resume: no ask {ask_id:?}"))?;
     let ask: Ask = serde_json::from_str(&raw).with_context(|| format!("resume: ask {ask_id:?}"))?;
+    // A BLOCKING (non-detached) ask still has its original worker polling for
+    // the answer: resuming it would archive the pair out from under that
+    // worker (which then bails "vanished") while a SECOND worker consumes the
+    // answer. Only detached asks are resumable by design.
+    if !ask.detach {
+        bail!(
+            "ask {ask_id} is a blocking ask — its worker is already waiting; \
+             resume only detached asks"
+        );
+    }
     let answer = read_answer(&store, ask_id)
         .with_context(|| format!("resume: ask {ask_id:?} has no answer yet"))?;
     let reference = if ask.reference.is_empty() {
@@ -237,31 +246,54 @@ pub fn archive_pair(paths: &Paths, ask_id: &str) {
 /// Best-effort inverse of [`archive_pair`]: move the MOST RECENTLY archived
 /// `<id>` records back into the live dirs. Used by the resume path when the
 /// worker spawn fails AFTER the pair was archived — restoring the pair restores
-/// the `sys-asks` resume signal, so the answer is not lost. Only restores when
-/// no live record exists (never clobbers a new ask reusing the id).
+/// the `sys-asks` resume signal, so the answer is not lost. The guard is
+/// PAIRWISE: if a NEW live ask reuses the id, NEITHER half is restored —
+/// restoring just the answer would attach a stale answer to a different
+/// question. The ANSWER half is restored FIRST; if that restore fails, the ask
+/// restore is skipped too (an answer without an ask is inert; an ask without
+/// its answer re-relays as pending — worse).
 pub fn unarchive_pair(paths: &Paths, ask_id: &str) {
     if util::safe_segment("ask id", ask_id).is_err() {
         return;
     }
-    for dir in [paths.asks_dir(), paths.answers_dir()] {
-        let live = dir.join(format!("{ask_id}.json"));
-        if live.exists() {
-            continue;
-        }
-        let archive = dir.join("archive");
-        // The archive suffixes on collision (`<id>.json`, `<id>-1.json`, …);
-        // the highest suffix is the record we just archived.
-        let mut newest: Option<std::path::PathBuf> = None;
-        let mut n = 0u64;
-        let mut candidate = archive.join(format!("{ask_id}.json"));
-        while candidate.is_file() {
-            newest = Some(candidate);
-            n += 1;
-            candidate = archive.join(format!("{ask_id}-{n}.json"));
-        }
-        if let Some(from) = newest
-            && let Err(e) = std::fs::rename(&from, &live)
-        {
+    // Pairwise guard: a live ask with this id means the id was REUSED by a new
+    // ask — restore nothing (never attach the old answer to the new question).
+    if paths.asks_dir().join(format!("{ask_id}.json")).exists() {
+        return;
+    }
+    // Answer first: if it cannot be restored, skip the ask half as well.
+    if !restore_newest_archived(&paths.answers_dir(), ask_id) {
+        return;
+    }
+    restore_newest_archived(&paths.asks_dir(), ask_id);
+}
+
+/// Move the MOST RECENTLY archived `<ask_id>` record in `dir/archive/` back to
+/// `dir/<ask_id>.json`. Returns true when the live record exists afterwards
+/// (already present, or restored); false when there was nothing to restore or
+/// the rename failed.
+fn restore_newest_archived(dir: &std::path::Path, ask_id: &str) -> bool {
+    let live = dir.join(format!("{ask_id}.json"));
+    if live.exists() {
+        return true;
+    }
+    let archive = dir.join("archive");
+    // The archive suffixes on collision (`<id>.json`, `<id>-1.json`, …);
+    // the highest suffix is the record we just archived.
+    let mut newest: Option<std::path::PathBuf> = None;
+    let mut n = 0u64;
+    let mut candidate = archive.join(format!("{ask_id}.json"));
+    while candidate.is_file() {
+        newest = Some(candidate);
+        n += 1;
+        candidate = archive.join(format!("{ask_id}-{n}.json"));
+    }
+    let Some(from) = newest else {
+        return false;
+    };
+    match std::fs::rename(&from, &live) {
+        Ok(()) => true,
+        Err(e) => {
             util::event(
                 util::Level::Warn,
                 "ask.unarchive_failed",
@@ -272,6 +304,7 @@ pub fn unarchive_pair(paths: &Paths, ask_id: &str) {
                 ),
                 &[("ask_id", serde_json::json!(ask_id))],
             );
+            false
         }
     }
 }
@@ -450,10 +483,12 @@ pub(crate) fn ask(
     );
     // Optional wall-clock bound: `LOOOP_ASK_TIMEOUT_S` (default: none — an ask
     // legitimately waits on a human indefinitely).
+    // checked_add: an absurd value (u64::MAX) would overflow Instant + Duration
+    // and panic — treat overflow as "no deadline".
     let deadline = std::env::var("LOOOP_ASK_TIMEOUT_S")
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
-        .map(|s| std::time::Instant::now() + Duration::from_secs(s));
+        .and_then(|s| std::time::Instant::now().checked_add(Duration::from_secs(s)));
     loop {
         if let Some(answer) = read_answer(&store, &id) {
             // Piggyback any steering the human sent while this worker was
@@ -512,12 +547,10 @@ pub fn pending_tells(paths: &Paths, worker: &str) -> Vec<Tell> {
                 Ok(t) => Some(t),
                 Err(e) => {
                     // Visible, not silent: a dropped tell is lost steering.
-                    util::event(
-                        util::Level::Warn,
-                        "tell.unparseable",
-                        &format!("tells/{id}.json is unparseable ({e}) — record ignored"),
-                        &[("tell_id", serde_json::json!(id))],
-                    );
+                    // STDERR, not stdout: `looop told` prints the drained
+                    // tells on stdout and that stream IS the text a worker
+                    // consumes — a warning there would be read as steering.
+                    eprintln!("tells/{id}.json is unparseable ({e}) — record ignored");
                     None
                 }
             }
@@ -789,12 +822,31 @@ mod tests {
         assert!(p.asks_dir().join("w-2.json").is_file());
     }
 
+    /// Restores an env var to its pre-test value on drop (panic-safe).
+    struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+    impl EnvRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            EnvRestore(key, prev)
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => unsafe { std::env::set_var(self.0, v) },
+                None => unsafe { std::env::remove_var(self.0) },
+            }
+        }
+    }
+
     #[test]
     fn ask_errors_when_the_ask_record_vanishes() {
+        // set_var is process-global: serialize against other env-mutating
+        // tests, and restore the knob even if an assert below panics.
+        let _g = crate::util::test_env_lock();
+        let _r = EnvRestore::set("LOOOP_ASK_POLL_MS", "10");
         let p = Paths::temp();
-        // Fast poll so the vanish is noticed quickly. set_var is process-global
-        // but no other test reads this knob.
-        unsafe { std::env::set_var("LOOOP_ASK_POLL_MS", "10") };
         let ask_file = p.asks_dir().join("w-1.json");
         let handle = std::thread::spawn(move || ask(&p, "w", "anyone there?", "", &[]));
         // Wait for the ask record to appear, then delete it out from under the
@@ -885,6 +937,12 @@ mod tests {
         );
         // resume_context before the answer is a loud error.
         assert!(resume_context(&p, &id).is_err());
+        // …and so is resuming a BLOCKING (non-detached) ask: its worker is
+        // already polling for the answer.
+        let blocking = write_ask(&p, "other", "quick q?", "", &[], false).unwrap();
+        answer(&p, &blocking, "quick a", false).unwrap();
+        let err = resume_context(&p, &blocking).unwrap_err().to_string();
+        assert!(err.contains("blocking ask"), "got: {err}");
         // …and so is an id that is not a safe path segment (traversal guard).
         assert!(resume_context(&p, "../evil").is_err());
 
@@ -948,6 +1006,43 @@ mod tests {
         // …and the second archive did not clobber the first record.
         assert!(p.asks_dir().join("archive/w-1.json").is_file());
         assert!(p.asks_dir().join("archive/w-1-1.json").is_file());
+    }
+
+    #[test]
+    fn unarchive_restores_the_pair_and_never_pairs_a_stale_answer_with_a_new_ask() {
+        let p = Paths::temp();
+        let id = ask_detached(&p, "w", "first?", "", &[]).unwrap();
+        cmd_answer(&p, &ans(&id, "one", false)).unwrap();
+        archive_pair(&p, &id);
+
+        // Plain restore: both halves come back, the pair is resumable again.
+        unarchive_pair(&p, &id);
+        assert!(p.asks_dir().join(format!("{id}.json")).is_file());
+        assert!(p.answers_dir().join(format!("{id}.json")).is_file());
+        assert_eq!(answered_detached(&p).len(), 1);
+
+        // Archive again, then let a NEW live ask REUSE the id: unarchive must
+        // restore NEITHER half — restoring only the answer would attach the
+        // stale "one" to the brand-new question.
+        archive_pair(&p, &id);
+        let id2 = ask_detached(&p, "w", "second, unrelated?", "", &[]).unwrap();
+        assert_eq!(id2, id, "the live id space reuses archived ids");
+        unarchive_pair(&p, &id);
+        assert!(
+            !p.answers_dir().join(format!("{id}.json")).exists(),
+            "a stale answer must not be attached to the new ask"
+        );
+        assert!(
+            p.asks_dir()
+                .join("archive")
+                .join(format!("{id}.json"))
+                .is_file(),
+            "the archived ask half stays archived"
+        );
+        assert!(
+            pending(&p).iter().any(|a| a.prompt == "second, unrelated?"),
+            "the new live ask is untouched"
+        );
     }
 
     #[test]

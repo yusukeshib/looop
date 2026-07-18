@@ -96,6 +96,19 @@ fn consume_next_wake(paths: &Paths) {
     let _ = fs::remove_file(paths.next_wake());
 }
 
+/// The seconds to sleep after a beat: `want` capped to a pending next-wake
+/// deadline ONLY while that deadline is in the FUTURE. A PAST-DUE deadline
+/// must NOT shorten the sleep: it already forces the next beat to re-decide
+/// (and only falls once a decide is attempted), so clamping to it — the old
+/// `remaining.max(1)` — turned any due wake that survived an idled-out beat
+/// (backoff / budget / config error) into a 1 Hz full-sense spin loop.
+fn clamp_sleep_to_wake(want: u64, due: Option<u64>, now: u64) -> u64 {
+    match due {
+        Some(due) if due > now => want.min(due - now),
+        _ => want,
+    }
+}
+
 /// A non-blocking exclusive `flock(2)` on an open fd. `true` = we hold it now.
 /// flock is the right primitive for single-instance: the kernel releases it when
 /// the holding process dies for ANY reason (normal exit, panic, `kill -9`, crash),
@@ -250,12 +263,10 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
             write_next_wake(paths, util::now_unix() + req);
             want = req;
         }
-        // Never sleep PAST a pending deadline (this beat's nudge or a leftover
-        // from a previous pulse) — cap the sleep to it.
-        if let Some(due) = read_next_wake(paths) {
-            let remaining = due.saturating_sub(util::now_unix()).max(1);
-            want = want.min(remaining);
-        }
+        // Never sleep PAST a pending FUTURE deadline (this beat's nudge or a
+        // leftover from a previous pulse). A past-due deadline does not
+        // shorten the sleep — see clamp_sleep_to_wake.
+        want = clamp_sleep_to_wake(want, read_next_wake(paths), util::now_unix());
         let suffix = if outcome.acted { "acted" } else { "idle" };
         if util::is_json() {
             // JSON watchers can't see the live countdown — keep the structured
@@ -336,6 +347,22 @@ mod tests {
         consume_next_wake(&p); // what the pulse loop does on decided_or_failed
         assert!(!next_wake_due(&p));
         assert!(!p.next_wake().is_file());
+    }
+
+    #[test]
+    fn past_due_wake_does_not_clamp_the_sleep() {
+        // No deadline: the default interval stands.
+        assert_eq!(clamp_sleep_to_wake(60, None, 1_000), 60);
+        // A FUTURE deadline caps the sleep to its remaining time…
+        assert_eq!(clamp_sleep_to_wake(60, Some(1_030), 1_000), 30);
+        // …but never extends a shorter sleep.
+        assert_eq!(clamp_sleep_to_wake(10, Some(1_030), 1_000), 10);
+        // A deadline due exactly NOW or PAST-DUE must not shorten the sleep:
+        // it already forces the next beat, and clamping it (the old
+        // `remaining.max(1)`) spun a 1s full-sense loop whenever a due wake
+        // survived an idled-out beat.
+        assert_eq!(clamp_sleep_to_wake(60, Some(1_000), 1_000), 60);
+        assert_eq!(clamp_sleep_to_wake(60, Some(900), 1_000), 60);
     }
 
     #[test]

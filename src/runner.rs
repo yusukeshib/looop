@@ -32,6 +32,20 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// Substitute `{{prompt_file}}` into a command template with shell quoting,
+/// WITHOUT double-quoting configs that already wrapped the placeholder in
+/// quotes (`"{{prompt_file}}"` / `'{{prompt_file}}'` worked before quoting was
+/// added, and nesting quotes would hand the shell a literal-quote path).
+/// Shared by the tick path (below) and the worker path (session.rs) so both
+/// sides of the config behave identically.
+pub(crate) fn substitute_prompt_file(template: &str, path: &str) -> String {
+    let quoted = shell_quote(path);
+    template
+        .replace("\"{{prompt_file}}\"", &quoted)
+        .replace("'{{prompt_file}}'", &quoted)
+        .replace("{{prompt_file}}", &quoted)
+}
+
 /// Run `tick_cmd` (a shell pipeline) under `bash -c`, with cwd at the data dir.
 /// The tick prompt reaches the runner one of two ways, mirroring the worker:
 /// if `tick_cmd` contains the `{{prompt_file}}` placeholder it is substituted
@@ -45,10 +59,7 @@ pub fn run_streamed(paths: &Paths, tick_cmd: &str, prompt_file: &Path, tee: &[Pa
     // (the same placeholder `worker_command` uses), substitute the path and
     // leave stdin alone. Otherwise fall back to feeding the file via stdin.
     let has_placeholder = tick_cmd.contains("{{prompt_file}}");
-    let tick_cmd = tick_cmd.replace(
-        "{{prompt_file}}",
-        &shell_quote(&prompt_file.to_string_lossy()),
-    );
+    let tick_cmd = substitute_prompt_file(tick_cmd, &prompt_file.to_string_lossy());
 
     // `{ …; } 2>&1` merges the whole pipeline's stderr into stdout in order, so
     // a single pipe carries everything (Rust can't easily interleave two pipes).

@@ -57,7 +57,17 @@ fn hash_policy_into(paths: &Paths, buf: &mut Vec<u8>) {
         if !f.is_file() {
             continue;
         }
-        let Ok(bytes) = fs::read(&f) else { continue };
+        let bytes = match fs::read(&f) {
+            Ok(b) => b,
+            Err(_) => {
+                // A present-but-UNREADABLE policy file must not be
+                // hash-invisible (identical to absent): a goal flipping
+                // unreadable would then never move the world. A sentinel
+                // section keeps the transition readable↔unreadable visible.
+                buf.extend_from_slice(format!("@@ {} !unreadable\n", rel(paths, &f)).as_bytes());
+                continue;
+            }
+        };
         // Length-prefixed section marker: a bare "@@ path\n" separator is
         // ambiguous when a file's CONTENT contains "@@ " lines; prefixing the
         // payload length makes the framing injective. NOTE: this changed the

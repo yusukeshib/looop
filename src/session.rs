@@ -73,8 +73,11 @@ fn build_worker_cmd(
              (the prompt file is the worker's brief): {raw:?}"
         ));
     }
+    // Shared, quote-aware substitution (same as the tick path): the path is
+    // shell-quoted, and a pre-quoted `"{{prompt_file}}"` / `'{{prompt_file}}'`
+    // template doesn't end up double-quoted.
     Ok(WorkerCmd {
-        cmd: raw.replace("{{prompt_file}}", prompt_file),
+        cmd: crate::runner::substitute_prompt_file(raw, prompt_file),
         overridden,
     })
 }
@@ -171,8 +174,9 @@ pub fn cmd_start_session(
 
     // Resolve the RESUME context FIRST: an unknown / not-yet-answered ask id
     // is a decider mistake and must fail the move loudly (LAST FAILURE names
-    // it) before anything is spawned. The pair is archived only after the
-    // worker actually launches, below.
+    // it) before anything is spawned. The pair is ARCHIVED just before the
+    // spawn (archive-then-spawn, so a crash between the two can't re-dispatch
+    // the same resume) and UN-ARCHIVED if the spawn fails, below.
     let resume_block = match resume {
         Some(ask_id) => match crate::mailbox::resume_context(paths, ask_id) {
             Ok(block) => Some(block),
@@ -1000,8 +1004,19 @@ mod tests {
     fn build_worker_cmd_template_default() {
         let tmpl = "pi --model opus @{{prompt_file}}";
         let out = build_worker_cmd(tmpl, None, "/p/x.md").unwrap();
-        assert_eq!(out.cmd, "pi --model opus @/p/x.md");
+        assert_eq!(out.cmd, "pi --model opus @'/p/x.md'");
         assert!(!out.overridden);
+    }
+
+    // The worker path uses the SAME quote-aware substitution as the tick path:
+    // a pre-quoted `"{{prompt_file}}"` template is not double-quoted, and a
+    // path with shell metacharacters stays a single argument.
+    #[test]
+    fn build_worker_cmd_quotes_like_the_tick_path() {
+        let out = build_worker_cmd("claude @\"{{prompt_file}}\"", None, "/p/x.md").unwrap();
+        assert_eq!(out.cmd, "claude @'/p/x.md'");
+        let out = build_worker_cmd("claude {{prompt_file}}", None, "/p/a b.md").unwrap();
+        assert_eq!(out.cmd, "claude '/p/a b.md'");
     }
 
     // A --command override replaces the template WHOLESALE.
@@ -1013,7 +1028,7 @@ mod tests {
             "/p/x.md",
         )
         .unwrap();
-        assert_eq!(out.cmd, "pi --model gpt-6 --no-tools @/p/x.md");
+        assert_eq!(out.cmd, "pi --model gpt-6 --no-tools @'/p/x.md'");
         assert!(out.overridden);
     }
 
@@ -1035,7 +1050,7 @@ mod tests {
     #[test]
     fn build_worker_cmd_blank_override_is_ignored() {
         let out = build_worker_cmd("claude @{{prompt_file}}", Some("  "), "/p/x.md").unwrap();
-        assert_eq!(out.cmd, "claude @/p/x.md");
+        assert_eq!(out.cmd, "claude @'/p/x.md'");
         assert!(!out.overridden);
     }
 
@@ -1069,6 +1084,6 @@ mod tests {
     #[test]
     fn build_worker_cmd_prompt_path_with_literal_placeholder() {
         let out = build_worker_cmd("claude @{{prompt_file}}", None, "/p/{{model}}.md").unwrap();
-        assert_eq!(out.cmd, "claude @/p/{{model}}.md");
+        assert_eq!(out.cmd, "claude @'/p/{{model}}.md'");
     }
 }

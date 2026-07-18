@@ -25,8 +25,29 @@ fn dep_hint(cmd: &str) -> &'static str {
 
 /// The binary a command line actually invokes: the first token that is not a
 /// leading `VAR=value` environment assignment (`FOO=1 claude -p` → `claude`).
+/// Quote-aware: a token opening with `'` or `"` yields the QUOTED SPAN
+/// (`'/path/with spaces/claude' -p` → `/path/with spaces/claude`), so quoted
+/// binaries resolve on PATH instead of failing the preflight.
 fn command_bin(cmd: &str) -> Option<&str> {
-    cmd.split_whitespace().find(|t| !is_env_assign(t))
+    let mut rest = cmd.trim_start();
+    while !rest.is_empty() {
+        let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+        let tok = &rest[..end];
+        if is_env_assign(tok) {
+            rest = rest[end..].trim_start();
+            continue;
+        }
+        // Peel surrounding quotes: the binary is the quoted span (which may
+        // contain whitespace), or the bare token when unterminated.
+        let first = tok.as_bytes()[0];
+        if (first == b'\'' || first == b'"')
+            && let Some(close) = rest[1..].find(first as char)
+        {
+            return Some(&rest[1..1 + close]);
+        }
+        return Some(tok);
+    }
+    None
 }
 
 /// True for a shell `NAME=value` prefix token (NAME = [A-Za-z_][A-Za-z0-9_]*).
@@ -55,6 +76,10 @@ pub fn require_deps(paths: &Paths) -> Result<()> {
         for key in ["tick_command", "worker_command"] {
             if let Some(cmd) = cfg.runner_cmd(key)
                 && let Some(bin) = command_bin(&cmd)
+                // A `$VAR` in the binary token is shell expansion we cannot
+                // resolve here (`"$LOOOP_BIN" -p`) — skip the check rather
+                // than hard-gate every verb on a false negative.
+                && !bin.contains('$')
                 && !crate::util::on_path(bin)
                 && !missing.iter().any(|(b, _)| b == bin)
             {
@@ -88,6 +113,42 @@ mod tests {
         assert_eq!(command_bin("9X=1"), Some("9X=1"));
         assert_eq!(command_bin(""), None);
         assert_eq!(command_bin("FOO=only assignments=no"), None);
+    }
+
+    #[test]
+    fn command_bin_peels_quotes_and_surfaces_shell_variables() {
+        // Quoted binaries resolve to the unquoted name/path.
+        assert_eq!(command_bin("\"claude\" -p"), Some("claude"));
+        assert_eq!(command_bin("'claude' -p"), Some("claude"));
+        assert_eq!(
+            command_bin("'/path/with spaces/claude' -p"),
+            Some("/path/with spaces/claude")
+        );
+        assert_eq!(
+            command_bin("FOO=1 \"/opt/my tools/pi\" --model x"),
+            Some("/opt/my tools/pi")
+        );
+        // Shell variables come back verbatim — require_deps skips them.
+        assert_eq!(command_bin("\"$LOOOP_BIN\" -p"), Some("$LOOOP_BIN"));
+        assert_eq!(command_bin("$LOOOP_BIN -p"), Some("$LOOOP_BIN"));
+        // Unterminated quote: fall back to the bare token.
+        assert_eq!(command_bin("'claude -p"), Some("'claude"));
+    }
+
+    #[test]
+    fn preflight_skips_shell_variable_binaries() {
+        let p = crate::paths::Paths::temp();
+        // Both commands invoke through a $VAR we cannot resolve statically —
+        // the preflight must NOT hard-gate on it.
+        crate::config::write(
+            &p,
+            &crate::config::wiring_json(
+                "\"$LOOOP_TICK_BIN\" -p",
+                "$LOOOP_WORKER_BIN {{prompt_file}}",
+            ),
+        )
+        .unwrap();
+        assert!(require_deps(&p).is_ok());
     }
 
     #[test]

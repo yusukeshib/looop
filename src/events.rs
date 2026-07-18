@@ -34,6 +34,12 @@ pub fn emit(paths: &Paths, event: &str, fields: serde_json::Value) {
     // Size-based rotation: past `LOOOP_EVENTS_MAX_BYTES` (default 5 MiB) the
     // current file rolls to `events.jsonl.1` (replacing any previous .1) before
     // this append, so the live file stays bounded at ~one generation.
+    //
+    // SINGLE-WRITER ASSUMPTION: the size-check + rename below is not atomic —
+    // two concurrent emitters could both pass the check and the second rename
+    // would clobber the freshly rotated .1 generation. Today the only writer
+    // is the single locked pulse process (one beat at a time), so the race
+    // cannot fire; if emit() ever gains concurrent callers, add locking here.
     let max_bytes: u64 = std::env::var("LOOOP_EVENTS_MAX_BYTES")
         .ok()
         .and_then(|v| v.trim().parse().ok())

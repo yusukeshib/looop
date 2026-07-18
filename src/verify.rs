@@ -111,6 +111,7 @@ pub fn reconcile(paths: &Paths) {
     let workers = crate::session::list_workers(paths);
     let started = std::time::Instant::now();
     let budget = std::time::Duration::from_secs(beat_budget_secs());
+    let mut budget_warned = false;
     for entry in entries.flatten() {
         let p = entry.path();
         if p.extension().and_then(|e| e.to_str()) != Some("cmd") {
@@ -122,24 +123,10 @@ pub fn reconcile(paths: &Paths) {
         if result(paths, &id).is_some() {
             continue; // already verified once
         }
-        // Per-beat budget: N dead workers must not cost N×timeout in one beat.
-        // Defer what's left (state untouched — next beat retries) once spent.
-        if started.elapsed() >= budget {
-            crate::util::event(
-                crate::util::Level::Warn,
-                "worker.verify_deferred",
-                &format!(
-                    "per-beat verify budget exhausted (LOOOP_VERIFY_BEAT_BUDGET_SECS={}s) — \
-                     deferring {id} (and any remaining) to the next beat",
-                    beat_budget_secs()
-                ),
-                &[("worker", serde_json::json!(id))],
-            );
-            break;
-        }
         // Only verify a session we still know about AND that is dead. A
         // vanished session (reaped corpse) is dropped — its verdict would be
-        // unattributable anyway.
+        // unattributable anyway. This bookkeeping is free, so it runs even
+        // when the budget below is spent.
         match workers.iter().find(|w| w.id == id) {
             Some(w) if !w.alive => {}
             Some(_) => continue, // still running
@@ -147,6 +134,27 @@ pub fn reconcile(paths: &Paths) {
                 clear(paths, &id);
                 continue;
             }
+        }
+        // Per-beat budget: N dead workers must not cost N×timeout in one beat.
+        // Checked just before actually RUNNING a verify command — the free
+        // bookkeeping above always runs, and the deferral warning only ever
+        // names a worker that WOULD have been verified. Deferred state is
+        // untouched, so the next beat retries.
+        if started.elapsed() >= budget {
+            if !budget_warned {
+                budget_warned = true;
+                crate::util::event(
+                    crate::util::Level::Warn,
+                    "worker.verify_deferred",
+                    &format!(
+                        "per-beat verify budget exhausted (LOOOP_VERIFY_BEAT_BUDGET_SECS={}s) — \
+                         deferring {id} (and any remaining) to the next beat",
+                        beat_budget_secs()
+                    ),
+                    &[("worker", serde_json::json!(id))],
+                );
+            }
+            continue;
         }
         let outcome = run_one(paths, &p);
         let json = serde_json::to_string(&outcome).unwrap_or_else(|_| "{}".into());

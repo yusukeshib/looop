@@ -59,12 +59,21 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
         Ok(c) => c,
         Err(_) => return 1,
     };
-    let deadline = Instant::now() + Duration::from_secs(to);
+    // checked_add: an absurd LOOOP_SENSOR_TIMEOUT (u64::MAX) would overflow
+    // Instant + Duration and panic — overflow means "no deadline". `to == 0`
+    // also disables the timeout.
+    let deadline = if to == 0 {
+        None
+    } else {
+        Instant::now().checked_add(Duration::from_secs(to))
+    };
     let rc = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.code().unwrap_or(1),
             Ok(None) => {
-                if to != 0 && Instant::now() >= deadline {
+                if let Some(d) = deadline
+                    && Instant::now() >= d
+                {
                     kill_group(child.id());
                     let _ = child.wait();
                     break 124;
@@ -72,7 +81,10 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(_) => {
-                let _ = child.kill();
+                // Same blast radius as the timeout path: the sensor owns its
+                // process GROUP, so kill the group, not just the direct child
+                // (helpers it forked must die with it).
+                kill_group(child.id());
                 let _ = child.wait();
                 break 1;
             }
@@ -818,9 +830,21 @@ mod tests {
         }
 
         // 1s budget — no external `timeout`/`gtimeout` binary involved.
+        // set_var is process-global: serialize against other env-mutating
+        // tests and restore the knob even if an assert below panics.
+        let _g = crate::util::test_env_lock();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match &self.0 {
+                    Some(v) => unsafe { std::env::set_var("LOOOP_SENSOR_TIMEOUT", v) },
+                    None => unsafe { std::env::remove_var("LOOOP_SENSOR_TIMEOUT") },
+                }
+            }
+        }
+        let _r = Restore(std::env::var_os("LOOOP_SENSOR_TIMEOUT"));
         unsafe { std::env::set_var("LOOOP_SENSOR_TIMEOUT", "1") };
         let r = Sensor::User(script).sense(&p, &snap);
-        unsafe { std::env::remove_var("LOOOP_SENSOR_TIMEOUT") };
 
         assert!(!r.ok, "a timed-out sensor is a failure");
         let body = fs::read_to_string(snap.join("sensor-hang.json")).unwrap();

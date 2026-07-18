@@ -16,6 +16,13 @@ use crate::util;
 use anyhow::{Result, bail};
 use std::process::ExitCode;
 
+/// How long an EMPTY claim file is treated as "in flight" before it is stale
+/// debris. Our own writers can never leave an empty file (create_exclusive
+/// publishes complete contents via rename), so an empty claim is foreign or
+/// crash debris — but give a foreign writer a short grace window (mtime-based)
+/// before removing it, so a mid-write old binary isn't instantly stolen from.
+const EMPTY_CLAIM_GRACE_SECS: u64 = 10;
+
 /// The `.session` recorded in a claim body, or empty if unparseable.
 fn holder_of(raw: &str) -> String {
     serde_json::from_str::<serde_json::Value>(raw)
@@ -85,9 +92,19 @@ pub(crate) fn claim(
         };
         if raw.is_empty() {
             // create_exclusive guarantees "exists ⇒ contents complete", so an
-            // empty file can only be an in-flight write from an OLD binary —
-            // treat it as "in flight, retry shortly", never as instantly stale.
-            std::thread::sleep(std::time::Duration::from_millis(25));
+            // empty file is foreign/crash debris. Treat it as in-flight only
+            // while YOUNG; once past the grace window it would wedge this
+            // claim name FOREVER (nobody ever fills it in) — remove it (the
+            // compare-and-delete keys on the empty contents, so a real lease
+            // written meanwhile survives) and retry the create.
+            if store
+                .age_secs(&key)
+                .is_some_and(|a| a < EMPTY_CLAIM_GRACE_SECS)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            } else {
+                let _ = store.remove_if_eq(&key, "");
+            }
             continue;
         }
         let holder = holder_of(&raw);
@@ -159,9 +176,27 @@ pub fn reap_stale_claims(paths: &Paths) {
             continue;
         };
         if raw.is_empty() {
-            // "exists ⇒ contents complete" holds for our own creates; an empty
-            // file is an in-flight write from an old binary — skip this pass
-            // instead of treating it as instantly stale.
+            // "exists ⇒ contents complete" holds for our own creates, so an
+            // empty file is foreign/crash debris. Skip it while YOUNG (a
+            // foreign writer may still be mid-write); once past the grace
+            // window remove it, or the name is wedged forever.
+            if store
+                .age_secs(&key)
+                .is_some_and(|a| a >= EMPTY_CLAIM_GRACE_SECS)
+                && store.remove_if_eq(&key, &raw).unwrap_or(false)
+            {
+                util::event(
+                    util::Level::Info,
+                    "claim.reaped",
+                    &format!("reaped stale empty claim {name} (crash debris)"),
+                    &[("claim", serde_json::json!(name))],
+                );
+                events::emit(
+                    paths,
+                    "claim_reaped",
+                    serde_json::json!({ "claim": name, "session": "" }),
+                );
+            }
             continue;
         }
         let sess = holder_of(&raw);
@@ -297,22 +332,61 @@ mod tests {
     }
 
     #[test]
-    fn empty_claim_file_is_in_flight_not_stale() {
-        // create_exclusive guarantees non-empty contents, so an EMPTY file can
-        // only be an in-flight write from an old binary: claim() retries then
-        // reports contention instead of instantly stealing, and the reaper
-        // skips it.
+    fn empty_claim_file_is_in_flight_only_while_young() {
+        // A FRESH empty file may be a foreign writer mid-write: claim() retries
+        // then reports contention instead of instantly stealing, and the
+        // reaper skips it.
         let p = Paths::temp();
         fs::create_dir_all(p.claims_dir()).unwrap();
-        fs::write(p.claims_dir().join("repo-e.json"), b"").unwrap();
+        let path = p.claims_dir().join("repo-e.json");
+        fs::write(&path, b"").unwrap();
         assert!(
             claim(&p, "repo-e", Some("w9")).is_err(),
-            "an empty holder is retried then surfaced as contention, never stolen"
+            "a young empty holder is retried then surfaced as contention, never stolen"
         );
         reap_stale_claims(&p);
         assert!(
-            p.claims_dir().join("repo-e.json").is_file(),
-            "the reaper must not reap an in-flight claim"
+            path.is_file(),
+            "the reaper must not reap a young (possibly in-flight) empty claim"
+        );
+    }
+
+    #[test]
+    fn old_empty_claim_file_is_stale_debris_and_is_reclaimed() {
+        // An empty file OLDER than the grace window can never be completed
+        // (rename-published creates are all-or-nothing) — leaving it would
+        // wedge the claim name forever. claim() removes it and wins…
+        let p = Paths::temp();
+        fs::create_dir_all(p.claims_dir()).unwrap();
+        let path = p.claims_dir().join("repo-o.json");
+        let age = |path: &std::path::Path| {
+            let old = std::time::SystemTime::now()
+                - std::time::Duration::from_secs(EMPTY_CLAIM_GRACE_SECS + 5);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        };
+        fs::write(&path, b"").unwrap();
+        age(&path);
+        assert!(matches!(
+            claim(&p, "repo-o", Some("w9")).unwrap(),
+            crate::contract::ClaimOutcome::Won
+        ));
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["session"], "w9", "the stale debris was reclaimed");
+
+        // …and the reaper removes an old empty file outright.
+        let path2 = p.claims_dir().join("repo-p.json");
+        fs::write(&path2, b"").unwrap();
+        age(&path2);
+        reap_stale_claims(&p);
+        assert!(
+            !path2.exists(),
+            "the reaper removes empty crash debris past the grace window"
         );
     }
 

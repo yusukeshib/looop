@@ -173,8 +173,10 @@ fn action_fingerprint(action: &Action) -> String {
 
 /// Write the write-ahead intent record just BEFORE a non-idempotent side effect.
 /// If the process dies during the effect, this file survives and is detected by
-/// [`warn_if_interrupted`] on the next beat.
-fn begin_intent(paths: &Paths, action: &Action) {
+/// [`warn_if_interrupted`] on the next beat. Returns the exact serialized body
+/// written, so [`clear_intent`] can compare-and-delete OUR record and never a
+/// concurrent actor's.
+fn begin_intent(paths: &Paths, action: &Action) -> String {
     let body = serde_json::json!({
         "kind": kind(action),
         "fingerprint": action_fingerprint(action),
@@ -182,30 +184,20 @@ fn begin_intent(paths: &Paths, action: &Action) {
     })
     .to_string();
     let _ = FileStore::new(paths).write_atomic(&Key::ActionWal, &body);
+    body
 }
 
 /// Clear the intent record once execute() has returned (Ok OR Err): reaching
 /// this line proves the process did not die DURING the side effect, so there is
 /// nothing to recover. Only an actual crash between begin/clear leaves it.
 ///
-/// Fingerprint-guarded: the WAL is a single global key, and a concurrent pulse
-/// beat + manual `looop run` would otherwise clear EACH OTHER's intent. Only
-/// remove the record when the stored fingerprint is OUR action's.
-fn clear_intent(paths: &Paths, action: &Action) {
-    let store = FileStore::new(paths);
-    let ours = action_fingerprint(action);
-    let matches = store
-        .read(&Key::ActionWal)
-        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
-        .and_then(|v| {
-            v.get("fingerprint")
-                .and_then(|f| f.as_str())
-                .map(|f| f == ours)
-        })
-        .unwrap_or(false);
-    if matches {
-        let _ = store.remove(&Key::ActionWal);
-    }
+/// Compare-and-delete on the EXACT body this actor wrote ([`begin_intent`]'s
+/// return value): the WAL is a single global key, and a concurrent pulse beat +
+/// manual `looop run` would otherwise clear EACH OTHER's intent — the old
+/// fingerprint-read-then-remove was check-then-act and could still remove a
+/// record that changed between the compare and the remove.
+fn clear_intent(paths: &Paths, wal_body: &str) {
+    let _ = FileStore::new(paths).remove_if_eq(&Key::ActionWal, wal_body);
 }
 
 /// At beat start: if a write-ahead intent record survived, the previous beat
@@ -219,8 +211,19 @@ pub fn warn_if_interrupted(paths: &Paths) -> bool {
     let Some(raw) = store.read(&Key::ActionWal) else {
         return false;
     };
-    let _ = store.remove(&Key::ActionWal); // one-shot report
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+    // A YOUNG record may belong to a LIVE actor: a concurrent manual
+    // `looop run` can legitimately hold its WAL for up to the run_shell
+    // deadline (LOOOP_SHELL_TIMEOUT_SECS). Consuming it here would eat a live
+    // run's crash guard — leave it alone until it is unambiguously a corpse
+    // (older than the shell deadline plus slack). An unparseable ts reads as
+    // 0, i.e. ancient — consumed.
+    let ts = v.get("ts").and_then(|x| x.as_u64()).unwrap_or(0);
+    if crate::util::now_unix().saturating_sub(ts) < shell_timeout_secs() + 60 {
+        return false;
+    }
+    // One-shot report — compare-and-delete exactly the record we inspected.
+    let _ = store.remove_if_eq(&Key::ActionWal, &raw);
     let akind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("?");
     let fp = v.get("fingerprint").and_then(|x| x.as_str()).unwrap_or("?");
     crate::util::event(
@@ -574,13 +577,14 @@ pub fn run_action(paths: &Paths, action: &Action, journal: Option<&str>) -> Resu
     // Write-ahead the intent for non-idempotent actions so a crash DURING the
     // side effect is detectable next beat instead of silently re-firing.
     // clear_intent runs whether execute returns Ok or Err.
-    let guarded = is_non_idempotent(action);
-    if guarded {
-        begin_intent(paths, action);
-    }
+    let wal_body = if is_non_idempotent(action) {
+        Some(begin_intent(paths, action))
+    } else {
+        None
+    };
     let exec_result = execute(paths, action);
-    if guarded {
-        clear_intent(paths, action);
+    if let Some(body) = &wal_body {
+        clear_intent(paths, body);
     }
     let summary = exec_result?;
     if let Some(id) = goal_of(action) {
@@ -955,6 +959,8 @@ mod tests {
     #[test]
     fn warn_if_interrupted_detects_and_clears_a_stale_intent() {
         let p = Paths::temp();
+        // A YOUNG intent may belong to a LIVE actor (a manual `looop run`
+        // mid-run_shell) — it must be left alone, not eaten every beat.
         begin_intent(
             &p,
             &Action::RunShell {
@@ -964,6 +970,22 @@ mod tests {
         );
         assert!(p.action_wal().exists(), "intent written before the effect");
         assert!(
+            !warn_if_interrupted(&p),
+            "a young WAL may be a live actor's — not reported"
+        );
+        assert!(p.action_wal().exists(), "a young WAL is left alone");
+        // An OLD intent (past the shell deadline + slack) is a crash corpse:
+        // reported once and consumed.
+        let old = serde_json::json!({
+            "kind": "run_shell",
+            "fingerprint": "fp-old",
+            "ts": crate::util::now_unix() - (shell_timeout_secs() + 61),
+        })
+        .to_string();
+        FileStore::new(&p)
+            .write_atomic(&Key::ActionWal, &old)
+            .unwrap();
+        assert!(
             warn_if_interrupted(&p),
             "a leftover intent is reported as an interrupted beat"
         );
@@ -972,7 +994,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_intent_only_removes_a_matching_fingerprint() {
+    fn clear_intent_only_removes_our_exact_record() {
         let p = Paths::temp();
         let ours = Action::RunShell {
             cmd: "echo ours".into(),
@@ -983,20 +1005,30 @@ mod tests {
             reason: String::new(),
         };
         // A concurrent actor's WAL must survive OUR clear…
-        begin_intent(&p, &theirs);
-        clear_intent(&p, &ours);
+        let our_body = begin_intent(&p, &ours);
+        let their_body = begin_intent(&p, &theirs); // overwrites (single key)
+        clear_intent(&p, &our_body);
         assert!(
             p.action_wal().exists(),
             "another actor's intent must not be cleared"
         );
-        // …while our own is cleared normally.
-        begin_intent(&p, &ours);
-        clear_intent(&p, &ours);
+        // …while the record we actually wrote is cleared normally.
+        clear_intent(&p, &their_body);
         assert!(!p.action_wal().exists(), "our own intent is cleared");
     }
 
     #[test]
     fn run_shell_times_out_and_kills_the_command() {
+        // Serialize with other env-mutating tests, and restore the knob even
+        // if an assert below panics.
+        let _env = crate::util::test_env_lock();
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("LOOOP_SHELL_TIMEOUT_SECS") };
+            }
+        }
+        let _restore = Restore;
         let p = Paths::temp();
         // Short native timeout via the env override the run_shell path reads.
         unsafe { std::env::set_var("LOOOP_SHELL_TIMEOUT_SECS", "1") };
@@ -1010,7 +1042,6 @@ mod tests {
             None,
         )
         .unwrap_err();
-        unsafe { std::env::remove_var("LOOOP_SHELL_TIMEOUT_SECS") };
         assert!(
             t0.elapsed().as_secs() < 10,
             "must not wait out the 30s sleep"
