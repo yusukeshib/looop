@@ -152,9 +152,7 @@ fn first_command_token(cmd: &str) -> Option<String> {
         // KEY=VAL assignment (identifier before the `=`): env prefix, skip.
         if let Some((key, _)) = tok.split_once('=')
             && !key.is_empty()
-            && key
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_')
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         {
             continue;
         }
@@ -230,11 +228,20 @@ mod tests {
     #[test]
     fn runner_label_skips_env_prefixes() {
         // Plain command: first token wins (unchanged behavior).
-        assert_eq!(first_command_token("claude -p --model sonnet").unwrap(), "claude");
+        assert_eq!(
+            first_command_token("claude -p --model sonnet").unwrap(),
+            "claude"
+        );
         // KEY=VAL prefixes are skipped…
-        assert_eq!(first_command_token("FOO=1 BAR=2 claude -p").unwrap(), "claude");
+        assert_eq!(
+            first_command_token("FOO=1 BAR=2 claude -p").unwrap(),
+            "claude"
+        );
         // …as is a leading `env` and its flags.
-        assert_eq!(first_command_token("env FOO=1 claude -p").unwrap(), "claude");
+        assert_eq!(
+            first_command_token("env FOO=1 claude -p").unwrap(),
+            "claude"
+        );
         assert_eq!(first_command_token("env -i claude -p").unwrap(), "claude");
         // A $VAR-invoked binary still labels as the token (log-only).
         assert_eq!(

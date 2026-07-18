@@ -55,7 +55,9 @@ fn interval(env: &str, cfg: &Config, key: &str, fallback: u64) -> u64 {
         util::event(
             Level::Warn,
             "pulse.guard_degraded",
-            &format!("{key} resolved to 0s (would busy-spin) — clamped to 1s; set a positive integer"),
+            &format!(
+                "{key} resolved to 0s (would busy-spin) — clamped to 1s; set a positive integer"
+            ),
             &[("key", serde_json::json!(key))],
         );
     }
@@ -373,7 +375,10 @@ mod tests {
         // 0, negative, and fractional all collapse to 0 via the casts — and
         // must clamp to 1s instead of busy-spinning.
         assert_eq!(interval(env, &cfg(serde_json::json!(0)), "interval", 60), 1);
-        assert_eq!(interval(env, &cfg(serde_json::json!(-5)), "interval", 60), 1);
+        assert_eq!(
+            interval(env, &cfg(serde_json::json!(-5)), "interval", 60),
+            1
+        );
         assert_eq!(
             interval(env, &cfg(serde_json::json!(0.5)), "interval", 60),
             1

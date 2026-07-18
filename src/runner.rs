@@ -115,12 +115,8 @@ pub fn run_streamed(
         .stdout(Stdio::piped());
 
     if !has_placeholder {
-        let stdin = File::open(prompt_file).map_err(|e| {
-            format!(
-                "cannot open the tick prompt {}: {e}",
-                prompt_file.display()
-            )
-        })?;
+        let stdin = File::open(prompt_file)
+            .map_err(|e| format!("cannot open the tick prompt {}: {e}", prompt_file.display()))?;
         cmd.stdin(Stdio::from(stdin));
     }
 
@@ -155,11 +151,23 @@ pub fn run_streamed(
         std::thread::spawn(move || {
             match cancel_rx.recv_timeout(std::time::Duration::from_secs(timeout)) {
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // Only Unix can actually kill the process group. On
+                    // non-Unix the watchdog can't terminate the runner, so
+                    // reporting a timeout would mislabel a runner that
+                    // finishes on its own as killed — and the error message
+                    // would falsely claim the group was killed. Return false
+                    // there (effectively disabling the watchdog) instead of
+                    // lying; the runner is left to complete naturally.
                     #[cfg(unix)]
-                    kill_pgid(pgid);
+                    {
+                        kill_pgid(pgid);
+                        true
+                    }
                     #[cfg(not(unix))]
-                    let _ = pgid;
-                    true
+                    {
+                        let _ = pgid;
+                        false
+                    }
                 }
                 _ => false, // cancelled: the runner finished in time
             }

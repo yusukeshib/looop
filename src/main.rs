@@ -143,17 +143,35 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
             // lists the real topics instead of suggesting a command that would
             // itself error.
             use clap::CommandFactory;
-            let mut root = cli::Cli::command();
-            let name = topic[0].as_str();
-            if let Some(sub) = root.find_subcommand_mut(name) {
-                let _ = sub.print_help();
+            // Walk the full topic chain: `looop help worker start` descends
+            // into the `worker` subcommand and then its `start` subcommand,
+            // matching the `trailing_var_arg` the CLI accepts (the old code
+            // only looked at topic[0], dropping nested topics). The
+            // immutable pass validates the path; the mutable pass re-traverses
+            // to call print_help (which needs &mut). A helper fn avoids the
+            // borrow-checker's overlapping-&mut rejection on inline loops.
+            let root = cli::Cli::command();
+            let mut found = true;
+            let mut probe = &root;
+            for name in &topic {
+                probe = match probe.find_subcommand(name) {
+                    Some(sub) => sub,
+                    None => {
+                        found = false;
+                        break;
+                    }
+                };
+            }
+            if found {
+                let mut root = cli::Cli::command();
+                let _ = descend_help(&mut root, &topic).print_help();
                 Ok(ExitCode::SUCCESS)
             } else {
                 let topics: Vec<String> = cli::Cli::command()
                     .get_subcommands()
                     .map(|s| s.get_name().to_string())
                     .collect();
-                eprintln!("looop help: unknown topic `{name}`");
+                eprintln!("looop help: unknown topic `{}`", topic.join(" "));
                 eprintln!("topics: {}", topics.join(", "));
                 Ok(ExitCode::from(1))
             }
@@ -270,4 +288,17 @@ fn export_env(paths: &Paths) {
     // NB: no $BABYSIT_DIR. looop never configures the babysit library through the
     // environment — it passes an explicit context (`paths.sessions()`) to every
     // call, and the detached worker receives its root via `--root`.
+}
+
+/// Descend a subcommand path (e.g. `["worker", "start"]`) returning the
+/// deepest subcommand. The caller has already validated via the immutable
+/// `find_subcommand` pass that every step resolves, so `unwrap` here is safe.
+/// Wrapped in a fn so the borrow checker accepts the chained `&mut` traversal
+/// (inline loops that reuse the `&mut` result trip E0499).
+fn descend_help<'a>(cmd: &'a mut clap::Command, path: &[String]) -> &'a mut clap::Command {
+    let mut current = cmd;
+    for name in path {
+        current = current.find_subcommand_mut(name).expect("validated above");
+    }
+    current
 }

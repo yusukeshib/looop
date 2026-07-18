@@ -227,9 +227,7 @@ pub fn cmd_start_session(
     // looop-exclusive). `pulse` is reserved for the control loop, so a worker
     // can never collide with the pulse.
     if id == PULSE_SESSION {
-        return refuse(format!(
-            "'{id}' is reserved for the pulse; pick another id"
-        ));
+        return refuse(format!("'{id}' is reserved for the pulse; pick another id"));
     }
     let session = id.to_string();
 

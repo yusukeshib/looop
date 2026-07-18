@@ -510,9 +510,7 @@ fn commit_outcome(paths: &Paths, hash: &str, run: DecideRun) -> TickOutcome {
                     (
                         Level::Error,
                         "tick.failed",
-                        format!(
-                            "the runner command failed before producing a decision: {cause}"
-                        ),
+                        format!("the runner command failed before producing a decision: {cause}"),
                         format!(
                             "tick failed after {secs}s (fail #{fails}): {cause} · replay: {replay}"
                         ),
@@ -757,10 +755,7 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(p.last_failure()).unwrap()).unwrap();
         assert!(
-            v["error"]
-                .as_str()
-                .unwrap()
-                .contains("timed out after 1s"),
+            v["error"].as_str().unwrap().contains("timed out after 1s"),
             "the failure names the deadline: {v}"
         );
         assert!(

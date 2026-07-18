@@ -442,9 +442,7 @@ mod tests {
         );
         // Exactly one of each parses.
         assert!(Cli::try_parse_from(["looop", "schedule", "write", "x", "--in", "5"]).is_ok());
-        assert!(
-            Cli::try_parse_from(["looop", "schedule", "write", "x", "--every", "60"]).is_ok()
-        );
+        assert!(Cli::try_parse_from(["looop", "schedule", "write", "x", "--every", "60"]).is_ok());
     }
 
     #[test]
@@ -452,7 +450,15 @@ mod tests {
         // Repeating --options APPENDS; each occurrence is still comma-split, so
         // a literal comma inside one option is NOT expressible (documented).
         let c = Cli::try_parse_from([
-            "looop", "ask", "w1", "--prompt", "p", "--options", "a,b", "--options", "c,d",
+            "looop",
+            "ask",
+            "w1",
+            "--prompt",
+            "p",
+            "--options",
+            "a,b",
+            "--options",
+            "c,d",
         ])
         .expect("repeated --options parses");
         let Some(Cmd::Ask(a)) = c.cmd else {

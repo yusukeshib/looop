@@ -243,9 +243,9 @@ pub fn resume_context(paths: &Paths, ask_id: &str) -> Result<String> {
         AnswerState::Missing => bail!("resume: ask {ask_id:?} has no answer yet"),
         // Resuming against a corrupt answer would inject garbage into a fresh
         // worker's brief — fail loudly (the file was already named on stderr).
-        AnswerState::Corrupt => bail!(
-            "resume: answers/{ask_id}.json is unreadable — re-answer with --force first"
-        ),
+        AnswerState::Corrupt => {
+            bail!("resume: answers/{ask_id}.json is unreadable — re-answer with --force first")
+        }
     };
     let reference = if ask.reference.is_empty() {
         "(none — look for reports/ left by the previous worker)".to_string()
