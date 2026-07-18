@@ -46,7 +46,10 @@ pub enum Cmd {
     /// that subcommand's own `--help` instead of erroring.
     Help {
         /// Optional topic — a subcommand name; routed to `looop <topic> --help`.
-        #[arg(trailing_var_arg = true)]
+        /// `allow_hyphen_values`: help must swallow ANYTHING (`looop help
+        /// --json`, a typo'd flag) and answer with the unknown-topic listing,
+        /// never a clap parse error — the help verb is a front door.
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         topic: Vec<String>,
     },
     /// Print the version.
@@ -369,8 +372,12 @@ pub enum ScheduleOp {
         /// One-shot: fire once, this many seconds from now.
         #[arg(long = "in", value_name = "SECS")]
         in_s: Option<u64>,
-        /// Recurring: fire every N seconds (min 60).
-        #[arg(long, value_name = "SECS")]
+        /// Recurring: fire every N seconds (min 60). The minimum is enforced
+        /// at PARSE time (a sub-minute period is a usage error with help, not
+        /// a runtime bail); the contract path — typed actions from the
+        /// decider, which never goes through clap — keeps its own runtime
+        /// check in schedule.rs as defense.
+        #[arg(long, value_name = "SECS", value_parser = clap::value_parser!(u64).range(60..))]
         every: Option<u64>,
         /// Why this trigger exists (shown to the decider when it fires).
         #[arg(long)]
@@ -446,6 +453,33 @@ mod tests {
         // Exactly one of each parses.
         assert!(Cli::try_parse_from(["looop", "schedule", "write", "x", "--in", "5"]).is_ok());
         assert!(Cli::try_parse_from(["looop", "schedule", "write", "x", "--every", "60"]).is_ok());
+    }
+
+    #[test]
+    fn schedule_every_enforces_the_documented_minimum_at_parse_time() {
+        // The docs say min 60 — clap now rejects a sub-minute period as a
+        // usage error instead of deferring to a runtime bail…
+        assert!(Cli::try_parse_from(["looop", "schedule", "write", "x", "--every", "59"]).is_err());
+        // …while the boundary and anything above it still parse.
+        assert!(
+            Cli::try_parse_from(["looop", "schedule", "write", "x", "--every", "3600"]).is_ok()
+        );
+        // `--in` keeps its full range (one-shots may fire in seconds).
+        assert!(Cli::try_parse_from(["looop", "schedule", "write", "x", "--in", "5"]).is_ok());
+    }
+
+    #[test]
+    fn help_swallows_hyphen_topics_instead_of_erroring() {
+        // A typo'd flag after `help` (`looop help --json`) must PARSE — the
+        // help verb answers with its unknown-topic listing, never a clap
+        // usage error.
+        let c = Cli::try_parse_from(["looop", "help", "--json"]).expect("help swallows flags");
+        let Some(Cmd::Help { topic }) = c.cmd else {
+            panic!("expected help")
+        };
+        assert_eq!(topic, vec!["--json"]);
+        // Real topics keep working.
+        assert!(Cli::try_parse_from(["looop", "help", "worker", "start"]).is_ok());
     }
 
     #[test]

@@ -56,7 +56,11 @@ pub fn sense(paths: &Paths) -> Sensed {
         // beat itself must run (and report) rather than die silently here.
         util::event(
             Level::Warn,
-            "tick.guard_degraded",
+            // Distinct code from the guards' `tick.guard_degraded`: this is
+            // DISK trouble at sense time (mkdir failed), not a guard-state
+            // persistence failure — monitoring must be able to tell the two
+            // classes apart.
+            "tick.sense_degraded",
             &format!("failed to ensure the data dirs (this beat may sense a partial world): {e}"),
             &[],
         );
@@ -78,13 +82,14 @@ pub fn sense(paths: &Paths) -> Sensed {
     sensor::run_all(paths, &snap, true);
     events::emit(paths, "sense_done", serde_json::json!({}));
 
-    // Hash and items are taken back-to-back from the same settled world (the
-    // sensors above have finished) so "the hash moved" and "some item differs"
-    // describe the SAME observation — see [`Sensed`].
-    Sensed {
-        hash: crate::worldhash::world_hash(paths),
-        items: crate::worldhash::world_items(paths),
-    }
+    // Hash and items come from ONE pass over the settled world (the sensors
+    // above have finished): `world_view` reads every input file exactly once
+    // and derives both views from those same bytes, so "the hash moved" and
+    // "some item differs" describe the SAME observation — see [`Sensed`].
+    // (Two independent `world_hash` + `world_items` calls would leave a
+    // window for a concurrent write to make them disagree.)
+    let (hash, items) = crate::worldhash::world_view(paths);
+    Sensed { hash, items }
 }
 
 /// Whether this beat may skip the AI: the world is unchanged since last beat AND
@@ -164,9 +169,11 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
     let Sensed { hash, items } = sense(paths);
 
     // 1b. flapping bookkeeping: track per-snapshot signal-change streaks and
-    // warn when one crosses the threshold. Runs every beat (a skip resets the
-    // streaks naturally — an unchanged world means unchanged signals).
-    let _ = update_flap(paths);
+    // warn when one crosses the threshold. Runs every beat (a skip decays the
+    // streaks naturally — an unchanged world means unchanged signals). Fed the
+    // items THIS beat just sensed — re-reading the world here would duplicate
+    // the IO and could diverge from what the beat actually saw.
+    let _ = update_flap(paths, &items);
 
     // 2..2c. gates that may idle the beat out before any AI spend.
     if let Some(idle) = should_decide(paths, &hash, force) {

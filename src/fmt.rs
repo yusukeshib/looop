@@ -110,6 +110,25 @@ pub(crate) fn format_line(line: &str) -> Option<String> {
             if let Some(c) = cost {
                 parts.push(format!("${c:.4}"));
             }
+            // A FAILED tick must not render as a dim `done (…)`: claude flags
+            // failure via `is_error: true` and/or an `error_*` subtype
+            // (error_max_turns, error_during_execution, …). Surface it as the
+            // same red no-glyph failure line the pi/codex arms use, naming the
+            // subtype so the archive says WHY.
+            let subtype = e.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
+            let failed = e
+                .get("is_error")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false)
+                || subtype.starts_with("error");
+            if failed {
+                let mut why: Vec<String> = Vec::new();
+                if !subtype.is_empty() {
+                    why.push(subtype.to_string());
+                }
+                why.extend(parts);
+                return Some(format!("  {}failed ({}){}", red(), why.join(" · "), rst()));
+            }
             if parts.is_empty() {
                 None
             } else {
@@ -350,6 +369,64 @@ mod tests {
         let err = json!({ "type": "error", "message": "stream disconnected" }).to_string();
         let out = format_line(&err).expect("codex stream error renders");
         assert!(out.contains("stream disconnected"), "{out}");
+    }
+
+    #[test]
+    fn format_line_pi_tool_execution_start_and_failed_end() {
+        // Real-shaped pi `--mode json` tool events.
+        let start = json!({
+            "type": "tool_execution_start", "toolName": "bash",
+            "args": { "command": "git   status" }
+        })
+        .to_string();
+        let out = format_line(&start).expect("pi tool start renders");
+        assert!(out.contains("bash"), "tool name surfaced: {out}");
+        assert!(
+            out.contains("git status"),
+            "command collapsed + shown: {out}"
+        );
+
+        // No args at all still yields the bare tool line…
+        let bare = json!({ "type": "tool_execution_start" }).to_string();
+        let out = format_line(&bare).expect("argless tool start renders");
+        assert!(out.contains("tool"), "{out}");
+
+        // …a CLEAN end adds nothing, a FAILED one is surfaced (red, no glyph).
+        let ok = json!({ "type": "tool_execution_end", "toolName": "bash", "isError": false })
+            .to_string();
+        assert_eq!(format_line(&ok), None);
+        let failed = json!({ "type": "tool_execution_end", "toolName": "bash", "isError": true })
+            .to_string();
+        let out = format_line(&failed).expect("pi tool failure renders");
+        assert!(out.contains("bash failed"), "{out}");
+    }
+
+    #[test]
+    fn format_line_claude_result_error_renders_failure_line() {
+        // is_error + error subtype: the archive must say FAILED, not `done`.
+        let err = json!({
+            "type": "result", "subtype": "error_max_turns", "is_error": true,
+            "duration_ms": 12345, "total_cost_usd": 0.0421
+        })
+        .to_string();
+        let out = format_line(&err).expect("error result renders");
+        assert!(out.contains("failed"), "{out}");
+        assert!(out.contains("error_max_turns"), "subtype surfaced: {out}");
+        assert!(out.contains("12.3s"), "duration still shown: {out}");
+        assert!(
+            !out.contains("done"),
+            "a failed tick never reads `done`: {out}"
+        );
+
+        // An error subtype alone (no is_error field) is still a failure…
+        let sub = json!({ "type": "result", "subtype": "error_during_execution" }).to_string();
+        let out = format_line(&sub).expect("error subtype renders");
+        assert!(out.contains("error_during_execution"), "{out}");
+
+        // …and a bare is_error with no subtype/metrics still surfaces.
+        let bare = json!({ "type": "result", "is_error": true }).to_string();
+        let out = format_line(&bare).expect("bare error result renders");
+        assert!(out.contains("failed"), "{out}");
     }
 
     #[test]

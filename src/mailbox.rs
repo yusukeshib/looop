@@ -20,6 +20,11 @@ use anyhow::{Context, Result, bail};
 use std::process::ExitCode;
 use std::time::Duration;
 
+/// The newest mailbox record schema this binary knows how to interpret.
+/// Bump when a record's meaning changes; [`warn_future_v`] flags records
+/// stamped by a NEWER binary on the read side.
+const KNOWN_V: u64 = 1;
+
 /// Schema version stamped into serialized mailbox records. Records written
 /// before versioning carry no `v` and deserialize as v1 (serde ignores unknown
 /// fields on read, so `v` is also transparently ACCEPTED on Ask, whose struct
@@ -29,12 +34,64 @@ fn default_v() -> u32 {
 }
 
 /// Stamp `"v": 1` into a serialized record body (see [`default_v`]).
+///
+/// TWO STAMPING STYLES exist on purpose: Tell (and schedule.rs's Schedule)
+/// carry `v` as a struct field — they are constructed in exactly one place,
+/// so the field is cheap. Ask is constructed as a literal by OTHER modules
+/// (seed.rs plants the starter ask), so adding a `v` field would force every
+/// literal — including ones this module doesn't own — to pick a version;
+/// injecting the stamp into the serialized JSON here keeps the version an
+/// implementation detail of the ONE write path instead. Unify to a struct
+/// field only if Ask construction is ever centralized.
 fn stamp_v1(body: &str) -> Result<String> {
     let mut val: serde_json::Value = serde_json::from_str(body)?;
     if let Some(obj) = val.as_object_mut() {
         obj.insert("v".into(), serde_json::json!(1));
     }
     Ok(serde_json::to_string_pretty(&val)?)
+}
+
+/// Print `msg` to stderr the FIRST time `key` is seen in this process, and
+/// report whether it printed. The mailbox read paths run every beat — and
+/// `ask()` polls every second — so an unconditional warning about the same
+/// broken record repeats hundreds of times (log spam that buries real
+/// signals). One line per condition per process is enough: the condition is
+/// durable (a corrupt file stays corrupt until a human acts).
+fn warn_once(key: String, msg: &str) -> bool {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let first = seen.insert(key);
+    if first {
+        eprintln!("{msg}");
+    }
+    first
+}
+
+/// Forward-compat signal on the READ side: when a record carries `v` GREATER
+/// than [`KNOWN_V`] it was written by a newer binary, and silently reading it
+/// with this schema may misinterpret fields. One stderr line (per record per
+/// process, via [`warn_once`]) makes that visible; the record is still read —
+/// v1 fields remain the best available interpretation. Returns whether the
+/// warning was emitted (first sighting of a future-v record); testable.
+fn warn_future_v(kind: &str, id: &str, raw: &str) -> bool {
+    let v = serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|val| val.get("v").and_then(serde_json::Value::as_u64))
+        .unwrap_or(1); // absent `v` ⇒ v1 (pre-versioning record)
+    if v <= KNOWN_V {
+        return false;
+    }
+    warn_once(
+        format!("future-v:{kind}:{id}"),
+        &format!(
+            "{kind}/{id}.json carries schema v{v} but this binary knows v{KNOWN_V} — \
+             written by a newer looop; fields may be misread"
+        ),
+    )
 }
 
 /// One pending question. Serialized to `asks/<id>.json` (with a `v: 1` schema
@@ -141,11 +198,20 @@ fn read_answer(store: &impl StateStore, ask_id: &str) -> AnswerState {
     let Some(raw) = store.read(&Key::Answer(ask_id.to_string())) else {
         return AnswerState::Missing;
     };
+    // Same forward-compat signal as asks/tells — answers are records too, and
+    // a v2 answer read as v1 would otherwise be misinterpreted silently.
+    warn_future_v("answers", ask_id, &raw);
+    // Deduplicated via warn_once: read_answer runs every beat (pending) and
+    // every poll second (ask), so a durable corruption would otherwise warn
+    // hundreds of times for one broken file.
     let v: serde_json::Value = match serde_json::from_str(&raw) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!(
-                "answers/{ask_id}.json is unparseable ({e}) — re-answer with `looop answer {ask_id} --force …`"
+            warn_once(
+                format!("answer-unparseable:{ask_id}"),
+                &format!(
+                    "answers/{ask_id}.json is unparseable ({e}) — re-answer with `looop answer {ask_id} --force …`"
+                ),
             );
             return AnswerState::Corrupt;
         }
@@ -153,8 +219,11 @@ fn read_answer(store: &impl StateStore, ask_id: &str) -> AnswerState {
     match v.get("answer").and_then(|x| x.as_str()) {
         Some(text) => AnswerState::Ready(text.to_owned()),
         None => {
-            eprintln!(
-                "answers/{ask_id}.json has no string `answer` field — re-answer with `looop answer {ask_id} --force …`"
+            warn_once(
+                format!("answer-no-field:{ask_id}"),
+                &format!(
+                    "answers/{ask_id}.json has no string `answer` field — re-answer with `looop answer {ask_id} --force …`"
+                ),
             );
             AnswerState::Corrupt
         }
@@ -171,6 +240,7 @@ pub fn pending(paths: &Paths) -> Vec<Ask> {
         let Some(raw) = store.read(&Key::Ask(id.clone())) else {
             continue;
         };
+        warn_future_v("asks", &id, &raw);
         match serde_json::from_str::<Ask>(&raw) {
             Ok(ask) => {
                 // A CORRUPT answer keeps the ask listed (the human must see
@@ -184,8 +254,12 @@ pub fn pending(paths: &Paths) -> Vec<Ask> {
             // — a worker may be blocked on it forever. STDERR, not stdout:
             // pending() feeds machine output (`looop asks --json`,
             // `looop state --json`) and stdout must stay clean for it.
+            // Once per record per process (pending runs every beat).
             Err(e) => {
-                eprintln!("asks/{id}.json is unparseable ({e}) — record ignored");
+                warn_once(
+                    format!("ask-unparseable:{id}"),
+                    &format!("asks/{id}.json is unparseable ({e}) — record ignored"),
+                );
             }
         }
     }
@@ -595,9 +669,22 @@ pub(crate) fn ask(
         }
         // Escape hatches so a worker can never block FOREVER on a dead ask:
         // (a) the ask record itself vanished (deleted / archived out from
-        //     under us) — nothing can ever answer it now;
-        if !store.exists(&Key::Ask(id.clone())) {
-            bail!("ask {id}: the ask record vanished (deleted or archived) — no answer can arrive");
+        //     under us) — nothing can ever answer it now. exists_checked, NOT
+        //     exists(): the plain form squashes a transient stat error
+        //     (EACCES, EIO, …) to "absent", which would KILL a legitimately
+        //     waiting worker over a hiccup. Only a definitive NotFound proves
+        //     no answer can arrive; on an error, warn (once) and keep polling.
+        match store.exists_checked(&Key::Ask(id.clone())) {
+            Ok(true) => {}
+            Ok(false) => bail!(
+                "ask {id}: the ask record vanished (deleted or archived) — no answer can arrive"
+            ),
+            Err(e) => {
+                warn_once(
+                    format!("ask-stat:{id}"),
+                    &format!("ask {id}: cannot stat asks/{id}.json ({e}) — still waiting"),
+                );
+            }
         }
         // (b) the optional timeout expired.
         if let Some(d) = deadline
@@ -632,6 +719,7 @@ pub fn pending_tells(paths: &Paths, worker: &str) -> Vec<Tell> {
         .into_iter()
         .filter_map(|id| {
             let raw = store.read(&Key::Tell(id.clone()))?;
+            warn_future_v("tells", &id, &raw);
             match serde_json::from_str::<Tell>(&raw) {
                 Ok(t) => Some(t),
                 Err(e) => {
@@ -639,7 +727,11 @@ pub fn pending_tells(paths: &Paths, worker: &str) -> Vec<Tell> {
                     // STDERR, not stdout: `looop told` prints the drained
                     // tells on stdout and that stream IS the text a worker
                     // consumes — a warning there would be read as steering.
-                    eprintln!("tells/{id}.json is unparseable ({e}) — record ignored");
+                    // Once per record per process (polled via `told`).
+                    warn_once(
+                        format!("tell-unparseable:{id}"),
+                        &format!("tells/{id}.json is unparseable ({e}) — record ignored"),
+                    );
                     None
                 }
             }
@@ -854,7 +946,14 @@ pub(crate) fn answer(paths: &Paths, ask_id: &str, text: &str, force: bool) -> Re
         bail!("answer: empty text");
     }
     let store = FileStore::new(paths);
-    if !store.exists(&Key::Ask(ask_id.to_string())) {
+    // exists_checked, NOT exists(): a transient stat error (EACCES, EIO, …)
+    // must surface as an ERROR, not masquerade as "no pending ask" — the
+    // human would conclude the ask was already resolved and walk away while
+    // the worker keeps waiting on an answer that never comes.
+    if !store
+        .exists_checked(&Key::Ask(ask_id.to_string()))
+        .with_context(|| format!("answer: checking asks/{ask_id}.json"))?
+    {
         bail!("answer: no pending ask {ask_id:?}");
     }
     // Answers are durable: refuse to clobber one already given unless `--force`.
@@ -885,9 +984,12 @@ pub fn cmd_asks(paths: &Paths, json: bool) -> Result<ExitCode> {
     use crate::contract::Contract;
     let asks = crate::contract::LocalContract::new(paths).asks()?;
     if json {
+        // filter_map, NOT unwrap_or_default: a serialization failure must
+        // DROP the entry — defaulting would inject a `null` element into the
+        // array and break every consumer that indexes into ask objects.
         let arr: Vec<serde_json::Value> = asks
             .iter()
-            .map(|a| serde_json::to_value(a).unwrap_or_default())
+            .filter_map(|a| serde_json::to_value(a).ok())
             .collect();
         println!(
             "{}",
@@ -1010,23 +1112,7 @@ mod tests {
         assert!(p.asks_dir().join("w-2.json").is_file());
     }
 
-    /// Restores an env var to its pre-test value on drop (panic-safe).
-    struct EnvRestore(&'static str, Option<std::ffi::OsString>);
-    impl EnvRestore {
-        fn set(key: &'static str, value: &str) -> Self {
-            let prev = std::env::var_os(key);
-            unsafe { std::env::set_var(key, value) };
-            EnvRestore(key, prev)
-        }
-    }
-    impl Drop for EnvRestore {
-        fn drop(&mut self) {
-            match &self.1 {
-                Some(v) => unsafe { std::env::set_var(self.0, v) },
-                None => unsafe { std::env::remove_var(self.0) },
-            }
-        }
-    }
+    use crate::store::EnvRestore;
 
     #[test]
     fn ask_errors_when_the_ask_record_vanishes() {
@@ -1451,6 +1537,115 @@ mod tests {
             cmd_tell(&p, &args).is_err(),
             "a corpse can never read a tell — refuse it"
         );
+    }
+
+    #[test]
+    fn warn_once_prints_once_per_key_per_process() {
+        // Regression for log spam: read_answer/pending warnings used to
+        // repeat every beat / every poll second for the same broken record.
+        assert!(warn_once("test-dedup-key-1".into(), "first sighting"));
+        assert!(
+            !warn_once("test-dedup-key-1".into(), "repeat"),
+            "the same key must not warn twice in one process"
+        );
+        assert!(
+            warn_once("test-dedup-key-2".into(), "different key"),
+            "deduplication is per key, not global"
+        );
+    }
+
+    #[test]
+    fn future_schema_versions_warn_once_and_known_ones_stay_silent() {
+        // v ≤ KNOWN_V (or absent ⇒ v1) is silent; v > KNOWN_V warns exactly
+        // once per record per process — the forward-compat signal.
+        assert!(!warn_future_v("asks", "fv-a", r#"{"v":1}"#));
+        assert!(!warn_future_v(
+            "asks",
+            "fv-b",
+            r#"{"prompt":"pre-versioning"}"#
+        ));
+        assert!(!warn_future_v("asks", "fv-c", "not json at all"));
+        assert!(warn_future_v("asks", "fv-d", r#"{"v":2}"#));
+        assert!(
+            !warn_future_v("asks", "fv-d", r#"{"v":2}"#),
+            "the same future-v record warns only once"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn answer_surfaces_a_stat_failure_instead_of_no_pending_ask() {
+        // Regression: answer() used exists(), which squashed a transient stat
+        // error (EACCES, EIO, …) to "absent" — the human was told "no pending
+        // ask" and walked away while the worker kept waiting. The failure
+        // must surface as an error naming the real cause.
+        let p = Paths::temp();
+        fs::create_dir_all(p.asks_dir()).unwrap();
+        fs::write(
+            p.asks_dir().join("w-1.json"),
+            serde_json::json!({"id":"w-1","worker":"w","prompt":"ok?","ts":1}).to_string(),
+        )
+        .unwrap();
+        let (enforced, _restore) = crate::store::deny_access(p.asks_dir());
+        if !enforced {
+            return; // running as root — permissions can't simulate EACCES
+        }
+        let err = answer(&p, "w-1", "x", false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("no pending ask"),
+            "a stat failure must not be reported as a missing ask: {msg}"
+        );
+        assert!(
+            msg.contains("checking asks/w-1.json"),
+            "the error names the real failure: {msg}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn ask_keeps_polling_through_a_transient_stat_failure() {
+        // Regression: the poll-exit used exists(), so a transient stat error
+        // read as "the ask record vanished" and KILLED a legitimately waiting
+        // worker. The loop must keep polling through the error window and
+        // still deliver the answer once the store recovers.
+        let _g = crate::util::test_env_lock();
+        let _r = EnvRestore::set("LOOOP_ASK_POLL_MS", "10");
+        let p = Paths::temp();
+        let ask_file = p.asks_dir().join("w-1.json");
+        // A NON-cleaning copy of the profile for the worker thread: the outer
+        // `p` owns the temp-dir teardown, and the test needs `p` on this side
+        // too (to deny/restore access and to answer).
+        let worker_paths = Paths {
+            bin: p.bin.clone(),
+            data_dir: p.data_dir.clone(),
+            config: p.config.clone(),
+            default_profile: p.default_profile,
+            temp_cleanup: false,
+        };
+        let handle = std::thread::spawn(move || ask(&worker_paths, "w", "still there?", "", &[]));
+        for _ in 0..200 {
+            if ask_file.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ask_file.is_file(), "ask record never appeared");
+        {
+            let (enforced, _deny) = crate::store::deny_access(p.asks_dir());
+            if enforced {
+                // Several poll intervals inside the error window: the worker
+                // must survive it (warn-once + keep polling), not bail.
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(
+                    !handle.is_finished(),
+                    "a transient stat failure must not kill a waiting worker"
+                );
+            }
+        } // perms restored — the store has "recovered"
+        answer(&p, "w-1", "yes", false).unwrap();
+        let got = handle.join().unwrap().expect("the answer still arrives");
+        assert!(got.contains("yes"), "got: {got}");
     }
 
     #[test]

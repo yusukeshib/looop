@@ -118,6 +118,132 @@ fn clamp_sleep_to_wake(want: u64, due: Option<u64>, now: u64) -> u64 {
     }
 }
 
+/// One 1-second-slice re-check of the sleep deadline: `until` (absolute unix
+/// seconds) shrinks when a FRESH `.next-wake.json` deadline — one that differs
+/// from what the sleep STARTED with — lands mid-sleep. Without this, a
+/// schedule/verb written during the sleep waited out the full interval (worse
+/// with AI cadence nudges) because the deadline was only read at sleep start.
+///
+/// Only a CHANGED deadline shortens the sleep: the initial deadline was
+/// already folded in by [`clamp_sleep_to_wake`], and an unchanged PAST-DUE
+/// leftover must keep being ignored (see clamp_sleep_to_wake — honoring it
+/// would recreate the 1 Hz spin loop it exists to prevent). A fresh deadline
+/// that is ALREADY due clamps to `now` — i.e. wake immediately — which is
+/// exactly what a "wake the loop now" verb wants. `until` only ever shrinks.
+fn recheck_wake_deadline(until: u64, initial_due: Option<u64>, due: Option<u64>, now: u64) -> u64 {
+    match due {
+        Some(d) if due != initial_due => until.min(d.max(now)),
+        _ => until,
+    }
+}
+
+/// Sleep up to `want` seconds after a beat, waking EARLY when (a) a graceful
+/// shutdown signal arrives or (b) a fresh wake deadline lands mid-sleep (see
+/// [`recheck_wake_deadline`]). The sleep is a chain of 1-second slices, each
+/// re-reading `.next-wake.json` and the shutdown flag — so both are honored
+/// within about a second instead of a full interval.
+///
+/// Output behavior matches [`util::sleep_countdown`], which this replaces on
+/// the pulse path: a live one-line countdown repainted each second when ANSI
+/// is on, and a plain silent sleep otherwise (JSON / NO_COLOR / non-PTY —
+/// detected via the shared color codes being empty), so logs see no repaint
+/// spam and no extra lines.
+fn sleep_wake_aware(paths: &Paths, want: u64, suffix: &str) {
+    let initial_due = read_next_wake(paths);
+    let mut until = util::now_unix() + want;
+    // ANSI proxy: the shared color codes are empty exactly when color is off.
+    let ansi = !util::rst().is_empty();
+    // Freeze the timestamp at the start (like sleep_countdown) so the line
+    // reads as "the beat logged at [ts], next one in Ns".
+    let ts = util::hms();
+    loop {
+        let now = util::now_unix();
+        if now >= until || shutdown_requested() {
+            break;
+        }
+        if ansi {
+            // CR + clear-to-EOL so a shrinking count leaves no stale digit.
+            print!(
+                "\r\x1b[2K{}[{ts}] next beat in {}s ({suffix}){}",
+                util::dim(),
+                until - now,
+                util::rst()
+            );
+            let _ = std::io::Write::flush(&mut std::io::stdout());
+        }
+        std::thread::sleep(Duration::from_secs(1));
+        until = recheck_wake_deadline(until, initial_due, read_next_wake(paths), util::now_unix());
+    }
+    if ansi {
+        // Erase the countdown line so the next beat prints clean.
+        print!("\r\x1b[2K");
+        let _ = std::io::Write::flush(&mut std::io::stdout());
+    }
+}
+
+/// Set by the SIGTERM/SIGINT handler; polled by the beat loop and the sleep
+/// loop. A relaxed/SeqCst atomic store is one of the few operations that is
+/// async-signal-safe, which is exactly why the handler does NOTHING else.
+static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a graceful-shutdown signal has been received.
+fn shutdown_requested() -> bool {
+    SHUTDOWN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// The signal handler proper: flag-and-return, nothing more (only
+/// async-signal-safe operations are legal here — no allocation, no locks, no
+/// I/O). The beat loop notices the flag at its next check and exits cleanly.
+#[cfg_attr(not(unix), allow(dead_code))] // only the Unix installer + tests reference it
+extern "C" fn on_shutdown_signal(_sig: i32) {
+    SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Register the graceful-shutdown handler for SIGTERM and SIGINT. Without it
+/// a signal kills the pulse mid-beat: [`LockGuard`] never drops, so the pid
+/// file lingers, and an in-flight beat is torn wherever it happens to be.
+/// With it the current beat FINISHES, the sleep loop exits within a second,
+/// and `cmd_run` returns normally — the guard drops and the pid file is
+/// removed.
+///
+/// SCOPE: direct SIGTERM/Ctrl-C only — DELIBERATELY not `looop down`, whose
+/// babysit kill path delivers SIGHUP (and expects the pulse gone within its
+/// 2s deadline; a graceful beat-completion can take up to the tick timeout,
+/// minutes). `down` stays an immediate stop: hard death is safe BY DESIGN
+/// here — state is level-triggered plain files, the flock dies with the
+/// process, and the WAL guard reports any torn non-idempotent action — so
+/// graceful exit is a nicety for operator signals, not a correctness
+/// requirement.
+///
+/// libc-free via the same extern-"C" technique as [`util::kill_process_group`]
+/// / `flock_file`. `signal(2)` rather than `sigaction(2)` deliberately: the
+/// sigaction struct's layout is platform-specific (padding, field order differ
+/// across macOS/Linux) and getting it wrong is silent UB, while `signal`'s ABI
+/// is a stable two-argument call on every Unix this project targets — and the
+/// one semantic difference that matters (one-shot SysV reset on some
+/// platforms) is harmless here because the first signal already initiates
+/// shutdown.
+#[cfg(unix)]
+fn install_shutdown_handler() {
+    // NB: the handler is passed as `usize` (not a typed fn pointer) so this
+    // declaration matches the ONE other extern signal declaration in the
+    // crate (`main::restore_sigpipe`, which needs SIG_DFL = 0) — two extern
+    // "C" fns with the same name but different signatures trip
+    // `clashing_extern_declarations`.
+    unsafe extern "C" {
+        fn signal(signum: i32, handler: usize) -> usize;
+    }
+    const SIGINT: i32 = 2;
+    const SIGTERM: i32 = 15;
+    let handler = on_shutdown_signal as extern "C" fn(i32) as usize;
+    unsafe {
+        let _ = signal(SIGINT, handler);
+        let _ = signal(SIGTERM, handler);
+    }
+}
+#[cfg(not(unix))]
+fn install_shutdown_handler() {}
+
 /// A non-blocking exclusive `flock(2)` on an open fd. `true` = we hold it now.
 /// flock is the right primitive for single-instance: the kernel releases it when
 /// the holding process dies for ANY reason (normal exit, panic, `kill -9`, crash),
@@ -194,7 +320,12 @@ fn acquire_lock(paths: &Paths) -> Result<LockGuard, LockDenied> {
     if !try_flock(&file) {
         return Err(LockDenied::Held); // a live pulse holds the flock
     }
-    let _ = fs::write(dir.join("pid"), format!("{}\n", std::process::id()));
+    // Rename-published like every other state file: a reader (`looop state`,
+    // the "already running" notice) must never see a torn pid.
+    let _ = crate::util::write_atomic(
+        &dir.join("pid"),
+        format!("{}\n", std::process::id()).as_bytes(),
+    );
     Ok(LockGuard {
         path: dir,
         _file: file,
@@ -223,6 +354,10 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
             ));
         }
     };
+
+    // Graceful shutdown: from here on a SIGTERM/SIGINT finishes the current
+    // beat and exits the loop cleanly instead of killing the pulse mid-beat.
+    install_shutdown_handler();
 
     let runner_name = cfg.runner_label();
     util::event(
@@ -310,7 +445,7 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
         let suffix = if outcome.acted { "acted" } else { "idle" };
         if util::is_json() {
             // JSON watchers can't see the live countdown — keep the structured
-            // marker, then sleep plainly.
+            // marker; sleep_wake_aware is silent without ANSI.
             util::event(
                 Level::Info,
                 "sleep",
@@ -320,12 +455,25 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
                     ("acted", serde_json::json!(outcome.acted)),
                 ],
             );
-            std::thread::sleep(Duration::from_secs(want));
-        } else {
-            // Human mode: a live countdown that IS the sleep.
-            util::sleep_countdown(want, suffix);
+        }
+        // Wake-aware sleep: honors a mid-sleep deadline AND the shutdown flag
+        // within about a second (human mode shows the live countdown).
+        sleep_wake_aware(paths, want, suffix);
+        // Graceful shutdown: the signal handler only sets the flag — the beat
+        // that was in flight has FINISHED, so exiting here is clean. Breaking
+        // (not exiting) lets `_guard` drop normally: the pid file is removed
+        // and the flock released.
+        if shutdown_requested() {
+            break;
         }
     }
+    util::event(
+        Level::Ok,
+        "pulse.stop",
+        "pulse stopped (SIGTERM/SIGINT) — current beat finished, lock released",
+        &[],
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 #[cfg(all(test, unix))]
@@ -417,6 +565,89 @@ mod tests {
             root: serde_json::json!({}),
         };
         assert_eq!(interval(env, &empty, "interval", 60), 60);
+    }
+
+    #[test]
+    fn recheck_shortens_only_for_a_fresh_deadline() {
+        let now = 1_000u64;
+        let until = 1_060u64;
+        // No deadline at all: the sleep runs its course.
+        assert_eq!(recheck_wake_deadline(until, None, None, now), until);
+        // The deadline the sleep STARTED with (clamped at sleep start already,
+        // and — when past-due — deliberately ignored, see clamp_sleep_to_wake):
+        // unchanged, so it never re-shortens.
+        assert_eq!(
+            recheck_wake_deadline(until, Some(900), Some(900), now),
+            until,
+            "an unchanged past-due leftover must not recreate the spin loop"
+        );
+        // A FRESH future deadline shortens the sleep to it…
+        assert_eq!(recheck_wake_deadline(until, None, Some(1_010), now), 1_010);
+        assert_eq!(
+            recheck_wake_deadline(until, Some(900), Some(1_010), now),
+            1_010,
+            "a mid-sleep rewrite of the deadline counts as fresh"
+        );
+        // …a fresh ALREADY-DUE deadline means "wake now"…
+        assert_eq!(recheck_wake_deadline(until, None, Some(990), now), now);
+        // …and a fresh deadline LATER than the sleep never extends it.
+        assert_eq!(recheck_wake_deadline(until, None, Some(2_000), now), until);
+        // A consumed deadline (fresh None) leaves the sleep alone.
+        assert_eq!(recheck_wake_deadline(until, Some(1_010), None, now), until);
+    }
+
+    #[test]
+    fn sleep_wakes_early_on_a_mid_sleep_deadline() {
+        // Serialize with the shutdown test below (shared SHUTDOWN static).
+        let _env = crate::util::test_env_lock();
+        let p = Paths::temp();
+        // A second Paths onto the SAME data dir for the writer thread
+        // (Paths::temp's cleanup-on-drop stays with `p` alone).
+        let p2 = Paths {
+            bin: p.bin.clone(),
+            data_dir: p.data_dir.clone(),
+            config: p.config.clone(),
+            default_profile: p.default_profile,
+            temp_cleanup: false,
+        };
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(1200));
+            // An immediately-due wake written mid-sleep — e.g. a schedule/verb
+            // nudging the loop — must cut the sleep short.
+            write_next_wake(&p2, crate::util::now_unix());
+        });
+        let t0 = std::time::Instant::now();
+        sleep_wake_aware(&p, 60, "idle");
+        writer.join().unwrap();
+        assert!(
+            t0.elapsed().as_secs() < 10,
+            "a fresh mid-sleep deadline must wake the loop within seconds, \
+             not after the full 60s interval"
+        );
+    }
+
+    #[test]
+    fn sleep_exits_promptly_on_shutdown() {
+        // Serialize with the mid-sleep test above (shared SHUTDOWN static),
+        // and ALWAYS reset the flag — even on panic — so no sibling test
+        // inherits a poisoned shutdown state.
+        let _env = crate::util::test_env_lock();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                SHUTDOWN.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let _reset = Reset;
+        let p = Paths::temp();
+        on_shutdown_signal(15); // what the real SIGTERM delivery does
+        assert!(shutdown_requested());
+        let t0 = std::time::Instant::now();
+        sleep_wake_aware(&p, 60, "idle");
+        assert!(
+            t0.elapsed().as_secs() < 5,
+            "a pending shutdown must end the sleep promptly, not after 60s"
+        );
     }
 
     #[test]

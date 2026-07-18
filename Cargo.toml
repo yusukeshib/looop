@@ -1,6 +1,6 @@
 [package]
 name = "looop"
-version = "0.59.0"
+version = "0.60.0"
 edition = "2024"
 description = "A tiny, portable, Kubernetes-shaped control loop for your work"
 license = "MIT"

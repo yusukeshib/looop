@@ -41,7 +41,7 @@ fn command_bin(cmd: &str) -> Option<&str> {
     while !rest.is_empty() {
         let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
         let tok = &rest[..end];
-        if is_env_assign(tok) {
+        if crate::config::is_env_assign(tok) {
             rest = rest[end..].trim_start();
             continue;
         }
@@ -56,7 +56,10 @@ fn command_bin(cmd: &str) -> Option<&str> {
         if first == b'\'' || first == b'"' {
             let close = rest[1..].find(first as char)?;
             let span = &rest[1..1 + close];
-            if span.contains('\\') {
+            // An EMPTY quoted span (`'' -p`) is not a binary at all — treat
+            // it like the other unparseable shapes (skip the preflight)
+            // rather than reporting an empty-string "missing dependency".
+            if span.is_empty() || span.contains('\\') {
                 return None;
             }
             return Some(span);
@@ -69,18 +72,6 @@ fn command_bin(cmd: &str) -> Option<&str> {
         return Some(tok);
     }
     None
-}
-
-/// True for a shell `NAME=value` prefix token (NAME = [A-Za-z_][A-Za-z0-9_]*).
-fn is_env_assign(tok: &str) -> bool {
-    match tok.split_once('=') {
-        Some((name, _)) => {
-            !name.is_empty()
-                && !name.starts_with(|c: char| c.is_ascii_digit())
-                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        }
-        None => false,
-    }
 }
 
 /// Verify hard prerequisites; bail with install hints listing everything
@@ -154,6 +145,10 @@ mod tests {
         assert_eq!(command_bin("$LOOOP_BIN -p"), Some("$LOOOP_BIN"));
         // Unterminated quote: unparseable — skip rather than misreport.
         assert_eq!(command_bin("'claude -p"), None);
+        // An EMPTY quoted span is no binary — skip, never report a missing
+        // "" dependency.
+        assert_eq!(command_bin("'' -p"), None);
+        assert_eq!(command_bin("\"\" -p"), None);
     }
 
     #[test]

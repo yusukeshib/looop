@@ -22,7 +22,7 @@ pub use fsio::{sorted_glob, temp_nonce, write_atomic, write_atomic_mode};
 // `Level::color`) — re-exporting them would trip unused_imports until a
 // caller appears.
 pub use log::{Level, b, dim, env_knob, event, init_color, init_format, is_json, red, rst, yel};
-pub use term::{Spinner, clip_ansi, sleep_countdown, term_cols};
+pub use term::{Spinner, clip_ansi, term_cols};
 pub(crate) use term::{char_cols, display_width};
 
 use std::path::Path;
@@ -110,10 +110,23 @@ pub fn safe_segment(kind: &str, seg: &str) -> anyhow::Result<()> {
         || seg.starts_with('.')
         || seg == ".."
         || seg.chars().any(char::is_whitespace)
+        // Control chars (NUL, ESC, …) are not traversal risks but poison file
+        // names, log lines, and prompt interpolation (a `\x1b` in a goal id
+        // could smuggle terminal escapes into `worker list` output).
+        || seg.chars().any(char::is_control)
     {
         anyhow::bail!("invalid {kind} {seg:?}");
     }
     Ok(())
+}
+
+/// POSIX single-quote `s` so a shell reproduces the exact original bytes as
+/// ONE word (close-quote, escaped quote, reopen for embedded `'`). The SINGLE
+/// shared implementation — the tick runner, the worker session spawn, and the
+/// `looop run` verb all route here so the quoting rule can never drift
+/// between call sites.
+pub fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// `command -v <cmd>` — true if found and executable on $PATH. A command

@@ -62,7 +62,10 @@ pub fn write(
 ) -> Result<String> {
     util::safe_segment("schedule name", name)?;
     let now = util::now_unix();
-    let sched = match (in_s, every_s) {
+    // The summary is built alongside the shape it describes, in the SAME
+    // match arm — re-deriving it from the finished Schedule afterwards needed
+    // a second match with an `unreachable!()` fourth arm.
+    let (sched, summary) = match (in_s, every_s) {
         (Some(_), Some(_)) | (None, None) => {
             bail!(
                 "write_schedule {name:?}: give exactly one of in_s (one-shot) or every_s (recurring)"
@@ -71,38 +74,43 @@ pub fn write(
         (Some(0), None) => bail!("write_schedule {name:?}: in_s must be > 0"),
         // saturating_add: a huge --in value must not overflow (panic in debug,
         // wrap→immediately-due in release) — clamp to "the end of time".
-        (Some(in_s), None) => Schedule {
-            v: 1,
-            at: Some(now.saturating_add(in_s)),
-            every_s: None,
-            anchor: None,
-            note: note.to_string(),
-        },
+        (Some(in_s), None) => {
+            let at = now.saturating_add(in_s);
+            (
+                Schedule {
+                    v: 1,
+                    at: Some(at),
+                    every_s: None,
+                    anchor: None,
+                    note: note.to_string(),
+                },
+                format!(
+                    "write-schedule {name} (one-shot, due in {}s)",
+                    at.saturating_sub(now)
+                ),
+            )
+        }
         (None, Some(e)) if e < MIN_EVERY_S => {
             bail!(
                 "write_schedule {name:?}: every_s must be >= {MIN_EVERY_S} (use next_interval_s for tighter follow-ups)"
             )
         }
-        (None, Some(e)) => Schedule {
-            v: 1,
-            at: None,
-            every_s: Some(e),
-            anchor: Some(now),
-            note: note.to_string(),
-        },
+        (None, Some(e)) => (
+            Schedule {
+                v: 1,
+                at: None,
+                every_s: Some(e),
+                anchor: Some(now),
+                note: note.to_string(),
+            },
+            format!("write-schedule {name} (recurring, every {e}s)"),
+        ),
     };
     FileStore::new(paths).write_atomic(
         &Key::Schedule(name.to_string()),
         &(serde_json::to_string_pretty(&sched)? + "\n"),
     )?;
-    Ok(match (sched.at, sched.every_s) {
-        (Some(at), _) => format!(
-            "write-schedule {name} (one-shot, due in {}s)",
-            at.saturating_sub(now)
-        ),
-        (_, Some(e)) => format!("write-schedule {name} (recurring, every {e}s)"),
-        _ => unreachable!(),
-    })
+    Ok(summary)
 }
 
 /// Remove `schedules/<name>.json` (idempotent). Named `remove`, not `drop`
@@ -140,10 +148,17 @@ pub fn list(paths: &Paths) -> Vec<(String, Option<Schedule>)> {
     store
         .list(&Collection::Schedules)
         .into_iter()
-        .filter_map(|name| {
-            let raw = store.read(&Key::Schedule(name.clone()))?;
-            let s: Option<Schedule> = serde_json::from_str(&raw).ok();
-            Some((name, s))
+        .map(|name| {
+            // A READ failure (permissions, I/O) folds into the same `None` as
+            // JSON-broken content: the entry must still be RETURNED so its
+            // stable "unparseable" signal reaches the world hash. Dropping it
+            // (as an early-return `?` in a filter_map once did) removed the
+            // file from the world hash entirely — contradicting the
+            // never-silently-dropped contract above.
+            let s: Option<Schedule> = store
+                .read(&Key::Schedule(name.clone()))
+                .and_then(|raw| serde_json::from_str(&raw).ok());
+            (name, s)
         })
         .collect()
 }
@@ -193,13 +208,22 @@ fn reading(s: &Schedule, now: u64) -> (serde_json::Value, serde_json::Value) {
             // anchor=0 makes it due immediately and the period then advances
             // normally — the schedule self-heals instead of silently dying.
             let anchor = s.anchor.unwrap_or(0);
-            let period = now.saturating_sub(anchor) / every.max(1);
+            // `every > 0` is guaranteed here: every_s == 0 is structurally
+            // invalid and returned above ([`is_invalid`]) — no `.max(1)`
+            // divide-by-zero defense needed.
+            let elapsed = now.saturating_sub(anchor);
+            let period = elapsed / every;
+            let rem = elapsed % every;
             (
                 serde_json::json!({ "period": period }),
                 serde_json::json!({
                     "kind": "recurring",
                     "every_s": every,
-                    "next_due_in_s": every - (now.saturating_sub(anchor) % every.max(1)),
+                    // rem == 0 is the exact due instant (the period just
+                    // bumped): report 0 ("due now"), not a full period — the
+                    // next fire is NOT `every` seconds away at the very moment
+                    // this one fires.
+                    "next_due_in_s": if rem == 0 { 0 } else { every - rem },
                     "note": s.note,
                 }),
             )
@@ -380,6 +404,55 @@ mod tests {
             assert_eq!(reading(&s, 1000).0, serde_json::json!("invalid"));
             assert_eq!(reading(&s, 99999).0, serde_json::json!("invalid"), "stable");
         }
+    }
+
+    #[test]
+    fn recurring_next_due_reports_zero_at_the_exact_due_instant() {
+        // Regression: at rem == 0 the old `every - rem` reported a FULL
+        // period ("due in 100s") at the very moment the schedule fired.
+        let s = Schedule {
+            v: 1,
+            at: None,
+            every_s: Some(100),
+            anchor: Some(1000),
+            note: String::new(),
+        };
+        assert_eq!(
+            reading(&s, 1100).1["next_due_in_s"],
+            serde_json::json!(0),
+            "due NOW at the period boundary"
+        );
+        assert_eq!(reading(&s, 1101).1["next_due_in_s"], serde_json::json!(99));
+        assert_eq!(reading(&s, 1199).1["next_due_in_s"], serde_json::json!(1));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_schedule_file_is_surfaced_not_dropped() {
+        // Regression: a read FAILURE (not just unparseable JSON) used to be
+        // dropped from list() by a `?` inside filter_map — silently removing
+        // the file from the world hash, contradicting list()'s own contract.
+        use std::os::unix::fs::PermissionsExt;
+        let p = Paths::temp();
+        std::fs::create_dir_all(p.schedules_dir()).unwrap();
+        let f = p.schedules_dir().join("locked.json");
+        std::fs::write(&f, br#"{"at": 123}"#).unwrap();
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root (some CI containers), chmod 000 does not make the
+        // read fail — there is nothing to assert then.
+        if std::fs::read_to_string(&f).is_ok() {
+            return;
+        }
+        let all = list(&p);
+        assert_eq!(all.len(), 1, "read failure is surfaced, not dropped");
+        assert!(
+            all[0].1.is_none(),
+            "an unreadable entry carries no Schedule"
+        );
+        let v = sys_schedules(&p);
+        assert_eq!(v["signal"]["locked"], serde_json::json!("unparseable"));
+        // Restore permissions so the temp dir can be cleaned up.
+        std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     #[test]

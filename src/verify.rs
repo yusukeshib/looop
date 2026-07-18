@@ -154,7 +154,11 @@ pub fn reconcile(paths: &Paths) {
             }
             continue;
         }
-        let outcome = run_one(paths, &p);
+        // `None` = the .cmd file vanished between read_dir and the read (a
+        // deliberate clear raced us) — nothing to judge, nothing to record.
+        let Some(outcome) = run_one(paths, &p) else {
+            continue;
+        };
         let json = serde_json::to_string(&outcome).unwrap_or_else(|_| "{}".into());
         // Rename-published: a torn result would be unparseable, look like "no
         // result yet", and re-run the (once-only) verify command next beat.
@@ -175,14 +179,45 @@ pub fn reconcile(paths: &Paths) {
     }
 }
 
-fn run_one(paths: &Paths, cmd_file: &std::path::Path) -> VerifyResult {
-    let cmd = fs::read_to_string(cmd_file).unwrap_or_default();
-    run_cmd(
+/// Run one due verification from its persisted `.cmd` file.
+///
+/// The read itself can fail, and neither failure may ever degrade into
+/// `bash -c ''` (exit 0) — that would record a FABRICATED pass, the exact lie
+/// this module exists to catch. Two distinct failure shapes:
+///
+///   • NotFound — the file vanished between reconcile()'s read_dir and this
+///     read: a TOCTOU with a deliberate [`clear`] (`looop kill`, reap). The
+///     worker's verify state was intentionally dropped, so recording ANY
+///     verdict here would resurrect state for a cleared worker. Skip (`None`)
+///     — the next beat's read_dir simply won't see the file.
+///   • Any other error (permissions, I/O) — the command is unknowable but the
+///     obligation stands, and skipping would retry (and warn) forever on a
+///     persistent error. Record a FAIL naming the unreadable file: the tick
+///     sees "postcondition FAIL" instead of a clean corpse, and the
+///     once-per-lifetime contract still holds.
+fn run_one(paths: &Paths, cmd_file: &std::path::Path) -> Option<VerifyResult> {
+    let cmd = match fs::read_to_string(cmd_file) {
+        Ok(cmd) => cmd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            return Some(VerifyResult {
+                ok: false,
+                exit_code: None,
+                output: format!(
+                    "verify command file {} is unreadable ({e}) — the postcondition could \
+                     not be checked, recorded as FAIL (never a fabricated pass)",
+                    cmd_file.display()
+                ),
+                ts: crate::util::now_unix(),
+            });
+        }
+    };
+    Some(run_cmd(
         &paths.data_dir,
         &cmd,
         timeout_secs(),
         "LOOOP_VERIFY_TIMEOUT_SECS",
-    )
+    ))
 }
 
 /// SIGKILL a child's whole process GROUP (the child was spawned with
@@ -531,10 +566,49 @@ mod tests {
         let f = paths.data_dir.join("verify-test.cmd");
         fs::create_dir_all(&paths.data_dir).unwrap();
         fs::write(&f, "echo missing-artifact >&2; exit 3").unwrap();
-        let r = run_one(&paths, &f);
+        let r = run_one(&paths, &f).expect("a readable command file is judged");
         assert!(!r.ok);
         assert_eq!(r.exit_code, Some(3));
         assert!(r.output.contains("missing-artifact"));
+    }
+
+    #[test]
+    fn run_one_vanished_cmd_file_skips_without_a_verdict() {
+        // TOCTOU with `looop kill` → clear(): the .cmd file listed by
+        // read_dir is gone by the time run_one reads it. The old
+        // `unwrap_or_default()` turned this into `bash -c ''` → exit 0 → a
+        // fabricated PASS; now it must record NOTHING.
+        let paths = Paths::temp();
+        let gone = dir(&paths).join("vanished.cmd");
+        assert!(
+            run_one(&paths, &gone).is_none(),
+            "a vanished command file is skipped, not judged"
+        );
+        assert!(
+            result(&paths, "vanished").is_none(),
+            "no verdict is recorded for a cleared worker"
+        );
+    }
+
+    #[test]
+    fn run_one_unreadable_cmd_file_records_fail_never_pass() {
+        // A persistent read error (here: the path is a DIRECTORY, so
+        // read_to_string fails with a non-NotFound error) must record a FAIL
+        // naming the file — never the old empty-command fabricated pass.
+        let paths = Paths::temp();
+        let d = paths.data_dir.join("unreadable.cmd");
+        fs::create_dir_all(&d).unwrap();
+        let r = run_one(&paths, &d).expect("a persistent read error is judged terminally");
+        assert!(!r.ok, "an unreadable command file can never verify as pass");
+        assert_eq!(
+            r.exit_code, None,
+            "no command ran, so there is no exit code"
+        );
+        assert!(
+            r.output.contains("unreadable") && r.output.contains("unreadable.cmd"),
+            "the FAIL names the unreadable file: {}",
+            r.output
+        );
     }
 
     #[test]

@@ -18,9 +18,9 @@
 //! All state is small JSON files in the data dir (stateless-process
 //! discipline, same as the rest of the beat).
 
+use crate::events;
 use crate::paths::Paths;
 use crate::util::{self, Level};
-use crate::{events, worldhash};
 use std::fs;
 use std::path::PathBuf;
 
@@ -42,24 +42,76 @@ pub(crate) fn backoff_delay(fails: u32) -> u64 {
         .min(BACKOFF_CAP_SECS)
 }
 
+/// Fail count assumed when the backoff file EXISTS but cannot be parsed (torn
+/// write, disk corruption). Restarting at 1 would fail OPEN — a garbled state
+/// file silently resets the exponential wait to its minimum right when the
+/// loop is already failing. Resuming from a mid-range count keeps the guard
+/// conservative (4 fails ⇒ a base·2³ = 480s window) without jumping straight
+/// to the cap; a success still clears everything as usual.
+const BACKOFF_CORRUPT_FAILS: u32 = 4;
+
 fn backoff_path(paths: &Paths) -> PathBuf {
     paths.data_dir.join(".tick-backoff")
+}
+
+/// The three observable states of the backoff file. ABSENT and CORRUPT must
+/// stay distinguishable for [`record_backoff`]: squashing corruption into
+/// "absent" restarted the fail count at 1 and reset the exponential backoff.
+enum BackoffRead {
+    Absent,
+    Corrupt,
+    Parsed(String, u32, u64),
+}
+
+fn read_backoff_raw(paths: &Paths) -> BackoffRead {
+    let raw = match fs::read_to_string(backoff_path(paths)) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BackoffRead::Absent,
+        // Present but unreadable (EACCES/EIO/…): the state file EXISTS, so
+        // restarting at 1 would fail OPEN just like a parse error. Treat it as
+        // CORRUPT so record_backoff resumes from BACKOFF_CORRUPT_FAILS.
+        Err(e) => {
+            util::event(
+                Level::Warn,
+                "tick.guard_degraded",
+                &format!(
+                    "backoff state file is unreadable ({e}) — treating as corrupt so the next \
+                     record_backoff resumes conservatively instead of resetting the exponential \
+                     backoff"
+                ),
+                &[],
+            );
+            return BackoffRead::Corrupt;
+        }
+    };
+    let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+        .ok()
+        .and_then(|v| {
+            let hash = v.get("hash")?.as_str()?.to_string();
+            let fails = v
+                .get("fails")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32;
+            let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            Some((hash, fails, ts))
+        });
+    match parsed {
+        Some((hash, fails, ts)) => BackoffRead::Parsed(hash, fails, ts),
+        None => BackoffRead::Corrupt,
+    }
 }
 
 /// Read backoff state as `(policy_hash, consecutive_fails, last_fail_unix)`.
 /// The stored hash is the POLICY hash (PLAYBOOK + goals) as of the last failed
 /// beat — a change there means the human steered and the wait may be cut short.
-/// `None` when absent/unparseable (no backoff in effect).
+/// `None` when absent/unparseable — a corrupt record carries no usable ts/hash
+/// to gate on, so no wait is enforced for it here; the NEXT failure's
+/// [`record_backoff`] repairs the count conservatively instead of resetting it.
 pub(crate) fn read_backoff(paths: &Paths) -> Option<(String, u32, u64)> {
-    let v: serde_json::Value =
-        serde_json::from_str(&fs::read_to_string(backoff_path(paths)).ok()?).ok()?;
-    let hash = v.get("hash")?.as_str()?.to_string();
-    let fails = v
-        .get("fails")
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0) as u32;
-    let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
-    Some((hash, fails, ts))
+    match read_backoff_raw(paths) {
+        BackoffRead::Parsed(hash, fails, ts) => Some((hash, fails, ts)),
+        BackoffRead::Absent | BackoffRead::Corrupt => None,
+    }
 }
 
 pub(crate) fn clear_backoff(paths: &Paths) {
@@ -70,11 +122,29 @@ pub(crate) fn clear_backoff(paths: &Paths) {
 /// increments on EVERY failure regardless of how the world hash moved — a failing
 /// action that mutates the world each beat would otherwise look "new" forever and
 /// reset the count, defeating the backoff. Only a SUCCESS ([`clear_backoff`])
-/// resets it. `policy` is the current POLICY hash ([`worldhash::policy_hash`]):
+/// resets it. `policy` is the current POLICY hash ([`crate::worldhash::policy_hash`]):
 /// the wait gate in [`crate::tick`] compares it to the live one so a steering
 /// edit (PLAYBOOK/goals) retries promptly, without resetting the counter.
 pub(crate) fn record_backoff(paths: &Paths, policy: &str) -> u32 {
-    let fails = read_backoff(paths).map_or(1, |(_, n, _)| n.saturating_add(1));
+    let fails = match read_backoff_raw(paths) {
+        BackoffRead::Absent => 1,
+        BackoffRead::Parsed(_, n, _) => n.saturating_add(1),
+        // Present but unparseable: the count is LOST, not zero. Resuming from
+        // a conservative count (instead of 1) keeps the exponential backoff
+        // failing CLOSED under state corruption — see BACKOFF_CORRUPT_FAILS.
+        BackoffRead::Corrupt => {
+            util::event(
+                Level::Warn,
+                "tick.guard_degraded",
+                &format!(
+                    "backoff state file is unparseable — resuming from a conservative fail \
+                     count ({BACKOFF_CORRUPT_FAILS}) instead of resetting the exponential backoff"
+                ),
+                &[],
+            );
+            BACKOFF_CORRUPT_FAILS
+        }
+    };
     let body =
         serde_json::json!({ "v": 1, "hash": policy, "fails": fails, "ts": util::now_unix() })
             .to_string();
@@ -150,7 +220,10 @@ fn flap_streak_threshold() -> u32 {
 /// beats is surfaced in the prompt (`FLAPPING SENSORS`) for the decider to fix
 /// (move the volatile fields to `.detail`) and warned once when crossing the
 /// threshold.
-pub(crate) fn update_flap(paths: &Paths) -> Vec<String> {
+pub(crate) fn update_flap(
+    paths: &Paths,
+    items: &std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
     let threshold = flap_streak_threshold();
     if threshold == 0 {
         return Vec::new();
@@ -167,19 +240,40 @@ pub(crate) fn update_flap(paths: &Paths) -> Vec<String> {
 
     let mut snaps = serde_json::Map::new();
     let mut flapping = Vec::new();
-    for (name, signal) in worldhash::world_items(paths) {
+    // `items` are the world items THIS beat sensed ([`crate::tick::sense`]),
+    // handed in rather than re-read from disk: a second worldhash pass here
+    // would duplicate the IO and could observe a DIFFERENT world than the one
+    // the beat is acting on (a snapshot rewritten in between).
+    for (name, signal) in items {
         let Some(name) = name.strip_prefix("snap:") else {
             continue; // policy files are the human's/decider's to edit — not flap
         };
+        let prev_streak = |e: &serde_json::Value| {
+            e.get("streak")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0) as u32
+        };
         let streak = match prev_snaps.get(name) {
-            Some(e) if e.get("last").and_then(|v| v.as_str()) == Some(signal.as_str()) => 0,
-            Some(e) => {
-                e.get("streak")
-                    .and_then(serde_json::Value::as_u64)
-                    .unwrap_or(0) as u32
-                    + 1
+            // Unchanged beat: DECAY the streak (−1) instead of resetting it
+            // to 0. A hard reset let an INTERMITTENT flapper (change, change,
+            // still, repeating) hover below the threshold forever while still
+            // costing a decide on most beats. Decrement keeps a net upward
+            // drift for any pattern that changes more often than it settles
+            // (halving would converge BELOW the default threshold of 5 for
+            // that same change-change-still pattern). Tradeoff: a genuinely
+            // settled sensor now takes `streak` quiet beats to be fully
+            // forgiven instead of one — acceptable, since it drops below the
+            // threshold (and out of the prompt) after the first quiet beat.
+            Some(e) if e.get("last").and_then(|v| v.as_str()) == Some(signal.as_str()) => {
+                prev_streak(e).saturating_sub(1)
             }
-            None => 0, // first sighting — nothing to compare against
+            // Changed signal — but only a WELL-FORMED prior entry proves a
+            // change happened. See the `_` arm for the corrupt case.
+            Some(e) if e.get("last").and_then(|v| v.as_str()).is_some() => prev_streak(e) + 1,
+            // First sighting, or an entry whose `last` is missing/corrupt:
+            // nothing trustworthy to compare against, so re-baseline at 0. A
+            // torn ledger must not inflate streaks by counting as a "change".
+            _ => 0,
         };
         if streak >= threshold {
             flapping.push(name.to_string());
@@ -266,13 +360,66 @@ pub(crate) fn decide_cap_per_hour() -> u64 {
     util::env_knob("LOOOP_MAX_DECIDES_PER_HOUR").unwrap_or(120)
 }
 
+/// Read the decide-attempt timestamps. Entries are validated INDIVIDUALLY so
+/// one corrupt entry costs only itself: deserializing `ts` straight into
+/// `Vec<u64>` blanked the WHOLE ledger on a single non-numeric value, silently
+/// resetting the hourly cap (fail-open). Whole-file corruption still empties
+/// the ledger (there is nothing to salvage) but WARNS instead of resetting
+/// the cap silently. An absent file is a fresh ledger, not corruption.
 pub(crate) fn read_decide_ledger(paths: &Paths) -> Vec<u64> {
-    fs::read_to_string(paths.decide_ledger())
-        .ok()
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
-        .and_then(|v| v.get("ts").cloned())
-        .and_then(|v| serde_json::from_value(v).ok())
-        .unwrap_or_default()
+    #[derive(serde::Deserialize)]
+    struct Ledger {
+        #[serde(default)]
+        ts: Vec<serde_json::Value>,
+    }
+    let raw = match fs::read_to_string(paths.decide_ledger()) {
+        Ok(raw) => raw,
+        // Absent file: a fresh ledger, not corruption — stay quiet.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        // Present but unreadable (EACCES/EIO/…): the ledger EXISTS, so silently
+        // returning empty would fail-open. WARN and restart empty (there is
+        // nothing to salvage), matching whole-file corruption discipline.
+        Err(e) => {
+            util::event(
+                Level::Warn,
+                "tick.guard_degraded",
+                &format!("the decide ledger is unreadable ({e}) — the hourly cap restarts empty"),
+                &[],
+            );
+            return Vec::new();
+        }
+    };
+    let ledger: Ledger = match serde_json::from_str(&raw) {
+        Ok(l) => l,
+        Err(e) => {
+            util::event(
+                Level::Warn,
+                "tick.guard_degraded",
+                &format!("the decide ledger is unparseable — the hourly cap restarts empty: {e}"),
+                &[],
+            );
+            return Vec::new();
+        }
+    };
+    let ts: Vec<u64> = ledger
+        .ts
+        .iter()
+        .filter_map(serde_json::Value::as_u64)
+        .collect();
+    if ts.len() != ledger.ts.len() {
+        util::event(
+            Level::Warn,
+            "tick.guard_degraded",
+            &format!(
+                "the decide ledger has {} non-numeric ts entry(ies) — skipped; the {} valid \
+                 attempt(s) still count against the hourly cap",
+                ledger.ts.len() - ts.len(),
+                ts.len()
+            ),
+            &[],
+        );
+    }
+    ts
 }
 
 /// Whether the hourly decide budget still has room. Returns `Err(retry_in_s)`
@@ -343,8 +490,13 @@ mod tests {
         assert!(util::now_unix() - ts[0] < 5);
     }
 
+    /// Sense the world and update the flap ledger, the way tick() wires them.
+    fn flap_beat(p: &Paths) -> Vec<String> {
+        update_flap(p, &crate::worldhash::world_items(p))
+    }
+
     #[test]
-    fn flapping_is_flagged_after_consecutive_signal_changes_and_resets() {
+    fn flapping_is_flagged_after_consecutive_signal_changes_and_decays() {
         let p = Paths::temp();
         fs::create_dir_all(p.snapshots_dir()).unwrap();
         let snap = p.snapshots_dir().join("sensor-noisy.json");
@@ -353,22 +505,149 @@ mod tests {
         // First sighting establishes a baseline; each subsequent CHANGE bumps
         // the streak. Threshold 5 ⇒ flagged on the 5th consecutive change.
         write(0);
-        assert!(update_flap(&p).is_empty());
+        assert!(flap_beat(&p).is_empty());
         for i in 1..=4u64 {
             write(i);
-            assert!(update_flap(&p).is_empty(), "streak {i} is below threshold");
+            assert!(flap_beat(&p).is_empty(), "streak {i} is below threshold");
         }
         write(5);
-        assert_eq!(update_flap(&p), vec!["sensor-noisy".to_string()]);
+        assert_eq!(flap_beat(&p), vec!["sensor-noisy".to_string()]);
         assert_eq!(
             flapping_sensors(&p),
             vec!["sensor-noisy".to_string()],
             "the prompt reads the same verdict from the ledger"
         );
 
-        // An unchanged beat resets the streak — a settled sensor is forgiven.
-        assert!(update_flap(&p).is_empty());
+        // An unchanged beat DECAYS the streak below the threshold — a settled
+        // sensor drops out of the prompt after one quiet beat.
+        assert!(flap_beat(&p).is_empty());
         assert!(flapping_sensors(&p).is_empty());
+    }
+
+    #[test]
+    fn intermittent_flapper_still_reaches_the_threshold() {
+        // Regression: reset-to-zero on any single unchanged beat let a
+        // change-change-still flapper (two decides out of every three beats)
+        // hover below the threshold forever. With decay (−1), the streak
+        // drifts +1 net per cycle and eventually crosses it.
+        let p = Paths::temp();
+        fs::create_dir_all(p.snapshots_dir()).unwrap();
+        let snap = p.snapshots_dir().join("sensor-burst.json");
+        let write = |n: u64| fs::write(&snap, format!(r#"{{"signal":{{"n":{n}}}}}"#)).unwrap();
+
+        write(0);
+        assert!(flap_beat(&p).is_empty(), "baseline");
+        let mut n = 0u64;
+        let mut flagged = false;
+        for _ in 0..10 {
+            // Two changed beats…
+            for _ in 0..2 {
+                n += 1;
+                write(n);
+                flagged |= !flap_beat(&p).is_empty();
+            }
+            // …then one still beat (the old hard reset zeroed the streak here).
+            flagged |= !flap_beat(&p).is_empty();
+        }
+        assert!(
+            flagged,
+            "a sustained change-change-still flapper must eventually be flagged"
+        );
+    }
+
+    #[test]
+    fn flap_entry_with_corrupt_last_counts_as_first_sighting() {
+        // Regression: an entry whose `last` key is missing/corrupt used to
+        // fall into the streak+1 arm — a torn ledger inflated streaks. It
+        // must re-baseline (streak 0) like a first sighting instead.
+        let p = Paths::temp();
+        fs::create_dir_all(p.snapshots_dir()).unwrap();
+        fs::write(
+            p.snapshots_dir().join("sensor-x.json"),
+            br#"{"signal":{"n":1}}"#,
+        )
+        .unwrap();
+        // Streak one below the threshold, `last` missing entirely: the old
+        // +1 arm would flag it this very beat.
+        fs::write(
+            p.flap_state(),
+            serde_json::json!({ "v": 1, "snaps": { "sensor-x": { "streak": 4 } } }).to_string(),
+        )
+        .unwrap();
+        assert!(
+            flap_beat(&p).is_empty(),
+            "corrupt entry must not be flagged"
+        );
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(p.flap_state()).unwrap()).unwrap();
+        assert_eq!(
+            v["snaps"]["sensor-x"]["streak"],
+            serde_json::json!(0),
+            "re-baselined at 0"
+        );
+    }
+
+    #[test]
+    fn update_flap_trusts_the_sensed_items_over_the_live_disk() {
+        // Regression for the duplicate-sense TOCTOU: update_flap takes the
+        // items the beat SENSED; a snapshot rewritten after the sense must
+        // not leak into this beat's ledger.
+        let p = Paths::temp();
+        fs::create_dir_all(p.snapshots_dir()).unwrap();
+        let snap = p.snapshots_dir().join("sensor-t.json");
+        fs::write(&snap, br#"{"signal":{"n":1}}"#).unwrap();
+        let items = crate::worldhash::world_items(&p);
+        // The world moves AFTER the sense…
+        fs::write(&snap, br#"{"signal":{"n":2}}"#).unwrap();
+        let _ = update_flap(&p, &items);
+        // …but the ledger records what was sensed, not what is on disk now.
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(p.flap_state()).unwrap()).unwrap();
+        assert_eq!(
+            v["snaps"]["sensor-t"]["last"],
+            serde_json::json!(r#"{"n":1}"#)
+        );
+    }
+
+    #[test]
+    fn corrupt_backoff_state_resumes_conservatively_instead_of_resetting() {
+        // Regression: a present-but-unparseable backoff file used to read as
+        // None, and record_backoff restarted the count at 1 — state
+        // corruption reset the exponential backoff (fail-open).
+        let p = Paths::temp();
+        let _ = crate::seed::ensure_dirs(&p);
+        fs::write(p.data_dir.join(".tick-backoff"), b"{not json").unwrap();
+        assert!(
+            read_backoff(&p).is_none(),
+            "a corrupt record carries no usable ts/hash to gate on"
+        );
+        assert_eq!(
+            record_backoff(&p, "h"),
+            BACKOFF_CORRUPT_FAILS,
+            "resume from the conservative count, not 1"
+        );
+        // The rewritten (now well-formed) record increments normally again.
+        assert_eq!(record_backoff(&p, "h"), BACKOFF_CORRUPT_FAILS + 1);
+    }
+
+    #[test]
+    fn decide_ledger_skips_corrupt_entries_but_keeps_valid_ones() {
+        // Regression: one non-numeric ts entry used to blank the WHOLE ledger,
+        // resetting the hourly decide cap (fail-open).
+        let p = Paths::temp();
+        fs::write(
+            p.decide_ledger(),
+            serde_json::json!({ "v": 1, "ts": [100, "garbage", 200, -1] }).to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            read_decide_ledger(&p),
+            vec![100, 200],
+            "valid entries survive a corrupt sibling"
+        );
+        // Whole-file corruption: nothing to salvage — empty (but warned).
+        fs::write(p.decide_ledger(), b"{not json").unwrap();
+        assert!(read_decide_ledger(&p).is_empty());
     }
 
     #[test]

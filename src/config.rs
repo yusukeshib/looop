@@ -149,6 +149,24 @@ impl Config {
     }
 }
 
+/// True for a shell `NAME=value` prefix token — the rule the shell itself
+/// uses to decide a leading token is an environment assignment rather than
+/// the command: NAME must be an identifier, `[A-Za-z_][A-Za-z0-9_]*` (so
+/// `9X=1` is NOT an assignment — it is the command). SINGLE-SOURCED here and
+/// shared by `first_command_token` (the runner label), deps.rs (the binary
+/// preflight) and init.rs (runner inference) — the three used to carry
+/// divergent private copies that disagreed on digit-leading names.
+pub(crate) fn is_env_assign(tok: &str) -> bool {
+    match tok.split_once('=') {
+        Some((name, _)) => {
+            !name.is_empty()
+                && !name.starts_with(|c: char| c.is_ascii_digit())
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        }
+        None => false,
+    }
+}
+
 /// First real command token of a shell command line: skips leading `KEY=VAL`
 /// env assignments and a leading `env` (with its flags), so an env-prefixed
 /// wiring labels as the actual program, not `FOO=1`/`env`. Whitespace-token
@@ -157,11 +175,8 @@ impl Config {
 fn first_command_token(cmd: &str) -> Option<String> {
     let mut after_env = false;
     for tok in cmd.split_whitespace() {
-        // KEY=VAL assignment (identifier before the `=`): env prefix, skip.
-        if let Some((key, _)) = tok.split_once('=')
-            && !key.is_empty()
-            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
+        // KEY=VAL assignment (shell identifier before the `=`): env prefix, skip.
+        if is_env_assign(tok) {
             continue;
         }
         if tok == "env" {
@@ -231,7 +246,25 @@ pub fn write(paths: &Paths, contents: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{first_command_token, strip_fmt_seam};
+    use super::{first_command_token, is_env_assign, strip_fmt_seam};
+
+    #[test]
+    fn env_assign_follows_the_shell_identifier_rule() {
+        // Plain assignments are recognized…
+        assert!(is_env_assign("FOO=1"));
+        assert!(is_env_assign("_x9=whatever"));
+        // …but a digit-leading name is NOT an assignment to the shell —
+        // `9X=1` is the command itself (the pin the three old copies
+        // disagreed on).
+        assert!(!is_env_assign("9X=1"));
+        // No `=` / empty name: not an assignment either.
+        assert!(!is_env_assign("claude"));
+        assert!(!is_env_assign("=x"));
+
+        // And the label walk honors the same rule end-to-end.
+        assert_eq!(first_command_token("FOO=1 cmd -p").unwrap(), "cmd");
+        assert_eq!(first_command_token("9X=1 cmd").unwrap(), "9X=1");
+    }
 
     #[test]
     fn runner_label_skips_env_prefixes() {

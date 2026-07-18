@@ -138,13 +138,25 @@ fn fingerprints(paths: &Paths) -> std::collections::BTreeMap<&'static str, Strin
     }
     m.insert("goals", util::content_hash(&goals));
 
-    // Snapshots: only the wake SIGNAL (matching world_hash) so volatile `.detail`
-    // never registers as a change. `snapshots()` returns sorted keys.
+    // Snapshots: mirror world_hash's per-file reduction — the wake SIGNAL for
+    // JSON files (volatile `.detail` never registers as a change) and the raw
+    // CONTENT (hashed) for non-JSON files. `snapshots()` cannot be used here:
+    // it silently skips non-JSON files, while world_hash consumes their raw
+    // bytes — `wait` would sleep through a snapshot that became, or changed
+    // as, non-JSON even though the world hash said "changed".
     let mut snaps = Vec::new();
-    for (k, v) in snapshots(paths) {
-        snaps.extend_from_slice(k.as_bytes());
+    for p in util::sorted_glob(&paths.snapshots_dir(), "json") {
+        let Some(stem) = p.file_stem().map(|s| s.to_string_lossy().to_string()) else {
+            continue;
+        };
+        let raw = fs::read(&p).unwrap_or_default();
+        let reduced = match serde_json::from_slice::<serde_json::Value>(&raw) {
+            Ok(v) => crate::worldhash::wake_signal(v).to_string(),
+            Err(_) => util::content_hash(&raw), // non-JSON: track the raw bytes
+        };
+        snaps.extend_from_slice(stem.as_bytes());
         snaps.push(b'\n');
-        snaps.extend_from_slice(crate::worldhash::wake_signal(v).to_string().as_bytes());
+        snaps.extend_from_slice(reduced.as_bytes());
         snaps.push(b'\n');
     }
     m.insert("snapshots", util::content_hash(&snaps));
@@ -173,12 +185,22 @@ pub(crate) fn wait_for_change(paths: &Paths, filter: WaitFilter) -> Vec<String> 
     if !mailbox::pending(paths).is_empty() {
         return vec!["asks".to_string()];
     }
-    let baseline = fingerprints(paths);
+    // Take the STAMP first, then the content fingerprints. A change landing
+    // between the two is then baked into the BASELINE but not the stamp: the
+    // first poll sees a stale stamp, recomputes the fingerprints, finds no
+    // category diff (the baseline already contains the change) and keeps
+    // waiting — correct, just one wasted recompute. The REVERSE order
+    // (fingerprints first) failed in the dangerous direction: a change
+    // landing in between (journal append, goal edit, snapshot publish) was in
+    // the stamp but NOT the baseline, so no poll ever recomputed and the
+    // change went unreported until the NEXT one.
     let mut last_stamp = probe_stamp(paths);
-    // Close the pre-baseline race ONCE, not per poll: an ask that landed
-    // between the pending check above and the stamp just taken is baked into
-    // BOTH (it would never register as a diff), so re-check the mailbox now.
-    // Anything landing AFTER the stamp moves the stamp and is caught below.
+    let baseline = fingerprints(paths);
+    // Close the pre-baseline ask race ONCE, not per poll: an ask that landed
+    // between the pending check above and the baseline just taken is baked
+    // into the fingerprints (it would never register as a diff), so re-check
+    // the mailbox now. Anything landing AFTER the stamp moves the stamp and
+    // is caught below.
     if !mailbox::pending(paths).is_empty() {
         return vec!["asks".to_string()];
     }
@@ -522,6 +544,62 @@ mod tests {
         assert_eq!(
             changed_categories(&after_ask, &fingerprints(&p)),
             vec!["journal"]
+        );
+    }
+
+    #[test]
+    fn snapshots_fingerprint_tracks_non_json_snapshot_files() {
+        // Regression: the snapshots fingerprint used to be built from
+        // snapshots(), which silently skips non-JSON files — while world_hash
+        // consumes their raw bytes. `wait` would sleep through a snapshot
+        // becoming, or changing as, non-JSON even though the hash moved.
+        let p = Paths::temp();
+        let _ = crate::seed::ensure_dirs(&p);
+        fs::create_dir_all(p.snapshots_dir()).unwrap();
+        let f = p.snapshots_dir().join("sensor-raw.json");
+
+        let base = fingerprints(&p);
+        fs::write(&f, b"not json AAAA").unwrap();
+        let a = fingerprints(&p);
+        assert_eq!(
+            changed_categories(&base, &a),
+            vec!["snapshots"],
+            "a snapshot BECOMING non-JSON registers"
+        );
+        fs::write(&f, b"not json BBBB").unwrap();
+        assert_eq!(
+            changed_categories(&a, &fingerprints(&p)),
+            vec!["snapshots"],
+            "a non-JSON snapshot CHANGING registers (same length, new content)"
+        );
+    }
+
+    #[test]
+    fn wait_baseline_takes_the_stamp_before_the_fingerprints() {
+        // Regression for the wait_for_change baseline race: the metadata
+        // stamp must be taken BEFORE the content fingerprints. With the old
+        // order (fingerprints first), a write landing between the two was in
+        // the stamp but absent from the baseline — the poll loop never saw
+        // the stamp move, never recomputed, and the change stayed unreported
+        // until the NEXT write. This exercises the same interleaving against
+        // the fixed order: the stale stamp forces a recompute, and the
+        // recompute correctly reports no diff (the baseline already contains
+        // the write) — no missed wake, no false wake.
+        let p = Paths::temp();
+        let _ = crate::seed::ensure_dirs(&p);
+
+        let stamp = probe_stamp(&p); // 1. stamp, as wait_for_change now does
+        fs::write(p.journal(), b"progress\n").unwrap(); // 2. interleaved write
+        let baseline = fingerprints(&p); // 3. baseline
+
+        assert_ne!(
+            stamp,
+            probe_stamp(&p),
+            "the stale stamp forces a fingerprint recompute on the first poll"
+        );
+        assert!(
+            changed_categories(&baseline, &fingerprints(&p)).is_empty(),
+            "the recompute reports no diff — the baseline already contains the write"
         );
     }
 
