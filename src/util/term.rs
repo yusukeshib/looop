@@ -62,11 +62,14 @@ pub(crate) fn display_width(chars: impl Iterator<Item = char>) -> usize {
 /// `safe_segment` allows non-ASCII ids, so 1-column-per-char is NOT a safe
 /// assumption here.
 ///
-/// NB: only CSI sequences (`ESC [ … <letter>`) are recognized. An OSC sequence
-/// (`ESC ] … BEL/ST`) has no alphabetic final byte before its terminator, so
-/// the copy-through loop would swallow text to the end of the line. That's
-/// fine here BY CONSTRUCTION: every input is looop's own self-generated SGR
-/// coloring (the `code!` constants), never OSC — don't feed this foreign ANSI.
+/// NB: only SGR CSI sequences (`ESC [ … m`) are preserved; every other
+/// escape is DROPPED (ESC + its bytes skipped, never copied). This is
+/// defense-in-depth: every input is looop's own self-generated SGR coloring
+/// (the `code!` constants), but stripping non-SGR escapes prevents
+/// terminal-control injection if untrusted ANSI ever reaches here, and — for
+/// non-CSI escapes like OSC (`ESC ] … BEL/ST`, no alphabetic final byte) —
+/// prevents the copy-through loop from swallowing following text. Dropped
+/// escapes still count as zero width, so the column budget is unaffected.
 pub fn clip_ansi(s: &str, max: usize) -> String {
     let mut out = String::with_capacity(s.len());
     let mut width = 0usize;
@@ -75,14 +78,51 @@ pub fn clip_ansi(s: &str, max: usize) -> String {
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
         if c == '\x1b' {
-            saw_esc = true;
-            out.push(c);
-            // Copy the CSI sequence through to its final byte (a letter).
-            for c2 in chars.by_ref() {
-                out.push(c2);
-                if c2.is_ascii_alphabetic() {
-                    break;
+            // Only SGR CSI (`ESC [ … m`) survives; all other escapes are
+            // dropped, advancing past their bytes so they can't leak as
+            // literal text or inject terminal-control sequences.
+            match chars.next() {
+                Some('[') => {
+                    // CSI: scan to the final byte (an ASCII letter); keep the
+                    // sequence only if it is SGR (`m`).
+                    let mut seq = String::from("\x1b[");
+                    let mut final_byte = None;
+                    for c2 in chars.by_ref() {
+                        seq.push(c2);
+                        if c2.is_ascii_alphabetic() {
+                            final_byte = Some(c2);
+                            break;
+                        }
+                    }
+                    if final_byte == Some('m') {
+                        saw_esc = true;
+                        out.push_str(&seq);
+                    }
                 }
+                // Non-CSI escape: advance past its bytes so they can't leak.
+                Some(d) => {
+                    if matches!(d, ']' | 'P' | 'X' | '^' | '_') {
+                        // OSC/DCS/SOS/PM/APC “string” escapes: terminated by
+                        // BEL or ST (`ESC \`). String content may contain
+                        // letters, so we must NOT stop at an alphabetic byte.
+                        let mut prev_esc = false;
+                        for c2 in chars.by_ref() {
+                            if c2 == '\x07' {
+                                break;
+                            }
+                            if prev_esc && c2 == '\\' {
+                                break;
+                            }
+                            prev_esc = c2 == '\x1b';
+                        }
+                    } else if matches!(d, 'N' | 'O') {
+                        // SS2/SS3: a single final byte follows the designator.
+                        let _ = chars.next();
+                    }
+                    // else: `d` was itself the final byte of a 2-byte escape
+                    // (`ESC =`, `ESC 7`, …) — nothing more to skip.
+                }
+                None => {}
             }
             continue;
         }
@@ -217,6 +257,28 @@ mod tests {
         );
         // A cut after a color start appends a reset so color can't bleed.
         assert_eq!(clip_ansi("\x1b[31mredredred", 3), "\x1b[31mred\x1b[0m");
+    }
+
+    #[test]
+    fn clip_ansi_drops_non_sgr_escapes() {
+        // Only SGR CSI (`ESC [ … m`) survives; other escapes are stripped so
+        // untrusted ANSI can't inject terminal-control sequences, and
+        // non-CSI escapes (OSC) can't swallow following text.
+        // SGR color codes are preserved whole.
+        assert_eq!(clip_ansi("\x1b[31mred\x1b[0m", 6), "\x1b[31mred\x1b[0m");
+        // A non-SGR CSI (erase-line `ESC [ 2 K`) is dropped, not copied.
+        assert_eq!(clip_ansi("\x1b[2Khello", 5), "hello");
+        // An OSC sequence (set-title `ESC ] 0 ; t BEL`) is dropped and does
+        // NOT swallow the text after it.
+        assert_eq!(clip_ansi("\x1b]0;t\x07hi", 2), "hi");
+        // A non-SGR escape between SGR codes doesn't bleed or reset tracking.
+        assert_eq!(clip_ansi("\x1b[31m\x1b[2Kab", 2), "\x1b[31mab");
+        // Truncation after an SGR still appends a reset; a dropped non-SGR
+        // escape before the cut does not change that.
+        assert_eq!(
+            clip_ansi("\x1b[2K\x1b[31mredredred", 3),
+            "\x1b[31mred\x1b[0m"
+        );
     }
 
     #[test]
