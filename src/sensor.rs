@@ -75,6 +75,11 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
                     && Instant::now() >= d
                 {
                     kill_group(child.id());
+                    // Portable fallback: kill_group shells out to `kill(1)`
+                    // (unix); if that ever fails or is a no-op, killing the
+                    // direct child keeps wait() from blocking forever
+                    // (redundant ESRCH on the happy path is harmless).
+                    let _ = child.kill();
                     let _ = child.wait();
                     break 124;
                 }
@@ -85,6 +90,7 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
                 // process GROUP, so kill the group, not just the direct child
                 // (helpers it forked must die with it).
                 kill_group(child.id());
+                let _ = child.kill(); // same portable fallback as the timeout path
                 let _ = child.wait();
                 break 1;
             }

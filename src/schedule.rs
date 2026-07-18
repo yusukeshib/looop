@@ -113,7 +113,7 @@ pub fn drop(paths: &Paths, name: &str) -> Result<String> {
 /// Whether a parsed schedule is structurally INVALID: both or neither of
 /// `at`/`every_s`, or a recurring period of 0 (which would bump the world hash
 /// every second — a flapping signal). Invalid entries are surfaced (stable
-/// "invalid" signal + a Warn event from [`list`]), never silently dropped.
+/// "invalid" signal + a stderr warning from [`list`]), never silently dropped.
 fn is_invalid(s: &Schedule) -> bool {
     match (s.at, s.every_s) {
         (Some(_), None) => false,
@@ -123,8 +123,8 @@ fn is_invalid(s: &Schedule) -> bool {
 }
 
 /// All schedules, sorted by name. An unparseable file or a structurally
-/// invalid record is surfaced via a Warn event (naming the file) instead of
-/// silently skipped; invalid-but-parseable records are still RETURNED so their
+/// invalid record is surfaced via a stderr warning (naming the file — stdout
+/// stays machine-clean for `--json` consumers) instead of silently skipped; invalid-but-parseable records are still RETURNED so their
 /// stable "invalid" signal reaches the world hash and the decider can fix them.
 pub fn list(paths: &Paths) -> Vec<(String, Schedule)> {
     let store = FileStore::new(paths);

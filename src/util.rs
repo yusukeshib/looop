@@ -322,12 +322,15 @@ pub fn write_atomic_mode(
     let res = (|| {
         let mut f = std::fs::File::create(&tmp)?;
         f.write_all(contents)?;
-        f.sync_all()?;
+        // Mode BEFORE sync_all: the fsync then covers the permission metadata
+        // too, so a crash right after the rename can't resurrect the file
+        // without its mode (e.g. a sensor script losing its exec bit).
         #[cfg(unix)]
         if let Some(mode) = mode {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+            f.set_permissions(std::fs::Permissions::from_mode(mode))?;
         }
+        f.sync_all()?;
         std::fs::rename(&tmp, path)?;
         // Durability of the rename itself: fsync the parent dir so the entry
         // survives a crash. Best-effort — the data bytes are already synced.
