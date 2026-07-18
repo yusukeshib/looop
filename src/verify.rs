@@ -23,6 +23,7 @@
 //! Workers without a declared `verify` behave exactly as before.
 
 use std::fs;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -139,41 +140,116 @@ pub fn reconcile(paths: &Paths) {
 
 fn run_one(paths: &Paths, cmd_file: &std::path::Path) -> VerifyResult {
     let cmd = fs::read_to_string(cmd_file).unwrap_or_default();
-    // `timeout` guards the pulse beat; run in the data dir like workers do.
-    let out = Command::new("timeout")
-        .arg(format!("{}s", timeout_secs()))
-        .arg("bash")
+    run_cmd(&paths.data_dir, &cmd, timeout_secs())
+}
+
+/// Run `cmd` under `bash -c` in `cwd` with a NATIVE timeout. No `timeout(1)`
+/// dependency: stock macOS ships without it (coreutils-only), which used to
+/// make every declared verify fail with "spawn failed" — the exact silent
+/// half-wiring the deps preflight exists to prevent. Output goes to a temp
+/// file (not a pipe) so a chatty command can never dead-lock the beat on a
+/// full pipe buffer; we poll `try_wait` and kill on deadline.
+fn run_cmd(cwd: &std::path::Path, cmd: &str, timeout: u64) -> VerifyResult {
+    let now = || crate::util::now_unix();
+    let fail = |output: String| VerifyResult {
+        ok: false,
+        exit_code: None,
+        output,
+        ts: now(),
+    };
+
+    // stdout+stderr merged into one temp file, in order. The name carries a
+    // process-wide counter, not just a timestamp — two runs in the same second
+    // (parallel tests, back-to-back verifies) must never share a capture file.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let out_path = std::env::temp_dir().join(format!(
+        "looop-verify-{}-{}.out",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let Ok(out_file) = fs::File::create(&out_path) else {
+        return fail("verify: cannot create output capture file".into());
+    };
+    let Ok(err_file) = out_file.try_clone() else {
+        return fail("verify: cannot clone output capture file".into());
+    };
+
+    let child = Command::new("bash")
         .arg("-c")
-        .arg(&cmd)
-        .current_dir(&paths.data_dir)
-        .output();
-    match out {
-        Ok(o) => {
-            let mut combined = String::from_utf8_lossy(&o.stdout).into_owned();
-            combined.push_str(&String::from_utf8_lossy(&o.stderr));
-            let tail = if combined.len() > OUTPUT_TAIL_BYTES {
-                let mut start = combined.len() - OUTPUT_TAIL_BYTES;
-                while !combined.is_char_boundary(start) {
-                    start += 1;
+        .arg(cmd)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(out_file)
+        .stderr(err_file)
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            let _ = fs::remove_file(&out_path);
+            return fail(format!("verify spawn failed: {e}"));
+        }
+    };
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait(); // reap; kill is racy but wait is not
+                    break None;
                 }
-                combined[start..].to_string()
-            } else {
-                combined
-            };
-            VerifyResult {
-                ok: o.status.success(),
-                exit_code: o.status.code(),
-                output: tail,
-                ts: crate::util::now_unix(),
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => {
+                // A failed status probe leaves the child state unknown. Kill and
+                // reap defensively so a verifier never escapes this deadline loop.
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
             }
         }
-        Err(e) => VerifyResult {
-            ok: false,
-            exit_code: None,
-            output: format!("verify spawn failed: {e}"),
-            ts: crate::util::now_unix(),
+    };
+
+    let mut tail = read_tail_file(&out_path, OUTPUT_TAIL_BYTES);
+    let _ = fs::remove_file(&out_path);
+    match status {
+        Some(s) => VerifyResult {
+            ok: s.success(),
+            exit_code: s.code(),
+            output: tail,
+            ts: now(),
         },
+        None => {
+            if !tail.is_empty() && !tail.ends_with('\n') {
+                tail.push('\n');
+            }
+            tail.push_str(&format!(
+                "verify timed out after {timeout}s (LOOOP_VERIFY_TIMEOUT_SECS) — killed"
+            ));
+            fail(tail)
+        }
     }
+}
+
+/// The UTF-8-safe tail of a file, capped at `max` bytes.
+fn read_tail_file(path: &std::path::Path, max: usize) -> String {
+    let Ok(mut file) = fs::File::open(path) else {
+        return String::new();
+    };
+    let Ok(len) = file.metadata().map(|meta| meta.len()) else {
+        return String::new();
+    };
+    let take = len.min(max as u64) as usize;
+    if file.seek(SeekFrom::End(-(take as i64))).is_err() {
+        return String::new();
+    }
+    let mut tail = Vec::with_capacity(take);
+    if file.read_to_end(&mut tail).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&tail).into_owned()
 }
 
 #[cfg(test)]
@@ -225,6 +301,40 @@ mod tests {
         assert!(!r.ok);
         assert_eq!(r.exit_code, Some(3));
         assert!(r.output.contains("missing-artifact"));
+    }
+
+    #[test]
+    fn run_cmd_kills_on_deadline_without_external_timeout_binary() {
+        // The native timeout must work where coreutils `timeout` is absent
+        // (stock macOS). A 1s deadline on a 30s sleep must come back promptly,
+        // marked failed, with the timeout named in the output.
+        let paths = Paths::temp();
+        let t0 = std::time::Instant::now();
+        let r = run_cmd(&paths.data_dir, "echo before; sleep 30", 1);
+        assert!(t0.elapsed().as_secs() < 10, "must not wait out the sleep");
+        assert!(!r.ok);
+        assert_eq!(r.exit_code, None, "a killed command has no exit code");
+        assert!(r.output.contains("before"), "pre-kill output is kept");
+        assert!(r.output.contains("timed out after 1s"));
+    }
+
+    #[test]
+    fn run_cmd_merges_stdout_and_stderr_and_succeeds() {
+        let paths = Paths::temp();
+        let r = run_cmd(&paths.data_dir, "echo out; echo err >&2", 10);
+        assert!(r.ok);
+        assert_eq!(r.exit_code, Some(0));
+        assert!(r.output.contains("out") && r.output.contains("err"));
+    }
+
+    #[test]
+    fn read_tail_file_is_bounded_and_lossy() {
+        let paths = Paths::temp();
+        fs::create_dir_all(&paths.data_dir).unwrap();
+        let path = paths.data_dir.join("output");
+        fs::write(&path, b"prefix\xfftail").unwrap();
+        let tail = read_tail_file(&path, 5);
+        assert_eq!(tail, "\u{fffd}tail");
     }
 
     #[test]

@@ -176,6 +176,41 @@ impl Paths {
     pub fn tells_dir(&self) -> PathBuf {
         self.data_dir.join("tells")
     }
+    /// Rolling history of PLAYBOOK.md: before every overwrite (`write_playbook`
+    /// — the decider's OR the human's) the previous body is snapshotted to
+    /// `playbook.d/<ts>.md`. The PLAYBOOK is the most valuable human-authored
+    /// artifact in the loop and the write API is whole-file replacement, so one
+    /// bad rewrite must never be able to destroy it unrecoverably. Pruned to
+    /// `LOOOP_PLAYBOOK_KEEP` generations (default 20).
+    pub fn playbook_history_dir(&self) -> PathBuf {
+        self.data_dir.join("playbook.d")
+    }
+    /// The output tail of the LAST executed `run_shell` move
+    /// (`{v,ts,cmd,exit_code,output}`). Surfaced in the next decide prompt
+    /// (`RUN_SHELL OUTPUT`) so a query's result actually reaches the decider —
+    /// without this, run_shell stdout went nowhere and "query" moves were
+    /// structurally useless. Consumed (removed) when the next decision executes.
+    pub fn last_shell(&self) -> PathBuf {
+        self.data_dir.join(".last-shell.json")
+    }
+    /// Per-snapshot signal-change streaks (`{v,snaps:{name:{last,streak}}}`).
+    /// A sensor whose wake SIGNAL changes on every consecutive beat defeats
+    /// both the unchanged-world skip and the failure backoff (the hash never
+    /// settles), so the whole economics of the loop hinge on catching it. The
+    /// beat updates this ledger after sensing; a streak at/over the threshold
+    /// is surfaced in the prompt (`FLAPPING SENSORS`) so the decider fixes the
+    /// sensor instead of burning a decide per beat forever.
+    pub fn flap_state(&self) -> PathBuf {
+        self.data_dir.join(".signal-flap.json")
+    }
+    /// Rolling ledger of decide attempts (`{v,ts:[unix,…]}`), pruned to the
+    /// last hour. Backs the global spend cap (`LOOOP_MAX_DECIDES_PER_HOUR`):
+    /// the skip gate and backoff bound a QUIET loop's cost, but nothing else
+    /// bounds a noisy one (a flapping sensor + cadence nudges can reach one
+    /// decide per 5s), so this is the hard ceiling underneath both.
+    pub fn decide_ledger(&self) -> PathBuf {
+        self.data_dir.join(".decide-ledger.json")
+    }
 
     /// A throwaway `Paths` rooted at a freshly-created temp data dir. Test-only.
     #[cfg(test)]

@@ -75,7 +75,10 @@ struct RunnerPreset {
 const PRESETS: &[RunnerPreset] = &[
     RunnerPreset {
         name: "claude",
-        tick: "claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model sonnet \"$(cat {{prompt_file}})\"",
+        // Tick prompt via STDIN (no {{prompt_file}}): a single argv string is
+        // capped at 128KiB on Linux (MAX_ARG_STRLEN) and the tick prompt can
+        // exceed it. Workers keep the placeholder (stdin is their attach TTY).
+        tick: "claude -p --output-format stream-json --verbose --dangerously-skip-permissions --model sonnet",
         worker: "claude --dangerously-skip-permissions --model opus \"$(cat {{prompt_file}})\"",
     },
     RunnerPreset {

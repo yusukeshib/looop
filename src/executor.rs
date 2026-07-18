@@ -216,6 +216,65 @@ pub fn warn_if_interrupted(paths: &Paths) -> bool {
     true
 }
 
+/// The last `max` chars of `s` (UTF-8 safe).
+fn tail_chars(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    s.chars().skip(n - max).collect()
+}
+
+/// How many PLAYBOOK generations `playbook.d/` retains (`LOOOP_PLAYBOOK_KEEP`,
+/// default 20; 0 = keep all).
+fn playbook_keep() -> usize {
+    std::env::var("LOOOP_PLAYBOOK_KEEP")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(20)
+}
+
+/// Snapshot the CURRENT PLAYBOOK.md into `playbook.d/<ts>.md` before an
+/// overwrite, then prune the history to [`playbook_keep`] generations. A
+/// missing playbook snapshots nothing; failures are best-effort (the history is
+/// a safety net, never a reason to block the write itself).
+fn next_playbook_snapshot_path(dir: &std::path::Path, stamp: &str) -> std::path::PathBuf {
+    let mut path = dir.join(format!("{stamp}.md"));
+    let mut n = 1;
+    while path.exists() {
+        // Keep collision names lexicographically chronological: pruning sorts
+        // paths, so an unpadded `-10` must not sort before `-2`.
+        path = dir.join(format!("{stamp}-{n:04}.md"));
+        n += 1;
+    }
+    path
+}
+
+fn snapshot_playbook(paths: &Paths) {
+    let Ok(current) = fs::read_to_string(paths.playbook()) else {
+        return; // no playbook yet — nothing to preserve
+    };
+    let dir = paths.playbook_history_dir();
+    let _ = fs::create_dir_all(&dir);
+    // One move per beat makes same-second collisions unlikely; disambiguate
+    // with a numeric suffix anyway so a snapshot is never silently clobbered.
+    let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let path = next_playbook_snapshot_path(&dir, &stamp);
+    let _ = fs::write(&path, &current);
+
+    let keep = playbook_keep();
+    if keep == 0 {
+        return;
+    }
+    let mut snaps = crate::util::sorted_glob(&dir, "md");
+    if snaps.len() > keep {
+        let excess = snaps.len() - keep;
+        for old in snaps.drain(..excess) {
+            let _ = fs::remove_file(old);
+        }
+    }
+}
+
 fn with_trailing_newline(body: &str) -> String {
     if body.ends_with('\n') {
         body.to_string()
@@ -256,11 +315,33 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
                 .output()
                 .with_context(|| format!("run_shell: {cmd}"))?;
             let code = out.status.code().unwrap_or(-1);
+            // Capture the output TAIL and persist it for the NEXT decide prompt
+            // (`RUN_SHELL OUTPUT`). Without this the stdout of a "query" move
+            // went nowhere — the decider could ask the world a question but
+            // never hear the answer. The tick arms a short cadence nudge after
+            // a run_shell so the follow-up beat actually happens (the command's
+            // output alone does not move the world hash).
+            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
+            combined.push_str(&String::from_utf8_lossy(&out.stderr));
+            let tail = tail_chars(&combined, 2048);
+            let body = serde_json::json!({
+                "v": 1,
+                "ts": crate::util::now_unix(),
+                "cmd": cmd,
+                "exit_code": code,
+                "output": tail,
+            });
+            let _ = fs::write(paths.last_shell(), body.to_string());
             let why = if reason.is_empty() { cmd } else { reason };
             if out.status.success() {
                 Ok(format!("run-shell · {why}"))
             } else {
-                bail!("run_shell exited {code}: {why}");
+                // Surface the tail in the error too, so LAST FAILURE names the
+                // actual cause instead of just the exit code.
+                bail!(
+                    "run_shell exited {code}: {why}\n{}",
+                    tail_chars(&combined, 512)
+                );
             }
         }
 
@@ -287,6 +368,11 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
         }
 
         Action::WritePlaybook { body } => {
+            // The write API is whole-file replacement and the PLAYBOOK is the
+            // most valuable human-authored artifact in the loop, so snapshot
+            // the previous body FIRST — one bad rewrite (the decider's or a
+            // fat-fingered human's) must never be an unrecoverable loss.
+            snapshot_playbook(paths);
             FileStore::new(paths).write_atomic(&Key::Playbook, &with_trailing_newline(body))?;
             Ok("write-playbook".into())
         }
@@ -415,6 +501,12 @@ pub fn consume_decision(paths: &Paths) -> Option<Result<Decided>> {
         } else {
             Some(decision.journal.as_str())
         };
+        // The stored run_shell output describes the PREVIOUS move, and the
+        // prompt behind THIS decision already carried it — consume it now so
+        // it is shown exactly once (a run_shell below re-creates it fresh).
+        // Deliberately HERE and not in run_action: a manual CLI verb executed
+        // between two beats must not eat the output before the decider sees it.
+        let _ = fs::remove_file(paths.last_shell());
         let summary = run_action(paths, &decision.action, journal)?;
         let journal_line = if decision.journal.trim().is_empty() {
             summary.clone()
@@ -657,6 +749,124 @@ mod tests {
         assert_eq!(goal_of(&a), Some("triage".to_string()));
         assert_eq!(kind(&a), "kill");
         assert!(!is_non_idempotent(&a));
+    }
+
+    #[test]
+    fn playbook_overwrite_snapshots_the_previous_body() {
+        let p = Paths::temp();
+        // No playbook yet: the first write has nothing to preserve.
+        run_action(
+            &p,
+            &Action::WritePlaybook {
+                body: "v1 rules".into(),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            crate::util::sorted_glob(&p.playbook_history_dir(), "md").is_empty(),
+            "nothing to snapshot before the first playbook"
+        );
+
+        // Overwriting preserves the OLD body in playbook.d/.
+        run_action(
+            &p,
+            &Action::WritePlaybook {
+                body: "v2 rules".into(),
+            },
+            None,
+        )
+        .unwrap();
+        let snaps = crate::util::sorted_glob(&p.playbook_history_dir(), "md");
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(fs::read_to_string(&snaps[0]).unwrap(), "v1 rules\n");
+        assert_eq!(
+            fs::read_to_string(p.playbook()).unwrap(),
+            "v2 rules\n",
+            "the live playbook carries the new body"
+        );
+    }
+
+    #[test]
+    fn playbook_snapshot_collision_names_sort_chronologically() {
+        let p = Paths::temp();
+        fs::write(p.playbook(), "original\n").unwrap();
+        let dir = p.playbook_history_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S").to_string();
+        fs::write(dir.join(format!("{stamp}.md")), "base").unwrap();
+        for n in 1..=10 {
+            fs::write(dir.join(format!("{stamp}-{n:04}.md")), "collision").unwrap();
+        }
+
+        let next = next_playbook_snapshot_path(&dir, &stamp);
+        assert_eq!(
+            next.file_name().unwrap().to_string_lossy(),
+            format!("{stamp}-0011.md")
+        );
+    }
+
+    #[test]
+    fn run_shell_output_is_captured_and_consumed_once() {
+        let p = Paths::temp();
+        run_action(
+            &p,
+            &Action::RunShell {
+                cmd: "echo query-result".into(),
+                reason: "probe".into(),
+            },
+            None,
+        )
+        .unwrap();
+        let raw = fs::read_to_string(p.last_shell()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["exit_code"], 0);
+        assert!(v["output"].as_str().unwrap().contains("query-result"));
+
+        // A MANUAL verb between beats must NOT eat it — the decider hasn't
+        // seen it yet (the prompt is built at decide time).
+        run_action(
+            &p,
+            &Action::Noop {
+                reason: "manual".into(),
+            },
+            None,
+        )
+        .unwrap();
+        assert!(
+            p.last_shell().is_file(),
+            "a manual action leaves the record for the decider"
+        );
+
+        // The next DECISION consumes it (its prompt carried the output).
+        fs::write(
+            p.data_dir.join(DECISION_FILE),
+            r#"{"action":"noop","reason":"seen it","journal":"ok"}"#,
+        )
+        .unwrap();
+        consume_decision(&p).unwrap().unwrap();
+        assert!(!p.last_shell().is_file(), "consumed by the next decision");
+    }
+
+    #[test]
+    fn failed_run_shell_records_output_and_names_it_in_the_error() {
+        let p = Paths::temp();
+        let err = run_action(
+            &p,
+            &Action::RunShell {
+                cmd: "echo boom >&2; exit 7".into(),
+                reason: String::new(),
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("boom"),
+            "LAST FAILURE sees the cause"
+        );
+        let raw = fs::read_to_string(p.last_shell()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["exit_code"], 7);
     }
 
     #[test]

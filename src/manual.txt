@@ -54,13 +54,20 @@ HOW IT RUNS
   `looop state`, `looop answer`, `looop goal write`.
 
 ONE BEAT (sense → decide → act)
-  Each beat the pulse wipes + re-runs every `sensors/*.sh` so `snapshots/`
-  reflects the world. If the world is UNCHANGED since last beat it stops there —
-  no LLM call, nearly free. When it changed, looop hands the PLAYBOOK + goals +
-  readings + pending asks to the configured `tick` runner, which emits ONE typed
-  action; looop executes it (and gates risky ones). It is the SOLE senser +
-  decider (single-instance flock), so beats never race. Cadence is one interval
-  (config `interval`, default 60s); a move may nudge the next beat sooner.
+  Each beat the pulse re-runs every `sensors/*.sh` (a snapshot still fresh under
+  a declared `# looop:interval=N` cadence is kept; anything a live sensor does
+  not own is pruned) so `snapshots/` reflects the world. If the world is
+  UNCHANGED since last beat it stops there — no LLM call, nearly free. When it
+  changed, looop hands the PLAYBOOK + goals + readings + pending asks to the
+  configured `tick` runner, which emits ONE typed action; looop executes it (and
+  gates risky ones). It is the SOLE senser + decider (single-instance flock), so
+  beats never race. Cadence is one interval (config `interval`, default 60s); a
+  move may nudge the next beat sooner. Spend stays bounded even when the world
+  is noisy: decide attempts are capped per rolling hour
+  (LOOOP_MAX_DECIDES_PER_HOUR, default 120), the live fleet is capped
+  (LOOOP_MAX_WORKERS, default 8), and a sensor whose wake signal changes every
+  beat is flagged to the decider as FLAPPING so it fixes the sensor instead of
+  burning a decide per beat.
 
 ============================================================================
 CLIENT CONTRACT  (read this to BECOME a looop client)
@@ -161,6 +168,9 @@ CODE / CONFIG / DATA are cleanly separated (all overridable by env)
                                 (<id>.json): a shell command declared at spawn,
                                 run ONCE by the pulse after the worker dies —
                                 exit status alone is never trusted as "done"
+            playbook.d/      <- PLAYBOOK history: the previous body is
+                                snapshotted here before every overwrite
+                                (LOOOP_PLAYBOOK_KEEP generations, default 20)
             snapshots/ runs/ .lock .last-tick-hash .tick-backoff  <- scratch
             reports/         <- worker deliverables a human reads (persist)
             sessions/<id>/   <- worker + pulse sessions (babysit state, per

@@ -32,8 +32,9 @@ const BACKOFF_BASE_SECS: u64 = 60;
 const BACKOFF_CAP_SECS: u64 = 3600;
 
 /// Re-sense the world: reap aged corpses + stale claims, surface any interrupted
-/// non-idempotent action from a crashed beat, wipe last beat's snapshots, run
-/// every sensor fresh, and return the resulting world hash. The pulse owns this.
+/// non-idempotent action from a crashed beat, refresh `snapshots/` (pruning
+/// what no live sensor owns; a fresh interval-cadenced snapshot survives), and
+/// return the resulting world hash. The pulse owns this.
 pub fn sense(paths: &Paths) -> String {
     let _ = crate::seed::ensure_dirs(paths);
     events::emit(paths, "tick_start", serde_json::json!({}));
@@ -96,8 +97,8 @@ fn clear_backoff(paths: &Paths) {
 /// the world moving off the failing state (the gate in [`tick`]) — resets it.
 fn record_backoff(paths: &Paths, hash: &str) -> u32 {
     let fails = read_backoff(paths).map(|(_, n, _)| n + 1).unwrap_or(1);
-    let body =
-        serde_json::json!({ "hash": hash, "fails": fails, "ts": util::now_unix() }).to_string();
+    let body = serde_json::json!({ "v": 1, "hash": hash, "fails": fails, "ts": util::now_unix() })
+        .to_string();
     let _ = fs::write(backoff_path(paths), body);
     fails
 }
@@ -126,7 +127,7 @@ fn noop_ttl_secs() -> u64 {
 /// other action — a real move resets the revisit clock).
 fn record_noop(paths: &Paths, kind: &str, hash: &str) {
     if kind == "noop" {
-        let body = serde_json::json!({ "ts": util::now_unix(), "hash": hash }).to_string();
+        let body = serde_json::json!({ "v": 1, "ts": util::now_unix(), "hash": hash }).to_string();
         let _ = fs::write(paths.noop_at(), body);
     } else {
         let _ = fs::remove_file(paths.noop_at());
@@ -152,6 +153,171 @@ fn noop_revisit_due(paths: &Paths, hash: &str) -> bool {
     same && util::now_unix().saturating_sub(ts) >= ttl
 }
 
+// ---- flapping-sensor detection --------------------------------------------------
+
+/// How many CONSECUTIVE beats a snapshot's wake signal must change before it is
+/// flagged as flapping (`LOOOP_FLAP_STREAK`; 0 disables; default 5).
+fn flap_streak_threshold() -> u32 {
+    std::env::var("LOOOP_FLAP_STREAK")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(5)
+}
+
+/// Update the per-snapshot signal-change streaks after a sense, and return the
+/// names currently at/over the flapping threshold.
+///
+/// WHY THIS EXISTS: the loop's entire cost model — "an unchanged world costs no
+/// AI call" — hinges on sensor authors correctly splitting volatile fields into
+/// `.detail`. A sensor that leaks a timestamp/counter into `.signal` silently
+/// defeats BOTH the skip gate and the failure backoff (the world hash never
+/// settles, and a moving hash clears backoff), turning a quiet loop into one
+/// decide per beat forever. Nothing else in the system detects that mistake, so
+/// the beat tracks it mechanically: a signal that has changed on N consecutive
+/// beats is surfaced in the prompt (`FLAPPING SENSORS`) for the decider to fix
+/// (move the volatile fields to `.detail`) and warned once when crossing the
+/// threshold.
+fn update_flap(paths: &Paths) -> Vec<String> {
+    let threshold = flap_streak_threshold();
+    if threshold == 0 {
+        return Vec::new();
+    }
+    let prev: serde_json::Value = fs::read_to_string(paths.flap_state())
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let prev_snaps = prev
+        .get("snaps")
+        .and_then(|v| v.as_object())
+        .cloned()
+        .unwrap_or_default();
+
+    let mut snaps = serde_json::Map::new();
+    let mut flapping = Vec::new();
+    for (name, signal) in crate::worldhash::world_items(paths) {
+        let Some(name) = name.strip_prefix("snap:") else {
+            continue; // policy files are the human's/decider's to edit — not flap
+        };
+        let streak = match prev_snaps.get(name) {
+            Some(e) if e.get("last").and_then(|v| v.as_str()) == Some(signal.as_str()) => 0,
+            Some(e) => e.get("streak").and_then(|v| v.as_u64()).unwrap_or(0) as u32 + 1,
+            None => 0, // first sighting — nothing to compare against
+        };
+        if streak >= threshold {
+            flapping.push(name.to_string());
+            if streak == threshold {
+                util::event(
+                    Level::Warn,
+                    "sense.flapping",
+                    &format!(
+                        "{name}: wake signal changed on {streak} consecutive beats — volatile \
+                         data is likely leaking into .signal (belongs in .detail); every such \
+                         beat costs a decide"
+                    ),
+                    &[
+                        ("sensor", serde_json::json!(name)),
+                        ("streak", serde_json::json!(streak)),
+                    ],
+                );
+                events::emit(
+                    paths,
+                    "sensor_flapping",
+                    serde_json::json!({ "sensor": name, "streak": streak }),
+                );
+            }
+        }
+        snaps.insert(
+            name.to_string(),
+            serde_json::json!({ "last": signal, "streak": streak }),
+        );
+    }
+    let body = serde_json::json!({ "v": 1, "snaps": snaps }).to_string();
+    let _ = fs::write(paths.flap_state(), body);
+    flapping
+}
+
+/// The snapshot names currently flagged as flapping (streak at/over the
+/// threshold), read from the ledger [`update_flap`] maintains. Consumed by the
+/// decide prompt's `FLAPPING SENSORS` section.
+pub fn flapping_sensors(paths: &Paths) -> Vec<String> {
+    let threshold = flap_streak_threshold();
+    if threshold == 0 {
+        return Vec::new();
+    }
+    let Ok(raw) = fs::read_to_string(paths.flap_state()) else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = v
+        .get("snaps")
+        .and_then(|s| s.as_object())
+        .map(|m| {
+            m.iter()
+                .filter(|(_, e)| {
+                    e.get("streak").and_then(|x| x.as_u64()).unwrap_or(0) >= threshold as u64
+                })
+                .map(|(k, _)| k.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+// ---- decide rate cap (global spend ceiling) --------------------------------------
+
+/// Max decide ATTEMPTS per rolling hour (`LOOOP_MAX_DECIDES_PER_HOUR`; 0
+/// disables; default 120). The skip gate and backoff bound a QUIET loop's
+/// spend; nothing else bounds a noisy one — cadence nudges can legally reach
+/// one decide per 5s (720/h), and a flapping sensor re-arms the beat forever.
+/// This is the hard ceiling underneath both: attempts (not successes) count,
+/// so failing beats spend budget too.
+fn decide_cap_per_hour() -> u64 {
+    std::env::var("LOOOP_MAX_DECIDES_PER_HOUR")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(120)
+}
+
+fn read_decide_ledger(paths: &Paths) -> Vec<u64> {
+    fs::read_to_string(paths.decide_ledger())
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+        .and_then(|v| v.get("ts").cloned())
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default()
+}
+
+/// Whether the hourly decide budget still has room. Returns `Err(retry_in_s)`
+/// when exhausted (seconds until the oldest attempt ages out of the window).
+fn decide_budget(now: u64, ledger: &[u64], cap: u64) -> Result<(), u64> {
+    if cap == 0 {
+        return Ok(());
+    }
+    let recent: Vec<u64> = ledger
+        .iter()
+        .copied()
+        .filter(|t| now.saturating_sub(*t) < 3600)
+        .collect();
+    if (recent.len() as u64) < cap {
+        return Ok(());
+    }
+    let oldest = recent.iter().copied().min().unwrap_or(now);
+    Err((oldest + 3600).saturating_sub(now).max(1))
+}
+
+/// Record one decide attempt and prune the ledger to the rolling hour.
+fn record_decide(paths: &Paths) {
+    let now = util::now_unix();
+    let mut ts = read_decide_ledger(paths);
+    ts.retain(|t| now.saturating_sub(*t) < 3600);
+    ts.push(now);
+    let body = serde_json::json!({ "v": 1, "ts": ts }).to_string();
+    let _ = fs::write(paths.decide_ledger(), body);
+}
+
 // ---- last-failure feedback ------------------------------------------------------
 
 /// Persist WHY this beat failed, so the NEXT decide prompt can surface it
@@ -159,6 +325,7 @@ fn noop_revisit_due(paths: &Paths, hash: &str) -> bool {
 /// failing move blind. Cleared by the next usable decision.
 fn record_failure(paths: &Paths, run_id: &str, code: &str, error: &str, fails: u32) {
     let body = serde_json::json!({
+        "v": 1,
         "ts": util::now_unix(),
         "run_id": run_id,
         "code": code,
@@ -190,6 +357,11 @@ impl TickOutcome {
 pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
     // 0+1. housekeeping + sense (emits tick_start / sense_done, returns the hash).
     let hash = sense(paths);
+
+    // 1b. flapping bookkeeping: track per-snapshot signal-change streaks and
+    // warn when one crosses the threshold. Runs every beat (a skip resets the
+    // streaks naturally — an unchanged world means unchanged signals).
+    let _ = update_flap(paths);
 
     // 2. skip if the world is unchanged (no AI call).
     let last = fs::read_to_string(paths.data_dir.join(".last-tick-hash"))
@@ -263,6 +435,33 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
         }
     }
 
+    // 2c. global spend ceiling: the skip gate and backoff bound a quiet loop,
+    // but a noisy one (flapping sensor, aggressive cadence nudges) can burn a
+    // decide per beat forever. Cap ATTEMPTS per rolling hour; when exhausted,
+    // idle out the beat — the world is level-triggered, so nothing is lost.
+    if let Err(retry_in) = decide_budget(
+        util::now_unix(),
+        &read_decide_ledger(paths),
+        decide_cap_per_hour(),
+    ) {
+        util::event(
+            Level::Warn,
+            "tick.capped",
+            &format!(
+                "hourly decide budget exhausted (LOOOP_MAX_DECIDES_PER_HOUR={}) — idling ~{retry_in}s; \
+                 if this is unexpected, look for a flapping sensor or a runaway cadence",
+                decide_cap_per_hour()
+            ),
+            &[("retry_in_s", serde_json::json!(retry_in))],
+        );
+        events::emit(
+            paths,
+            "tick_capped",
+            serde_json::json!({ "retry_in_s": retry_in }),
+        );
+        return TickOutcome::idle();
+    }
+
     // 3. hand everything to the AI for one move.
     let cfg = match Config::load(paths) {
         Ok(c) => c,
@@ -315,6 +514,10 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
     // stays a clean structured-event log.
     let tee: Vec<PathBuf> = vec![run_dir.join("output.log"), paths.data_dir.join("tick.log")];
 
+    // Spend is committed the moment the runner launches — attempts count
+    // against the hourly budget whether or not they produce a decision.
+    record_decide(paths);
+
     let runner_ok = {
         // Show a live "working" indicator on the pulse's stdout while the runner
         // streams (its chatter is teed to the replay archive, not echoed here).
@@ -348,7 +551,15 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
             // saw it in the prompt and moved past it.
             let _ = fs::remove_file(paths.last_failure());
             record_noop(paths, d.kind, &hash);
-            let next_interval_s = d.next_interval_s;
+            // A run_shell's output tail is persisted for the NEXT prompt
+            // (`RUN_SHELL OUTPUT`), but the command's output alone never moves
+            // the world hash — without a nudge the next beat would skip and the
+            // decider would never see what its own query returned. Arm a short
+            // follow-up unless the decision already scheduled one.
+            let next_interval_s = match d.next_interval_s {
+                None if d.kind == "shell" => Some(5),
+                other => other,
+            };
             util::event(
                 Level::Ok,
                 "tick.decided",
@@ -819,6 +1030,172 @@ pub fn cmd_wait(paths: &Paths, args: &crate::cli::WaitArgs) -> Result<ExitCode> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Wire a FAKE runner into a temp profile: `tick_command` just copies a
+    /// pre-staged decision file into `.decision.json` (cwd is the data dir; the
+    /// prompt arrives on stdin and is ignored). This exercises the REAL beat —
+    /// sense → hash → runner → consume → execute → commit — with no LLM.
+    fn wire_fake_runner(p: &Paths, decision_json: &str) {
+        fs::write(p.data_dir.join("fixture-decision.json"), decision_json).unwrap();
+        fs::write(
+            &p.config,
+            serde_json::json!({
+                "tick_command": "cat fixture-decision.json > .decision.json",
+                "worker_command": "true {{prompt_file}}"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    /// Rewire the runner to one that always fails — used to prove a later beat
+    /// SKIPPED (the runner was never invoked) rather than succeeded again.
+    fn wire_failing_runner(p: &Paths) {
+        fs::write(
+            &p.config,
+            serde_json::json!({
+                "tick_command": "false",
+                "worker_command": "true {{prompt_file}}"
+            })
+            .to_string(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn full_beat_with_fake_runner_commits_then_skips_unchanged_world() {
+        let p = Paths::temp();
+        fs::write(p.data_dir.join("PLAYBOOK.md"), "be good\n").unwrap();
+        wire_fake_runner(
+            &p,
+            r#"{"action":"noop","reason":"steady","journal":"steady state"}"#,
+        );
+
+        // Beat 1 (forced, like a pulse start): the fake runner's noop lands.
+        let out = tick(&p, true);
+        assert!(!out.acted, "noop is a decision but not an act");
+        let committed = fs::read_to_string(p.data_dir.join(".last-tick-hash")).unwrap();
+        assert!(!committed.trim().is_empty(), "hash committed on success");
+        assert!(p.last_world().is_file(), "WHAT-CHANGED baseline committed");
+        assert!(!p.data_dir.join(".tick-backoff").is_file(), "no backoff");
+        let journal = fs::read_to_string(p.journal()).unwrap();
+        assert!(journal.contains("steady state"), "journal line appended");
+
+        // Beat 2: unchanged world must SKIP — prove it by wiring a runner that
+        // would FAIL if invoked, then asserting no failure was recorded.
+        wire_failing_runner(&p);
+        let out2 = tick(&p, false);
+        assert!(!out2.acted);
+        assert!(
+            !p.last_failure().is_file(),
+            "skip means the failing runner was never invoked"
+        );
+    }
+
+    #[test]
+    fn full_beat_executes_a_write_goal_and_reports_acted() {
+        let p = Paths::temp();
+        fs::write(p.data_dir.join("PLAYBOOK.md"), "be good\n").unwrap();
+        wire_fake_runner(
+            &p,
+            r#"{"action":"write_goal","id":"ship","body":"ship v2","journal":"opened ship goal"}"#,
+        );
+        let out = tick(&p, true);
+        assert!(out.acted, "a real move counts as acted");
+        let goal = fs::read_to_string(p.goals_dir().join("ship.md")).unwrap();
+        assert_eq!(goal, "ship v2\n");
+    }
+
+    #[test]
+    fn full_beat_with_failing_runner_arms_backoff_and_records_failure() {
+        let p = Paths::temp();
+        fs::write(p.data_dir.join("PLAYBOOK.md"), "be good\n").unwrap();
+        wire_failing_runner(&p);
+        let out = tick(&p, true);
+        assert!(!out.acted);
+        let (_, fails, _) = read_backoff(&p).expect("backoff armed");
+        assert_eq!(fails, 1);
+        assert!(p.last_failure().is_file(), "LAST FAILURE feedback recorded");
+        assert!(
+            !p.data_dir.join(".last-tick-hash").is_file(),
+            "a failed beat commits nothing"
+        );
+    }
+
+    #[test]
+    fn run_shell_decision_arms_a_follow_up_nudge() {
+        let p = Paths::temp();
+        fs::write(p.data_dir.join("PLAYBOOK.md"), "be good\n").unwrap();
+        wire_fake_runner(
+            &p,
+            r#"{"action":"run_shell","cmd":"echo hi","reason":"probe","journal":"probed"}"#,
+        );
+        let out = tick(&p, true);
+        assert!(out.acted);
+        assert_eq!(
+            out.next_interval_s,
+            Some(5),
+            "run_shell schedules the follow-up beat that reads its output"
+        );
+        assert!(p.last_shell().is_file(), "output captured for the prompt");
+    }
+
+    #[test]
+    fn decide_budget_blocks_at_cap_and_names_the_retry() {
+        // Under cap: fine.
+        assert!(decide_budget(1000, &[], 2).is_ok());
+        assert!(decide_budget(1000, &[500], 2).is_ok());
+        // At cap: blocked until the oldest attempt ages out of the hour.
+        let err = decide_budget(1000, &[500, 900], 2).unwrap_err();
+        assert_eq!(err, 500 + 3600 - 1000);
+        // Old attempts age out of the window.
+        assert!(decide_budget(5000, &[500, 900], 2).is_ok());
+        // 0 disables.
+        assert!(decide_budget(1000, &[1, 2, 3], 0).is_ok());
+    }
+
+    #[test]
+    fn record_decide_appends_and_prunes_the_rolling_hour() {
+        let p = Paths::temp();
+        let old = util::now_unix() - 4000;
+        fs::write(
+            p.decide_ledger(),
+            serde_json::json!({ "v": 1, "ts": [old] }).to_string(),
+        )
+        .unwrap();
+        record_decide(&p);
+        let ts = read_decide_ledger(&p);
+        assert_eq!(ts.len(), 1, "the aged-out attempt was pruned");
+        assert!(util::now_unix() - ts[0] < 5);
+    }
+
+    #[test]
+    fn flapping_is_flagged_after_consecutive_signal_changes_and_resets() {
+        let p = Paths::temp();
+        fs::create_dir_all(p.snapshots_dir()).unwrap();
+        let snap = p.snapshots_dir().join("sensor-noisy.json");
+        let write = |n: u64| fs::write(&snap, format!(r#"{{"signal":{{"n":{n}}}}}"#)).unwrap();
+
+        // First sighting establishes a baseline; each subsequent CHANGE bumps
+        // the streak. Threshold 5 ⇒ flagged on the 5th consecutive change.
+        write(0);
+        assert!(update_flap(&p).is_empty());
+        for i in 1..=4u64 {
+            write(i);
+            assert!(update_flap(&p).is_empty(), "streak {i} is below threshold");
+        }
+        write(5);
+        assert_eq!(update_flap(&p), vec!["sensor-noisy".to_string()]);
+        assert_eq!(
+            flapping_sensors(&p),
+            vec!["sensor-noisy".to_string()],
+            "the prompt reads the same verdict from the ledger"
+        );
+
+        // An unchanged beat resets the streak — a settled sensor is forgiven.
+        assert!(update_flap(&p).is_empty());
+        assert!(flapping_sensors(&p).is_empty());
+    }
 
     #[test]
     fn can_skip_only_when_unchanged_and_not_forced() {
