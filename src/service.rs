@@ -15,6 +15,12 @@ use crate::paths::Paths;
 /// that never existed.
 const PULSE_SURVIVED_WARNING: &str = "looop: WARNING — the pulse survived the kill (still alive after 2s); \
      not reaped — retry `looop down` or inspect it with `looop state` / `looop worker list -a`";
+
+/// The `looop up` not-yet-alive warning — a named constant for the same drift
+/// guard as above: spawning is asynchronous, so "spawned" is not "observed
+/// alive", and we never report a start we didn't see.
+const PULSE_NOT_OBSERVED_WARNING: &str = "looop: WARNING — the pulse was spawned but not yet observed alive (5s); \
+     inspect it with `looop worker list -a` or retry `looop up`";
 use crate::run;
 use crate::session::{self, PULSE_SESSION};
 use anyhow::Result;
@@ -51,7 +57,14 @@ pub fn cmd_up(paths: &Paths, json: bool) -> Result<ExitCode> {
         }
         let bin = paths.bin.to_string_lossy().to_string();
         session::spawn_detached(paths, vec![bin, "pulse".to_string()], PULSE_SESSION)?;
-        session::await_alive(paths, PULSE_SESSION, Duration::from_secs(5));
+        // Never report a start we didn't observe: the spawn is detached and
+        // asynchronous, so only an is-alive sighting within the grace window
+        // earns the success line — mirroring `looop down`, which refuses to
+        // print "pulse stopped" while the pulse is still alive.
+        if !session::await_alive(paths, PULSE_SESSION, Duration::from_secs(5)) {
+            eprintln!("{PULSE_NOT_OBSERVED_WARNING}");
+            return Ok(ExitCode::from(1));
+        }
         println!("looop: pulse started{}", if json { " [json]" } else { "" });
     }
     Ok(ExitCode::SUCCESS)
@@ -109,7 +122,7 @@ pub fn cmd_pulse(paths: &Paths) -> Result<ExitCode> {
 
 #[cfg(test)]
 mod tests {
-    use super::PULSE_SURVIVED_WARNING;
+    use super::{PULSE_NOT_OBSERVED_WARNING, PULSE_SURVIVED_WARNING};
 
     /// Drift guard: every `looop <verb>` a user-facing message constant tells
     /// the user to run must be a REAL clap subcommand — a stale message once
@@ -118,7 +131,7 @@ mod tests {
     fn messages_reference_only_real_subcommands() {
         use clap::CommandFactory;
         let root = crate::cli::Cli::command();
-        for msg in [PULSE_SURVIVED_WARNING] {
+        for msg in [PULSE_SURVIVED_WARNING, PULSE_NOT_OBSERVED_WARNING] {
             let mut rest = msg;
             while let Some(i) = rest.find("looop ") {
                 let tail = &rest[i + "looop ".len()..];

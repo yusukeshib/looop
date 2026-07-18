@@ -304,7 +304,10 @@ pub enum WorkerOp {
 
 #[derive(Args, Debug)]
 pub struct AskArgs {
-    /// The worker id raising the ask. Defaults to $LOOOP_SESSION_ID.
+    /// The worker id raising the ask (an ID, never the question — the
+    /// question text goes in --prompt; an id containing whitespace is
+    /// rejected downstream). Defaults to $LOOOP_SESSION_ID.
+    #[arg(value_name = "WORKER_ID")]
     pub worker: Option<String>,
     /// What you need to know from the human.
     #[arg(long)]

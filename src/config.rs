@@ -96,11 +96,19 @@ impl Config {
     /// Load $LOOOP_CONFIG, falling back to the inline default when absent
     /// (matches bash: `[ -f "$CONFIG" ] && cat || default_config`).
     pub fn load(paths: &Paths) -> Result<Self> {
-        let text = if paths.config.is_file() {
-            fs::read_to_string(&paths.config)
-                .with_context(|| format!("reading config {}", paths.config.display()))?
-        } else {
-            DEFAULT_CONFIG.clone()
+        // Read FIRST, fall back on NotFound only — no is_file() pre-check.
+        // The check-then-read shape was a TOCTOU (a config removed between the
+        // two calls errored instead of falling back), and worse: a pre-check
+        // maps EACCES/EIO to "no file", silently masking a REAL config behind
+        // a permission error with the inline default. Only true absence may
+        // mean "not initialized".
+        let text = match fs::read_to_string(&paths.config) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => DEFAULT_CONFIG.clone(),
+            Err(e) => {
+                return Err(e)
+                    .with_context(|| format!("reading config {}", paths.config.display()));
+            }
         };
         let root: serde_json::Value =
             serde_json::from_str(&text).context("parsing looop config JSON")?;
@@ -212,11 +220,11 @@ pub fn is_initialized(paths: &Paths) -> bool {
 /// Write the runner wiring to $LOOOP_CONFIG (creating its parent dir). Used by
 /// `looop init`; always overwrites any existing file.
 pub fn write(paths: &Paths, contents: &str) -> Result<()> {
-    if let Some(dir) = paths.config.parent() {
-        fs::create_dir_all(dir)
-            .with_context(|| format!("creating config dir {}", dir.display()))?;
-    }
-    fs::write(&paths.config, contents)
+    // Atomic replace (temp + fsync + rename — creates the parent dir too),
+    // not fs::write: truncate-then-write leaves a TORN or empty config if the
+    // process dies mid-write, and a running pulse re-reads this file — it must
+    // see the old wiring or the new, never half of either.
+    crate::util::write_atomic(&paths.config, contents.as_bytes())
         .with_context(|| format!("writing config {}", paths.config.display()))?;
     Ok(())
 }

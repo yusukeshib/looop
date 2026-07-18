@@ -35,12 +35,32 @@ use std::time::Instant;
 // itself now lives in `tick_guards`.
 pub(crate) use crate::tick_guards::flapping_sensors;
 
+/// What one sense produced: the world hash AND the named world items, taken
+/// from the SAME read of the world. The items are threaded through the beat to
+/// [`commit_outcome`], which writes them as the `.last-world` baseline — the
+/// world THIS decision saw. Recomputing them after the action ran (decide can
+/// take up to 30 min) would bake the action's own effects into the baseline
+/// and silently shrink the next prompt's WHAT-CHANGED diff.
+pub struct Sensed {
+    pub hash: String,
+    pub items: std::collections::BTreeMap<String, String>,
+}
+
 /// Re-sense the world: reap aged corpses + stale claims, surface any interrupted
 /// non-idempotent action from a crashed beat, refresh `snapshots/` (pruning
 /// what no live sensor owns; a fresh interval-cadenced snapshot survives), and
-/// return the resulting world hash. The pulse owns this.
-pub fn sense(paths: &Paths) -> String {
-    let _ = crate::seed::ensure_dirs(paths);
+/// return the resulting world hash + items. The pulse owns this.
+pub fn sense(paths: &Paths) -> Sensed {
+    if let Err(e) = crate::seed::ensure_dirs(paths) {
+        // Degraded, not fatal: sensors/snapshots may fail this beat, but the
+        // beat itself must run (and report) rather than die silently here.
+        util::event(
+            Level::Warn,
+            "tick.guard_degraded",
+            &format!("failed to ensure the data dirs (this beat may sense a partial world): {e}"),
+            &[],
+        );
+    }
     events::emit(paths, "tick_start", serde_json::json!({}));
 
     session::prune_aged(
@@ -58,7 +78,13 @@ pub fn sense(paths: &Paths) -> String {
     sensor::run_all(paths, &snap, true);
     events::emit(paths, "sense_done", serde_json::json!({}));
 
-    crate::worldhash::world_hash(paths)
+    // Hash and items are taken back-to-back from the same settled world (the
+    // sensors above have finished) so "the hash moved" and "some item differs"
+    // describe the SAME observation — see [`Sensed`].
+    Sensed {
+        hash: crate::worldhash::world_hash(paths),
+        items: crate::worldhash::world_items(paths),
+    }
 }
 
 /// Whether this beat may skip the AI: the world is unchanged since last beat AND
@@ -125,9 +151,17 @@ fn last_tick_hash_path(paths: &Paths) -> PathBuf {
 }
 
 /// Run one beat. `force` bypasses the unchanged-world skip once (see [`can_skip`]).
+///
+/// CONTRACT: the caller must hold the pulse's single-instance flock (see
+/// `run::acquire_lock`). The beat's guard files (`.last-tick-hash`,
+/// `.tick-backoff`, the noop/flap/decide ledgers) are all plain
+/// read-modify-write — two concurrent beats would race those updates (and
+/// wipe/regenerate `snapshots/` under each other). The tests call `tick`
+/// directly on isolated temp dirs, which satisfies the invariant trivially.
 pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
-    // 0+1. housekeeping + sense (emits tick_start / sense_done, returns the hash).
-    let hash = sense(paths);
+    // 0+1. housekeeping + sense (emits tick_start / sense_done, returns the
+    // hash + the same-read world items).
+    let Sensed { hash, items } = sense(paths);
 
     // 1b. flapping bookkeeping: track per-snapshot signal-change streaks and
     // warn when one crosses the threshold. Runs every beat (a skip resets the
@@ -145,7 +179,7 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
     };
 
     // 4. commit the outcome (or arm backoff) and prune the replay archive.
-    let outcome = commit_outcome(paths, &hash, run);
+    let outcome = commit_outcome(paths, &hash, items, run);
     prune_runs(paths);
     outcome
 }
@@ -192,19 +226,30 @@ fn should_decide(paths: &Paths, hash: &str, force: bool) -> Option<TickOutcome> 
         );
     }
 
-    // 2b. backoff (H1): after consecutive FAILED beats at the same world state,
-    // wait out an exponential window before burning another AI call. The world
-    // moving off the failing state clears it (a human edit to goals/PLAYBOOK
-    // changes the world hash, so steering retries promptly).
-    if let Some((bhash, fails, ts)) = read_backoff(paths)
+    // 2b. backoff (H1): after consecutive FAILED beats, wait out an exponential
+    // window before burning another AI call. A moving WORLD hash does NOT lift
+    // the wait — a failing action can mutate the world every beat, and clearing
+    // on movement would pin the count at 1 forever (no backoff at all). Only a
+    // SUCCESSFUL beat clears the counter (commit_outcome). What DOES cut the
+    // wait short — without touching the counter — is a human steering edit: the
+    // record stores the POLICY hash (PLAYBOOK + goals) of the last failure, so
+    // an edited goal retries promptly while sensor churn waits the window out.
+    if let Some((bpolicy, fails, ts)) = read_backoff(paths)
         && fails > 0
     {
-        if bhash != hash {
-            clear_backoff(paths);
-        } else {
-            let wait = backoff_delay(fails);
-            let elapsed = util::now_unix().saturating_sub(ts);
-            if elapsed < wait {
+        let wait = backoff_delay(fails);
+        let elapsed = util::now_unix().saturating_sub(ts);
+        if elapsed < wait {
+            if bpolicy != crate::worldhash::policy_hash(paths) {
+                util::event(
+                    Level::Info,
+                    "tick.backoff_cut",
+                    &format!(
+                        "goals/PLAYBOOK edited since the last failure — retrying now (fail #{fails}; the counter survives until a beat succeeds)"
+                    ),
+                    &[("fails", serde_json::json!(fails))],
+                );
+            } else {
                 let remain = wait - elapsed;
                 util::event(
                     Level::Warn,
@@ -393,11 +438,29 @@ fn run_decider(paths: &Paths) -> Option<DecideRun> {
     })
 }
 
+/// One decide attempt's failure shape, flattened out of the (runner, outcome)
+/// pairing so [`commit_outcome`] can match exhaustively with no panic path.
+enum BeatFailure {
+    /// The runner exited cleanly but the decision it wrote was unusable.
+    BadDecision(anyhow::Error),
+    /// The runner exited cleanly but never wrote a decision.
+    NoDecision,
+    /// The runner itself failed (spawn failure, deadline kill, nonzero exit).
+    Runner(String),
+}
+
 /// Commit one decide attempt: a beat SUCCEEDS only when a usable decision was
-/// produced — commit the world hash, clear backoff, journal the move. Every
-/// other outcome arms backoff and leaves the hash uncommitted so a transient
-/// issue retries.
-fn commit_outcome(paths: &Paths, hash: &str, run: DecideRun) -> TickOutcome {
+/// produced — commit the world hash + the sensed baseline, clear backoff,
+/// journal the move. Every other outcome arms backoff and leaves the hash
+/// uncommitted so a transient issue retries. `items` is the world snapshot
+/// taken by [`sense`] at the SAME read as `hash` — the world THIS decision
+/// saw — not a fresh read (the action already ran; see [`Sensed`]).
+fn commit_outcome(
+    paths: &Paths,
+    hash: &str,
+    items: std::collections::BTreeMap<String, String>,
+    run: DecideRun,
+) -> TickOutcome {
     let DecideRun {
         run_id,
         run_dir,
@@ -405,8 +468,16 @@ fn commit_outcome(paths: &Paths, hash: &str, run: DecideRun) -> TickOutcome {
         runner,
         outcome,
     } = run;
-    let (acted, next_interval_s) = match (runner, outcome) {
-        (Ok(()), Some(Ok(d))) => {
+    // Flatten the (runner, outcome) pairing first: a flat 4-arm match with no
+    // unreachable!() — every shape is either the one success or a named failure.
+    let decided: Result<executor::Decided, BeatFailure> = match (runner, outcome) {
+        (Ok(()), Some(Ok(d))) => Ok(d),
+        (Ok(()), Some(Err(e))) => Err(BeatFailure::BadDecision(e)),
+        (Ok(()), None) => Err(BeatFailure::NoDecision),
+        (Err(cause), _) => Err(BeatFailure::Runner(cause)),
+    };
+    let (acted, next_interval_s) = match decided {
+        Ok(d) => {
             // This is the MOST important persistence of the whole beat: the
             // hash commit is what stops the next beat from re-deciding — and
             // possibly re-issuing the same non-idempotent run_shell. A failed
@@ -426,14 +497,17 @@ fn commit_outcome(paths: &Paths, hash: &str, run: DecideRun) -> TickOutcome {
             }
             // Commit the WHAT-CHANGED baseline alongside the hash: the next
             // decide prompt diffs the live world against the world THIS decision
-            // saw. A failed beat leaves both uncommitted, so the same diff is
+            // saw — the `items` snapshot sense() took together with `hash`, NOT
+            // a fresh read (the action already ran and may have moved the
+            // world; a post-action read would hide its effects from the next
+            // diff). A failed beat leaves both uncommitted, so the same diff is
             // re-reported until a decision lands.
             // (These are two separate atomic writes, not one transaction: a
             // crash between them leaves the hash committed with a stale
             // baseline, so ONE beat's what-changed diff may over-report. That
             // is accepted — the next committed decision rewrites both, and the
             // hash, which gates spend, always lands first.)
-            if let Ok(items) = serde_json::to_string(&crate::worldhash::world_items(paths)) {
+            if let Ok(items) = serde_json::to_string(&items) {
                 let _ = util::write_atomic(&paths.last_world(), items.as_bytes());
             }
             clear_backoff(paths);
@@ -471,8 +545,11 @@ fn commit_outcome(paths: &Paths, hash: &str, run: DecideRun) -> TickOutcome {
             // "acted" for cadence, but it DID commit the hash above.
             (d.kind != "noop", next_interval_s)
         }
-        failure => {
-            let fails = record_backoff(paths, hash);
+        Err(failure) => {
+            // The backoff record pairs the fail count with the CURRENT policy
+            // hash: a later PLAYBOOK/goal edit is detected by comparison in
+            // should_decide and cuts the wait short (steering retries promptly).
+            let fails = record_backoff(paths, &crate::worldhash::policy_hash(paths));
             let replay = run_dir.display().to_string();
             let mut fields = vec![
                 ("secs", serde_json::json!(secs)),
@@ -480,7 +557,7 @@ fn commit_outcome(paths: &Paths, hash: &str, run: DecideRun) -> TickOutcome {
                 ("fails", serde_json::json!(fails)),
             ];
             let (level, code, err, msg) = match failure {
-                (Ok(()), Some(Err(e))) => {
+                BeatFailure::BadDecision(e) => {
                     fields.push(("error", serde_json::json!(e.to_string())));
                     (
                         Level::Error,
@@ -491,7 +568,7 @@ fn commit_outcome(paths: &Paths, hash: &str, run: DecideRun) -> TickOutcome {
                         ),
                     )
                 }
-                (Ok(()), None) => (
+                BeatFailure::NoDecision => (
                     Level::Warn,
                     "tick.no_decision",
                     "the runner ran but emitted no .decision.json (it must write exactly one \
@@ -501,10 +578,7 @@ fn commit_outcome(paths: &Paths, hash: &str, run: DecideRun) -> TickOutcome {
                         "ran {secs}s but emitted no .decision.json (no move, fail #{fails}) · replay: {replay}"
                     ),
                 ),
-                // The success shape was consumed by the outer match's first
-                // arm; the compiler just can't see that through the binding.
-                (Ok(()), Some(Ok(_))) => unreachable!("handled by the success arm above"),
-                (Err(cause), _) => {
+                BeatFailure::Runner(cause) => {
                     fields.push(("replay", serde_json::json!(replay.clone())));
                     fields.push(("error", serde_json::json!(cause.clone())));
                     (
@@ -761,6 +835,200 @@ mod tests {
         assert!(
             !p.data_dir.join(".last-tick-hash").is_file(),
             "a timed-out beat commits nothing"
+        );
+    }
+
+    /// Install a user sensor whose wake signal bumps on EVERY beat — the shape
+    /// of a failing action that mutates the world (or a flapping sensor). The
+    /// counter state lives at an absolute path (sensors inherit the test cwd).
+    fn wire_counter_sensor(p: &Paths) {
+        fs::create_dir_all(p.sensors_dir()).unwrap();
+        let state = p.data_dir.join("counter-state");
+        let script = p.sensors_dir().join("counter.sh");
+        fs::write(
+            &script,
+            format!(
+                "#!/usr/bin/env bash\nn=$(cat {s} 2>/dev/null || echo 0)\nn=$((n+1))\necho \"$n\" > {s}\necho \"{{\\\"signal\\\":{{\\\"n\\\":$n}}}}\"\n",
+                s = state.display()
+            ),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perm = fs::metadata(&script).unwrap().permissions();
+            perm.set_mode(0o755);
+            fs::set_permissions(&script, perm).unwrap();
+        }
+    }
+
+    #[test]
+    fn backoff_counts_across_a_moving_world_and_only_success_clears_it() {
+        let p = Paths::temp();
+        fs::write(p.data_dir.join("PLAYBOOK.md"), "be good\n").unwrap();
+        wire_counter_sensor(&p);
+        wire_failing_runner(&p);
+
+        // Beat 1: the runner fails — backoff arms at fails=1 (window 60s).
+        let out = tick(&p, true);
+        assert!(out.decided_or_failed, "the failing runner was launched");
+        assert_eq!(read_backoff(&p).unwrap().1, 1, "backoff armed");
+
+        // Beat 2: the counter sensor MOVED the world hash, but the policy did
+        // not — the backoff window must be honored (idle out). Hash movement
+        // alone must never defeat the backoff: a failing action that mutates
+        // the world every beat would otherwise retry forever at full rate.
+        let out = tick(&p, false);
+        assert!(
+            !out.decided_or_failed,
+            "the backoff window is honored even though the world hash moved"
+        );
+        assert_eq!(
+            read_backoff(&p).unwrap().1,
+            1,
+            "an idled-out beat does not touch the fail counter"
+        );
+
+        // A STEERING edit (PLAYBOOK = policy) cuts the WAIT short; the retry
+        // fails again and the counter INCREMENTS — hash movement never reset it.
+        fs::write(p.data_dir.join("PLAYBOOK.md"), "be better\n").unwrap();
+        let out = tick(&p, false);
+        assert!(out.decided_or_failed, "a policy edit retries promptly");
+        assert_eq!(
+            read_backoff(&p).unwrap().1,
+            2,
+            "fails reaches 2 across a moving world hash"
+        );
+
+        // With no new steering edit the (now wider) window is honored again.
+        let out = tick(&p, false);
+        assert!(
+            !out.decided_or_failed,
+            "the widened window idles the beat out"
+        );
+
+        // Only a SUCCESSFUL beat clears the counter (steer once more to cut
+        // the wait, then let a working runner land a decision).
+        fs::write(p.data_dir.join("PLAYBOOK.md"), "be best\n").unwrap();
+        wire_fake_runner(
+            &p,
+            r#"{"action":"noop","reason":"ok","journal":"recovered"}"#,
+        );
+        let out = tick(&p, false);
+        assert!(out.decided_or_failed, "the recovery beat decided");
+        assert!(
+            read_backoff(&p).is_none(),
+            "a successful beat is the ONLY thing that clears the backoff"
+        );
+    }
+
+    #[test]
+    fn decide_cap_reached_idles_the_beat_out_without_launching_the_runner() {
+        let p = Paths::temp();
+        let _ = crate::seed::ensure_dirs(&p);
+        fs::write(p.data_dir.join("PLAYBOOK.md"), "be good\n").unwrap();
+        // Exhaust the hourly budget (default 120) with fresh attempts, then
+        // prove the beat idles out BEFORE the runner: wire one that would
+        // record a failure if it ever launched.
+        let now = util::now_unix();
+        let ts: Vec<u64> = vec![now; crate::tick_guards::decide_cap_per_hour() as usize];
+        fs::write(
+            p.decide_ledger(),
+            serde_json::json!({ "v": 1, "ts": ts }).to_string(),
+        )
+        .unwrap();
+        wire_failing_runner(&p);
+
+        let out = tick(&p, true);
+        assert!(!out.decided_or_failed, "a capped beat idles out");
+        assert!(
+            !p.last_failure().is_file(),
+            "the runner was never launched (no failure recorded)"
+        );
+        assert!(
+            !p.data_dir.join(".tick-backoff").is_file(),
+            "a capped beat is not a FAILED beat — no backoff armed"
+        );
+    }
+
+    #[test]
+    fn aged_noop_at_an_unchanged_world_re_decides_via_the_ttl_bypass() {
+        let p = Paths::temp();
+        fs::write(p.data_dir.join("PLAYBOOK.md"), "be good\n").unwrap();
+        wire_fake_runner(&p, r#"{"action":"noop","reason":"fine","journal":"fine"}"#);
+
+        // Beat 1 commits a noop at the current world hash.
+        let out = tick(&p, true);
+        assert!(!out.acted);
+        assert!(p.noop_at().is_file(), "the noop record was written");
+
+        // Age the committed noop record past the TTL (keep its hash).
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(p.noop_at()).unwrap()).unwrap();
+        let aged = serde_json::json!({
+            "v": 1,
+            "ts": util::now_unix() - crate::tick_guards::noop_ttl_secs() - 1,
+            "hash": v["hash"],
+        });
+        fs::write(p.noop_at(), aged.to_string()).unwrap();
+
+        // Beat 2 (unforced, world unchanged): the skip gate would normally
+        // idle out, but the aged noop bypasses it and a REAL move lands.
+        wire_fake_runner(
+            &p,
+            r#"{"action":"write_goal","id":"wake","body":"do it","journal":"woke up"}"#,
+        );
+        let out = tick(&p, false);
+        assert!(out.acted, "the aged noop re-decided instead of skipping");
+        assert!(p.goals_dir().join("wake.md").is_file());
+    }
+
+    #[test]
+    fn prune_runs_keeps_the_newest_by_mtime_and_zero_keeps_all() {
+        // Serialize with other env-mutating tests and always restore the knob.
+        let _env = crate::util::test_env_lock();
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("LOOOP_RUNS_KEEP") };
+            }
+        }
+        let _restore = Restore;
+
+        let p = Paths::temp();
+        fs::create_dir_all(p.runs_dir()).unwrap();
+        // Five run dirs with DISTINCT, explicit mtimes — oldest first — so the
+        // test proves mtime ORDERING, not directory-listing order.
+        for i in 0..5u64 {
+            let d = p.runs_dir().join(format!("tick-{i}"));
+            fs::create_dir_all(&d).unwrap();
+            let f = fs::File::open(&d).unwrap();
+            f.set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(100 - i))
+                .unwrap();
+        }
+
+        // keep=0 keeps ALL.
+        unsafe { std::env::set_var("LOOOP_RUNS_KEEP", "0") };
+        prune_runs(&p);
+        assert_eq!(
+            fs::read_dir(p.runs_dir()).unwrap().count(),
+            5,
+            "LOOOP_RUNS_KEEP=0 disables pruning"
+        );
+
+        // keep=2 keeps the two NEWEST by mtime (tick-3, tick-4).
+        unsafe { std::env::set_var("LOOOP_RUNS_KEEP", "2") };
+        prune_runs(&p);
+        let mut left: Vec<String> = fs::read_dir(p.runs_dir())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(
+            left,
+            vec!["tick-3".to_string(), "tick-4".to_string()],
+            "the newest runs by mtime survive"
         );
     }
 

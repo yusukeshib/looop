@@ -40,12 +40,22 @@ fn rel(paths: &Paths, p: &Path) -> String {
 /// change-detection hash. `serde_json::Value` serializes objects with sorted
 /// keys (BTreeMap), matching `jq -cS`'s canonical form.
 pub(crate) fn wake_signal(v: serde_json::Value) -> serde_json::Value {
-    match &v {
-        serde_json::Value::Object(m) if m.contains_key("signal") => {
-            m.get("signal").cloned().unwrap_or(serde_json::Value::Null)
-        }
-        _ => v,
+    if let serde_json::Value::Object(m) = &v
+        && let Some(signal) = m.get("signal")
+    {
+        return signal.clone();
     }
+    v
+}
+
+/// Hash of the POLICY half only (PLAYBOOK + goals): the steering surface a
+/// HUMAN edits. The backoff gate stores this alongside the fail counter so a
+/// steering edit can cut the backoff wait short, while mere sensor movement
+/// (which a failing action can cause every beat) cannot.
+pub(crate) fn policy_hash(paths: &Paths) -> String {
+    let mut buf: Vec<u8> = Vec::new();
+    hash_policy_into(paths, &mut buf);
+    util::content_hash(&buf)
 }
 
 /// Hash the POLICY half only: PLAYBOOK + goals/*.md, each behind an unambiguous

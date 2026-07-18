@@ -220,8 +220,10 @@ pub(crate) fn wait_for_change(paths: &Paths, filter: WaitFilter) -> Vec<String> 
 /// A cheap metadata-only stamp over everything [`fingerprints`] observes:
 /// journal + PLAYBOOK (file mtime+len) and every entry of the goals /
 /// snapshots / asks / answers dirs (name+mtime+len — creations and deletions
-/// move it too). All observable writes go through rename-publish or append, so
-/// any content change moves an mtime or a length. (Theoretical gap: a same-
+/// move it too). All observable writes go through rename-publish or append —
+/// including sensor snapshots, which `sensor::exec_sensor` streams into a
+/// sibling `.tmp` and rename-publishes — so any content change moves an mtime
+/// or a length and a reader never sees a torn file. (Theoretical gap: a same-
 /// length in-place rewrite within one mtime tick on a coarse-granularity
 /// filesystem — APFS/ext4 report nanoseconds, and looop's own writers always
 /// rename, so this is accepted.)

@@ -23,7 +23,7 @@
 use crate::config;
 use crate::paths::Paths;
 use crate::seed;
-use crate::util::{b, dim, rst};
+use crate::util::{b, char_cols, dim, display_width, rst};
 use anyhow::Result;
 use ratatui::crossterm::{
     cursor,
@@ -192,8 +192,30 @@ fn prompt_runner_tui(default: usize) -> Menu {
     let rows = PRESETS.len() + 1; // choices
     let mut drawn = false;
 
+    // SCROLL-RESERVE: emit the menu's newlines FIRST, then move back up. Any
+    // scrolling the menu needs thus happens ONCE, before drawing. Without the
+    // reservation, a cursor starting near the bottom of the screen would make
+    // the last row's newline scroll the screen on EVERY repaint, and the
+    // relative MoveUp would land one row higher each time — smearing menu
+    // copies into scrollback. (`rows >= 2` always: PRESETS is non-empty.)
+    for _ in 1..rows {
+        let _ = write!(out, "\r\n");
+    }
+    if execute!(
+        out,
+        cursor::MoveUp((rows - 1) as u16),
+        cursor::MoveToColumn(0)
+    )
+    .is_err()
+    {
+        return Menu::Unsupported;
+    }
+
     let result = loop {
-        if drawn && execute!(out, cursor::MoveUp(rows as u16)).is_err() {
+        // Repaint from the menu's TOP row. The draw below never emits a
+        // newline (rows are separated by MoveDown within the reserved block),
+        // so the region cannot scroll and this relative move stays exact.
+        if drawn && execute!(out, cursor::MoveUp((rows - 1) as u16)).is_err() {
             break Menu::Unsupported;
         }
         drawn = true;
@@ -230,15 +252,24 @@ fn prompt_runner_tui(default: usize) -> Menu {
     if drawn {
         match result {
             Menu::Selected(_) | Menu::Unsupported => {
-                let _ = execute!(out, cursor::MoveUp(rows as u16));
-                for _ in 0..rows {
+                // Erase the reserved block (top to bottom, no newlines — same
+                // no-scroll discipline as the draw) and park the cursor on its
+                // now-blank top row so the next output overwrites the menu.
+                let _ = execute!(out, cursor::MoveUp((rows - 1) as u16));
+                for i in 0..rows {
                     let _ = execute!(out, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine));
-                    let _ = writeln!(out);
+                    if i + 1 < rows {
+                        let _ = execute!(out, cursor::MoveDown(1));
+                    }
                 }
-                let _ = execute!(out, cursor::MoveUp(rows as u16));
+                let _ = execute!(
+                    out,
+                    cursor::MoveUp((rows - 1) as u16),
+                    cursor::MoveToColumn(0)
+                );
             }
             Menu::Abort => {
-                let _ = writeln!(out);
+                let _ = write!(out, "\r\n");
             }
         }
     }
@@ -247,16 +278,23 @@ fn prompt_runner_tui(default: usize) -> Menu {
     // _raw drops here: raw mode off, cursor shown — on every path.
 }
 
+/// Paint the menu into its pre-reserved rows, starting from the CURRENT line.
+/// Rows are separated by MoveDown — never a newline — so painting the bottom
+/// row can't scroll the screen and break the caller's relative-MoveUp repaint
+/// (see the scroll-reserve note in [`prompt_runner_tui`]). Ends on the LAST row.
 fn draw_runner_menu(out: &mut io::Stdout, selected: usize) -> io::Result<()> {
-    for (i, p) in PRESETS.iter().enumerate() {
+    let total = PRESETS.len() + 1;
+    for i in 0..total {
         execute!(out, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
         let cursor = if i == selected { "> " } else { "  " };
-        writeln!(out, "{cursor}{}", p.name)?;
+        match PRESETS.get(i) {
+            Some(p) => write!(out, "{cursor}{}", p.name)?,
+            None => write!(out, "{cursor}custom")?,
+        }
+        if i + 1 < total {
+            execute!(out, cursor::MoveDown(1))?;
+        }
     }
-    execute!(out, cursor::MoveToColumn(0), Clear(ClearType::CurrentLine))?;
-    let custom = PRESETS.len();
-    let cursor = if custom == selected { "> " } else { "  " };
-    writeln!(out, "{cursor}custom")?;
     out.flush()
 }
 
@@ -315,7 +353,9 @@ fn print_next_steps(runner: &str) {
 
 /// Common abort exit (Esc / Ctrl-C in a prompt): write nothing, exit 130.
 fn aborted() -> Result<ExitCode> {
-    println!("aborted (no config written).");
+    // Diagnostic, not output: stderr, so `looop init | tee`-style captures
+    // stay clean and scripts branching on stdout see nothing.
+    eprintln!("aborted (no config written).");
     Ok(ExitCode::from(130))
 }
 
@@ -350,42 +390,16 @@ enum Edit {
     Unsupported,
 }
 
-/// Display width of one char in terminal columns, for the inline editor's
-/// cursor / horizontal-scroll math: wide East-Asian and emoji glyphs occupy
-/// TWO columns, everything else one. A hand-rolled table of the common wide
-/// ranges (CJK, Hangul, fullwidth forms, emoji) — deliberately NOT a new
-/// dependency; this covers what realistically lands in a command string
-/// (paths, prompts, model names). Combining marks / zero-width joiners are
-/// approximated as 1 column — acceptable for a config editor.
-fn char_width(c: char) -> usize {
-    let wide = matches!(c as u32,
-        0x1100..=0x115F           // Hangul Jamo (leading consonants)
-        | 0x2E80..=0x303E         // CJK radicals, Kangxi, CJK symbols/punct
-        | 0x3041..=0x33FF         // Hiragana..Katakana..CJK compat
-        | 0x3400..=0x4DBF         // CJK ext A
-        | 0x4E00..=0x9FFF         // CJK unified ideographs
-        | 0xA000..=0xA4CF         // Yi
-        | 0xAC00..=0xD7A3         // Hangul syllables
-        | 0xF900..=0xFAFF         // CJK compatibility ideographs
-        | 0xFE30..=0xFE4F         // CJK compatibility forms
-        | 0xFF00..=0xFF60         // fullwidth forms
-        | 0xFFE0..=0xFFE6         // fullwidth signs
-        | 0x1F300..=0x1FAFF       // emoji & pictographs
-        | 0x20000..=0x3FFFD       // CJK ext B and beyond
-    );
-    if wide { 2 } else { 1 }
-}
-
-/// Total display columns of a char sequence (see [`char_width`]).
-fn display_width(chars: impl Iterator<Item = char>) -> usize {
-    chars.map(char_width).sum()
-}
+// The inline editor's cursor / horizontal-scroll math runs in DISPLAY COLUMNS
+// via the SHARED width table `util::char_cols` / `util::display_width` — this
+// module used to carry its own private copy, which drifted from util's on the
+// emoji ranges (a 1-vs-2 miss here misplaces the editor cursor).
 
 /// A readline-style editor. Prints `label` on its own dim line, then edits the
 /// command on the line below, prefilled with `initial` (cursor at end). Long
 /// commands SCROLL HORIZONTALLY within one physical line (window = term width-1),
 /// so wrapping never confuses the cursor math. All window/cursor math is in
-/// DISPLAY COLUMNS (via [`char_width`]), not chars, so CJK/emoji in the command
+/// DISPLAY COLUMNS (via [`char_cols`]), not chars, so CJK/emoji in the command
 /// keep the cursor aligned. Restores cooked mode before returning.
 fn editable(label: &str, initial: &str) -> Edit {
     let mut out = io::stdout();
@@ -414,7 +428,7 @@ fn editable(label: &str, initial: &str) -> Edit {
         let mut start = pos;
         let mut cursor_cols = 0usize; // display width of buf[start..pos]
         while start > 0 {
-            let w = char_width(buf[start - 1]);
+            let w = char_cols(buf[start - 1]);
             if cursor_cols + w > win.saturating_sub(1) {
                 break;
             }
@@ -425,7 +439,7 @@ fn editable(label: &str, initial: &str) -> Edit {
         let mut end = start;
         let mut used = 0usize;
         while end < buf.len() {
-            let w = char_width(buf[end]);
+            let w = char_cols(buf[end]);
             if used + w > win {
                 break;
             }
@@ -523,14 +537,14 @@ mod tests {
     }
 
     #[test]
-    fn char_width_distinguishes_wide_glyphs() {
-        assert_eq!(char_width('a'), 1);
-        assert_eq!(char_width('-'), 1);
-        assert_eq!(char_width('あ'), 2); // Hiragana
-        assert_eq!(char_width('漢'), 2); // CJK ideograph
-        assert_eq!(char_width('한'), 2); // Hangul syllable
-        assert_eq!(char_width('🎉'), 2); // emoji
-        assert_eq!(char_width('Ａ'), 2); // fullwidth A
+    fn editor_width_math_uses_the_shared_table() {
+        // The editor's window/cursor arithmetic runs on the SHARED util width
+        // table — assert the glyphs a command string realistically carries
+        // (paths, prompts, model names) still measure as the editor expects.
+        assert_eq!(char_cols('a'), 1);
+        assert_eq!(char_cols('-'), 1);
+        assert_eq!(char_cols('あ'), 2); // Hiragana
+        assert_eq!(char_cols('🎉'), 2); // emoji
         assert_eq!(display_width("pi -p あ🎉".chars()), 6 + 4);
     }
 

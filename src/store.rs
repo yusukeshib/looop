@@ -218,8 +218,11 @@ impl<'a> FileStore<'a> {
 
 /// fsync the DIRECTORY containing `path`, so a rename that just landed in it
 /// survives a crash (the dir entry itself needs a sync, not just the data).
-/// Local replica of util's private helper — kept identical, best-effort at
-/// call sites.
+/// Local replica of util's PRIVATE helper — kept identical, best-effort at
+/// call sites. Deliberately not deduplicated: util keeps its fsync helper
+/// private to its own write_atomic implementation, and widening it to
+/// pub(crate) to save these six lines would couple this module to util's
+/// internals for a trivial, drift-proof idiom (open parent, sync_all).
 #[cfg(unix)]
 fn sync_parent_dir(path: &std::path::Path) -> io::Result<()> {
     if let Some(dir) = path.parent() {
@@ -292,8 +295,14 @@ impl StateStore for FileStore<'_> {
         // keeps "exists ⇒ contents complete" for lock-free readers: the final
         // path only ever appears fully written + fsynced.
         let _lock = DirLock::acquire(&parent)?;
-        if path.exists() {
-            return Ok(false);
+        // fs::metadata, NOT path.exists(): exists() maps EVERY stat error
+        // (EACCES, EIO, …) to false, which would let the rename below CLOBBER
+        // a record we merely failed to see — breaking lease exclusivity. Only
+        // a definitive NotFound may proceed; any other error surfaces.
+        match fs::metadata(&path) {
+            Ok(_) => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
         }
         let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("key");
         let tmp = parent.join(format!(
@@ -334,6 +343,31 @@ impl StateStore for FileStore<'_> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
+        // journal.md gets the same one-generation size cap events.jsonl has
+        // (`LOOOP_JOURNAL_MAX_BYTES`, default 5 MiB, 0 = off): the journal is
+        // append-only with no other pruning, so without a cap it grows without
+        // bound. Same discipline as events.rs emit(): serialize ONLY the
+        // size-check + rename with a NON-blocking flock on a sibling lock file
+        // (kernel-managed — a crash never leaves a stale lock; contended ⇒
+        // skip, the next append past the cap retries), and keep the append
+        // itself lock-free. Best-effort: rotation must never fail a write.
+        if matches!(key, Key::Journal) {
+            let max_bytes: u64 =
+                crate::util::env_knob("LOOOP_JOURNAL_MAX_BYTES").unwrap_or(5 * 1024 * 1024);
+            let name = path.file_name().map(|s| s.to_string_lossy().to_string());
+            if max_bytes > 0
+                && let Some(name) = name
+                && let Ok(lock) = fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(path.with_file_name(format!(".{name}.rotlock")))
+                && crate::util::flock_file(&lock, false)
+                && fs::metadata(&path).is_ok_and(|m| m.len() > max_bytes)
+            {
+                let _ = fs::rename(&path, path.with_file_name(format!("{name}.1")));
+            }
+        }
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -353,11 +387,19 @@ impl StateStore for FileStore<'_> {
         // ask ids can be REUSED after a pair is archived (`next_ask_id` scans
         // only the live dirs), so an archived record must never be clobbered.
         fn into_archive(from: std::path::PathBuf, stem: &str, ext: &str) -> io::Result<()> {
-            let dir = from
+            let live_dir = from
                 .parent()
-                .ok_or_else(|| io::Error::other("archive: no parent dir"))?
-                .join("archive");
+                .ok_or_else(|| io::Error::other("archive: no parent dir"))?;
+            let dir = live_dir.join("archive");
             fs::create_dir_all(&dir)?;
+            // The free-suffix scan + rename must be ONE critical section:
+            // unlocked, two concurrent archives of the same id could both pick
+            // the same free suffix and the second rename would silently
+            // clobber the first record — and unarchive_pair's no-clobber guard
+            // already assumes archive-side movement is serialized under the
+            // LIVE dir's writer lock (the same DirLock create_exclusive
+            // takes), so that lock is the shared serialization point.
+            let _lock = DirLock::acquire(live_dir)?;
             let mut to = dir.join(format!("{stem}.{ext}"));
             let mut n = 1;
             while to.exists() {
@@ -595,6 +637,100 @@ mod tests {
         assert_eq!(
             fs::read_to_string(dir.join("triage-1.md")).unwrap(),
             "second body"
+        );
+    }
+
+    #[test]
+    fn concurrent_archives_never_clobber_an_archived_record() {
+        // Regression for the unlocked suffix scan: two concurrent archives of
+        // the SAME id could both pick the same free `-N` suffix, and the
+        // loser's rename silently destroyed the winner's archived record.
+        // Under the live-dir DirLock every successful archive must land under
+        // its OWN name, so files-in-archive == successful-archive-calls.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let p = Paths::temp();
+        let archived = AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    let s = FileStore::new(&p);
+                    let k = Key::Goal("hot".into());
+                    for i in 0..40 {
+                        // The write may be overwritten (or archived away) by
+                        // the sibling thread — only Ok archives are counted.
+                        let _ = s.write_atomic(&k, &format!("body {i}"));
+                        if s.archive(&k).is_ok() {
+                            archived.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        let files = fs::read_dir(p.goals_dir().join("archive"))
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|e| e.path().extension().is_some_and(|x| x == "md"))
+            .count();
+        assert_eq!(
+            files,
+            archived.load(Ordering::Relaxed),
+            "every successful archive must keep its own record (no suffix clobber)"
+        );
+    }
+
+    /// Restores an env var to its pre-test value on drop (panic-safe).
+    struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+    impl EnvRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            EnvRestore(key, prev)
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => unsafe { std::env::set_var(self.0, v) },
+                None => unsafe { std::env::remove_var(self.0) },
+            }
+        }
+    }
+
+    #[test]
+    fn journal_rotates_one_generation_at_the_size_cap() {
+        // set_var is process-global: serialize against other env-mutating
+        // tests and restore the knob even if an assert panics.
+        let _g = crate::util::test_env_lock();
+        let _r = EnvRestore::set("LOOOP_JOURNAL_MAX_BYTES", "64");
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        for i in 0..8 {
+            s.append_line(&Key::Journal, &format!("- entry {i} xxxxxxxxxxxxxxxx"))
+                .unwrap();
+        }
+        let rotated = p.data_dir.join("journal.md.1");
+        assert!(
+            rotated.is_file(),
+            "past the cap the journal must roll to journal.md.1"
+        );
+        let live = fs::read_to_string(p.journal()).unwrap();
+        assert!(
+            live.len() <= 64 + 32,
+            "the live journal stays bounded near the cap, got {} bytes",
+            live.len()
+        );
+        // One-generation policy (matches events.jsonl): the newest entries are
+        // split across live + .1; anything older was deliberately dropped when
+        // a later rotation replaced the previous .1 — so assert recency, not
+        // full retention.
+        let all = format!("{}{live}", fs::read_to_string(&rotated).unwrap());
+        assert!(
+            all.contains("- entry 7 "),
+            "the newest entry must survive rotation"
+        );
+        assert!(
+            !all.contains("- entry 0 "),
+            "the oldest generation is dropped (one rotated generation kept)"
         );
     }
 

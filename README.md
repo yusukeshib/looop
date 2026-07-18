@@ -246,3 +246,31 @@ its stdin is the live attach TTY.)
 Model ids above are examples. For claude, `sonnet`/`opus` are aliases that always
 resolve to the latest of each; pin a specific version (e.g.
 `--model claude-opus-4-1`) if you need reproducibility.
+
+## Threat model
+
+looop's `run_shell` action executes a **decider-written command** via `bash -c`
+with the operator's own authority — it *trusts the decider*. Be aware of what
+feeds that decider: the decide prompt embeds **sensor output**, and sensors
+routinely ingest external data (issue bodies, inbound email, API responses), so
+the prompt is an **injection surface** — a hostile input could try to talk the
+decider into a harmful command.
+
+Two mitigations exist, and it matters what they do and do not guarantee:
+
+- **Prompt hardening**: interpolated bodies (goals, sensor snapshots, asks, the
+  journal) cannot forge prompt section headers or item separators, and are
+  size-capped. This limits *structural* injection, not persuasion.
+- **A run_shell deny-list** (a *tripwire, not a sandbox*): before execution the
+  command string is screened for a small set of obviously destructive shapes —
+  `rm -rf /` or `~`, `sudo`, force-pushing `main`/`master`, `curl … | sh`,
+  `mkfs`, `dd of=/dev/…`, redirects onto raw disks, shutdown/reboot. A denied
+  command is **not executed**; the beat fails with an error the next decide
+  prompt sees (LAST FAILURE), so the decider rethinks. String matching over
+  shell is trivially bypassable (`$(…)`, aliases, exotic quoting): the
+  deny-list catches the dumb catastrophic mistake, **it does not contain an
+  adversary**. Setting `LOOOP_SHELL_ALLOW_DANGEROUS=1` disables it entirely.
+
+If you need real containment, run looop (or at least its workers) inside a
+sandbox — a container, VM, or dedicated user account with scoped credentials —
+and treat everything a sensor reads as untrusted input.

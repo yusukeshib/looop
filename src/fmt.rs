@@ -4,6 +4,15 @@
 //! renders each line via `format_line` into the friendly `tool:` progress that
 //! is archived to runs/<id>/output.log. There is no external formatter and looop
 //! never re-execs itself to post-process its own child.
+//!
+//! Three runner schemas are recognized: pi (`--mode json`), claude
+//! (`-p --output-format stream-json`, the default tick wiring) and codex
+//! (`exec --json`). Codex support is BEST-EFFORT: its event schema
+//! (`thread.started` / `item.started` / `item.completed` … with a nested
+//! `item` object) is still marked experimental upstream, so the arm below
+//! reads only the stable-looking generic shapes (`item.type`, `text`,
+//! `command`, `exit_code`) defensively — an unrecognized codex event degrades
+//! to silence, never to a crash or garbage in the archive.
 
 /// Render one NDJSON event line; `None` means "emit nothing" (mirrors jq empty).
 /// Used in-process by `runner::run_streamed` to turn the tick runner's raw
@@ -105,6 +114,60 @@ pub(crate) fn format_line(line: &str) -> Option<String> {
                 None
             } else {
                 Some(format!("  {}done ({}){}", dim(), parts.join(" · "), rst()))
+            }
+        }
+        // ---- codex `exec --json` schema (best-effort — see module doc) ----
+        // Events wrap a nested `item`; the shapes we consume look like:
+        //   {"type":"item.started","item":{"type":"command_execution",
+        //       "command":"bash -lc …","status":"in_progress"}}
+        //   {"type":"item.completed","item":{"type":"command_execution",
+        //       "command":"…","exit_code":1,"status":"failed"}}
+        //   {"type":"item.completed","item":{"type":"agent_message","text":"…"}}
+        "item.started" | "item.completed" => {
+            let item = e.get("item")?;
+            match item.get("type").and_then(|t| t.as_str()) {
+                // The command line is shown once, when execution STARTS (the
+                // progress signal); completion only matters when it FAILED.
+                Some("command_execution") if ty == "item.started" => {
+                    let cmd = item.get("command").and_then(|c| c.as_str()).unwrap_or("");
+                    Some(tool_line(
+                        "command",
+                        Some(&serde_json::json!({ "command": cmd })),
+                    ))
+                }
+                Some("command_execution") => {
+                    let failed = item
+                        .get("exit_code")
+                        .and_then(serde_json::Value::as_i64)
+                        .is_some_and(|c| c != 0);
+                    // Same red no-glyph failure line as the pi arm.
+                    failed.then(|| format!("  {}command failed{}", red(), rst()))
+                }
+                // The assistant's narration, complete text at item.completed
+                // (deltas ride item.updated, which we skip — the archive wants
+                // whole messages, not a character stream).
+                Some("agent_message") if ty == "item.completed" => {
+                    let text = item.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    if text.trim().is_empty() {
+                        None
+                    } else {
+                        Some(format!("\n{text}"))
+                    }
+                }
+                // reasoning / file_change / mcp_tool_call / web_search /
+                // unknown item kinds: no progress worth archiving (defensive —
+                // the schema is experimental upstream).
+                _ => None,
+            }
+        }
+        // codex fatal stream error: surface it — otherwise the run archive
+        // ends silently mid-stream with no hint why.
+        "error" => {
+            let msg = e.get("message").and_then(|m| m.as_str()).unwrap_or("");
+            if msg.is_empty() {
+                None
+            } else {
+                Some(format!("  {}error: {msg}{}", red(), rst()))
             }
         }
         // claude bookkeeping events carry no progress worth archiving.
@@ -229,6 +292,64 @@ mod tests {
         })
         .to_string();
         assert_eq!(format_line(&empty), None);
+    }
+
+    #[test]
+    fn format_line_codex_items_render_progress() {
+        // Representative codex `exec --json` lines (schema is experimental
+        // upstream — these mirror the shapes the arm reads defensively).
+        // A command execution surfaces its command line when it STARTS…
+        let started = json!({
+            "type": "item.started",
+            "item": { "id": "item_1", "type": "command_execution",
+                      "command": "bash -lc 'git   status'", "status": "in_progress" }
+        })
+        .to_string();
+        let out = format_line(&started).expect("codex command start renders");
+        assert!(
+            out.contains("git status"),
+            "command collapsed + shown: {out}"
+        );
+
+        // …a CLEAN completion adds nothing (the start line already logged it)…
+        let ok = json!({
+            "type": "item.completed",
+            "item": { "type": "command_execution", "command": "ls",
+                      "exit_code": 0, "status": "completed" }
+        })
+        .to_string();
+        assert_eq!(format_line(&ok), None);
+
+        // …but a FAILED one is surfaced (red, no glyph — like the pi arm).
+        let failed = json!({
+            "type": "item.completed",
+            "item": { "type": "command_execution", "command": "ls",
+                      "exit_code": 1, "status": "failed" }
+        })
+        .to_string();
+        let out = format_line(&failed).expect("codex command failure renders");
+        assert!(out.contains("failed"), "{out}");
+
+        // The assistant's message lands whole at item.completed.
+        let msg = json!({
+            "type": "item.completed",
+            "item": { "id": "item_2", "type": "agent_message", "text": "all done" }
+        })
+        .to_string();
+        assert_eq!(format_line(&msg), Some("\nall done".to_string()));
+
+        // Reasoning + bookkeeping events stay silent; a stream error surfaces.
+        let reasoning = json!({
+            "type": "item.completed",
+            "item": { "type": "reasoning", "text": "thinking…" }
+        })
+        .to_string();
+        assert_eq!(format_line(&reasoning), None);
+        let turn = json!({ "type": "turn.completed", "usage": { "input_tokens": 5 } }).to_string();
+        assert_eq!(format_line(&turn), None);
+        let err = json!({ "type": "error", "message": "stream disconnected" }).to_string();
+        let out = format_line(&err).expect("codex stream error renders");
+        assert!(out.contains("stream disconnected"), "{out}");
     }
 
     #[test]

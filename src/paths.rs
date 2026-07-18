@@ -22,6 +22,10 @@ pub struct Paths {
     /// True when this is the default profile (data_dir == the XDG default), used
     /// only to decide whether shell hints need an explicit `LOOOP_DATA_DIR=`.
     pub default_profile: bool,
+    /// Test-only: delete `data_dir` on drop. Set ONLY by [`Paths::temp`] — a
+    /// `resolve()`d Paths points at REAL state and must never be auto-deleted.
+    #[cfg(test)]
+    pub(crate) temp_cleanup: bool,
 }
 
 fn home() -> PathBuf {
@@ -30,6 +34,12 @@ fn home() -> PathBuf {
         // A clean, actionable exit instead of a panic + backtrace: $HOME being
         // unset is an environment problem (cron / stripped-down service env),
         // not a bug worth a panic message.
+        //
+        // EMBEDDING CAVEAT: process::exit in a library-layer fn is a CLI UX
+        // choice — looop is a binary, so exiting here is the whole program's
+        // answer. Anyone lifting this module into a library context should
+        // turn this arm into an Err instead: exit(2) would tear down the HOST
+        // process (skipping its destructors) on a missing env var.
         _ => {
             eprintln!(
                 "looop: $HOME is not set — set HOME, or point LOOOP_DATA_DIR (and \
@@ -91,6 +101,8 @@ impl Paths {
             data_dir,
             config,
             default_profile,
+            #[cfg(test)]
+            temp_cleanup: false,
         }
     }
 
@@ -233,6 +245,11 @@ impl Paths {
     }
 
     /// A throwaway `Paths` rooted at a freshly-created temp data dir. Test-only.
+    /// The dir is deleted when the value drops (see the `Drop` impl below), so
+    /// a test run no longer strews `looop-test-*` dirs across the system temp
+    /// dir. Tests hold their `Paths` by value for their whole body (moving it
+    /// into a thread joins before the assertions end), so drop-at-test-end is
+    /// exactly the teardown point.
     #[cfg(test)]
     pub fn temp() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -245,6 +262,20 @@ impl Paths {
             data_dir: dir.clone(),
             config: dir.join("config.json"),
             default_profile: false,
+            temp_cleanup: true,
+        }
+    }
+}
+
+/// Test-only teardown for [`Paths::temp`]: remove the throwaway data dir when
+/// the test's `Paths` drops. Gated on `temp_cleanup` so a `resolve()`d Paths
+/// (real state) can never be deleted, even in a test build. Best-effort — a
+/// failed cleanup must never panic across a test's own result.
+#[cfg(test)]
+impl Drop for Paths {
+    fn drop(&mut self) {
+        if self.temp_cleanup {
+            let _ = std::fs::remove_dir_all(&self.data_dir);
         }
     }
 }
