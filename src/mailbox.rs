@@ -115,6 +115,8 @@ pub fn answered_detached(paths: &Paths) -> Vec<(Ask, String)> {
 /// reference. Errors when the ask is unknown or not answered yet — a resume
 /// against a pending ask is a decider mistake and must fail loudly.
 pub fn resume_context(paths: &Paths, ask_id: &str) -> Result<String> {
+    // The id becomes a path segment (asks/<id>.json) — same guard as answer().
+    util::safe_segment("ask id", ask_id)?;
     let store = FileStore::new(paths);
     let raw = store
         .read(&Key::Ask(ask_id.to_string()))
@@ -142,8 +144,13 @@ pub fn resume_context(paths: &Paths, ask_id: &str) -> Result<String> {
 
 /// Archive a consumed ask/answer pair (asks/archive/, answers/archive/) so the
 /// `sys-asks` resume signal settles. Best-effort on the answer half (an ask
-/// without an answer file archives just the ask).
+/// without an answer file archives just the ask). An id that is not a safe
+/// path segment archives nothing — the id becomes a filename, so it gets the
+/// same guard as every other mailbox verb.
 pub fn archive_pair(paths: &Paths, ask_id: &str) {
+    if util::safe_segment("ask id", ask_id).is_err() {
+        return;
+    }
     let store = FileStore::new(paths);
     let _ = store.archive(&Key::Ask(ask_id.to_string()));
     let _ = store.archive(&Key::Answer(ask_id.to_string()));
@@ -658,6 +665,8 @@ mod tests {
         );
         // resume_context before the answer is a loud error.
         assert!(resume_context(&p, &id).is_err());
+        // …and so is an id that is not a safe path segment (traversal guard).
+        assert!(resume_context(&p, "../evil").is_err());
 
         // Answer: the ask leaves pending and becomes resumable.
         cmd_answer(&p, &ans(&id, "split it", false)).unwrap();
