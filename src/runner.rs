@@ -141,11 +141,15 @@ pub fn run_streamed(
     };
 
     // Deadline watchdog: this thread is about to block streaming the runner's
-    // output, so a separate thread owns the timeout. It sleeps on a channel;
-    // a send (at stream EOF below, BEFORE the child is reaped) cancels it, and
-    // only an actual TIMEOUT (not a disconnect) kills the group. Returns
-    // whether it fired.
+    // output, so a separate thread owns the timeout WHILE WE STREAM. It sleeps
+    // on a channel; a send (after the stream ends below, BEFORE the child is
+    // reaped) cancels it, and only an actual TIMEOUT (not a disconnect) kills
+    // the group. Returns whether it fired. Once the stream ends, THIS thread
+    // takes the deadline back (see the reap loop below) — the watchdog never
+    // outlives the un-reaped child, so its group kill can never hit a
+    // recycled pgid.
     let timeout = tick_timeout_secs();
+    let started = std::time::Instant::now();
     let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
     let pgid = child.id() as i32;
     let watchdog = (timeout > 0).then(|| {
@@ -202,14 +206,10 @@ pub fn run_streamed(
     // SIGPIPE-ing a live child and mislabeling the beat as a runner failure.
     let mut reader = BufReader::new(out);
     let mut buf: Vec<u8> = Vec::new();
-    let mut saw_eof = false;
     loop {
         buf.clear();
         match reader.read_until(b'\n', &mut buf) {
-            Ok(0) => {
-                saw_eof = true;
-                break;
-            }
+            Ok(0) => break, // EOF: every writer closed the pipe
             Ok(_) => {
                 let line = String::from_utf8_lossy(&buf);
                 let line = line.trim_end_matches(['\n', '\r']);
@@ -229,28 +229,46 @@ pub fn run_streamed(
     // would deadlock both sides on a full pipe buffer.
     drop(reader);
 
-    let timed_out;
-    let status;
-    if saw_eof {
-        // Clean EOF: every writer closed the pipe — the runner is exiting (or
-        // was killed). Cancel + join the watchdog BEFORE reaping, so
-        //   (a) a runner that exits just under the deadline cannot be
-        //       misreported as timed out by a watchdog whose recv_timeout
-        //       expires while we reap, and
-        //   (b) the group kill can never fire AFTER wait() has reaped the
-        //       child — which could hit a recycled pgid belonging to someone
-        //       else. Joining first closes that window entirely on this path.
-        let _ = cancel_tx.send(());
-        timed_out = watchdog.is_some_and(|h| h.join().unwrap_or(false));
-        status = child.wait();
+    // Take the deadline back from the watchdog BEFORE reaping: joining first
+    // guarantees the watchdog's group kill can never fire AFTER wait() has
+    // reaped the child — which could hit a recycled pgid belonging to someone
+    // else. But the stream ending does NOT prove the child is exiting: EOF
+    // only means every writer closed the pipe (a runner can close its stdout
+    // and keep running), and after a read error the child is definitely still
+    // alive — so a plain wait() here could hang the single-instance pulse
+    // forever with the watchdog gone. Instead, reap with the ORIGINAL
+    // deadline: poll try_wait() and kill the group ourselves if it expires.
+    // Killing here is race-free where the watchdog was not: the child is
+    // still un-reaped, so its pgid cannot have been recycled.
+    let _ = cancel_tx.send(());
+    // (cfg_attr: only the Unix arm below can set it — non-Unix would warn.)
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut timed_out = watchdog.is_some_and(|h| h.join().unwrap_or(false));
+    let status = if timeout == 0 {
+        child.wait() // deadline disabled by the operator — wait indefinitely
     } else {
-        // Read ERROR: the child may still be alive and writing, so the
-        // watchdog must stay armed — it is the only thing that can unstick a
-        // hung child while we block in wait() here.
-        status = child.wait();
-        let _ = cancel_tx.send(());
-        timed_out = watchdog.is_some_and(|h| h.join().unwrap_or(false));
-    }
+        let deadline = started + std::time::Duration::from_secs(timeout);
+        loop {
+            match child.try_wait() {
+                Ok(Some(s)) => break Ok(s),
+                Ok(None) if std::time::Instant::now() >= deadline => {
+                    // Same outcome as the watchdog firing mid-stream, minus
+                    // the post-reap race: kill the group, then reap for real.
+                    // (On non-Unix nothing can kill the group — fall through
+                    // to a plain wait without claiming a kill happened,
+                    // matching the watchdog's non-Unix behavior.)
+                    #[cfg(unix)]
+                    {
+                        kill_pgid(pgid);
+                        timed_out = true;
+                    }
+                    break child.wait();
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),
+                Err(e) => break Err(e),
+            }
+        }
+    };
     match status {
         // A clean zero exit WINS over a racing timeout flag: if the runner
         // finished its work, reporting "timed out · killed" would be a lie

@@ -299,7 +299,9 @@ fn denied_shell_pattern(cmd: &str) -> Option<&'static str> {
     let tokens: Vec<&str> = lower.split_whitespace().collect();
 
     // Privilege escalation: looop must act with the operator's own authority.
-    if tokens.contains(&"sudo") {
+    // Command-POSITION only: `grep sudo /etc/group` or `man sudo` merely
+    // MENTIONS the word — only an invocation trips the wire.
+    if command_position(&tokens).any(|t| t == "sudo") {
         return Some("sudo (privilege escalation)");
     }
     // `rm -rf` (any flag spelling carrying both r and f) aimed at the root or
@@ -336,24 +338,76 @@ fn denied_shell_pattern(cmd: &str) -> Option<&'static str> {
         }
     }
     // Raw-device destruction: format, dd onto a device, redirect onto a disk.
-    if tokens.iter().any(|t| t.starts_with("mkfs")) {
+    if command_position(&tokens).any(|t| t.starts_with("mkfs")) {
         return Some("mkfs (filesystem format)");
     }
-    if tokens.iter().any(|t| t.starts_with("of=/dev/")) {
+    // `of=/dev/null` (the classic dd benchmark/discard sink) and its harmless
+    // sibling pseudo-devices are NOT raw-device destruction.
+    if tokens.iter().any(|t| {
+        t.starts_with("of=/dev/")
+            && !matches!(
+                *t,
+                "of=/dev/null" | "of=/dev/zero" | "of=/dev/stdout" | "of=/dev/stderr"
+            )
+    }) {
         return Some("dd onto a raw device");
     }
     let squeezed = tokens.join(" ");
-    if squeezed.contains(">/dev/sd") || squeezed.contains("> /dev/sd") {
-        return Some("redirect onto a raw disk device");
+    // Linux whole-disk/partition names AND the macOS/BSD ones (this project's
+    // primary host): /dev/sd*, /dev/nvme*, /dev/disk*, /dev/rdisk*.
+    for dev in ["/dev/sd", "/dev/nvme", "/dev/disk", "/dev/rdisk"] {
+        if squeezed.contains(&format!(">{dev}")) || squeezed.contains(&format!("> {dev}")) {
+            return Some("redirect onto a raw disk device");
+        }
     }
-    // Host power state is never looop's to change.
-    if tokens
-        .iter()
-        .any(|t| matches!(*t, "shutdown" | "reboot" | "halt" | "poweroff"))
-    {
+    // Host power state is never looop's to change. Command-position only:
+    // `last reboot` / `journalctl | grep shutdown` merely mention the word.
+    if command_position(&tokens).any(|t| matches!(t, "shutdown" | "reboot" | "halt" | "poweroff")) {
         return Some("shutdown/reboot");
     }
     None
+}
+
+/// The subset of `tokens` in COMMAND position: the first word, any word after
+/// a shell separator (`;`, `&&`, `||`, `|`, `&`, `(` — separate token or glued
+/// onto the previous one), any word after a common command wrapper
+/// (`env`/`nohup`/`time`/`exec`/`xargs`/`then`/`else`/`elif`/`do`), and any
+/// word after a leading VAR=value assignment. Best-effort like the rest of the
+/// tripwire: a construction exotic enough to hide the invocation from this
+/// walk is the accepted-bypassable case [`denied_shell_pattern`] documents.
+fn command_position<'a>(tokens: &'a [&'a str]) -> impl Iterator<Item = &'a str> {
+    fn is_assignment(t: &str) -> bool {
+        t.split_once('=').is_some_and(|(name, _)| {
+            !name.is_empty() && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+    }
+    tokens.iter().enumerate().filter_map(|(i, t)| {
+        let cmd_pos = i == 0 || {
+            let prev = tokens[i - 1];
+            matches!(
+                prev,
+                ";" | "&&"
+                    | "||"
+                    | "|"
+                    | "&"
+                    | "("
+                    | "then"
+                    | "else"
+                    | "elif"
+                    | "do"
+                    | "exec"
+                    | "env"
+                    | "nohup"
+                    | "time"
+                    | "xargs"
+            ) || prev.ends_with(';')
+                || prev.ends_with('|')
+                || prev.ends_with('&')
+                || prev.ends_with('(')
+                || is_assignment(prev)
+        };
+        cmd_pos.then_some(*t)
+    })
 }
 
 /// The last `max` chars of `s` (UTF-8 safe).
@@ -1310,8 +1364,12 @@ mod tests {
             "mkfs.ext4 /dev/sda1",
             "dd if=img of=/dev/sda",
             "cat img > /dev/sda1",
+            "cat img > /dev/disk0", // macOS raw-disk names count too
             "shutdown -h now",
             "reboot",
+            "true && sudo make install", // command position after a separator
+            "echo done; reboot",         // …including one glued onto the word
+            "env FOO=1 sudo id",         // …and after wrappers / assignments
         ] {
             assert!(denied_shell_pattern(cmd).is_some(), "must be denied: {cmd}");
         }
@@ -1329,6 +1387,11 @@ mod tests {
             "curl https://x | jq .name",
             "grep -rf patterns.txt src/", // -rf flags on grep, not rm
             "ls ~/projects",
+            "grep sudo /etc/group",       // MENTIONS sudo, doesn't invoke it
+            "man mkfs",                   // mkfs as an argument, not a command
+            "last reboot",                // reboot history, not a reboot
+            "journalctl | grep shutdown", // shutdown as a grep pattern
+            "dd if=/dev/sda of=/dev/null bs=1m count=1", // read benchmark: null sink
         ] {
             assert!(
                 denied_shell_pattern(cmd).is_none(),

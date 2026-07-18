@@ -669,6 +669,7 @@ pub fn pending_tells(paths: &Paths, worker: &str) -> Vec<Tell> {
 /// deliberately doesn't have.
 pub fn drain_tells(paths: &Paths, worker: &str) -> Vec<String> {
     let consumed = paths.tells_dir().join("consumed");
+    prune_consumed_tells(&consumed);
     let mut out = Vec::new();
     for t in pending_tells(paths, worker) {
         if std::fs::create_dir_all(&consumed).is_err() {
@@ -694,6 +695,38 @@ pub fn drain_tells(paths: &Paths, worker: &str) -> Vec<String> {
         }
     }
     out
+}
+
+/// Best-effort retention sweep for `tells/consumed/`: every delivered tell
+/// leaves an audit record there (see [`drain_tells`]) and nothing else ever
+/// removes them, so without a sweep the dir grows WITHOUT BOUND — the same
+/// failure class the events.jsonl / journal.md size caps guard against. Age
+/// is the right axis here (the records exist for post-mortem audit, and an
+/// old one has served its purpose): entries older than
+/// `LOOOP_TELLS_CONSUMED_KEEP_SECS` (default 7 days; 0 = keep forever) are
+/// removed by mtime. Runs at drain time — the only writer of consumed/ — so
+/// the sweep piggybacks on exactly the path that causes the growth. A sweep
+/// failure must never fail (or even slow) a delivery, hence all-ignore.
+fn prune_consumed_tells(consumed: &std::path::Path) {
+    let keep: u64 =
+        crate::util::env_knob("LOOOP_TELLS_CONSUMED_KEEP_SECS").unwrap_or(7 * 24 * 3600);
+    // checked_sub: an absurd knob (u64::MAX) would underflow SystemTime and
+    // panic — treat it as "keep forever", same spirit as the ask deadline.
+    let Some(cutoff) = (keep > 0)
+        .then(|| std::time::SystemTime::now().checked_sub(std::time::Duration::from_secs(keep)))
+        .flatten()
+    else {
+        return;
+    };
+    for e in std::fs::read_dir(consumed).into_iter().flatten().flatten() {
+        let aged = e
+            .metadata()
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t < cutoff);
+        if aged {
+            let _ = std::fs::remove_file(e.path());
+        }
+    }
 }
 
 /// Drop every pending tell for `worker` UNDELIVERED. Called when a worker
@@ -1343,6 +1376,44 @@ mod tests {
                 .count(),
             2,
             "every delivered tell leaves an audit record under consumed/"
+        );
+    }
+
+    #[test]
+    fn consumed_tell_audit_records_are_swept_past_the_retention_window() {
+        // Regression guard for unbounded growth: drain_tells leaves one audit
+        // file under tells/consumed/ per delivery and nothing else removes
+        // them — the drain-time sweep must reap records older than the
+        // retention window while leaving fresh ones alone.
+        let p = Paths::temp();
+        queue_tell(&p, "w", 1, "deliver me");
+        assert_eq!(drain_tells(&p, "w").len(), 1);
+        let consumed = p.tells_dir().join("consumed");
+        let entry = std::fs::read_dir(&consumed)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        // A fresh record survives a drain (the sweep is age-based).
+        assert!(drain_tells(&p, "w").is_empty());
+        assert_eq!(
+            std::fs::read_dir(&consumed).unwrap().count(),
+            1,
+            "a fresh audit record is kept"
+        );
+        // Age it past the default 7-day retention; the next drain sweeps it
+        // (even with nothing pending — the sweep runs unconditionally).
+        std::fs::File::open(entry.path())
+            .unwrap()
+            .set_modified(
+                std::time::SystemTime::now() - std::time::Duration::from_secs(8 * 24 * 3600),
+            )
+            .unwrap();
+        assert!(drain_tells(&p, "w").is_empty());
+        assert_eq!(
+            std::fs::read_dir(&consumed).unwrap().count(),
+            0,
+            "an aged audit record is swept"
         );
     }
 

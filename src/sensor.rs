@@ -107,6 +107,11 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
     } else {
         Instant::now().checked_add(Duration::from_secs(to))
     };
+    // Set ONLY when the child actually died to a signal (never inferred from
+    // the numeric rc): a script that itself `exit 130`s must not be reported
+    // as "killed by signal 2".
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    let mut killed_by_signal: Option<i32> = None;
     let rc = loop {
         match child.try_wait() {
             Ok(Some(status)) => {
@@ -118,6 +123,7 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
                 {
                     use std::os::unix::process::ExitStatusExt;
                     if let Some(sig) = status.signal() {
+                        killed_by_signal = Some(sig);
                         break 128 + sig;
                     }
                 }
@@ -161,10 +167,9 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
     if rc != 0 {
         let msg = if rc == 124 {
             format!("sensor timed out after {to}s (LOOOP_SENSOR_TIMEOUT)")
-        } else if rc > 128 {
+        } else if let Some(sig) = killed_by_signal {
             format!(
-                "sensor killed by signal {} — an external kill (OOM, TERM), not a script bug",
-                rc - 128
+                "sensor killed by signal {sig} — an external kill (OOM, TERM), not a script bug"
             )
         } else {
             "sensor exited non-zero — fix the script or its environment".to_string()
@@ -1045,6 +1050,36 @@ mod tests {
                 .contains("killed by signal 15"),
             "the blob names the signal so the decider can tell an external kill \
              from a script bug: {body}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn plain_exit_above_128_is_not_misreported_as_a_signal_death() {
+        // A script that itself `exit 130`s has a real exit CODE — the blob
+        // must not claim "killed by signal 2" just because 130 > 128.
+        let p = Paths::temp();
+        let snap = p.snapshots_dir();
+        fs::create_dir_all(&snap).unwrap();
+        fs::create_dir_all(p.sensors_dir()).unwrap();
+        let script = p.sensors_dir().join("exit130.sh");
+        fs::write(&script, "#!/usr/bin/env bash\nexit 130\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let r = Sensor::User(script).sense(&p, &snap);
+        assert!(!r.ok);
+        let body = fs::read_to_string(snap.join("sensor-exit130.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(v["signal"]["exit_code"], serde_json::json!(130));
+        assert!(
+            !v["detail"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("killed by signal"),
+            "an ordinary exit code above 128 is a script failure, not a signal death: {body}"
         );
     }
 
