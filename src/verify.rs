@@ -38,10 +38,7 @@ const DEFAULT_TIMEOUT_SECS: u64 = 60;
 const OUTPUT_TAIL_BYTES: usize = 2048;
 
 fn timeout_secs() -> u64 {
-    std::env::var("LOOOP_VERIFY_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(DEFAULT_TIMEOUT_SECS)
+    crate::util::env_knob("LOOOP_VERIFY_TIMEOUT_SECS").unwrap_or(DEFAULT_TIMEOUT_SECS)
 }
 
 /// Total wall-clock budget for ALL verifications in one beat (seconds). N
@@ -50,10 +47,7 @@ fn timeout_secs() -> u64 {
 /// untouched, so the next beat picks them up). `LOOOP_VERIFY_BEAT_BUDGET_SECS`,
 /// default 120.
 fn beat_budget_secs() -> u64 {
-    std::env::var("LOOOP_VERIFY_BEAT_BUDGET_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(120)
+    crate::util::env_knob("LOOOP_VERIFY_BEAT_BUDGET_SECS").unwrap_or(120)
 }
 
 fn dir(paths: &Paths) -> PathBuf {

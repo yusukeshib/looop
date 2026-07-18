@@ -15,10 +15,7 @@ use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
 fn env_num(var: &str, default: u64) -> u64 {
-    std::env::var(var)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(default)
+    crate::util::env_knob(var).unwrap_or(default)
 }
 
 /// Read up to the last `max` bytes of a file as a trimmed lossy string (the
@@ -248,7 +245,7 @@ impl Sensor {
                 // breaks on future mtimes (clock skew). A future SNAPSHOT
                 // mtime counts as fresh (age 0).
                 if let (Some(iv), Some(snap_m)) = (declared_interval(script), mtime(&out)) {
-                    let fresh = snap_m.elapsed().map(|d| d.as_secs() < iv).unwrap_or(true);
+                    let fresh = snap_m.elapsed().map_or(true, |d| d.as_secs() < iv);
                     let edited = mtime(script).is_some_and(|m| m > snap_m);
                     if fresh && !edited {
                         return Reading {
@@ -264,7 +261,7 @@ impl Sensor {
                 // message in the normalized error snapshot written by
                 // exec_sensor; nothing extra to append here.)
                 // Drop the empty .err a successful sensor leaves behind.
-                if fs::metadata(&err).map(|m| m.len() == 0).unwrap_or(false) {
+                if fs::metadata(&err).is_ok_and(|m| m.len() == 0) {
                     let _ = fs::remove_file(&err);
                 }
                 rc == 0
@@ -475,7 +472,7 @@ fn sys_goals(paths: &Paths) -> serde_json::Value {
 
     let mut goals = serde_json::Map::new();
     for id in ids {
-        let last = activity.get(&id).and_then(|v| v.as_u64());
+        let last = activity.get(&id).and_then(serde_json::Value::as_u64);
         let entry = match last {
             Some(ts) => serde_json::json!({
                 "last_acted_unix": ts,
@@ -509,7 +506,7 @@ pub fn run_all(paths: &Paths, snap_dir: &Path, verbose: bool) {
     // Snapshots are no longer wiped wholesale each beat — a fresh file under a
     // declared `# looop:interval` cadence must survive — so staleness is handled
     // by name instead: anything not in the current sensor set goes.
-    let owned: std::collections::HashSet<String> = sensors.iter().map(|s| s.name()).collect();
+    let owned: std::collections::HashSet<String> = sensors.iter().map(Sensor::name).collect();
     for e in fs::read_dir(snap_dir).into_iter().flatten().flatten() {
         let p = e.path();
         let stem = p

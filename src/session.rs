@@ -221,10 +221,7 @@ pub fn cmd_start_session(
     // a pathological goal/playbook can accumulate a heavy agent per beat
     // indefinitely. The refusal reaches the decider as a failed move (LAST
     // FAILURE names it), so it can kill or wait instead of piling on.
-    let cap: usize = std::env::var("LOOOP_MAX_WORKERS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(8);
+    let cap: usize = crate::util::env_knob("LOOOP_MAX_WORKERS").unwrap_or(8);
     if cap != 0 {
         // Check-then-spawn is a TOCTOU race in principle (two concurrent
         // starts could both pass the count), but starts are issued by the
@@ -711,8 +708,7 @@ pub fn prune_aged(paths: &Paths, max_age: std::time::Duration) {
                     .ok()
                     .and_then(|m| m.modified().ok())
                     .and_then(|t| t.elapsed().ok())
-                    .map(|age| age >= max_age)
-                    .unwrap_or(false);
+                    .is_some_and(|age| age >= max_age);
             if old {
                 let _ = tokio::fs::remove_dir_all(&dir).await;
                 crate::verify::clear(paths, &id);
@@ -839,15 +835,22 @@ pub fn run_detached_worker(args: &[String]) -> anyhow::Result<i32> {
 /// returned immediately. `dup_cloexec` keeps the copy out of the child.
 #[cfg(unix)]
 pub(crate) fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
+    use std::cell::Cell;
     use std::io::Write;
     use std::os::unix::io::AsRawFd;
     unsafe extern "C" {
         fn dup2(a: i32, b: i32) -> i32;
         fn close(fd: i32) -> i32;
     }
+    if SUPPRESS_DEPTH.with(Cell::get) > 0 {
+        return f();
+    }
     let Ok(devnull) = std::fs::OpenOptions::new().write(true).open("/dev/null") else {
         return f();
     };
+    let _swap = STDOUT_SWAP
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let _ = std::io::stdout().flush();
     unsafe {
         // Close-on-exec so the detached worker `f` spawns never inherits this
@@ -857,12 +860,29 @@ pub(crate) fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
             return f();
         }
         dup2(devnull.as_raw_fd(), 1);
+        SUPPRESS_DEPTH.with(|d| d.set(d.get() + 1));
         let out = f();
+        SUPPRESS_DEPTH.with(|d| d.set(d.get() - 1));
         let _ = std::io::stdout().flush();
         dup2(saved, 1);
         close(saved);
         out
     }
+}
+
+/// fd 1 is PROCESS-GLOBAL state: two threads swapping it concurrently could
+/// each "save" the other's /dev/null and restore THAT as the real stdout,
+/// leaving the whole process silenced forever (observed as parallel tests
+/// losing the libtest results/summary mid-run). This mutex serializes the
+/// whole swap window; [`SUPPRESS_DEPTH`] makes NESTED suppression on the same
+/// thread (execute → start_worker → suppress_stdout) a plain pass-through
+/// instead of a self-deadlock — fd 1 is already /dev/null inside the outer
+/// window, so the inner swap was always redundant.
+#[cfg(unix)]
+static STDOUT_SWAP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(unix)]
+thread_local! {
+    static SUPPRESS_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 /// `dup(fd)` that returns a close-on-exec copy, so it is not inherited across a
@@ -951,6 +971,48 @@ mod tests {
     fn pulse_is_recognized() {
         assert!(sess(PULSE_SESSION).is_pulse());
         assert!(!sess("triage").is_pulse());
+    }
+
+    // Regression: suppress_stdout swaps fd 1 — PROCESS-GLOBAL state. Without
+    // serialization, two concurrent suppressions could each "save" the other's
+    // /dev/null and restore it as the real stdout, permanently silencing the
+    // process (this ate the libtest results/summary under parallel `cargo
+    // test`). Also asserts nesting on one thread passes through (no deadlock).
+    #[cfg(unix)]
+    #[test]
+    fn suppress_stdout_is_reentrant_and_race_free() {
+        use std::os::fd::BorrowedFd;
+        use std::os::unix::fs::MetadataExt;
+        // Observe fd 1 while HOLDING the swap lock: another parallel test may
+        // legitimately be inside its own suppression window right now, and an
+        // unsynchronized peek would see its temporary /dev/null.
+        let ident = || {
+            let _swap = STDOUT_SWAP
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let fd = unsafe { BorrowedFd::borrow_raw(1) };
+            let f = std::fs::File::from(fd.try_clone_to_owned().unwrap());
+            let m = f.metadata().unwrap();
+            (m.dev(), m.ino(), m.rdev())
+        };
+        let before = ident();
+        // Nested on one thread: pass-through, not a self-deadlock.
+        assert_eq!(suppress_stdout(|| suppress_stdout(|| 42)), 42);
+        // Hammer the swap from two threads at once.
+        std::thread::scope(|s| {
+            for _ in 0..2 {
+                s.spawn(|| {
+                    for _ in 0..200 {
+                        suppress_stdout(|| std::hint::black_box(()));
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            ident(),
+            before,
+            "stdout identity must survive concurrent suppression windows"
+        );
     }
 
     // Regression: the fd we dup inside suppress_stdout MUST be close-on-exec.

@@ -201,3 +201,41 @@ DEPENDENCIES
   Session management (babysit) is LINKED IN as a library and runs in-process; no
   babysit binary is required. A worker that touches code makes its own sandbox
   (box if available, else git worktree).
+
+ENVIRONMENT KNOBS (all optional; unset = the default shown; an unparseable
+  value warns and falls back to the default)
+  wiring
+    LOOOP_DATA_DIR              data dir override (profiles)   default: XDG state
+    LOOOP_CONFIG                config file override           default: <DATA>/config.json
+    LOOOP_LOG_FORMAT=json       structured JSON event stream   default: human lines
+    LOOOP_BIN / LOOOP_SESSION_ID / LOOOP_CLAIMS_DIR / LOOOP_REPORTS_DIR
+                                exported BY looop for its children (sensors,
+                                workers, the runner pipeline) — read, don't set
+  cadence & AI spend
+    LOOOP_INTERVAL              seconds between beats          default: 60
+                                                               (or config `interval`)
+    LOOOP_MAX_DECIDES_PER_HOUR  decide-attempt ceiling         default: 120 (0 = off)
+    LOOOP_NOOP_TTL              re-decide an aged noop (secs)  default: 21600 (0 = off)
+    LOOOP_FLAP_STREAK           beats before "flapping" flag   default: 5 (0 = off)
+  timeouts & limits
+    LOOOP_SHELL_TIMEOUT_SECS    run_shell action deadline      default: 300
+    LOOOP_SENSOR_TIMEOUT        per-sensor deadline (secs)     default: 60
+    LOOOP_SENSOR_MAX_BYTES      per-snapshot size cap          default: 8192
+    LOOOP_VERIFY_TIMEOUT_SECS   per-verify deadline            default: 60
+    LOOOP_VERIFY_BEAT_BUDGET_SECS  all verifies, one beat      default: 120
+    LOOOP_MAX_WORKERS           standing live-fleet cap        default: 8 (0 = off)
+    LOOOP_WORKER_STUCK_SECS     silent-worker threshold        default: 900
+  retention
+    LOOOP_RUNS_KEEP             runs/ replay dirs kept         default: 50 (0 = all)
+    LOOOP_PLAYBOOK_KEEP         playbook.d/ generations        default: 20 (0 = all)
+    LOOOP_SESSION_TTL           session corpse TTL (secs)      default: 259200
+                                                               (or config `session_ttl`)
+    LOOOP_EVENTS_MAX_BYTES      events.jsonl rotate size       default: 5242880 (0 = off)
+  client polling
+    LOOOP_WAIT_POLL_MS          `looop wait` poll interval     default: 1000
+    LOOOP_ASK_POLL_MS           blocking-ask poll interval     default: 1000
+    LOOOP_ASK_TIMEOUT_S         blocking-ask wall clock        default: none (waits forever)
+  deps preflight
+    LOOOP_TICK_BIN / LOOOP_WORKER_BIN  referenced from config.json commands so
+                                one wiring can point tick/worker at different
+                                binaries; resolved by `looop init`.

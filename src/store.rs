@@ -155,19 +155,10 @@ impl DirLock {
             .truncate(false)
             .write(true)
             .open(dir.join(".dirlock"))?;
-        // Same libc-free extern-"C" flock technique as run.rs's single-instance
-        // lock — blocking LOCK_EX here (writers queue; the critical sections
-        // are a handful of syscalls).
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::AsRawFd;
-            const LOCK_EX: i32 = 2;
-            unsafe extern "C" {
-                fn flock(fd: i32, op: i32) -> i32;
-            }
-            if unsafe { flock(file.as_raw_fd(), LOCK_EX) } != 0 {
-                return Err(io::Error::last_os_error());
-            }
+        // Shared flock helper (util::flock_file) — blocking LOCK_EX here
+        // (writers queue; the critical sections are a handful of syscalls).
+        if !crate::util::flock_file(&file, true) {
+            return Err(io::Error::last_os_error());
         }
         Ok(DirLock { _file: file })
     }
@@ -239,10 +230,10 @@ impl StateStore for FileStore<'_> {
 
     fn create_exclusive(&self, key: &Key, contents: &str) -> io::Result<bool> {
         let path = self.path(key);
-        let parent = path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let parent = path.parent().map_or_else(
+            || std::path::PathBuf::from("."),
+            std::path::Path::to_path_buf,
+        );
         // Mutual exclusion comes from the per-directory writer lock: while we
         // hold it, no other create_exclusive/remove_if_eq can interleave, so a
         // plain exists-check + rename-publish is race-free. rename (not
@@ -335,10 +326,10 @@ impl StateStore for FileStore<'_> {
 
     fn remove_if_eq(&self, key: &Key, expected: &str) -> io::Result<bool> {
         let path = self.path(key);
-        let parent = path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        let parent = path.parent().map_or_else(
+            || std::path::PathBuf::from("."),
+            std::path::Path::to_path_buf,
+        );
         // Read + compare + delete under the per-directory writer lock: no
         // rename-aside, so the key is NEVER observably absent while a losing
         // compare is in flight (the old design had a window where a concurrent
@@ -362,7 +353,7 @@ impl StateStore for FileStore<'_> {
     fn age_secs(&self, key: &Key) -> Option<u64> {
         let modified = fs::metadata(self.path(key)).ok()?.modified().ok()?;
         // An mtime in the future (clock skew) reads as age 0, never an error.
-        Some(modified.elapsed().map(|d| d.as_secs()).unwrap_or(0))
+        Some(modified.elapsed().map_or(0, |d| d.as_secs()))
     }
 
     fn list(&self, collection: &Collection) -> Vec<String> {
@@ -372,7 +363,7 @@ impl StateStore for FileStore<'_> {
             .flatten()
             .flatten()
             .map(|e| e.path())
-            .filter(|p| p.extension().map(|x| x == ext).unwrap_or(false))
+            .filter(|p| p.extension().is_some_and(|x| x == ext))
             .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().to_string()))
             .collect();
         names.sort();
@@ -426,7 +417,7 @@ mod tests {
         assert_eq!(body, r#"{"session":"w1"}"#);
         let leftovers: Vec<_> = fs::read_dir(p.claims_dir())
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp left behind: {leftovers:?}");
@@ -486,7 +477,7 @@ mod tests {
         assert_eq!(s.read(&k).as_deref(), Some("current"), "key untouched");
         let leftovers: Vec<_> = fs::read_dir(p.claims_dir())
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp left behind: {leftovers:?}");

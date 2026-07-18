@@ -375,7 +375,7 @@ fn editable(label: &str, initial: &str) -> Edit {
     let result = loop {
         // Single-line horizontal-scroll window so long commands never wrap (which
         // would break absolute-column cursor math). Keep the cursor visible.
-        let cols = size().map(|(w, _)| w as usize).unwrap_or(80).max(1);
+        let cols = size().map_or(80, |(w, _)| w as usize).max(1);
         let win = cols.saturating_sub(label_cols as usize + 1).max(8);
         let start = if pos >= win { pos - win + 1 } else { 0 };
         let end = (start + win).min(buf.len());

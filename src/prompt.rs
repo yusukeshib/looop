@@ -230,10 +230,12 @@ fn most_neglected_goal(paths: &Paths) -> Option<String> {
         .unwrap_or_default();
     // store.list is already sorted (deterministic tie-break).
     // last-acted unix; never-acted => 0 (oldest possible) => ranked most neglected.
-    store
-        .list(&Collection::Goals)
-        .into_iter()
-        .min_by_key(|id| activity.get(id).and_then(|v| v.as_u64()).unwrap_or(0))
+    store.list(&Collection::Goals).into_iter().min_by_key(|id| {
+        activity
+            .get(id)
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+    })
 }
 
 fn tail_lines(text: &str, n: usize) -> String {
@@ -301,7 +303,10 @@ fn run_shell_output(paths: &Paths) -> Option<String> {
     let raw = fs::read_to_string(paths.last_shell()).ok()?;
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let cmd = v.get("cmd").and_then(|x| x.as_str()).unwrap_or("?");
-    let code = v.get("exit_code").and_then(|x| x.as_i64()).unwrap_or(-1);
+    let code = v
+        .get("exit_code")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or(-1);
     let output = v.get("output").and_then(|x| x.as_str()).unwrap_or("");
     let body = if output.trim().is_empty() {
         "(no output)"
@@ -339,8 +344,11 @@ fn last_failure(paths: &Paths) -> Option<String> {
     let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
     let code = v.get("code").and_then(|x| x.as_str()).unwrap_or("?");
     let error = v.get("error").and_then(|x| x.as_str()).unwrap_or("?");
-    let fails = v.get("fails").and_then(|x| x.as_u64()).unwrap_or(1);
-    let ts = v.get("ts").and_then(|x| x.as_u64()).unwrap_or(0);
+    let fails = v
+        .get("fails")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(1);
+    let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
     let ago = crate::util::now_unix().saturating_sub(ts);
     Some(format!(
         "Your previous decide attempt FAILED ({code}, fail #{fails}, {ago}s ago):\n{}\n\

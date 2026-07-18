@@ -234,12 +234,33 @@ pub fn date_fmt(fmt: &str) -> String {
     chrono::Local::now().format(fmt).to_string()
 }
 
+/// Read a numeric `LOOOP_*` tuning knob from the environment. `None` when the
+/// variable is unset — the caller applies its default. An UNPARSEABLE value
+/// also falls back to the default, but WARNS first: every knob used to be read
+/// ad hoc with `.parse().ok()`, so a typo like `LOOOP_NOOP_TTL=6h` silently
+/// became the default and the operator never learned their override was dead.
+/// This is the ONE place env knobs are parsed — new knobs must go through it.
+pub fn env_knob<T: std::str::FromStr>(name: &str) -> Option<T> {
+    let raw = std::env::var(name).ok()?;
+    match raw.trim().parse::<T>() {
+        Ok(v) => Some(v),
+        Err(_) => {
+            event(
+                Level::Warn,
+                "env.invalid",
+                &format!("ignoring {name}={raw:?} (not a valid number) — using the default"),
+                &[("var", serde_json::json!(name))],
+            );
+            None
+        }
+    }
+}
+
 /// Wall-clock seconds since the Unix epoch (0 if the clock is before it).
 pub fn now_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Content hash for `world_hash` — deterministic FNV-1a (128-bit), computed
@@ -252,6 +273,13 @@ pub fn now_unix() -> u64 {
 /// so `.last-tick-hash` stays comparable beat to beat. The exact digest differs
 /// from the old shell tools, so the first beat after upgrading sees one
 /// (harmless) "world changed".
+///
+/// NB: FNV-1a is NOT cryptographic — collisions are only "astronomically
+/// unlikely", not adversary-proof. That is a deliberate trade: the inputs
+/// (sensor signals, goals, PLAYBOOK) come from the operator's own loop, not an
+/// attacker, and a collision's worst case is one wrongly-skipped beat that the
+/// noop TTL revisit later repairs. Do not reuse this hash anywhere integrity
+/// against hostile input matters.
 pub fn content_hash(input: &[u8]) -> String {
     // FNV-1a, 128-bit (offset basis + prime per the FNV spec).
     const OFFSET: u128 = 0x6c62272e07bb014262b821756295c58d;
@@ -262,6 +290,28 @@ pub fn content_hash(input: &[u8]) -> String {
         h = h.wrapping_mul(PRIME);
     }
     format!("{h:032x}")
+}
+
+/// Take a `flock(2)` on an open file. `block` = wait for the holder (LOCK_EX);
+/// otherwise fail fast (LOCK_EX|LOCK_NB). `true` = we hold it now. flock is
+/// kernel-managed per-inode state: it dies with the process, so there is never
+/// a stale lock to reclaim and no PID-liveness guessing. This is the ONE
+/// extern-"C" flock declaration — `store.rs` (per-directory writer lock) and
+/// `run.rs` (single-instance pulse lock) both route through it.
+#[cfg(unix)]
+pub(crate) fn flock_file(f: &std::fs::File, block: bool) -> bool {
+    use std::os::unix::io::AsRawFd;
+    const LOCK_EX: i32 = 2;
+    const LOCK_NB: i32 = 4;
+    unsafe extern "C" {
+        fn flock(fd: i32, op: i32) -> i32;
+    }
+    let op = if block { LOCK_EX } else { LOCK_EX | LOCK_NB };
+    unsafe { flock(f.as_raw_fd(), op) == 0 }
+}
+#[cfg(not(unix))]
+pub(crate) fn flock_file(_f: &std::fs::File, _block: bool) -> bool {
+    true // best-effort: flock-based exclusion is unix-only
 }
 
 /// A process-wide monotonic nonce for temp-file names. `now_unix()` alone is
@@ -356,7 +406,8 @@ pub fn write_atomic_mode(
 #[cfg(test)]
 pub fn test_env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    LOCK.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 pub fn safe_segment(kind: &str, seg: &str) -> anyhow::Result<()> {
@@ -380,7 +431,7 @@ pub fn sorted_glob(dir: &Path, ext: &str) -> Vec<PathBuf> {
         .flatten()
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().map(|e| e == ext).unwrap_or(false))
+        .filter(|p| p.extension().is_some_and(|e| e == ext))
         .collect();
     v.sort();
     v
@@ -400,9 +451,7 @@ pub fn on_path(cmd: &str) -> bool {
 #[cfg(unix)]
 fn is_executable(p: &std::path::Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p)
-        .map(|m| m.permissions().mode() & 0o111 != 0)
-        .unwrap_or(false)
+    std::fs::metadata(p).is_ok_and(|m| m.permissions().mode() & 0o111 != 0)
 }
 #[cfg(not(unix))]
 fn is_executable(_p: &std::path::Path) -> bool {
@@ -537,7 +586,7 @@ mod tests {
         // No leftover temp siblings.
         let leftovers: Vec<_> = std::fs::read_dir(target.parent().unwrap())
             .unwrap()
-            .filter_map(|e| e.ok())
+            .filter_map(std::result::Result::ok)
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp file left behind: {leftovers:?}");
