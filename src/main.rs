@@ -124,9 +124,54 @@ fn diagnostic(msg: &str) -> String {
     }
 }
 
-/// Route a parsed command to its handler. The deps gate wraps every verb that
-/// actually touches the loop's tools; read-only/meta verbs (help, version)
-/// skip it, matching the pre-clap wiring.
+/// Which verbs actually LAUNCH the configured runner, and therefore must
+/// pass the deps preflight ([`deps::require_deps`]) before running:
+/// `pulse` (the per-beat tick command) and `worker start` (the worker
+/// command). Everything else — teardown (`down`/`kill`), reads
+/// (`state`/`wait`/`asks`), the mailbox/lease/schedule contract, and pure
+/// filesystem writes (goal/sensor/playbook) — touches only the data dir and
+/// babysit sessions, so it runs UNGATED: `looop down` must work exactly when
+/// the operator removed the runner, and machine consumers (`state --json`,
+/// `answer`) must not break because the runner is momentarily off PATH.
+/// (`up` is deliberately absent: cmd_up checks `init` FIRST, then runs the
+/// preflight itself — see the dispatch arm's comment.)
+///
+/// Exhaustive match, NO wildcard arm: adding a verb forces an explicit
+/// gated-or-not decision here (the compile error is the drift guard).
+fn needs_runner(cmd: &cli::Cmd) -> bool {
+    use cli::{Cmd, WorkerOp};
+    match cmd {
+        Cmd::Pulse => true,
+        Cmd::Worker(a) => matches!(a.op, WorkerOp::Start { .. }),
+        Cmd::Help { .. }
+        | Cmd::Version
+        | Cmd::Init
+        | Cmd::Up(_)
+        | Cmd::Down
+        | Cmd::State(_)
+        | Cmd::Wait(_)
+        | Cmd::Asks(_)
+        | Cmd::Answer(_)
+        | Cmd::Goal(_)
+        | Cmd::Sensor(_)
+        | Cmd::Playbook(_)
+        | Cmd::Run(_)
+        | Cmd::Ask(_)
+        | Cmd::Tell(_)
+        | Cmd::Told(_)
+        | Cmd::Schedule(_)
+        | Cmd::Kill(_)
+        | Cmd::Screenshot(_)
+        | Cmd::Claim(_)
+        | Cmd::Unclaim(_)
+        | Cmd::Config(_) => false,
+    }
+}
+
+/// Route a parsed command to its handler. The deps gate wraps ONLY the verbs
+/// that actually launch the configured runner (see [`needs_runner`]);
+/// everything filesystem/session-only runs ungated so teardown, reads, and
+/// the machine contract keep working when the runner binary is missing.
 fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
     use cli::{Cmd, GoalOp, PlaybookOp, SensorOp, WorkerOp};
 
@@ -141,7 +186,12 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
         return Ok(ExitCode::SUCCESS);
     };
 
-    let gated = |f: &dyn Fn() -> Result<ExitCode>| deps::require_deps(paths).and_then(|_| f());
+    // The runner preflight, applied ONCE up front to the runner-launching
+    // verbs (needs_runner) instead of per-arm — so the gated set lives in one
+    // testable predicate rather than scattered wrappers.
+    if needs_runner(&cmd) {
+        deps::require_deps(paths)?;
+    }
 
     match cmd {
         Cmd::Help { topic } => {
@@ -191,34 +241,34 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
         // told to run `looop init`, not nagged about a missing runner they may
         // not even want), then runs the deps preflight itself.
         Cmd::Up(a) => service::cmd_up(paths, a.json),
-        Cmd::Down => gated(&|| service::cmd_down(paths)),
-        Cmd::Pulse => gated(&|| service::cmd_pulse(paths)),
-        Cmd::State(a) => gated(&|| observe::cmd_state(paths, a.json)),
-        Cmd::Wait(a) => gated(&|| observe::cmd_wait(paths, &a)),
-        Cmd::Asks(a) => gated(&|| mailbox::cmd_asks(paths, a.json)),
-        Cmd::Answer(a) => gated(&|| mailbox::cmd_answer(paths, &a)),
-        Cmd::Goal(a) => gated(&|| match &a.op {
+        Cmd::Down => service::cmd_down(paths),
+        Cmd::Pulse => service::cmd_pulse(paths),
+        Cmd::State(a) => observe::cmd_state(paths, a.json),
+        Cmd::Wait(a) => observe::cmd_wait(paths, &a),
+        Cmd::Asks(a) => mailbox::cmd_asks(paths, a.json),
+        Cmd::Answer(a) => mailbox::cmd_answer(paths, &a),
+        Cmd::Goal(a) => match &a.op {
             GoalOp::Write { id, body, journal } => {
                 executor::write_goal(paths, id, body, journal.journal.as_deref())
             }
             GoalOp::Archive { id, journal } => {
                 executor::archive_goal(paths, id, journal.journal.as_deref())
             }
-        }),
-        Cmd::Sensor(a) => gated(&|| {
+        },
+        Cmd::Sensor(a) => {
             let SensorOp::Write {
                 name,
                 script,
                 journal,
             } = &a.op;
             executor::write_sensor(paths, name, script, journal.journal.as_deref())
-        }),
-        Cmd::Playbook(a) => gated(&|| {
+        }
+        Cmd::Playbook(a) => {
             let PlaybookOp::Write { body, journal } = &a.op;
             executor::write_playbook(paths, body, journal.journal.as_deref())
-        }),
-        Cmd::Run(a) => gated(&|| executor::cmd_run(paths, &a)),
-        Cmd::Worker(a) => gated(&|| match &a.op {
+        }
+        Cmd::Run(a) => executor::cmd_run(paths, &a),
+        Cmd::Worker(a) => match &a.op {
             WorkerOp::Start {
                 id,
                 prompt,
@@ -242,15 +292,15 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
                 watch,
                 interval,
             } => session::cmd_worker_list(paths, *json, *all, *watch, *interval),
-        }),
-        Cmd::Ask(a) => gated(&|| mailbox::cmd_ask(paths, &a)),
-        Cmd::Tell(a) => gated(&|| mailbox::cmd_tell(paths, &a)),
-        Cmd::Told(a) => gated(&|| mailbox::cmd_told(paths, &a)),
-        Cmd::Schedule(a) => gated(&|| schedule::cmd_schedule(paths, &a)),
-        Cmd::Kill(a) => gated(&|| session::cmd_kill(paths, &a.id)),
-        Cmd::Screenshot(a) => gated(&|| session::cmd_screenshot(paths, &a)),
-        Cmd::Claim(a) => gated(&|| gate::cmd_claim(paths, &a)),
-        Cmd::Unclaim(a) => gated(&|| gate::cmd_unclaim(paths, &a)),
+        },
+        Cmd::Ask(a) => mailbox::cmd_ask(paths, &a),
+        Cmd::Tell(a) => mailbox::cmd_tell(paths, &a),
+        Cmd::Told(a) => mailbox::cmd_told(paths, &a),
+        Cmd::Schedule(a) => schedule::cmd_schedule(paths, &a),
+        Cmd::Kill(a) => session::cmd_kill(paths, &a.id),
+        Cmd::Screenshot(a) => session::cmd_screenshot(paths, &a),
+        Cmd::Claim(a) => gate::cmd_claim(paths, &a),
+        Cmd::Unclaim(a) => gate::cmd_unclaim(paths, &a),
         // Not gated: shell integration is meta (like help/version) and must work
         // before the runner is installed so a user can wire completions early.
         Cmd::Config(a) => shellinit::cmd_config(&a.shell),
@@ -389,6 +439,77 @@ mod tests {
             "--",
             "cmd"
         ])));
+    }
+
+    /// Drift guard for the deps gate: EXACTLY the runner-launching verbs
+    /// (`pulse`, `worker start`) preflight the runner binary; every
+    /// filesystem/session-only verb must stay ungated — `looop down` has to
+    /// work precisely when the operator removed the runner, and the machine
+    /// contract (`state --json`, `asks --json`, `answer`) must not break when
+    /// the runner is momentarily off PATH (or before `looop init`). Parses
+    /// real argvs through clap so the assertion covers the shapes users type,
+    /// not hand-built enum values. (The exhaustive match in `needs_runner`
+    /// already forces a decision for NEW verbs at compile time; this test
+    /// pins the decisions for the EXISTING ones.)
+    #[test]
+    fn deps_gate_covers_only_runner_launching_verbs() {
+        use super::needs_runner;
+        use clap::Parser;
+        let parse = |argv: &[&str]| {
+            let full: Vec<&str> = std::iter::once("looop")
+                .chain(argv.iter().copied())
+                .collect();
+            crate::cli::Cli::try_parse_from(&full)
+                .unwrap_or_else(|e| panic!("argv {argv:?} must parse: {e}"))
+                .cmd
+                .expect("argv carries a verb")
+        };
+
+        // GATED: the only verbs that launch the configured runner.
+        for argv in [
+            vec!["pulse"],
+            vec!["worker", "start", "w1", "do", "the", "thing"],
+        ] {
+            assert!(
+                needs_runner(&parse(&argv)),
+                "{argv:?} launches the runner and must be deps-gated"
+            );
+        }
+
+        // UNGATED: teardown, reads, mailbox/lease/schedule contract, pure
+        // filesystem writes, ad-hoc shell, and meta verbs.
+        for argv in [
+            vec!["help"],
+            vec!["version"],
+            vec!["init"],
+            vec!["up"], // cmd_up runs the preflight itself, AFTER the init check
+            vec!["down"],
+            vec!["state", "--json"],
+            vec!["wait"],
+            vec!["asks", "--json"],
+            vec!["answer", "a1", "yes"],
+            vec!["goal", "write", "g1", "body"],
+            vec!["goal", "archive", "g1"],
+            vec!["sensor", "write", "s1", "echo ok"],
+            vec!["playbook", "write", "body"],
+            vec!["run", "echo", "hi"],
+            vec!["worker", "kill", "w1"],
+            vec!["worker", "list"],
+            vec!["ask", "w1", "--prompt", "q?"],
+            vec!["tell", "w1", "msg"],
+            vec!["told", "w1"],
+            vec!["schedule", "list"],
+            vec!["kill", "w1"],
+            vec!["screenshot", "w1"],
+            vec!["claim", "repo"],
+            vec!["unclaim", "repo"],
+            vec!["config", "zsh"],
+        ] {
+            assert!(
+                !needs_runner(&parse(&argv)),
+                "{argv:?} never launches the runner and must run ungated"
+            );
+        }
     }
 
     #[test]

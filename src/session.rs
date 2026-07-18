@@ -277,13 +277,28 @@ pub fn cmd_start_session(
     // indefinitely. The refusal reaches the decider as a failed move (LAST
     // FAILURE names the cap via `StartOutcome.reason`), so it can kill or wait
     // instead of piling on.
+    // Enumerate the fleet ONCE for the two gates below, and fail CLOSED when
+    // the enumeration itself fails: the lenient `list()` collapses an I/O
+    // error to an empty fleet, which would silently bypass BOTH the cap and
+    // the duplicate-id check and admit a worker over N already running. The
+    // refusal reaches the decider's LAST FAILURE the same way the cap does,
+    // so it can retry or wait instead of piling on.
+    let fleet = match try_list(paths) {
+        Ok(f) => f,
+        Err(e) => {
+            return refuse(format!(
+                "cannot enumerate the fleet ({e}); refusing to start until the fleet is readable"
+            ));
+        }
+    };
+
     let cap: usize = crate::util::env_knob("LOOOP_MAX_WORKERS").unwrap_or(8);
     if cap != 0 {
         // Check-then-spawn is a TOCTOU race in principle (two concurrent
-        // starts could both pass the count), but starts are issued by the
-        // single decider one-move-per-beat, so the race is benign — not worth
-        // a lock.
-        let live = list_workers(paths).iter().filter(|w| w.alive).count();
+        // starts could both pass the count — the pulse's decider races a
+        // manual `looop worker start` in another process). Over-admitting by
+        // one under that rare interleaving is benign — not worth a lock.
+        let live = fleet.iter().filter(|w| !w.is_pulse() && w.alive).count();
         if live >= cap {
             return refuse(format!(
                 "{live} live workers — at the fleet cap (LOOOP_MAX_WORKERS={cap}); \
@@ -293,11 +308,11 @@ pub fn cmd_start_session(
     }
 
     // Check-then-act (exists → alive → reap-in-commit-phase) races a
-    // concurrent start of the same id in principle; the single-decider
-    // dispatch model makes it benign (the spawn below would fail loudly on a
-    // true collision).
-    let id_taken = status_exists(paths, &session);
-    if id_taken && is_alive(paths, &session) {
+    // concurrent start of the same id in principle (same manual-verb
+    // concurrency as the cap above); the spawn below fails loudly on a true
+    // collision, so the window is accepted.
+    let id_taken = fleet.iter().any(|s| s.id == session);
+    if id_taken && fleet.iter().any(|s| s.id == session && s.alive) {
         return refuse(format!("session {session} is already running"));
     }
 
@@ -744,13 +759,37 @@ pub fn output_idle_secs(paths: &Paths, id: &str) -> Option<u64> {
         .map(|d| d.as_secs())
 }
 
+/// List every session in this profile's fleet, surfacing the enumeration
+/// error. GATING callers — the fleet cap and duplicate-id checks in
+/// `cmd_start_session`, `looop up`'s already-running probe, `looop down`'s
+/// sweep — use THIS and fail CLOSED: an error-to-empty collapse there turns an
+/// I/O failure into a wrong DECISION (cap bypass, a second pulse, a `down`
+/// that claims a clean stop over a live fleet). Read-only/sensor callers use
+/// the lenient [`list`] instead.
+pub fn try_list(paths: &Paths) -> anyhow::Result<Vec<Session>> {
+    Ok(rt()
+        .block_on(paths.sessions().list_sessions())?
+        .into_iter()
+        .map(project)
+        .collect())
+}
+
 /// List every session in this profile's fleet. Any failure yields an empty
-/// list: the pulse degrades gracefully, never wedges.
+/// list: the pulse's SENSING paths degrade gracefully, never wedge — but not
+/// silently: the error is surfaced as a warn event, because a fleet read as
+/// empty when enumeration actually FAILED is a degraded reading the operator
+/// must be able to see. Paths whose decisions must not fail open use
+/// [`try_list`].
 pub fn list(paths: &Paths) -> Vec<Session> {
-    match rt().block_on(paths.sessions().list_sessions()) {
-        Ok(sessions) => sessions.into_iter().map(project).collect(),
-        Err(_) => Vec::new(),
-    }
+    try_list(paths).unwrap_or_else(|e| {
+        crate::util::event(
+            crate::util::Level::Warn,
+            "fleet.list_degraded",
+            &format!("cannot enumerate the fleet ({e}) — reading it as empty"),
+            &[],
+        );
+        Vec::new()
+    })
 }
 
 /// Worker sessions only — the pulse is excluded. Everything that reasons
@@ -1092,6 +1131,14 @@ pub fn is_alive(paths: &Paths, session: &str) -> bool {
     list(paths).iter().any(|s| s.id == session && s.alive)
 }
 
+/// Is a session currently alive? — the fail-closed variant of [`is_alive`]
+/// for GATING callers: `looop up` must not read an enumeration error as "no
+/// pulse" and spawn a second one; `looop down` must not read it as "nothing
+/// to stop" and exit 0 over a live fleet.
+pub fn try_is_alive(paths: &Paths, session: &str) -> anyhow::Result<bool> {
+    Ok(try_list(paths)?.iter().any(|s| s.id == session && s.alive))
+}
+
 /// Block (briefly) until a session is registered and alive. For callers that
 /// spawn detached then immediately follow it (e.g. the foreground `looop`): the
 /// supervisor needs a beat to register the session, so following it instantly
@@ -1243,6 +1290,36 @@ mod tests {
         let id = crate::mailbox::ask_detached(&p, "w", "q?", "", &[]).unwrap();
         let out = cmd_start_session(&p, "w", "brief", None, None, Some(&id)).unwrap();
         assert_eq!(out.code, ExitCode::from(1));
+    }
+
+    #[test]
+    fn start_session_fails_closed_when_the_fleet_cannot_be_enumerated() {
+        // The lenient list() used to collapse EVERY babysit error to an empty
+        // fleet, so a transient I/O failure sailed past the cap AND the
+        // duplicate-id gate. The gating path must refuse instead — and the
+        // refusal must carry its cause to the decider's LAST FAILURE.
+        let p = crate::paths::Paths::temp();
+        let _ = crate::seed::ensure_dirs(&p);
+        // Sabotage: a regular FILE where babysit's sessions dir belongs makes
+        // its read_dir fail — the shape of any transient enumeration error.
+        std::fs::write(p.data_dir.join("sessions"), "not a dir").unwrap();
+        let out = cmd_start_session(&p, "w", "brief", None, None, None)
+            .expect("an enumeration failure is a refusal, not an Err");
+        assert_eq!(out.code, ExitCode::from(1));
+        let reason = out.reason.expect("the refusal names its cause");
+        assert!(
+            reason.contains("cannot enumerate the fleet"),
+            "the reason names the enumeration failure: {reason}"
+        );
+        // The fail-closed probes surface the error …
+        assert!(try_list(&p).is_err(), "try_list must surface the error");
+        assert!(
+            try_is_alive(&p, "w").is_err(),
+            "try_is_alive must surface the error"
+        );
+        // … while the lenient sensor path still degrades to empty (warned,
+        // not wedged).
+        assert!(list(&p).is_empty());
     }
 
     #[test]

@@ -43,8 +43,9 @@ fn session_or_env(session: Option<&str>) -> String {
 /// `looop claim <name> [--session <id>]` — atomically acquire the lease for
 /// `<name>`. Exit 0 if we now hold it (or already held it), exit 1 if a LIVE
 /// session holds it. The acquire is O_EXCL so two racers can't both win; a lease
-/// held by a DEAD session is reclaimed. The claim body is `{session,name}`,
-/// matching what `sys_claims` surfaces and `reap_stale_claims` reaps.
+/// held by a DEAD session is reclaimed. The claim body is
+/// `{session,name,ts,nonce}` (see [`claim`] for why the ts/nonce stamp
+/// exists), matching what `sys_claims` surfaces and `reap_stale_claims` reaps.
 pub fn cmd_claim(paths: &Paths, args: &crate::cli::ClaimArgs) -> Result<ExitCode> {
     use crate::contract::{ClaimOutcome, Contract};
     let name = &args.name;
@@ -85,7 +86,25 @@ pub(crate) fn claim(
     }
     let store = FileStore::new(paths);
     let key = Key::Claim(name.to_string());
-    let body = serde_json::json!({ "session": session, "name": name }).to_string();
+    // The body carries `ts`/`nonce` on top of the `{session,name}` identity
+    // fields as ABA armor: worker/session ids are deliberately REUSED across
+    // generations (see mailbox: "worker ids ARE goal ids and get reused"), so
+    // without them a new generation's lease is byte-identical to a dead
+    // predecessor's — and every compare-and-delete in this module
+    // (remove_if_eq) is only as strong as the uniqueness of the bytes it
+    // compares. A reaper that inspected the corpse could then delete the live
+    // successor's lease, silently voiding mutual exclusion. `ts` records the
+    // acquisition time; `nonce` (pid + process-wide counter) keeps two
+    // acquisitions distinct even within the same second. Readers stay
+    // backward-compatible: [`holder_of`] and the reaper look ONLY at
+    // `.session`, so old-format `{session,name}` leases still parse.
+    let body = serde_json::json!({
+        "session": session,
+        "name": name,
+        "ts": util::now_unix(),
+        "nonce": format!("{}-{}", std::process::id(), util::temp_nonce()),
+    })
+    .to_string();
 
     // Retry a bounded number of times: each iteration is one atomic create-if-absent
     // (exclusive-create via the store); a stale lease is reclaimed via COMPARE-
@@ -119,7 +138,21 @@ pub(crate) fn claim(
         }
         let holder = holder_of(&raw);
         if !holder.is_empty() && holder == session {
-            return Ok(ClaimOutcome::AlreadyOwned);
+            // Same session id — but not necessarily the same GENERATION:
+            // ids are reused, so this lease may be a dead predecessor's
+            // corpse that a concurrent reaper has ALREADY read and judged
+            // stale. Adopting its bytes verbatim would let the reaper's
+            // in-flight compare-and-delete match — and delete — a lease we
+            // just told the caller it holds (the ABA hole). REWRITE with our
+            // fresh body instead: the compare-and-swap keys on the bytes we
+            // inspected and runs under the same per-directory writer lock as
+            // remove_if_eq, so a stale-keyed delete now loses, and a lease a
+            // third racer published between our read and the swap is never
+            // clobbered (the swap loses instead, and we re-inspect).
+            if store.replace_if_eq(&key, &raw, &body)? {
+                return Ok(ClaimOutcome::AlreadyOwned);
+            }
+            continue; // the lease changed underneath us — re-inspect
         }
         if !holder.is_empty() && session::is_alive(paths, &holder) {
             return Ok(ClaimOutcome::HeldByLive(holder));
@@ -352,6 +385,75 @@ mod tests {
         assert!(!store.remove_if_eq(&key, &observed).unwrap());
         let v: serde_json::Value = serde_json::from_str(&store.read(&key).unwrap()).unwrap();
         assert_eq!(v["session"], "fresh", "the fresh lease was not stolen");
+    }
+
+    #[test]
+    fn reacquired_lease_has_fresh_bytes_so_a_stale_keyed_reap_loses() {
+        // Regression (ABA): worker/session ids are reused across generations,
+        // so a claim body of just {session,name} made a NEW generation's lease
+        // byte-identical to its dead predecessor's — and the AlreadyOwned path
+        // ADOPTED the corpse's file verbatim. A reaper that had read the
+        // corpse (and passed its liveness recheck while the holder was dead)
+        // would then remove_if_eq the identical bytes and delete a lease its
+        // owner believed it held, silently voiding mutual exclusion. Fixed
+        // twice over: the body carries ts+nonce (distinct bytes per
+        // acquisition) AND re-acquisition REWRITES the lease, so the reaper's
+        // compare-and-delete — keyed to the corpse's bytes — must lose.
+        let p = Paths::temp();
+        let store = FileStore::new(&p);
+        let key = Key::Claim("repo-aba".into());
+        // Generation 1 of "triage" acquires, then dies (no live session here).
+        assert!(matches!(
+            claim(&p, "repo-aba", Some("triage")).unwrap(),
+            crate::contract::ClaimOutcome::Won
+        ));
+        // The reaper reads the corpse and judges it stale…
+        let corpse = store.read(&key).unwrap();
+        // …meanwhile generation 2 of "triage" (same reused id) re-claims.
+        assert!(matches!(
+            claim(&p, "repo-aba", Some("triage")).unwrap(),
+            crate::contract::ClaimOutcome::AlreadyOwned
+        ));
+        let fresh = store.read(&key).unwrap();
+        assert_ne!(
+            corpse, fresh,
+            "re-acquisition must publish fresh lease bytes, never adopt the corpse's"
+        );
+        // The reaper's delete, keyed to the bytes it inspected, must now lose.
+        assert!(
+            !store.remove_if_eq(&key, &corpse).unwrap(),
+            "a compare-and-delete keyed to the dead generation's bytes must not \
+             reap the live generation's lease"
+        );
+        assert_eq!(
+            store.read(&key).unwrap(),
+            fresh,
+            "the live lease survives the stale-keyed reap"
+        );
+    }
+
+    #[test]
+    fn old_format_lease_without_ts_nonce_still_parses_and_is_refreshed() {
+        // Backward compat: leases written by an older binary carry only
+        // {session,name}. They must still read (holder_of keys on .session
+        // alone), still be reclaimable from a dead holder, and — when the
+        // same session re-claims — be refreshed to the stamped format.
+        let p = Paths::temp();
+        fs::create_dir_all(p.claims_dir()).unwrap();
+        let path = p.claims_dir().join("repo-old.json");
+        fs::write(&path, br#"{"session":"w1","name":"repo-old"}"#).unwrap();
+        assert!(matches!(
+            claim(&p, "repo-old", Some("w1")).unwrap(),
+            crate::contract::ClaimOutcome::AlreadyOwned
+        ));
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["session"], "w1");
+        assert_eq!(v["name"], "repo-old");
+        assert!(
+            v["ts"].is_u64() && v["nonce"].is_string(),
+            "the old-format lease is refreshed to the ABA-armored format: {v}"
+        );
     }
 
     #[test]

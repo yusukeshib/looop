@@ -156,13 +156,19 @@ pub fn reconcile(paths: &Paths) {
         }
         // `None` = the .cmd file vanished between read_dir and the read (a
         // deliberate clear raced us) — nothing to judge, nothing to record.
-        let Some(outcome) = run_one(paths, &p) else {
+        let Some((outcome, cmd)) = run_one(paths, &p) else {
             continue;
         };
         let json = serde_json::to_string(&outcome).unwrap_or_else(|_| "{}".into());
         // Rename-published: a torn result would be unparseable, look like "no
         // result yet", and re-run the (once-only) verify command next beat.
         let _ = crate::util::write_atomic(&result_path(paths, &id), json.as_bytes());
+        // The event names WHAT ran, not just pass/fail: `verify` is AI-authored
+        // shell executed automatically (constitution rule 2 constrains it to
+        // read-only checks), so a human watching the pulse must be able to
+        // audit the actual command text. One-lined + clipped so a runaway
+        // command can't flood the event stream.
+        let cmd_shown: String = cmd.trim().replace('\n', " ").chars().take(256).collect();
         crate::util::event(
             if outcome.ok {
                 crate::util::Level::Info
@@ -171,15 +177,18 @@ pub fn reconcile(paths: &Paths) {
             },
             "worker.verify",
             &format!(
-                "{id}: postcondition {}",
+                "{id}: postcondition {} — $ {cmd_shown}",
                 if outcome.ok { "pass" } else { "FAIL" }
             ),
-            &[],
+            &[("cmd", serde_json::json!(cmd_shown))],
         );
     }
 }
 
-/// Run one due verification from its persisted `.cmd` file.
+/// Run one due verification from its persisted `.cmd` file. Returns the
+/// verdict PLUS the command text that was judged (a placeholder when the file
+/// was unreadable), so the caller's `worker.verify` event can show a human
+/// WHAT ran — not just pass/fail.
 ///
 /// The read itself can fail, and neither failure may ever degrade into
 /// `bash -c ''` (exit 0) — that would record a FABRICATED pass, the exact lie
@@ -195,29 +204,33 @@ pub fn reconcile(paths: &Paths) {
 ///     persistent error. Record a FAIL naming the unreadable file: the tick
 ///     sees "postcondition FAIL" instead of a clean corpse, and the
 ///     once-per-lifetime contract still holds.
-fn run_one(paths: &Paths, cmd_file: &std::path::Path) -> Option<VerifyResult> {
+fn run_one(paths: &Paths, cmd_file: &std::path::Path) -> Option<(VerifyResult, String)> {
     let cmd = match fs::read_to_string(cmd_file) {
         Ok(cmd) => cmd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
         Err(e) => {
-            return Some(VerifyResult {
-                ok: false,
-                exit_code: None,
-                output: format!(
-                    "verify command file {} is unreadable ({e}) — the postcondition could \
-                     not be checked, recorded as FAIL (never a fabricated pass)",
-                    cmd_file.display()
-                ),
-                ts: crate::util::now_unix(),
-            });
+            return Some((
+                VerifyResult {
+                    ok: false,
+                    exit_code: None,
+                    output: format!(
+                        "verify command file {} is unreadable ({e}) — the postcondition could \
+                         not be checked, recorded as FAIL (never a fabricated pass)",
+                        cmd_file.display()
+                    ),
+                    ts: crate::util::now_unix(),
+                },
+                "(unreadable)".to_string(),
+            ));
         }
     };
-    Some(run_cmd(
+    let outcome = run_cmd(
         &paths.data_dir,
         &cmd,
         timeout_secs(),
         "LOOOP_VERIFY_TIMEOUT_SECS",
-    ))
+    );
+    Some((outcome, cmd))
 }
 
 /// SIGKILL a child's whole process GROUP (the child was spawned with
@@ -374,8 +387,11 @@ pub(crate) fn run_cmd(
     }
 }
 
-/// The UTF-8-safe tail of a file, capped at `max` bytes.
-fn read_tail_file(path: &std::path::Path, max: usize) -> String {
+/// The UTF-8-safe tail of a file, capped at `max` bytes — SEEK-based, so only
+/// the tail is ever loaded (a whole-file read would let an unbounded capture
+/// file balloon the pulse's memory). pub(crate): sensor.rs's stderr-tail read
+/// delegates here for exactly that bound (its `.err` files have no size cap).
+pub(crate) fn read_tail_file(path: &std::path::Path, max: usize) -> String {
     let Ok(mut file) = fs::File::open(path) else {
         return String::new();
     };
@@ -566,10 +582,13 @@ mod tests {
         let f = paths.data_dir.join("verify-test.cmd");
         fs::create_dir_all(&paths.data_dir).unwrap();
         fs::write(&f, "echo missing-artifact >&2; exit 3").unwrap();
-        let r = run_one(&paths, &f).expect("a readable command file is judged");
+        let (r, cmd) = run_one(&paths, &f).expect("a readable command file is judged");
         assert!(!r.ok);
         assert_eq!(r.exit_code, Some(3));
         assert!(r.output.contains("missing-artifact"));
+        // The command text rides along so the worker.verify event can show a
+        // human WHAT ran — pass/fail alone hid the AI-authored shell entirely.
+        assert_eq!(cmd, "echo missing-artifact >&2; exit 3");
     }
 
     #[test]
@@ -598,8 +617,12 @@ mod tests {
         let paths = Paths::temp();
         let d = paths.data_dir.join("unreadable.cmd");
         fs::create_dir_all(&d).unwrap();
-        let r = run_one(&paths, &d).expect("a persistent read error is judged terminally");
+        let (r, cmd) = run_one(&paths, &d).expect("a persistent read error is judged terminally");
         assert!(!r.ok, "an unreadable command file can never verify as pass");
+        assert_eq!(
+            cmd, "(unreadable)",
+            "the event still gets a placeholder command, never fabricated text"
+        );
         assert_eq!(
             r.exit_code, None,
             "no command ran, so there is no exit code"
