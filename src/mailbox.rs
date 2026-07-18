@@ -20,7 +20,25 @@ use anyhow::{Context, Result, bail};
 use std::process::ExitCode;
 use std::time::Duration;
 
-/// One pending question. Serialized to `asks/<id>.json`.
+/// Schema version stamped into serialized mailbox records. Records written
+/// before versioning carry no `v` and deserialize as v1 (serde ignores unknown
+/// fields on read, so `v` is also transparently ACCEPTED on Ask, whose struct
+/// deliberately carries no `v` field — other modules construct Ask literals).
+fn default_v() -> u32 {
+    1
+}
+
+/// Stamp `"v": 1` into a serialized record body (see [`default_v`]).
+fn stamp_v1(body: &str) -> Result<String> {
+    let mut val: serde_json::Value = serde_json::from_str(body)?;
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("v".into(), serde_json::json!(1));
+    }
+    Ok(serde_json::to_string_pretty(&val)?)
+}
+
+/// One pending question. Serialized to `asks/<id>.json` (with a `v: 1` schema
+/// stamp injected at write time; absent `v` on read means v1).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Ask {
     /// Correlation id: `<worker>-<n>`. The answer lands at `answers/<id>.json`.
@@ -47,13 +65,16 @@ pub struct Ask {
     pub ts: u64,
 }
 
-/// Allocate the next ask id for a worker: `<worker>-<n>` where `n` is one past
-/// the highest existing index across BOTH asks/ and answers/ (so an answered
-/// ask's id is never reused while its record lingers).
-fn next_ask_id(store: &impl StateStore, worker: &str) -> String {
+/// Allocate the next sequential id for a worker: `<worker>-<n>` where `n` is
+/// one past the highest existing index across `collections`. Shared by asks
+/// (scans asks/ AND answers/, so an answered ask's id is never reused while its
+/// record lingers) and tells (scans tells/ only). The scan-max+1 is inherently
+/// racy across processes — callers must WRITE the record via `create_exclusive`
+/// and re-scan on collision (see [`write_new_record`]).
+fn next_seq_id(store: &impl StateStore, collections: &[Collection], worker: &str) -> String {
     let mut max = 0u64;
-    for coll in [Collection::Asks, Collection::Answers] {
-        for stem in store.list(&coll) {
+    for coll in collections {
+        for stem in store.list(coll) {
             if let Some(idx) = stem.strip_prefix(&format!("{worker}-"))
                 && let Ok(n) = idx.parse::<u64>()
             {
@@ -62,6 +83,29 @@ fn next_ask_id(store: &impl StateStore, worker: &str) -> String {
         }
     }
     format!("{worker}-{}", max + 1)
+}
+
+/// Allocate an id and durably create the record for it, retrying on collision:
+/// scan-max+1 then EXCLUSIVE-create — when two issuers race to the same id,
+/// exactly one create wins and the loser re-scans. `make` builds the record
+/// body for a candidate id; `key` maps the id to its store key. Bounded (~20
+/// attempts) so pathological contention errors out instead of spinning.
+fn write_new_record(
+    store: &impl StateStore,
+    collections: &[Collection],
+    worker: &str,
+    key: impl Fn(String) -> Key,
+    make: impl Fn(&str) -> Result<String>,
+) -> Result<String> {
+    for _ in 0..20 {
+        let id = next_seq_id(store, collections, worker);
+        let body = make(&id)?;
+        if store.create_exclusive(&key(id.clone()), &body)? {
+            return Ok(id);
+        }
+        // Collision: another issuer took this id first — re-scan and retry.
+    }
+    bail!("mailbox: could not allocate an id for {worker:?} after 20 attempts (contention)")
 }
 
 /// Read the answer text for an ask id, if it has been answered.
@@ -78,11 +122,22 @@ pub fn pending(paths: &Paths) -> Vec<Ask> {
     let store = FileStore::new(paths);
     let mut out = Vec::new();
     for id in store.list(&Collection::Asks) {
-        if let Some(raw) = store.read(&Key::Ask(id.clone()))
-            && let Ok(ask) = serde_json::from_str::<Ask>(&raw)
-            && read_answer(&store, &ask.id).is_none()
-        {
-            out.push(ask);
+        let Some(raw) = store.read(&Key::Ask(id.clone())) else {
+            continue;
+        };
+        match serde_json::from_str::<Ask>(&raw) {
+            Ok(ask) => {
+                if read_answer(&store, &ask.id).is_none() {
+                    out.push(ask);
+                }
+            }
+            // A record we cannot parse is a VISIBLE problem, not a silent drop
+            // — a worker may be blocked on it forever. STDERR, not stdout:
+            // pending() feeds machine output (`looop asks --json`,
+            // `looop state --json`) and stdout must stay clean for it.
+            Err(e) => {
+                eprintln!("asks/{id}.json is unparseable ({e}) — record ignored");
+            }
         }
     }
     out.sort_by(|a, b| a.ts.cmp(&b.ts).then_with(|| a.id.cmp(&b.id)));
@@ -98,6 +153,8 @@ pub fn answered_detached(paths: &Paths) -> Vec<(Ask, String)> {
     let store = FileStore::new(paths);
     let mut out = Vec::new();
     for id in store.list(&Collection::Asks) {
+        // Parse failures are surfaced by `pending()` (which scans the same
+        // records every beat); here they are just skipped.
         if let Some(raw) = store.read(&Key::Ask(id.clone()))
             && let Ok(ask) = serde_json::from_str::<Ask>(&raw)
             && ask.detach
@@ -122,6 +179,16 @@ pub fn resume_context(paths: &Paths, ask_id: &str) -> Result<String> {
         .read(&Key::Ask(ask_id.to_string()))
         .with_context(|| format!("resume: no ask {ask_id:?}"))?;
     let ask: Ask = serde_json::from_str(&raw).with_context(|| format!("resume: ask {ask_id:?}"))?;
+    // A BLOCKING (non-detached) ask still has its original worker polling for
+    // the answer: resuming it would archive the pair out from under that
+    // worker (which then bails "vanished") while a SECOND worker consumes the
+    // answer. Only detached asks are resumable by design.
+    if !ask.detach {
+        bail!(
+            "ask {ask_id} is a blocking ask — its worker is already waiting; \
+             resume only detached asks"
+        );
+    }
     let answer = read_answer(&store, ask_id)
         .with_context(|| format!("resume: ask {ask_id:?} has no answer yet"))?;
     let reference = if ask.reference.is_empty() {
@@ -152,8 +219,94 @@ pub fn archive_pair(paths: &Paths, ask_id: &str) {
         return;
     }
     let store = FileStore::new(paths);
-    let _ = store.archive(&Key::Ask(ask_id.to_string()));
-    let _ = store.archive(&Key::Answer(ask_id.to_string()));
+    // Failures are non-fatal but must be VISIBLE — a pair that fails to
+    // archive keeps the sys-asks resume signal hot (possible re-dispatch).
+    if let Err(e) = store.archive(&Key::Ask(ask_id.to_string())) {
+        util::event(
+            util::Level::Warn,
+            "ask.archive_failed",
+            &format!("could not archive asks/{ask_id}.json: {e}"),
+            &[("ask_id", serde_json::json!(ask_id))],
+        );
+    }
+    match store.archive(&Key::Answer(ask_id.to_string())) {
+        Ok(()) => {}
+        // Best-effort on the answer half: an ask without an answer file
+        // archives just the ask (a detached ask killed before answering).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => util::event(
+            util::Level::Warn,
+            "ask.archive_failed",
+            &format!("could not archive answers/{ask_id}.json: {e}"),
+            &[("ask_id", serde_json::json!(ask_id))],
+        ),
+    }
+}
+
+/// Best-effort inverse of [`archive_pair`]: move the MOST RECENTLY archived
+/// `<id>` records back into the live dirs. Used by the resume path when the
+/// worker spawn fails AFTER the pair was archived — restoring the pair restores
+/// the `sys-asks` resume signal, so the answer is not lost. The guard is
+/// PAIRWISE: if a NEW live ask reuses the id, NEITHER half is restored —
+/// restoring just the answer would attach a stale answer to a different
+/// question. The ANSWER half is restored FIRST; if that restore fails, the ask
+/// restore is skipped too (an answer without an ask is inert; an ask without
+/// its answer re-relays as pending — worse).
+pub fn unarchive_pair(paths: &Paths, ask_id: &str) {
+    if util::safe_segment("ask id", ask_id).is_err() {
+        return;
+    }
+    // Pairwise guard: a live ask with this id means the id was REUSED by a new
+    // ask — restore nothing (never attach the old answer to the new question).
+    if paths.asks_dir().join(format!("{ask_id}.json")).exists() {
+        return;
+    }
+    // Answer first: if it cannot be restored, skip the ask half as well.
+    if !restore_newest_archived(&paths.answers_dir(), ask_id) {
+        return;
+    }
+    restore_newest_archived(&paths.asks_dir(), ask_id);
+}
+
+/// Move the MOST RECENTLY archived `<ask_id>` record in `dir/archive/` back to
+/// `dir/<ask_id>.json`. Returns true when the live record exists afterwards
+/// (already present, or restored); false when there was nothing to restore or
+/// the rename failed.
+fn restore_newest_archived(dir: &std::path::Path, ask_id: &str) -> bool {
+    let live = dir.join(format!("{ask_id}.json"));
+    if live.exists() {
+        return true;
+    }
+    let archive = dir.join("archive");
+    // The archive suffixes on collision (`<id>.json`, `<id>-1.json`, …);
+    // the highest suffix is the record we just archived.
+    let mut newest: Option<std::path::PathBuf> = None;
+    let mut n = 0u64;
+    let mut candidate = archive.join(format!("{ask_id}.json"));
+    while candidate.is_file() {
+        newest = Some(candidate);
+        n += 1;
+        candidate = archive.join(format!("{ask_id}-{n}.json"));
+    }
+    let Some(from) = newest else {
+        return false;
+    };
+    match std::fs::rename(&from, &live) {
+        Ok(()) => true,
+        Err(e) => {
+            util::event(
+                util::Level::Warn,
+                "ask.unarchive_failed",
+                &format!(
+                    "could not restore {} → {}: {e}",
+                    from.display(),
+                    live.display()
+                ),
+                &[("ask_id", serde_json::json!(ask_id))],
+            );
+            false
+        }
+    }
 }
 
 /// The `sys-asks` system-sensor probe: makes the mailbox a FIRST-CLASS part of
@@ -253,17 +406,27 @@ fn write_ask(
         bail!("ask: empty --prompt");
     }
     let store = FileStore::new(paths);
-    let id = next_ask_id(&store, worker);
-    let ask = Ask {
-        id: id.clone(),
-        worker: worker.to_string(),
-        prompt: prompt.to_string(),
-        reference: reference.to_string(),
-        options: options.to_vec(),
-        detach,
-        ts: util::now_unix(),
-    };
-    store.write_atomic(&Key::Ask(id.clone()), &serde_json::to_string_pretty(&ask)?)?;
+    // Exclusive-create with re-scan on collision: two workers (or two asks
+    // from one worker) racing to the same id can never silently overwrite
+    // each other — the loser re-scans and takes the next id.
+    let id = write_new_record(
+        &store,
+        &[Collection::Asks, Collection::Answers],
+        worker,
+        Key::Ask,
+        |id| {
+            let ask = Ask {
+                id: id.to_string(),
+                worker: worker.to_string(),
+                prompt: prompt.to_string(),
+                reference: reference.to_string(),
+                options: options.to_vec(),
+                detach,
+                ts: util::now_unix(),
+            };
+            stamp_v1(&serde_json::to_string(&ask)?)
+        },
+    )?;
     util::event(
         util::Level::Step,
         "ask",
@@ -318,6 +481,14 @@ pub(crate) fn ask(
             .and_then(|v| v.trim().parse().ok())
             .unwrap_or(1000),
     );
+    // Optional wall-clock bound: `LOOOP_ASK_TIMEOUT_S` (default: none — an ask
+    // legitimately waits on a human indefinitely).
+    // checked_add: an absurd value (u64::MAX) would overflow Instant + Duration
+    // and panic — treat overflow as "no deadline".
+    let deadline = std::env::var("LOOOP_ASK_TIMEOUT_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .and_then(|s| std::time::Instant::now().checked_add(Duration::from_secs(s)));
     loop {
         if let Some(answer) = read_answer(&store, &id) {
             // Piggyback any steering the human sent while this worker was
@@ -333,6 +504,18 @@ pub(crate) fn ask(
                 tells.join("\n")
             ));
         }
+        // Escape hatches so a worker can never block FOREVER on a dead ask:
+        // (a) the ask record itself vanished (deleted / archived out from
+        //     under us) — nothing can ever answer it now;
+        if !store.exists(&Key::Ask(id.clone())) {
+            bail!("ask {id}: the ask record vanished (deleted or archived) — no answer can arrive");
+        }
+        // (b) the optional timeout expired.
+        if let Some(d) = deadline
+            && std::time::Instant::now() >= d
+        {
+            bail!("ask {id}: timed out waiting for an answer (LOOOP_ASK_TIMEOUT_S)");
+        }
         std::thread::sleep(poll);
     }
 }
@@ -343,23 +526,13 @@ pub(crate) fn ask(
 /// consumed (deleted) when the worker drains it.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Tell {
+    /// Record schema version (v1 today; absent ⇒ v1).
+    #[serde(default = "default_v")]
+    pub v: u32,
     pub id: String,
     pub worker: String,
     pub msg: String,
     pub ts: u64,
-}
-
-/// Allocate `<worker>-<n>` one past the highest pending tell for the worker.
-fn next_tell_id(store: &impl StateStore, worker: &str) -> String {
-    let mut max = 0u64;
-    for stem in store.list(&Collection::Tells) {
-        if let Some(idx) = stem.strip_prefix(&format!("{worker}-"))
-            && let Ok(n) = idx.parse::<u64>()
-        {
-            max = max.max(n);
-        }
-    }
-    format!("{worker}-{}", max + 1)
 }
 
 /// Undelivered tells for `worker`, oldest first.
@@ -369,8 +542,18 @@ pub fn pending_tells(paths: &Paths, worker: &str) -> Vec<Tell> {
         .list(&Collection::Tells)
         .into_iter()
         .filter_map(|id| {
-            let raw = store.read(&Key::Tell(id))?;
-            serde_json::from_str::<Tell>(&raw).ok()
+            let raw = store.read(&Key::Tell(id.clone()))?;
+            match serde_json::from_str::<Tell>(&raw) {
+                Ok(t) => Some(t),
+                Err(e) => {
+                    // Visible, not silent: a dropped tell is lost steering.
+                    // STDERR, not stdout: `looop told` prints the drained
+                    // tells on stdout and that stream IS the text a worker
+                    // consumes — a warning there would be read as steering.
+                    eprintln!("tells/{id}.json is unparseable ({e}) — record ignored");
+                    None
+                }
+            }
         })
         .filter(|t| t.worker == worker)
         .collect();
@@ -408,21 +591,27 @@ pub fn cmd_tell(paths: &Paths, args: &crate::cli::TellArgs) -> Result<ExitCode> 
         );
     }
     let store = FileStore::new(paths);
-    let id = next_tell_id(&store, &args.worker);
-    let tell = Tell {
-        id: id.clone(),
-        worker: args.worker.clone(),
-        msg,
-        ts: util::now_unix(),
-    };
-    store.write_atomic(
-        &Key::Tell(id.clone()),
-        &serde_json::to_string_pretty(&tell)?,
+    // Same collision-safe allocation as asks: exclusive-create, re-scan on loss.
+    let id = write_new_record(
+        &store,
+        &[Collection::Tells],
+        &args.worker,
+        Key::Tell,
+        |id| {
+            let tell = Tell {
+                v: 1,
+                id: id.to_string(),
+                worker: args.worker.clone(),
+                msg: msg.clone(),
+                ts: util::now_unix(),
+            };
+            Ok(serde_json::to_string_pretty(&tell)?)
+        },
     )?;
     util::event(
         util::Level::Ok,
         "tell",
-        &format!("queued for {}: {}", args.worker, tell.msg),
+        &format!("queued for {}: {msg}", args.worker),
         &[
             ("tell_id", serde_json::json!(id)),
             ("worker", serde_json::json!(args.worker)),
@@ -567,7 +756,10 @@ mod tests {
         fs::create_dir_all(p.asks_dir()).unwrap();
         fs::create_dir_all(p.answers_dir()).unwrap();
 
-        assert_eq!(next_ask_id(&store, "triage"), "triage-1");
+        assert_eq!(
+            next_seq_id(&store, &[Collection::Asks, Collection::Answers], "triage"),
+            "triage-1"
+        );
         let a = Ask {
             id: "triage-1".into(),
             worker: "triage".into(),
@@ -583,14 +775,93 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(next_ask_id(&store, "triage"), "triage-2");
+        assert_eq!(
+            next_seq_id(&store, &[Collection::Asks, Collection::Answers], "triage"),
+            "triage-2"
+        );
         assert_eq!(pending(&p).len(), 1, "unanswered ask is pending");
 
         // Answering it removes it from pending but keeps the id reserved.
         cmd_answer(&p, &ans("triage-1", "yes", false)).unwrap();
         assert!(pending(&p).is_empty(), "answered ask is not pending");
         assert_eq!(read_answer(&store, "triage-1").as_deref(), Some("yes"));
-        assert_eq!(next_ask_id(&store, "triage"), "triage-2");
+        assert_eq!(
+            next_seq_id(&store, &[Collection::Asks, Collection::Answers], "triage"),
+            "triage-2"
+        );
+    }
+
+    #[test]
+    fn write_new_record_rescans_on_collision() {
+        let p = Paths::temp();
+        let store = FileStore::new(&p);
+        fs::create_dir_all(p.asks_dir()).unwrap();
+        // Simulate a racer: the FIRST time the body is built (i.e. after the
+        // scan chose an id, before our exclusive create), another issuer lands
+        // the same id. Our create must lose, re-scan, and take the next id.
+        let raced = std::cell::Cell::new(false);
+        let id = write_new_record(
+            &store,
+            &[Collection::Asks, Collection::Answers],
+            "w",
+            Key::Ask,
+            |id| {
+                if !raced.replace(true) {
+                    fs::write(p.asks_dir().join(format!("{id}.json")), "{\"racer\":1}").unwrap();
+                }
+                Ok(format!("{{\"mine\":\"{id}\"}}"))
+            },
+        )
+        .unwrap();
+        assert_eq!(id, "w-2", "loser re-scans past the racer's id");
+        assert_eq!(
+            fs::read_to_string(p.asks_dir().join("w-1.json")).unwrap(),
+            "{\"racer\":1}",
+            "the racer's record is never overwritten"
+        );
+        assert!(p.asks_dir().join("w-2.json").is_file());
+    }
+
+    /// Restores an env var to its pre-test value on drop (panic-safe).
+    struct EnvRestore(&'static str, Option<std::ffi::OsString>);
+    impl EnvRestore {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            EnvRestore(key, prev)
+        }
+    }
+    impl Drop for EnvRestore {
+        fn drop(&mut self) {
+            match &self.1 {
+                Some(v) => unsafe { std::env::set_var(self.0, v) },
+                None => unsafe { std::env::remove_var(self.0) },
+            }
+        }
+    }
+
+    #[test]
+    fn ask_errors_when_the_ask_record_vanishes() {
+        // set_var is process-global: serialize against other env-mutating
+        // tests, and restore the knob even if an assert below panics.
+        let _g = crate::util::test_env_lock();
+        let _r = EnvRestore::set("LOOOP_ASK_POLL_MS", "10");
+        let p = Paths::temp();
+        let ask_file = p.asks_dir().join("w-1.json");
+        let handle = std::thread::spawn(move || ask(&p, "w", "anyone there?", "", &[]));
+        // Wait for the ask record to appear, then delete it out from under the
+        // blocked worker — the poll loop must ERROR instead of spinning forever.
+        for _ in 0..200 {
+            if ask_file.is_file() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(ask_file.is_file(), "ask record never appeared");
+        fs::remove_file(&ask_file).unwrap();
+        let res = handle.join().unwrap();
+        let err = res.expect_err("a vanished ask must error, not block forever");
+        assert!(err.to_string().contains("vanished"), "got: {err}");
     }
 
     #[test]
@@ -630,9 +901,10 @@ mod tests {
         let p = Paths::temp();
         let store = FileStore::new(&p);
         for (i, msg) in ["focus the PR", "skip the docs"].iter().enumerate() {
-            let id = next_tell_id(&store, "triage");
+            let id = next_seq_id(&store, &[Collection::Tells], "triage");
             assert_eq!(id, format!("triage-{}", i + 1));
             let t = Tell {
+                v: 1,
                 id: id.clone(),
                 worker: "triage".into(),
                 msg: msg.to_string(),
@@ -665,6 +937,12 @@ mod tests {
         );
         // resume_context before the answer is a loud error.
         assert!(resume_context(&p, &id).is_err());
+        // …and so is resuming a BLOCKING (non-detached) ask: its worker is
+        // already polling for the answer.
+        let blocking = write_ask(&p, "other", "quick q?", "", &[], false).unwrap();
+        answer(&p, &blocking, "quick a", false).unwrap();
+        let err = resume_context(&p, &blocking).unwrap_err().to_string();
+        assert!(err.contains("blocking ask"), "got: {err}");
         // …and so is an id that is not a safe path segment (traversal guard).
         assert!(resume_context(&p, "../evil").is_err());
 
@@ -728,6 +1006,43 @@ mod tests {
         // …and the second archive did not clobber the first record.
         assert!(p.asks_dir().join("archive/w-1.json").is_file());
         assert!(p.asks_dir().join("archive/w-1-1.json").is_file());
+    }
+
+    #[test]
+    fn unarchive_restores_the_pair_and_never_pairs_a_stale_answer_with_a_new_ask() {
+        let p = Paths::temp();
+        let id = ask_detached(&p, "w", "first?", "", &[]).unwrap();
+        cmd_answer(&p, &ans(&id, "one", false)).unwrap();
+        archive_pair(&p, &id);
+
+        // Plain restore: both halves come back, the pair is resumable again.
+        unarchive_pair(&p, &id);
+        assert!(p.asks_dir().join(format!("{id}.json")).is_file());
+        assert!(p.answers_dir().join(format!("{id}.json")).is_file());
+        assert_eq!(answered_detached(&p).len(), 1);
+
+        // Archive again, then let a NEW live ask REUSE the id: unarchive must
+        // restore NEITHER half — restoring only the answer would attach the
+        // stale "one" to the brand-new question.
+        archive_pair(&p, &id);
+        let id2 = ask_detached(&p, "w", "second, unrelated?", "", &[]).unwrap();
+        assert_eq!(id2, id, "the live id space reuses archived ids");
+        unarchive_pair(&p, &id);
+        assert!(
+            !p.answers_dir().join(format!("{id}.json")).exists(),
+            "a stale answer must not be attached to the new ask"
+        );
+        assert!(
+            p.asks_dir()
+                .join("archive")
+                .join(format!("{id}.json"))
+                .is_file(),
+            "the archived ask half stays archived"
+        );
+        assert!(
+            pending(&p).iter().any(|a| a.prompt == "second, unrelated?"),
+            "the new live ask is untouched"
+        );
     }
 
     #[test]

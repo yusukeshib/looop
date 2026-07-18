@@ -16,11 +16,17 @@ use crate::util;
 use anyhow::{Result, bail};
 use std::process::ExitCode;
 
-/// The `.session` recorded in a claim, or empty if absent/unparseable.
-fn claim_holder(store: &impl StateStore, key: &Key) -> String {
-    store
-        .read(key)
-        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+/// How long an EMPTY claim file is treated as "in flight" before it is stale
+/// debris. Our own writers can never leave an empty file (create_exclusive
+/// publishes complete contents via rename), so an empty claim is foreign or
+/// crash debris — but give a foreign writer a short grace window (mtime-based)
+/// before removing it, so a mid-write old binary isn't instantly stolen from.
+const EMPTY_CLAIM_GRACE_SECS: u64 = 10;
+
+/// The `.session` recorded in a claim body, or empty if unparseable.
+fn holder_of(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
         .and_then(|v| v.get("session").and_then(|x| x.as_str()).map(str::to_owned))
         .unwrap_or_default()
 }
@@ -72,22 +78,46 @@ pub(crate) fn claim(
     let body = serde_json::json!({ "session": session, "name": name }).to_string();
 
     // Retry a bounded number of times: each iteration is one atomic create-if-absent
-    // (O_EXCL via the store); a stale lease is removed and the create retried (the
-    // loop only re-runs when we reclaimed a dead holder, so it terminates).
+    // (exclusive-create via the store); a stale lease is reclaimed via COMPARE-
+    // AND-DELETE (remove only if the contents still match what we read — so a
+    // lease FRESHLY re-acquired between our read and our delete is never stolen)
+    // and the create retried.
     for _ in 0..8 {
         if store.create_exclusive(&key, &body)? {
             return Ok(ClaimOutcome::Won);
         }
         // Already held: inspect the holder to decide own / live / reclaim.
-        let holder = claim_holder(&store, &key);
+        let Some(raw) = store.read(&key) else {
+            continue; // vanished between create and read — just retry the create
+        };
+        if raw.is_empty() {
+            // create_exclusive guarantees "exists ⇒ contents complete", so an
+            // empty file is foreign/crash debris. Treat it as in-flight only
+            // while YOUNG; once past the grace window it would wedge this
+            // claim name FOREVER (nobody ever fills it in) — remove it (the
+            // compare-and-delete keys on the empty contents, so a real lease
+            // written meanwhile survives) and retry the create.
+            if store
+                .age_secs(&key)
+                .is_some_and(|a| a < EMPTY_CLAIM_GRACE_SECS)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            } else {
+                let _ = store.remove_if_eq(&key, "");
+            }
+            continue;
+        }
+        let holder = holder_of(&raw);
         if !holder.is_empty() && holder == session {
             return Ok(ClaimOutcome::AlreadyOwned);
         }
         if !holder.is_empty() && session::is_alive(paths, &holder) {
             return Ok(ClaimOutcome::HeldByLive(holder));
         }
-        // Stale (holder empty or dead): reclaim and retry the atomic create.
-        let _ = store.remove(&key);
+        // Stale (holder unparseable or dead): compare-and-delete, then retry
+        // the atomic create. A `false` (someone re-acquired) just loops — the
+        // next iteration re-inspects the fresh holder.
+        let _ = store.remove_if_eq(&key, &raw);
     }
     bail!("claim {name}: contention reclaiming a stale lease");
 }
@@ -114,13 +144,18 @@ pub(crate) fn unclaim(paths: &Paths, name: &str, session: Option<&str>) -> Resul
     let session = session_or_env(session);
     let store = FileStore::new(paths);
     let key = Key::Claim(name.to_string());
-    if !store.exists(&key) {
+    let Some(raw) = store.read(&key) else {
         return Ok(true); // already released (idempotent)
-    }
-    let holder = claim_holder(&store, &key);
+    };
+    let holder = holder_of(&raw);
     if holder.is_empty() || holder == session || !session::is_alive(paths, &holder) {
-        store.remove(&key)?;
-        return Ok(true);
+        // Compare-and-delete: only remove the lease we actually inspected — a
+        // lease FRESHLY acquired by someone else after our read stays intact.
+        return match store.remove_if_eq(&key, &raw)? {
+            true => Ok(true),
+            // Contents changed underneath us: someone else now holds it.
+            false => Ok(false),
+        };
     }
     Ok(false)
 }
@@ -137,9 +172,40 @@ pub fn reap_stale_claims(paths: &Paths) {
 
     for name in store.list(&Collection::Claims) {
         let key = Key::Claim(name.clone());
-        let sess = claim_holder(&store, &key);
+        let Some(raw) = store.read(&key) else {
+            continue;
+        };
+        if raw.is_empty() {
+            // "exists ⇒ contents complete" holds for our own creates, so an
+            // empty file is foreign/crash debris. Skip it while YOUNG (a
+            // foreign writer may still be mid-write); once past the grace
+            // window remove it, or the name is wedged forever.
+            if store
+                .age_secs(&key)
+                .is_some_and(|a| a >= EMPTY_CLAIM_GRACE_SECS)
+                && store.remove_if_eq(&key, &raw).unwrap_or(false)
+            {
+                util::event(
+                    util::Level::Info,
+                    "claim.reaped",
+                    &format!("reaped stale empty claim {name} (crash debris)"),
+                    &[("claim", serde_json::json!(name))],
+                );
+                events::emit(
+                    paths,
+                    "claim_reaped",
+                    serde_json::json!({ "claim": name, "session": "" }),
+                );
+            }
+            continue;
+        }
+        let sess = holder_of(&raw);
         if sess.is_empty() || !alive.iter().any(|a| a == &sess) {
-            let _ = store.remove(&key);
+            // Compare-and-delete: never reap a lease that was freshly re-
+            // acquired between our read and this delete.
+            if !store.remove_if_eq(&key, &raw).unwrap_or(false) {
+                continue;
+            }
             util::event(
                 util::Level::Info,
                 "claim.reaped",
@@ -240,6 +306,88 @@ mod tests {
         );
         assert!(p.claims_dir().join("repo-q.json").is_file());
         assert!(!p.claims_dir().join("w1.json").exists());
+    }
+
+    #[test]
+    fn reclaim_is_compare_and_delete_never_stealing_a_fresh_lease() {
+        // The mechanism claim()/unclaim()/reap use: remove_if_eq only deletes
+        // the lease the caller actually INSPECTED — a fresh lease written
+        // between the read and the delete survives.
+        let p = Paths::temp();
+        let store = crate::store::FileStore::new(&p);
+        let key = crate::store::Key::Claim("repo-r".into());
+        store
+            .create_exclusive(&key, r#"{"session":"dead","name":"repo-r"}"#)
+            .unwrap();
+        let observed = store.read(&key).unwrap();
+        // A racer reclaims first and writes its FRESH lease…
+        store.remove(&key).unwrap();
+        store
+            .create_exclusive(&key, r#"{"session":"fresh","name":"repo-r"}"#)
+            .unwrap();
+        // …so our delete (keyed to the stale contents) must lose.
+        assert!(!store.remove_if_eq(&key, &observed).unwrap());
+        let v: serde_json::Value = serde_json::from_str(&store.read(&key).unwrap()).unwrap();
+        assert_eq!(v["session"], "fresh", "the fresh lease was not stolen");
+    }
+
+    #[test]
+    fn empty_claim_file_is_in_flight_only_while_young() {
+        // A FRESH empty file may be a foreign writer mid-write: claim() retries
+        // then reports contention instead of instantly stealing, and the
+        // reaper skips it.
+        let p = Paths::temp();
+        fs::create_dir_all(p.claims_dir()).unwrap();
+        let path = p.claims_dir().join("repo-e.json");
+        fs::write(&path, b"").unwrap();
+        assert!(
+            claim(&p, "repo-e", Some("w9")).is_err(),
+            "a young empty holder is retried then surfaced as contention, never stolen"
+        );
+        reap_stale_claims(&p);
+        assert!(
+            path.is_file(),
+            "the reaper must not reap a young (possibly in-flight) empty claim"
+        );
+    }
+
+    #[test]
+    fn old_empty_claim_file_is_stale_debris_and_is_reclaimed() {
+        // An empty file OLDER than the grace window can never be completed
+        // (rename-published creates are all-or-nothing) — leaving it would
+        // wedge the claim name forever. claim() removes it and wins…
+        let p = Paths::temp();
+        fs::create_dir_all(p.claims_dir()).unwrap();
+        let path = p.claims_dir().join("repo-o.json");
+        let age = |path: &std::path::Path| {
+            let old = std::time::SystemTime::now()
+                - std::time::Duration::from_secs(EMPTY_CLAIM_GRACE_SECS + 5);
+            fs::OpenOptions::new()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_modified(old)
+                .unwrap();
+        };
+        fs::write(&path, b"").unwrap();
+        age(&path);
+        assert!(matches!(
+            claim(&p, "repo-o", Some("w9")).unwrap(),
+            crate::contract::ClaimOutcome::Won
+        ));
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["session"], "w9", "the stale debris was reclaimed");
+
+        // …and the reaper removes an old empty file outright.
+        let path2 = p.claims_dir().join("repo-p.json");
+        fs::write(&path2, b"").unwrap();
+        age(&path2);
+        reap_stale_claims(&p);
+        assert!(
+            !path2.exists(),
+            "the reaper removes empty crash debris past the grace window"
+        );
     }
 
     #[test]

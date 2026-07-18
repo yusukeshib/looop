@@ -29,9 +29,17 @@ use anyhow::{Result, bail};
 /// world hash every beat).
 const MIN_EVERY_S: u64 = 60;
 
+/// Record schema version stamp (absent ⇒ v1).
+fn default_v() -> u32 {
+    1
+}
+
 /// One parsed schedule file.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Schedule {
+    /// Record schema version (v1 today; absent ⇒ v1).
+    #[serde(default = "default_v")]
+    pub v: u32,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub at: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -62,6 +70,7 @@ pub fn write(
         }
         (Some(0), None) => bail!("write_schedule {name:?}: in_s must be > 0"),
         (Some(in_s), None) => Schedule {
+            v: 1,
             at: Some(now + in_s),
             every_s: None,
             anchor: None,
@@ -73,6 +82,7 @@ pub fn write(
             )
         }
         (None, Some(e)) => Schedule {
+            v: 1,
             at: None,
             every_s: Some(e),
             anchor: Some(now),
@@ -100,7 +110,22 @@ pub fn drop(paths: &Paths, name: &str) -> Result<String> {
     Ok(format!("drop-schedule {name}"))
 }
 
-/// All schedules, sorted by name, with unparseable files skipped.
+/// Whether a parsed schedule is structurally INVALID: both or neither of
+/// `at`/`every_s`, or a recurring period of 0 (which would bump the world hash
+/// every second — a flapping signal). Invalid entries are surfaced (stable
+/// "invalid" signal + a stderr warning from [`list`]), never silently dropped.
+fn is_invalid(s: &Schedule) -> bool {
+    match (s.at, s.every_s) {
+        (Some(_), None) => false,
+        (None, Some(e)) => e == 0,
+        _ => true,
+    }
+}
+
+/// All schedules, sorted by name. An unparseable file or a structurally
+/// invalid record is surfaced via a stderr warning (naming the file — stdout
+/// stays machine-clean for `--json` consumers) instead of silently skipped; invalid-but-parseable records are still RETURNED so their
+/// stable "invalid" signal reaches the world hash and the decider can fix them.
 pub fn list(paths: &Paths) -> Vec<(String, Schedule)> {
     let store = FileStore::new(paths);
     store
@@ -108,7 +133,20 @@ pub fn list(paths: &Paths) -> Vec<(String, Schedule)> {
         .into_iter()
         .filter_map(|name| {
             let raw = store.read(&Key::Schedule(name.clone()))?;
-            let s: Schedule = serde_json::from_str(&raw).ok()?;
+            let s: Schedule = match serde_json::from_str(&raw) {
+                Ok(s) => s,
+                Err(e) => {
+                    // STDERR, not stdout: list() feeds machine output
+                    // (`looop state --json`) — a stdout warning would corrupt it.
+                    eprintln!("schedules/{name}.json is unparseable ({e}) — it will never fire");
+                    return None;
+                }
+            };
+            if is_invalid(&s) {
+                eprintln!(
+                    "schedules/{name}.json is invalid (need exactly one of `at`/`every_s`, every_s > 0) — it will never fire"
+                );
+            }
             Some((name, s))
         })
         .collect()
@@ -117,6 +155,14 @@ pub fn list(paths: &Paths) -> Vec<(String, Schedule)> {
 /// The wake-signal value of one schedule at `now`, plus its human detail.
 /// Signal stability IS the design: it changes exactly when the schedule fires.
 fn reading(s: &Schedule, now: u64) -> (serde_json::Value, serde_json::Value) {
+    // Structurally invalid records get a STABLE "invalid" signal (never flaps)
+    // — list() has already emitted the Warn naming the file.
+    if is_invalid(s) {
+        return (
+            serde_json::json!("invalid"),
+            serde_json::json!({ "kind": "invalid", "note": s.note }),
+        );
+    }
     match (s.at, s.every_s) {
         (Some(at), _) => {
             let due = now >= at;
@@ -130,7 +176,11 @@ fn reading(s: &Schedule, now: u64) -> (serde_json::Value, serde_json::Value) {
             )
         }
         (_, Some(every)) => {
-            let anchor = s.anchor.unwrap_or(now);
+            // A hand-written recurring schedule may omit `anchor`. Defaulting
+            // it to `now` would pin the period at 0 forever (it NEVER fires);
+            // anchor=0 makes it due immediately and the period then advances
+            // normally — the schedule self-heals instead of silently dying.
+            let anchor = s.anchor.unwrap_or(0);
             let period = now.saturating_sub(anchor) / every.max(1);
             (
                 serde_json::json!({ "period": period }),
@@ -221,6 +271,7 @@ mod tests {
     #[test]
     fn one_shot_signal_flips_to_due_and_stays_stable() {
         let s = Schedule {
+            v: 1,
             at: Some(1000),
             every_s: None,
             anchor: None,
@@ -235,6 +286,7 @@ mod tests {
     #[test]
     fn recurring_signal_bumps_once_per_period() {
         let s = Schedule {
+            v: 1,
             at: None,
             every_s: Some(100),
             anchor: Some(1000),
@@ -244,6 +296,72 @@ mod tests {
         assert_eq!(reading(&s, 1099).0, serde_json::json!({"period": 0}));
         assert_eq!(reading(&s, 1100).0, serde_json::json!({"period": 1}));
         assert_eq!(reading(&s, 1350).0, serde_json::json!({"period": 3}));
+    }
+
+    #[test]
+    fn recurring_without_anchor_fires_immediately_and_self_heals() {
+        // A hand-written schedule missing `anchor` must not be pinned at
+        // period 0 forever (the old `anchor = now` default): anchor defaults
+        // to 0, so it is due at once and the period then advances normally.
+        let s = Schedule {
+            v: 1,
+            at: None,
+            every_s: Some(100),
+            anchor: None,
+            note: String::new(),
+        };
+        let (sig, det) = reading(&s, 1000);
+        assert_eq!(sig, serde_json::json!({"period": 10}), "fires immediately");
+        assert_eq!(det["kind"], "recurring");
+        // …and keeps bumping once per period afterwards.
+        assert_eq!(reading(&s, 1100).0, serde_json::json!({"period": 11}));
+    }
+
+    #[test]
+    fn invalid_schedules_read_as_a_stable_invalid_signal() {
+        // every_s == 0 would flap the world hash every second; both-set and
+        // neither-set are contradictions. All read as a STABLE "invalid".
+        for s in [
+            Schedule {
+                v: 1,
+                at: None,
+                every_s: Some(0),
+                anchor: Some(0),
+                note: String::new(),
+            },
+            Schedule {
+                v: 1,
+                at: Some(5),
+                every_s: Some(60),
+                anchor: None,
+                note: String::new(),
+            },
+            Schedule {
+                v: 1,
+                at: None,
+                every_s: None,
+                anchor: None,
+                note: String::new(),
+            },
+        ] {
+            assert_eq!(reading(&s, 1000).0, serde_json::json!("invalid"));
+            assert_eq!(reading(&s, 99999).0, serde_json::json!("invalid"), "stable");
+        }
+    }
+
+    #[test]
+    fn hand_written_invalid_schedule_is_listed_not_dropped() {
+        let p = Paths::temp();
+        std::fs::create_dir_all(p.schedules_dir()).unwrap();
+        std::fs::write(p.schedules_dir().join("bad.json"), br#"{"every_s": 0}"#).unwrap();
+        let all = list(&p);
+        assert_eq!(
+            all.len(),
+            1,
+            "invalid entry is surfaced, not silently dropped"
+        );
+        let v = sys_schedules(&p);
+        assert_eq!(v["signal"]["bad"], serde_json::json!("invalid"));
     }
 
     #[test]

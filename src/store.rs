@@ -97,8 +97,9 @@ pub trait StateStore {
 
     /// Atomic create-if-absent — the mutual-exclusion primitive. Returns
     /// `Ok(true)` if this call created `key`, `Ok(false)` if it already existed.
-    /// FileStore uses `O_EXCL`; a DB would use a unique insert. This is what lets
-    /// two racers never both "win" a lease.
+    /// FileStore serializes writers with a per-directory lock and publishes via
+    /// rename; a DB would use a unique insert. This is what lets two racers
+    /// never both "win" a lease.
     fn create_exclusive(&self, key: &Key, contents: &str) -> io::Result<bool>;
 
     /// Append a line (with a trailing newline) to `key`, creating it if absent.
@@ -112,10 +113,64 @@ pub trait StateStore {
     /// Remove `key`. Absent key is not an error (idempotent).
     fn remove(&self, key: &Key) -> io::Result<()>;
 
+    /// COMPARE-AND-DELETE: remove `key` ONLY IF its current contents still
+    /// equal `expected`. Returns `Ok(true)` when the key is now gone (we
+    /// removed it, or it was already absent), `Ok(false)` when the contents
+    /// changed underneath us and the key remains. This is what lets a stale-
+    /// lease reclaim never delete a lease that was FRESHLY re-acquired between
+    /// the caller's read and its delete (two racers can't both win: FileStore
+    /// runs the read+compare+delete under the same per-directory writer lock
+    /// create_exclusive takes, so the key is never observably ABSENT while a
+    /// losing delete is in flight). A DB backend would use
+    /// `DELETE … WHERE contents = ?`.
+    fn remove_if_eq(&self, key: &Key, expected: &str) -> io::Result<bool>;
+
+    /// Seconds since `key` was last written, or `None` when absent (or the
+    /// backend cannot tell). Coarse — used only for staleness horizons (e.g.
+    /// "is this empty claim file older than the in-flight grace period?").
+    fn age_secs(&self, key: &Key) -> Option<u64>;
+
     /// The names present in `collection` (the `<name>` part of each key), in
     /// sorted order. For `Asks`/`Answers` that is the ask id; for `Claims` the
     /// claim name.
     fn list(&self, collection: &Collection) -> Vec<String>;
+}
+
+/// A per-directory WRITER lock: `flock(LOCK_EX)` on `<dir>/.dirlock`, released
+/// when the guard drops (or the process dies — flock is kernel-managed, so a
+/// crash never leaves a stale lock). Only the multi-step writer primitives
+/// (`create_exclusive`, `remove_if_eq`) take it; READERS never do — they rely
+/// on rename-published files, so "exists ⇒ contents complete" holds lock-free.
+/// The `.dirlock` name has no extension, so `list`/`sorted_glob` (which filter
+/// by `.json`/`.md`/…) never surface it as an entry.
+struct DirLock {
+    _file: fs::File,
+}
+
+impl DirLock {
+    fn acquire(dir: &std::path::Path) -> io::Result<DirLock> {
+        fs::create_dir_all(dir)?;
+        let file = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(".dirlock"))?;
+        // Same libc-free extern-"C" flock technique as run.rs's single-instance
+        // lock — blocking LOCK_EX here (writers queue; the critical sections
+        // are a handful of syscalls).
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            const LOCK_EX: i32 = 2;
+            unsafe extern "C" {
+                fn flock(fd: i32, op: i32) -> i32;
+            }
+            if unsafe { flock(file.as_raw_fd(), LOCK_EX) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(DirLock { _file: file })
+    }
 }
 
 /// The filesystem-backed [`StateStore`] — the current on-disk layout. Borrows
@@ -170,36 +225,56 @@ impl StateStore for FileStore<'_> {
 
     fn write_atomic(&self, key: &Key, contents: &str) -> io::Result<()> {
         let path = self.path(key);
-        crate::util::write_atomic(&path, contents.as_bytes())?;
         // A sensor's content is a script the runtime execs, so the backing file
-        // must be executable. The exec bit is a FileStore detail, not a caller's.
-        #[cfg(unix)]
-        if matches!(key, Key::Sensor(_)) {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perm = fs::metadata(&path)?.permissions();
-            perm.set_mode(0o755);
-            fs::set_permissions(&path, perm)?;
-        }
+        // must be executable. The exec bit is set on the TEMP file BEFORE the
+        // rename, so a concurrent exec never observes a non-executable window.
+        let mode = if matches!(key, Key::Sensor(_)) {
+            Some(0o755)
+        } else {
+            None
+        };
+        crate::util::write_atomic_mode(&path, contents.as_bytes(), mode)?;
         Ok(())
     }
 
     fn create_exclusive(&self, key: &Key, contents: &str) -> io::Result<bool> {
         let path = self.path(key);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+        let parent = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        // Mutual exclusion comes from the per-directory writer lock: while we
+        // hold it, no other create_exclusive/remove_if_eq can interleave, so a
+        // plain exists-check + rename-publish is race-free. rename (not
+        // hard_link — which fails on SMB/NFS/FUSE mounts without link support)
+        // keeps "exists ⇒ contents complete" for lock-free readers: the final
+        // path only ever appears fully written + fsynced.
+        let _lock = DirLock::acquire(&parent)?;
+        if path.exists() {
+            return Ok(false);
         }
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(mut f) => {
-                use io::Write;
-                f.write_all(contents.as_bytes())?;
-                Ok(true)
+        let stem = path.file_name().and_then(|s| s.to_str()).unwrap_or("key");
+        let tmp = parent.join(format!(
+            ".{stem}.{}.{}.excl.tmp",
+            std::process::id(),
+            crate::util::temp_nonce()
+        ));
+        let write = (|| -> io::Result<()> {
+            use io::Write;
+            let mut f = fs::File::create(&tmp)?;
+            f.write_all(contents.as_bytes())?;
+            f.sync_all()
+        })();
+        if let Err(e) = write {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        match fs::rename(&tmp, &path) {
+            Ok(()) => Ok(true),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                Err(e)
             }
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(false),
-            Err(e) => Err(e),
         }
     }
 
@@ -235,12 +310,10 @@ impl StateStore for FileStore<'_> {
             fs::rename(&from, to)
         }
         match key {
-            Key::Goal(id) => {
-                let from = self.paths.goals_dir().join(format!("{id}.md"));
-                let archive = self.paths.goals_dir().join("archive");
-                fs::create_dir_all(&archive)?;
-                fs::rename(&from, archive.join(format!("{id}.md")))
-            }
+            // A goal id can be recreated after archiving, so the archive must
+            // suffix on collision like the mailbox does — a plain rename to a
+            // fixed path would silently clobber the previous archived record.
+            Key::Goal(id) => into_archive(self.path(key), id, "md"),
             // A consumed ask/answer pair (resumed detached ask) moves aside so
             // the sys-asks wake signal settles while the record stays auditable.
             Key::Ask(id) => into_archive(self.path(key), id, "json"),
@@ -258,6 +331,38 @@ impl StateStore for FileStore<'_> {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
         }
+    }
+
+    fn remove_if_eq(&self, key: &Key, expected: &str) -> io::Result<bool> {
+        let path = self.path(key);
+        let parent = path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| std::path::PathBuf::from("."));
+        // Read + compare + delete under the per-directory writer lock: no
+        // rename-aside, so the key is NEVER observably absent while a losing
+        // compare is in flight (the old design had a window where a concurrent
+        // create_exclusive could win and then be destroyed by the restore).
+        let _lock = DirLock::acquire(&parent)?;
+        let actual = match fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(true), // already gone
+            Err(e) => return Err(e),
+        };
+        if actual != expected {
+            return Ok(false); // a FRESH value landed — the caller lost
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn age_secs(&self, key: &Key) -> Option<u64> {
+        let modified = fs::metadata(self.path(key)).ok()?.modified().ok()?;
+        // An mtime in the future (clock skew) reads as age 0, never an error.
+        Some(modified.elapsed().map(|d| d.as_secs()).unwrap_or(0))
     }
 
     fn list(&self, collection: &Collection) -> Vec<String> {
@@ -305,6 +410,135 @@ mod tests {
             "second sees it already exists"
         );
         assert_eq!(s.read(&k).as_deref(), Some("first"), "loser never clobbers");
+    }
+
+    #[test]
+    fn create_exclusive_never_exposes_an_empty_file() {
+        // "Exists ⇒ contents complete": after Ok(true) the file is fully
+        // written (the rename publish happens only after write+fsync), and
+        // no temp siblings are left behind.
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        let k = Key::Claim("lease".into());
+        assert!(s.create_exclusive(&k, r#"{"session":"w1"}"#).unwrap());
+        let body = s.read(&k).unwrap();
+        assert!(!body.is_empty(), "created key must never read back empty");
+        assert_eq!(body, r#"{"session":"w1"}"#);
+        let leftovers: Vec<_> = fs::read_dir(p.claims_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn remove_if_eq_is_a_compare_and_delete() {
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        let k = Key::Claim("repo".into());
+        s.write_atomic(&k, "stale").unwrap();
+        let observed = s.read(&k).unwrap();
+        // A FRESH lease lands between the read and the reclaim …
+        s.write_atomic(&k, "fresh").unwrap();
+        // … so the compare-and-delete must LOSE and leave the fresh lease.
+        assert!(!s.remove_if_eq(&k, &observed).unwrap());
+        assert_eq!(s.read(&k).as_deref(), Some("fresh"), "fresh lease survives");
+        // Matching contents: the delete wins and the key is gone.
+        assert!(s.remove_if_eq(&k, "fresh").unwrap());
+        assert!(!s.exists(&k));
+        // Already-absent key: gone ⇒ Ok(true) (idempotent for reapers).
+        assert!(s.remove_if_eq(&k, "anything").unwrap());
+    }
+
+    #[test]
+    fn losing_remove_if_eq_leaves_no_temp_and_no_absent_window() {
+        // Regression for the rename-aside design: a LOSING compare-and-delete
+        // must never make the key observably ABSENT (which let a concurrent
+        // create_exclusive slip in, only for the restore to destroy its fresh
+        // lease) and must leave no .cad.tmp debris behind.
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        let k = Key::Claim("repo".into());
+        s.write_atomic(&k, "current").unwrap();
+        std::thread::scope(|scope| {
+            let intruder = scope.spawn(|| {
+                let s2 = FileStore::new(&p);
+                let k2 = Key::Claim("repo".into());
+                let mut wins = 0;
+                for _ in 0..200 {
+                    if s2.create_exclusive(&k2, "intruder").unwrap() {
+                        wins += 1;
+                    }
+                }
+                wins
+            });
+            for _ in 0..200 {
+                // Mismatched expected: every call must LOSE and change nothing.
+                assert!(!s.remove_if_eq(&k, "mismatched").unwrap());
+            }
+            assert_eq!(
+                intruder.join().unwrap(),
+                0,
+                "a losing compare-and-delete must never expose an absent window"
+            );
+        });
+        assert_eq!(s.read(&k).as_deref(), Some("current"), "key untouched");
+        let leftovers: Vec<_> = fs::read_dir(p.claims_dir())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn age_secs_reports_presence_and_freshness() {
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        let k = Key::Claim("repo".into());
+        assert_eq!(s.age_secs(&k), None, "absent key has no age");
+        s.write_atomic(&k, "body").unwrap();
+        assert!(s.age_secs(&k).unwrap() < 5, "a fresh write is young");
+    }
+
+    #[test]
+    fn dirlock_file_is_invisible_to_list() {
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        s.create_exclusive(&Key::Claim("a".into()), "{}").unwrap();
+        assert!(
+            p.claims_dir().join(".dirlock").is_file(),
+            "the writer lock file exists after a locked write"
+        );
+        assert_eq!(
+            s.list(&Collection::Claims),
+            vec!["a"],
+            ".dirlock must never surface as a claim"
+        );
+    }
+
+    #[test]
+    fn goal_archive_suffixes_instead_of_overwriting() {
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        let k = Key::Goal("triage".into());
+        s.write_atomic(&k, "first body").unwrap();
+        s.archive(&k).unwrap();
+        // The id is reused, then archived again — must NOT clobber the first.
+        s.write_atomic(&k, "second body").unwrap();
+        s.archive(&k).unwrap();
+        let dir = p.goals_dir().join("archive");
+        assert!(dir.join("triage.md").is_file());
+        assert!(dir.join("triage-1.md").is_file());
+        assert_eq!(
+            fs::read_to_string(dir.join("triage.md")).unwrap(),
+            "first body"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("triage-1.md")).unwrap(),
+            "second body"
+        );
     }
 
     #[test]

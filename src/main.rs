@@ -130,8 +130,14 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
     let gated = |f: &dyn Fn() -> Result<ExitCode>| deps::require_deps(paths).and_then(|_| f());
 
     match cmd {
-        Cmd::Help => {
-            help::print(paths);
+        Cmd::Help { topic } => {
+            if topic.is_empty() {
+                help::print(paths);
+            } else {
+                // `looop help worker` used to be a clap error; be a front door
+                // instead and route to the subcommand's own help.
+                println!("see: looop {} --help", topic.join(" "));
+            }
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Version => {

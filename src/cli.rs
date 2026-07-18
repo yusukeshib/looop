@@ -41,8 +41,13 @@ pub struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub enum Cmd {
-    /// Show the manual.
-    Help,
+    /// Show the manual. With a topic (e.g. `looop help worker`), points at
+    /// that subcommand's own `--help` instead of erroring.
+    Help {
+        /// Optional topic — a subcommand name; routed to `looop <topic> --help`.
+        #[arg(trailing_var_arg = true)]
+        topic: Vec<String>,
+    },
     /// Print the version.
     Version,
     /// Interactive setup: choose the agent runner and write its wiring.
@@ -318,8 +323,9 @@ pub struct KillArgs {
 pub struct TellArgs {
     /// The live worker to steer.
     pub worker: String,
-    /// The steering message.
-    #[arg(trailing_var_arg = true)]
+    /// The steering message. Its own leading dashes pass through verbatim
+    /// (like `run`), so a message starting with `-` needs no `--`.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
     pub body: Vec<String>,
 }
 
@@ -372,10 +378,10 @@ pub enum ScheduleOp {
 pub struct ScreenshotArgs {
     pub id: Option<String>,
     /// Emit ANSI-colored output.
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["json", "plain"])]
     pub ansi: bool,
     /// Emit JSON.
-    #[arg(long)]
+    #[arg(long, conflicts_with = "plain")]
     pub json: bool,
     /// Emit plain text (default).
     #[arg(long)]
@@ -392,4 +398,29 @@ pub struct ClaimArgs {
     /// Holding session id. Defaults to $LOOOP_SESSION_ID.
     #[arg(long)]
     pub session: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn screenshot_output_formats_are_mutually_exclusive() {
+        assert!(Cli::try_parse_from(["looop", "ss", "x", "--ansi", "--json"]).is_err());
+        assert!(Cli::try_parse_from(["looop", "ss", "x", "--ansi", "--plain"]).is_err());
+        assert!(Cli::try_parse_from(["looop", "ss", "x", "--json", "--plain"]).is_err());
+        assert!(Cli::try_parse_from(["looop", "ss", "x", "--plain", "--no-trim"]).is_ok());
+    }
+
+    #[test]
+    fn tell_body_accepts_leading_hyphens() {
+        let c = Cli::try_parse_from(["looop", "tell", "w1", "--use", "the", "-f", "flag"])
+            .expect("hyphen-leading tell body parses");
+        let Some(Cmd::Tell(t)) = c.cmd else {
+            panic!("expected tell")
+        };
+        assert_eq!(t.worker, "w1");
+        assert_eq!(t.body, vec!["--use", "the", "-f", "flag"]);
+    }
 }

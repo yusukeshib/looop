@@ -73,8 +73,11 @@ fn build_worker_cmd(
              (the prompt file is the worker's brief): {raw:?}"
         ));
     }
+    // Shared, quote-aware substitution (same as the tick path): the path is
+    // shell-quoted, and a pre-quoted `"{{prompt_file}}"` / `'{{prompt_file}}'`
+    // template doesn't end up double-quoted.
     Ok(WorkerCmd {
-        cmd: raw.replace("{{prompt_file}}", prompt_file),
+        cmd: crate::runner::substitute_prompt_file(raw, prompt_file),
         overridden,
     })
 }
@@ -171,8 +174,9 @@ pub fn cmd_start_session(
 
     // Resolve the RESUME context FIRST: an unknown / not-yet-answered ask id
     // is a decider mistake and must fail the move loudly (LAST FAILURE names
-    // it) before anything is spawned. The pair is archived only after the
-    // worker actually launches, below.
+    // it) before anything is spawned. The pair is ARCHIVED just before the
+    // spawn (archive-then-spawn, so a crash between the two can't re-dispatch
+    // the same resume) and UN-ARCHIVED if the spawn fails, below.
     let resume_block = match resume {
         Some(ask_id) => match crate::mailbox::resume_context(paths, ask_id) {
             Ok(block) => Some(block),
@@ -222,6 +226,10 @@ pub fn cmd_start_session(
         .and_then(|v| v.trim().parse().ok())
         .unwrap_or(8);
     if cap != 0 {
+        // Check-then-spawn is a TOCTOU race in principle (two concurrent
+        // starts could both pass the count), but starts are issued by the
+        // single decider one-move-per-beat, so the race is benign — not worth
+        // a lock.
         let live = list_workers(paths).iter().filter(|w| w.alive).count();
         if live >= cap {
             eprintln!(
@@ -232,6 +240,9 @@ pub fn cmd_start_session(
         }
     }
 
+    // Check-then-act (exists → alive → reap) races a concurrent start of the
+    // same id in principle; the single-decider dispatch model makes it benign
+    // (the spawn below would fail loudly on a true collision).
     if status_exists(paths, &session) {
         if is_alive(paths, &session) {
             eprintln!("start-session: session {session} is already running");
@@ -280,17 +291,32 @@ pub fn cmd_start_session(
         shell_quote(&paths.data_dir.to_string_lossy())
     );
 
+    // ARCHIVE-THEN-SPAWN: consume the answered resume pair BEFORE launching.
+    // The old order (spawn, then archive) re-dispatched the same resume when a
+    // crash landed between the two — the sys-asks resume signal stayed hot with
+    // a worker already running. Archiving first makes a crash lose at most one
+    // dispatch (recoverable: the record stays under asks/archive/); if the
+    // spawn FAILS we un-archive so the resume signal returns.
+    if let Some(ask_id) = resume {
+        crate::mailbox::archive_pair(paths, ask_id);
+    }
+
     // Launch the worker detached, IN-PROCESS via the babysit library (no
     // `babysit` binary). babysit re-execs looop as the headless supervisor.
     // `-c`, not `-lc`: a non-login shell sources no rc files, so the worker
     // launches against looop's inherited environment instead of re-running the
     // operator's login profile (hermetic + cheaper). The runner template itself
     // is still a shell string ($(cat ...), &&), so the shell stays.
-    spawn_detached(
+    if let Err(e) = spawn_detached(
         paths,
         vec!["bash".to_string(), "-c".to_string(), launch],
         &session,
-    )?;
+    ) {
+        if let Some(ask_id) = resume {
+            crate::mailbox::unarchive_pair(paths, ask_id);
+        }
+        return Err(e);
+    }
 
     // Label the banner with what actually launched: the override's first
     // token when a per-worker `--command` replaced the template, else the
@@ -305,12 +331,6 @@ pub fn cmd_start_session(
     } else {
         (runner, "")
     };
-    // The worker is launched: the resume pair is consumed — archive it so the
-    // sys-asks resume signal settles (the record stays under asks/archive/).
-    if let Some(ask_id) = resume {
-        crate::mailbox::archive_pair(paths, ask_id);
-    }
-
     println!(
         "started {session} (runner: {runner}{override_note}, cwd: {})",
         paths.data_dir.display()
@@ -847,8 +867,12 @@ pub(crate) fn suppress_stdout<T>(f: impl FnOnce() -> T) -> T {
 
 /// `dup(fd)` that returns a close-on-exec copy, so it is not inherited across a
 /// later `exec`/spawn. Returns a negative value on failure (caller falls back).
-/// F_SETFD / FD_CLOEXEC are 2 / 1 on both macOS and Linux, so we avoid pulling
-/// in libc as a direct dependency.
+///
+/// Hand-written FFI is deliberate: replacing it would require the `libc` (or
+/// `nix`) crate as a new dependency, which this project avoids. The constants
+/// are safe to hardcode — F_SETFD / FD_CLOEXEC are POSIX-stable and are 2 / 1
+/// on both macOS and Linux (verified by the `dup_cloexec_sets_close_on_exec`
+/// test, which round-trips through F_GETFD).
 #[cfg(unix)]
 unsafe fn dup_cloexec(fd: i32) -> i32 {
     unsafe extern "C" {
@@ -980,8 +1004,19 @@ mod tests {
     fn build_worker_cmd_template_default() {
         let tmpl = "pi --model opus @{{prompt_file}}";
         let out = build_worker_cmd(tmpl, None, "/p/x.md").unwrap();
-        assert_eq!(out.cmd, "pi --model opus @/p/x.md");
+        assert_eq!(out.cmd, "pi --model opus @'/p/x.md'");
         assert!(!out.overridden);
+    }
+
+    // The worker path uses the SAME quote-aware substitution as the tick path:
+    // a pre-quoted `"{{prompt_file}}"` template is not double-quoted, and a
+    // path with shell metacharacters stays a single argument.
+    #[test]
+    fn build_worker_cmd_quotes_like_the_tick_path() {
+        let out = build_worker_cmd("claude @\"{{prompt_file}}\"", None, "/p/x.md").unwrap();
+        assert_eq!(out.cmd, "claude @'/p/x.md'");
+        let out = build_worker_cmd("claude {{prompt_file}}", None, "/p/a b.md").unwrap();
+        assert_eq!(out.cmd, "claude '/p/a b.md'");
     }
 
     // A --command override replaces the template WHOLESALE.
@@ -993,7 +1028,7 @@ mod tests {
             "/p/x.md",
         )
         .unwrap();
-        assert_eq!(out.cmd, "pi --model gpt-6 --no-tools @/p/x.md");
+        assert_eq!(out.cmd, "pi --model gpt-6 --no-tools @'/p/x.md'");
         assert!(out.overridden);
     }
 
@@ -1015,7 +1050,7 @@ mod tests {
     #[test]
     fn build_worker_cmd_blank_override_is_ignored() {
         let out = build_worker_cmd("claude @{{prompt_file}}", Some("  "), "/p/x.md").unwrap();
-        assert_eq!(out.cmd, "claude @/p/x.md");
+        assert_eq!(out.cmd, "claude @'/p/x.md'");
         assert!(!out.overridden);
     }
 
@@ -1049,6 +1084,6 @@ mod tests {
     #[test]
     fn build_worker_cmd_prompt_path_with_literal_placeholder() {
         let out = build_worker_cmd("claude @{{prompt_file}}", None, "/p/{{model}}.md").unwrap();
-        assert_eq!(out.cmd, "claude @/p/{{model}}.md");
+        assert_eq!(out.cmd, "claude @'/p/{{model}}.md'");
     }
 }

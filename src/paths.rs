@@ -25,9 +25,19 @@ pub struct Paths {
 }
 
 fn home() -> PathBuf {
-    env::var_os("HOME")
-        .map(PathBuf::from)
-        .expect("looop: $HOME is not set")
+    match env::var_os("HOME") {
+        Some(h) if !h.is_empty() => PathBuf::from(h),
+        // A clean, actionable exit instead of a panic + backtrace: $HOME being
+        // unset is an environment problem (cron / stripped-down service env),
+        // not a bug worth a panic message.
+        _ => {
+            eprintln!(
+                "looop: $HOME is not set — set HOME, or point LOOOP_DATA_DIR (and \
+                 XDG_STATE_HOME) at explicit paths"
+            );
+            std::process::exit(2);
+        }
+    }
 }
 
 /// `${XDG_<name>:-$HOME/<fallback>}` — env override else HOME-relative default.

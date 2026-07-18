@@ -133,6 +133,10 @@ fn goal_of(action: &Action) -> Option<String> {
 /// Stamp `id` as acted-on "now" in the goal-activity ledger (goal id -> unix
 /// secs). Best-effort: a write failure just means the staleness reading is a
 /// beat stale.
+///
+/// NOTE: this is a lossy read-modify-write — a concurrent pulse beat and a
+/// manual `looop` verb can race, and the last writer wins (one stamp may be
+/// dropped). Acceptable: the ledger only feeds an advisory staleness reading.
 fn record_goal_activity(paths: &Paths, id: &str) {
     let store = FileStore::new(paths);
     let mut map: serde_json::Map<String, serde_json::Value> = store
@@ -169,8 +173,10 @@ fn action_fingerprint(action: &Action) -> String {
 
 /// Write the write-ahead intent record just BEFORE a non-idempotent side effect.
 /// If the process dies during the effect, this file survives and is detected by
-/// [`warn_if_interrupted`] on the next beat.
-fn begin_intent(paths: &Paths, action: &Action) {
+/// [`warn_if_interrupted`] on the next beat. Returns the exact serialized body
+/// written, so [`clear_intent`] can compare-and-delete OUR record and never a
+/// concurrent actor's.
+fn begin_intent(paths: &Paths, action: &Action) -> String {
     let body = serde_json::json!({
         "kind": kind(action),
         "fingerprint": action_fingerprint(action),
@@ -178,13 +184,20 @@ fn begin_intent(paths: &Paths, action: &Action) {
     })
     .to_string();
     let _ = FileStore::new(paths).write_atomic(&Key::ActionWal, &body);
+    body
 }
 
 /// Clear the intent record once execute() has returned (Ok OR Err): reaching
 /// this line proves the process did not die DURING the side effect, so there is
 /// nothing to recover. Only an actual crash between begin/clear leaves it.
-fn clear_intent(paths: &Paths) {
-    let _ = FileStore::new(paths).remove(&Key::ActionWal);
+///
+/// Compare-and-delete on the EXACT body this actor wrote ([`begin_intent`]'s
+/// return value): the WAL is a single global key, and a concurrent pulse beat +
+/// manual `looop run` would otherwise clear EACH OTHER's intent — the old
+/// fingerprint-read-then-remove was check-then-act and could still remove a
+/// record that changed between the compare and the remove.
+fn clear_intent(paths: &Paths, wal_body: &str) {
+    let _ = FileStore::new(paths).remove_if_eq(&Key::ActionWal, wal_body);
 }
 
 /// At beat start: if a write-ahead intent record survived, the previous beat
@@ -198,8 +211,19 @@ pub fn warn_if_interrupted(paths: &Paths) -> bool {
     let Some(raw) = store.read(&Key::ActionWal) else {
         return false;
     };
-    let _ = store.remove(&Key::ActionWal); // one-shot report
     let v: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+    // A YOUNG record may belong to a LIVE actor: a concurrent manual
+    // `looop run` can legitimately hold its WAL for up to the run_shell
+    // deadline (LOOOP_SHELL_TIMEOUT_SECS). Consuming it here would eat a live
+    // run's crash guard — leave it alone until it is unambiguously a corpse
+    // (older than the shell deadline plus slack). An unparseable ts reads as
+    // 0, i.e. ancient — consumed.
+    let ts = v.get("ts").and_then(|x| x.as_u64()).unwrap_or(0);
+    if crate::util::now_unix().saturating_sub(ts) < shell_timeout_secs() + 60 {
+        return false;
+    }
+    // One-shot report — compare-and-delete exactly the record we inspected.
+    let _ = store.remove_if_eq(&Key::ActionWal, &raw);
     let akind = v.get("kind").and_then(|x| x.as_str()).unwrap_or("?");
     let fp = v.get("fingerprint").and_then(|x| x.as_str()).unwrap_or("?");
     crate::util::event(
@@ -220,6 +244,16 @@ pub fn warn_if_interrupted(paths: &Paths) -> bool {
         serde_json::json!({ "action": akind, "fingerprint": fp }),
     );
     true
+}
+
+/// Hard cap on a run_shell command's runtime (seconds): the escape hatch runs
+/// inside the pulse beat, so it must be bounded like a verify command.
+/// `LOOOP_SHELL_TIMEOUT_SECS`, default 300.
+fn shell_timeout_secs() -> u64 {
+    std::env::var("LOOOP_SHELL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(300)
 }
 
 /// The last `max` chars of `s` (UTF-8 safe).
@@ -314,22 +348,25 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
             // rc files, so the command runs against looop's inherited environment
             // rather than re-running the operator's login profile every beat
             // (hermetic + cheaper).
-            let out = std::process::Command::new("bash")
-                .arg("-c")
-                .arg(cmd)
-                .current_dir(&paths.data_dir)
-                .output()
-                .with_context(|| format!("run_shell: {cmd}"))?;
-            let code = out.status.code().unwrap_or(-1);
+            //
+            // Bounded: the command runs through the shared native-timeout path
+            // (`verify::run_cmd`) — spawned in its own process group and the
+            // WHOLE group killed on deadline — so one hung command can never
+            // wedge the pulse forever. `LOOOP_SHELL_TIMEOUT_SECS`, default 300.
+            let res = crate::verify::run_cmd(
+                &paths.data_dir,
+                cmd,
+                shell_timeout_secs(),
+                "LOOOP_SHELL_TIMEOUT_SECS",
+            );
+            let code = res.exit_code.unwrap_or(-1);
             // Capture the output TAIL and persist it for the NEXT decide prompt
             // (`RUN_SHELL OUTPUT`). Without this the stdout of a "query" move
             // went nowhere — the decider could ask the world a question but
             // never hear the answer. The tick arms a short cadence nudge after
             // a run_shell so the follow-up beat actually happens (the command's
             // output alone does not move the world hash).
-            let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
-            combined.push_str(&String::from_utf8_lossy(&out.stderr));
-            let tail = tail_chars(&combined, 2048);
+            let tail = tail_chars(&res.output, 2048);
             let body = serde_json::json!({
                 "v": 1,
                 "ts": crate::util::now_unix(),
@@ -339,14 +376,14 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
             });
             let _ = fs::write(paths.last_shell(), body.to_string());
             let why = if reason.is_empty() { cmd } else { reason };
-            if out.status.success() {
+            if res.ok {
                 Ok(format!("run-shell · {why}"))
             } else {
                 // Surface the tail in the error too, so LAST FAILURE names the
                 // actual cause instead of just the exit code.
                 bail!(
                     "run_shell exited {code}: {why}\n{}",
-                    tail_chars(&combined, 512)
+                    tail_chars(&res.output, 512)
                 );
             }
         }
@@ -540,13 +577,14 @@ pub fn run_action(paths: &Paths, action: &Action, journal: Option<&str>) -> Resu
     // Write-ahead the intent for non-idempotent actions so a crash DURING the
     // side effect is detectable next beat instead of silently re-firing.
     // clear_intent runs whether execute returns Ok or Err.
-    let guarded = is_non_idempotent(action);
-    if guarded {
-        begin_intent(paths, action);
-    }
+    let wal_body = if is_non_idempotent(action) {
+        Some(begin_intent(paths, action))
+    } else {
+        None
+    };
     let exec_result = execute(paths, action);
-    if guarded {
-        clear_intent(paths);
+    if let Some(body) = &wal_body {
+        clear_intent(paths, body);
     }
     let summary = exec_result?;
     if let Some(id) = goal_of(action) {
@@ -921,6 +959,8 @@ mod tests {
     #[test]
     fn warn_if_interrupted_detects_and_clears_a_stale_intent() {
         let p = Paths::temp();
+        // A YOUNG intent may belong to a LIVE actor (a manual `looop run`
+        // mid-run_shell) — it must be left alone, not eaten every beat.
         begin_intent(
             &p,
             &Action::RunShell {
@@ -930,11 +970,91 @@ mod tests {
         );
         assert!(p.action_wal().exists(), "intent written before the effect");
         assert!(
+            !warn_if_interrupted(&p),
+            "a young WAL may be a live actor's — not reported"
+        );
+        assert!(p.action_wal().exists(), "a young WAL is left alone");
+        // An OLD intent (past the shell deadline + slack) is a crash corpse:
+        // reported once and consumed.
+        let old = serde_json::json!({
+            "kind": "run_shell",
+            "fingerprint": "fp-old",
+            "ts": crate::util::now_unix() - (shell_timeout_secs() + 61),
+        })
+        .to_string();
+        FileStore::new(&p)
+            .write_atomic(&Key::ActionWal, &old)
+            .unwrap();
+        assert!(
             warn_if_interrupted(&p),
             "a leftover intent is reported as an interrupted beat"
         );
         assert!(!p.action_wal().exists(), "the report is one-shot");
         assert!(!warn_if_interrupted(&p));
+    }
+
+    #[test]
+    fn clear_intent_only_removes_our_exact_record() {
+        let p = Paths::temp();
+        let ours = Action::RunShell {
+            cmd: "echo ours".into(),
+            reason: String::new(),
+        };
+        let theirs = Action::RunShell {
+            cmd: "echo theirs".into(),
+            reason: String::new(),
+        };
+        // A concurrent actor's WAL must survive OUR clear…
+        let our_body = begin_intent(&p, &ours);
+        let their_body = begin_intent(&p, &theirs); // overwrites (single key)
+        clear_intent(&p, &our_body);
+        assert!(
+            p.action_wal().exists(),
+            "another actor's intent must not be cleared"
+        );
+        // …while the record we actually wrote is cleared normally.
+        clear_intent(&p, &their_body);
+        assert!(!p.action_wal().exists(), "our own intent is cleared");
+    }
+
+    #[test]
+    fn run_shell_times_out_and_kills_the_command() {
+        // Serialize with other env-mutating tests, and restore the knob even
+        // if an assert below panics.
+        let _env = crate::util::test_env_lock();
+        struct Restore;
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var("LOOOP_SHELL_TIMEOUT_SECS") };
+            }
+        }
+        let _restore = Restore;
+        let p = Paths::temp();
+        // Short native timeout via the env override the run_shell path reads.
+        unsafe { std::env::set_var("LOOOP_SHELL_TIMEOUT_SECS", "1") };
+        let t0 = std::time::Instant::now();
+        let err = run_action(
+            &p,
+            &Action::RunShell {
+                cmd: "echo pre; sleep 30".into(),
+                reason: String::new(),
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            t0.elapsed().as_secs() < 10,
+            "must not wait out the 30s sleep"
+        );
+        assert!(
+            err.to_string().contains("timed out after 1s"),
+            "error names the timeout: {err}"
+        );
+        // The captured record carries the timeout diagnosis for the next prompt.
+        let raw = fs::read_to_string(p.last_shell()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["exit_code"], -1, "a killed command has no exit code");
+        assert!(v["output"].as_str().unwrap().contains("timed out after 1s"));
     }
 
     #[test]

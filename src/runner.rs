@@ -4,6 +4,12 @@
 //! free-form chatter is archived to the tee files but never echoed live
 //! (replay it from runs/<id>/output.log).
 //!
+//! NOTE: each tee sink is opened with `File::create`, which TRUNCATES it —
+//! deliberately so for `tick.log`: it holds ONLY the LAST beat's rendered
+//! output (a cheap "what just happened" probe). The durable per-beat history
+//! lives in `runs/<id>/output.log` (one file per beat, pruned by
+//! `LOOOP_RUNS_KEEP`).
+//!
 //! Formatting happens IN-PROCESS here: we read the runner's raw NDJSON stdout
 //! line-by-line and render each line via `fmt::format_line` (the friendly
 //! `→ bash:` progress). There is no external formatter and looop never re-execs
@@ -18,6 +24,28 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// Single-quote `s` for safe interpolation into a `bash -c` script: close the
+/// quote, emit an escaped quote, reopen (`'\''` — the classic POSIX dance).
+/// Without this a prompt-file path containing spaces/quotes/`$` would be
+/// word-split or expanded by the shell.
+fn shell_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Substitute `{{prompt_file}}` into a command template with shell quoting,
+/// WITHOUT double-quoting configs that already wrapped the placeholder in
+/// quotes (`"{{prompt_file}}"` / `'{{prompt_file}}'` worked before quoting was
+/// added, and nesting quotes would hand the shell a literal-quote path).
+/// Shared by the tick path (below) and the worker path (session.rs) so both
+/// sides of the config behave identically.
+pub(crate) fn substitute_prompt_file(template: &str, path: &str) -> String {
+    let quoted = shell_quote(path);
+    template
+        .replace("\"{{prompt_file}}\"", &quoted)
+        .replace("'{{prompt_file}}'", &quoted)
+        .replace("{{prompt_file}}", &quoted)
+}
+
 /// Run `tick_cmd` (a shell pipeline) under `bash -c`, with cwd at the data dir.
 /// The tick prompt reaches the runner one of two ways, mirroring the worker:
 /// if `tick_cmd` contains the `{{prompt_file}}` placeholder it is substituted
@@ -31,7 +59,7 @@ pub fn run_streamed(paths: &Paths, tick_cmd: &str, prompt_file: &Path, tee: &[Pa
     // (the same placeholder `worker_command` uses), substitute the path and
     // leave stdin alone. Otherwise fall back to feeding the file via stdin.
     let has_placeholder = tick_cmd.contains("{{prompt_file}}");
-    let tick_cmd = tick_cmd.replace("{{prompt_file}}", &prompt_file.to_string_lossy());
+    let tick_cmd = substitute_prompt_file(tick_cmd, &prompt_file.to_string_lossy());
 
     // `{ …; } 2>&1` merges the whole pipeline's stderr into stdout in order, so
     // a single pipe carries everything (Rust can't easily interleave two pipes).
@@ -62,18 +90,33 @@ pub fn run_streamed(paths: &Paths, tick_cmd: &str, prompt_file: &Path, tee: &[Pa
         return false;
     };
 
+    // File::create truncates — intentional: tick.log carries the LAST beat
+    // only (see the module comment); runs/<id>/output.log is per-beat anyway.
     let mut sinks: Vec<File> = tee.iter().filter_map(|p| File::create(p).ok()).collect();
 
-    for line in BufReader::new(out).lines() {
-        let Ok(line) = line else { break };
-        // Archive only the rendered progress (what the old `_ fmt` pipe wrote).
-        if let Some(rendered) = fmt::format_line(&line) {
-            let prefix = format!("{}[{}]{} ", util::dim(), util::hms(), util::rst());
-            for f in &mut sinks {
-                let _ = writeln!(f, "{prefix}{rendered}");
+    let mut reader = BufReader::new(out);
+    let mut line = String::new();
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break, // EOF
+            Ok(_) => {
+                let line = line.trim_end_matches(['\n', '\r']);
+                // Archive only the rendered progress (what the old `_ fmt` pipe wrote).
+                if let Some(rendered) = fmt::format_line(line) {
+                    let prefix = format!("{}[{}]{} ", util::dim(), util::hms(), util::rst());
+                    for f in &mut sinks {
+                        let _ = writeln!(f, "{prefix}{rendered}");
+                    }
+                }
             }
+            Err(_) => break,
         }
     }
+    // Drop our end of the pipe BEFORE waiting: after a read error above the
+    // child may still be writing, and wait()-ing while holding the read end
+    // would deadlock both sides on a full pipe buffer.
+    drop(reader);
 
     child.wait().map(|s| s.success()).unwrap_or(false)
 }

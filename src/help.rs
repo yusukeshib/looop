@@ -16,7 +16,13 @@ const MANUAL: &str = include_str!("manual.txt");
 
 pub fn print(paths: &Paths) {
     print!("{MANUAL}");
-    println!(
+    println!("{}", usage_text(paths));
+}
+
+/// The live Usage/Paths tail of the manual, as a string (so tests can guard it
+/// against drifting from the clap definitions in cli.rs).
+fn usage_text(paths: &Paths) -> String {
+    format!(
         r#"
 Usage:
   HUMAN (looop runs itself — this is nearly all you touch):
@@ -46,16 +52,19 @@ Usage:
   looop tell <worker> "<msg>"   queue steering INTO a live worker — it picks the
                                 message up at its next `told` check or along with
                                 its next ask answer
-  looop screenshot <id> [--ansi|--json] [--no-trim]   capture a session's screen
-  looop worker start <id> [prompt|-] [--command CMD] [--verify CMD]
+  looop screenshot <id> [--ansi|--json|--plain] [--no-trim]   capture a session's screen
+  looop worker start <id> [prompt|-] [--command CMD] [--verify CMD] [--resume <ask-id>]
                                 spawn a worker; --verify = post-condition shell
                                 command run ONCE after the worker dies (exit 0 =
                                 verified done; fail is surfaced in sys-sessions
                                 as verify:"fail" — exit status alone is never
-                                trusted as "work done")
-  looop worker list [--json|--all|--watch [--interval N]]   fleet + health (busy/waiting-ask/stuck/dead), idle/uptime/ask age, verify verdict
+                                trusted as "work done"); --resume <ask-id> =
+                                consume an ANSWERED (detached) ask — injects its
+                                question, the human's answer and the checkpoint
+                                into the brief, then archives the ask/answer pair
+  looop worker list [--json] [-a|--all] [-w|--watch [--interval N]]   fleet + health (busy/waiting-ask/stuck/dead), idle/uptime/ask age, verify verdict
 
-  Shorthands: `worker`=`w`, `worker list`=`ls`, `screenshot`=`ss`,
+  Shorthands: `worker`=`w`, `worker ls` / `w ls` = `worker list`, `screenshot`=`ss`,
   and `write`=`w` (`goal w` / `sensor w` / `playbook w` / `schedule w`).
 
   WORKER self-callbacks (auto-injected CONTRACT — not for humans):
@@ -83,5 +92,47 @@ dir; `git init` it yourself for history.)"#,
         config = paths.config.display(),
         data = paths.data_dir.display(),
         fleet = paths.data_dir.join("sessions").display(),
-    );
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Drift guard: every long flag clap defines for `screenshot`,
+    /// `worker start` and `worker list` must appear in the hand-written usage
+    /// text (and the short -a/-w spellings for worker list stay documented).
+    #[test]
+    fn usage_covers_every_clap_flag_for_screenshot_and_worker() {
+        use clap::CommandFactory;
+        let text = usage_text(&Paths::temp());
+
+        let root = crate::cli::Cli::command();
+        let screenshot = root.find_subcommand("screenshot").expect("screenshot");
+        let worker = root.find_subcommand("worker").expect("worker");
+        let start = worker.find_subcommand("start").expect("worker start");
+        let list = worker.find_subcommand("list").expect("worker list");
+
+        for sub in [screenshot, start, list] {
+            for a in sub.get_arguments() {
+                let Some(long) = a.get_long() else { continue };
+                // `help` is clap-injected; `journal` is the shared cross-verb
+                // note flag, documented via the action verbs, not per-verb.
+                if long == "help" || long == "journal" {
+                    continue;
+                }
+                assert!(
+                    text.contains(&format!("--{long}")),
+                    "help drift: --{long} (from `{}`) missing from usage",
+                    sub.get_name()
+                );
+            }
+        }
+
+        // The worker-list short flags are part of the documented surface.
+        assert!(text.contains("-a|--all"), "-a short flag documented");
+        assert!(text.contains("-w|--watch"), "-w short flag documented");
+        // And the corrected list shorthand.
+        assert!(text.contains("`worker ls` / `w ls`"));
+    }
 }
