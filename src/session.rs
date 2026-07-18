@@ -83,13 +83,21 @@ const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
 - Never send notifications (no terminal-notifier or any OS notification). You are
   an agent; surface anything a human must see by ASKing (below) — the human sees
   it through whatever client they run.
-- When you need a human decision / info / approval, do NOT guess — ASK and WAIT.
-  This ONE command writes your question to the mailbox and BLOCKS until the root
-  agent (or human) answers, printing the answer to stdout:
-    answer=$("$LOOOP_BIN" ask __ID__ --prompt "<what you need to know>")
-  (optionally --ref reports/x.md and/or --options a,b). Use $answer and continue.
-  You do NOT need a terminal, stdin, or attach — just call it and read its output.
-  Ask once per question; it returns only when answered.
+- When you need a human decision / info / approval, do NOT guess — ASK. Two modes:
+  • QUICK question (answer likely within the hour) — BLOCK on it:
+      answer=$("$LOOOP_BIN" ask __ID__ --prompt "<what you need to know>")
+    (optionally --ref reports/x.md and/or --options a,b). Use $answer, continue.
+    You do NOT need a terminal, stdin, or attach — just call it and read its
+    output. Ask once per question; it returns only when answered.
+  • LONG wait (the human may take hours or days) — CHECKPOINT and DETACH:
+      1) write your FULL state (done / remaining / how to continue) to
+         reports/__ID__-checkpoint.md
+      2) "$LOOOP_BIN" ask __ID__ --detach --prompt "…" --ref reports/__ID__-checkpoint.md
+      3) end your session: "$LOOOP_BIN" kill __ID__
+    Do NOT sit idle waiting: when the human answers, looop dispatches a FRESH
+    worker with the answer and your checkpoint. Your exit is by design, not a
+    failure. When unsure which mode, prefer detach — idling is the expensive
+    mistake.
 - STEERING: the human can queue mid-task course corrections for you. Between
   major steps (and BEFORE any big/irreversible-adjacent step), run:
     "$LOOOP_BIN" told
@@ -157,8 +165,24 @@ pub fn cmd_start_session(
     prompt: &str,
     command: Option<&str>,
     verify: Option<&str>,
+    resume: Option<&str>,
 ) -> Result<StartOutcome> {
     seed::ensure_dirs(paths)?;
+
+    // Resolve the RESUME context FIRST: an unknown / not-yet-answered ask id
+    // is a decider mistake and must fail the move loudly (LAST FAILURE names
+    // it) before anything is spawned. The pair is archived only after the
+    // worker actually launches, below.
+    let resume_block = match resume {
+        Some(ask_id) => match crate::mailbox::resume_context(paths, ask_id) {
+            Ok(block) => Some(block),
+            Err(e) => {
+                eprintln!("start-session: {e}");
+                return Ok(StartOutcome::failed());
+            }
+        },
+        None => None,
+    };
 
     // The id becomes both a path segment (the prompt file) and the session id,
     // so reject traversal/dotfile/separator ids up front — the same guard the
@@ -230,7 +254,8 @@ pub fn cmd_start_session(
     let contract = CONTRACT
         .replace("__SESSION__", &session)
         .replace("__ID__", id);
-    fs::write(&prompt_file, format!("{contract}{prompt}\n"))?;
+    let resume_part = resume_block.as_deref().unwrap_or("");
+    fs::write(&prompt_file, format!("{contract}{resume_part}{prompt}\n"))?;
 
     // Resolve the launch command: a per-worker `--command` override replaces
     // the template wholesale; otherwise the template. Only `{{prompt_file}}`
@@ -280,6 +305,12 @@ pub fn cmd_start_session(
     } else {
         (runner, "")
     };
+    // The worker is launched: the resume pair is consumed — archive it so the
+    // sys-asks resume signal settles (the record stays under asks/archive/).
+    if let Some(ask_id) = resume {
+        crate::mailbox::archive_pair(paths, ask_id);
+    }
+
     println!(
         "started {session} (runner: {runner}{override_note}, cwd: {})",
         paths.data_dir.display()
@@ -931,6 +962,20 @@ mod tests {
     }
 
     // No override: the template renders with only {{prompt_file}} substituted.
+    #[test]
+    fn start_session_refuses_a_resume_without_an_answer() {
+        // The resume check runs BEFORE any spawn: an unknown ask id — or one
+        // the human hasn't answered yet — must fail the move loudly.
+        let p = crate::paths::Paths::temp();
+        let out = cmd_start_session(&p, "w", "brief", None, None, Some("ghost-1")).unwrap();
+        assert_eq!(out.code, ExitCode::from(1));
+
+        // A pending (unanswered) detached ask is refused too.
+        let id = crate::mailbox::ask_detached(&p, "w", "q?", "", &[]).unwrap();
+        let out = cmd_start_session(&p, "w", "brief", None, None, Some(&id)).unwrap();
+        assert_eq!(out.code, ExitCode::from(1));
+    }
+
     #[test]
     fn build_worker_cmd_template_default() {
         let tmpl = "pi --model opus @{{prompt_file}}";

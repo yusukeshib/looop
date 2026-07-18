@@ -217,6 +217,23 @@ impl StateStore for FileStore<'_> {
     }
 
     fn archive(&self, key: &Key) -> io::Result<()> {
+        // Helper: move `from` into `<dir>/archive/`, suffixing on collision —
+        // ask ids can be REUSED after a pair is archived (`next_ask_id` scans
+        // only the live dirs), so an archived record must never be clobbered.
+        fn into_archive(from: std::path::PathBuf, stem: &str, ext: &str) -> io::Result<()> {
+            let dir = from
+                .parent()
+                .ok_or_else(|| io::Error::other("archive: no parent dir"))?
+                .join("archive");
+            fs::create_dir_all(&dir)?;
+            let mut to = dir.join(format!("{stem}.{ext}"));
+            let mut n = 1;
+            while to.exists() {
+                to = dir.join(format!("{stem}-{n}.{ext}"));
+                n += 1;
+            }
+            fs::rename(&from, to)
+        }
         match key {
             Key::Goal(id) => {
                 let from = self.paths.goals_dir().join(format!("{id}.md"));
@@ -224,9 +241,13 @@ impl StateStore for FileStore<'_> {
                 fs::create_dir_all(&archive)?;
                 fs::rename(&from, archive.join(format!("{id}.md")))
             }
+            // A consumed ask/answer pair (resumed detached ask) moves aside so
+            // the sys-asks wake signal settles while the record stays auditable.
+            Key::Ask(id) => into_archive(self.path(key), id, "json"),
+            Key::Answer(id) => into_archive(self.path(key), id, "json"),
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "archive: only goals are archivable",
+                "archive: only goals and ask/answer records are archivable",
             )),
         }
     }

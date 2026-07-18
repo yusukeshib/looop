@@ -133,6 +133,10 @@ const SYSTEM_SENSORS: &[(&str, Probe)] = &[
     ("claims", sys_claims),
     ("goals", sys_goals),
     ("schedules", crate::schedule::sys_schedules),
+    // The mailbox as a first-class world item: an ask raised / answered /
+    // resumed changes this signal. Without it, a DETACHED ask's answer would
+    // never wake the loop (no live worker transitions in sys-sessions).
+    ("asks", crate::mailbox::sys_asks),
 ];
 
 /// One sensor's outcome, for the run summary.

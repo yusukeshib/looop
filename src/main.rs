@@ -178,6 +178,7 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
                 prompt,
                 command,
                 verify,
+                resume,
                 journal,
             } => executor::start_worker(
                 paths,
@@ -185,6 +186,7 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
                 prompt,
                 command.as_deref(),
                 verify.as_deref(),
+                resume.as_deref(),
                 journal.journal.as_deref(),
             ),
             WorkerOp::Kill { id } => session::cmd_kill(paths, id),

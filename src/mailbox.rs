@@ -36,6 +36,13 @@ pub struct Ask {
     /// Optional discrete choices the answer should pick from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
+    /// DETACHED ask: the worker checkpointed its state and EXITED instead of
+    /// blocking on the answer. Its death is by design (not stranded); when the
+    /// human answers, the decider re-dispatches a fresh worker with
+    /// `start_worker.resume = <ask id>`, which injects the answer + checkpoint
+    /// and archives the pair.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detach: bool,
     /// Unix seconds the ask was raised.
     pub ts: u64,
 }
@@ -82,6 +89,112 @@ pub fn pending(paths: &Paths) -> Vec<Ask> {
     out
 }
 
+/// DETACHED asks that HAVE an answer and have not been resumed yet, oldest
+/// first, each paired with its answer text. These are the decider's cue to
+/// re-dispatch: `start_worker` with `resume = <ask id>` injects the answer +
+/// checkpoint into the fresh worker's brief and archives the pair (which
+/// settles the `sys-asks` wake signal).
+pub fn answered_detached(paths: &Paths) -> Vec<(Ask, String)> {
+    let store = FileStore::new(paths);
+    let mut out = Vec::new();
+    for id in store.list(&Collection::Asks) {
+        if let Some(raw) = store.read(&Key::Ask(id.clone()))
+            && let Ok(ask) = serde_json::from_str::<Ask>(&raw)
+            && ask.detach
+            && let Some(answer) = read_answer(&store, &ask.id)
+        {
+            out.push((ask, answer));
+        }
+    }
+    out.sort_by(|a, b| a.0.ts.cmp(&b.0.ts).then_with(|| a.0.id.cmp(&b.0.id)));
+    out
+}
+
+/// The RESUME preamble for a fresh worker taking over an answered detached
+/// ask: the original question, the human's answer, and the checkpoint
+/// reference. Errors when the ask is unknown or not answered yet — a resume
+/// against a pending ask is a decider mistake and must fail loudly.
+pub fn resume_context(paths: &Paths, ask_id: &str) -> Result<String> {
+    // The id becomes a path segment (asks/<id>.json) — same guard as answer().
+    util::safe_segment("ask id", ask_id)?;
+    let store = FileStore::new(paths);
+    let raw = store
+        .read(&Key::Ask(ask_id.to_string()))
+        .with_context(|| format!("resume: no ask {ask_id:?}"))?;
+    let ask: Ask = serde_json::from_str(&raw).with_context(|| format!("resume: ask {ask_id:?}"))?;
+    let answer = read_answer(&store, ask_id)
+        .with_context(|| format!("resume: ask {ask_id:?} has no answer yet"))?;
+    let reference = if ask.reference.is_empty() {
+        "(none — look for reports/ left by the previous worker)".to_string()
+    } else {
+        ask.reference.clone()
+    };
+    Ok(format!(
+        "# ⚡ RESUME (auto-injected)\n\
+         A previous worker checkpointed its state and asked the human, then exited.\n\
+         You are the fresh worker carrying that work forward.\n\
+         - Question asked: {}\n\
+         - Human's answer: {}\n\
+         - Checkpoint / reference: {}\n\
+         Read the checkpoint FIRST, obey the answer, and continue from where the\n\
+         previous worker left off — do not redo completed steps.\n\n---\n\n",
+        ask.prompt, answer, reference
+    ))
+}
+
+/// Archive a consumed ask/answer pair (asks/archive/, answers/archive/) so the
+/// `sys-asks` resume signal settles. Best-effort on the answer half (an ask
+/// without an answer file archives just the ask). An id that is not a safe
+/// path segment archives nothing — the id becomes a filename, so it gets the
+/// same guard as every other mailbox verb.
+pub fn archive_pair(paths: &Paths, ask_id: &str) {
+    if util::safe_segment("ask id", ask_id).is_err() {
+        return;
+    }
+    let store = FileStore::new(paths);
+    let _ = store.archive(&Key::Ask(ask_id.to_string()));
+    let _ = store.archive(&Key::Answer(ask_id.to_string()));
+}
+
+/// The `sys-asks` system-sensor probe: makes the mailbox a FIRST-CLASS part of
+/// the world hash. Signal: the pending ask ids plus the answered-detached ids
+/// awaiting a resume — an ask being raised, answered, or resumed each changes
+/// the signal exactly once (level-triggered, no clock in the signal). Volatile
+/// context (ages, prompts) rides in detail.
+pub fn sys_asks(paths: &Paths) -> serde_json::Value {
+    let now = util::now_unix();
+    let pending = pending(paths);
+    let resume: Vec<(Ask, String)> = answered_detached(paths);
+    let mut detail = serde_json::Map::new();
+    for a in &pending {
+        detail.insert(
+            a.id.clone(),
+            serde_json::json!({
+                "worker": a.worker,
+                "detach": a.detach,
+                "age_s": now.saturating_sub(a.ts),
+            }),
+        );
+    }
+    for (a, _) in &resume {
+        detail.insert(
+            a.id.clone(),
+            serde_json::json!({
+                "worker": a.worker,
+                "answered": true,
+                "age_s": now.saturating_sub(a.ts),
+            }),
+        );
+    }
+    serde_json::json!({
+        "signal": {
+            "pending": pending.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
+            "resume": resume.iter().map(|(a, _)| a.id.clone()).collect::<Vec<_>>(),
+        },
+        "detail": detail,
+    })
+}
+
 /// `looop ask <worker> --prompt "…" [--ref PATH] [--options a,b,c]`
 ///
 /// Worker self-callback (CONTRACT). Writes the ask, then BLOCKS polling answers/
@@ -102,6 +215,19 @@ pub fn cmd_ask(paths: &Paths, args: &crate::cli::AskArgs) -> Result<ExitCode> {
     let reference = args.reference.clone().unwrap_or_default();
     // clap already split `--options a,b` on commas; trim each entry.
     let options: Vec<String> = args.options.iter().map(|s| s.trim().to_string()).collect();
+    if args.detach {
+        // Non-blocking: write the ask and hand back its id. The worker is
+        // expected to have checkpointed (--ref) and to END ITS SESSION now —
+        // the answer is delivered to a FRESH worker via `--resume <id>`.
+        let id = crate::contract::LocalContract::new(paths).ask_detached(
+            &worker,
+            &args.prompt,
+            &reference,
+            &options,
+        )?;
+        println!("{id}");
+        return Ok(ExitCode::SUCCESS);
+    }
     let answer = crate::contract::LocalContract::new(paths).ask(
         &worker,
         &args.prompt,
@@ -112,15 +238,15 @@ pub fn cmd_ask(paths: &Paths, args: &crate::cli::AskArgs) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-/// CONTRACT core for `ask`: write the durable ask, then BLOCK polling answers/
-/// until the human replies, returning the answer text. Transport-agnostic (no
-/// stdout): the CLI presenter prints it; a remote backend would long-poll.
-pub(crate) fn ask(
+/// Durably write one ask record and return its id (shared by the blocking and
+/// detached paths).
+fn write_ask(
     paths: &Paths,
     worker: &str,
     prompt: &str,
     reference: &str,
     options: &[String],
+    detach: bool,
 ) -> Result<String> {
     util::safe_segment("worker id", worker)?;
     if prompt.trim().is_empty() {
@@ -134,18 +260,55 @@ pub(crate) fn ask(
         prompt: prompt.to_string(),
         reference: reference.to_string(),
         options: options.to_vec(),
+        detach,
         ts: util::now_unix(),
     };
     store.write_atomic(&Key::Ask(id.clone()), &serde_json::to_string_pretty(&ask)?)?;
     util::event(
         util::Level::Step,
         "ask",
-        &format!("{worker} is waiting: {prompt}"),
+        &format!(
+            "{worker} {}: {prompt}",
+            if detach {
+                "asked (detached — will resume on answer)"
+            } else {
+                "is waiting"
+            }
+        ),
         &[
             ("ask_id", serde_json::json!(id)),
             ("worker", serde_json::json!(worker)),
+            ("detach", serde_json::json!(detach)),
         ],
     );
+    Ok(id)
+}
+
+/// CONTRACT core for `ask --detach`: write the durable ask and return its ID
+/// immediately — no blocking. The asking worker checkpoints and exits; the
+/// answer is delivered to a FRESH worker via `worker_start(…, resume)`.
+pub(crate) fn ask_detached(
+    paths: &Paths,
+    worker: &str,
+    prompt: &str,
+    reference: &str,
+    options: &[String],
+) -> Result<String> {
+    write_ask(paths, worker, prompt, reference, options, true)
+}
+
+/// CONTRACT core for `ask`: write the durable ask, then BLOCK polling answers/
+/// until the human replies, returning the answer text. Transport-agnostic (no
+/// stdout): the CLI presenter prints it; a remote backend would long-poll.
+pub(crate) fn ask(
+    paths: &Paths,
+    worker: &str,
+    prompt: &str,
+    reference: &str,
+    options: &[String],
+) -> Result<String> {
+    let id = write_ask(paths, worker, prompt, reference, options, false)?;
+    let store = FileStore::new(paths);
 
     // Block until answered. The human sees this ask (via a
     // client / `looop state`) and replies with `looop answer <id>`.
@@ -411,6 +574,7 @@ mod tests {
             prompt: "merge?".into(),
             reference: String::new(),
             options: vec![],
+            detach: false,
             ts: 1,
         };
         fs::write(
@@ -484,6 +648,86 @@ mod tests {
         let drained = drain_tells(&p, "triage");
         assert_eq!(drained, vec!["• focus the PR", "• skip the docs"]);
         assert!(pending_tells(&p, "triage").is_empty(), "drain consumes");
+    }
+
+    #[test]
+    fn detached_ask_returns_id_and_resumes_through_the_pair_lifecycle() {
+        let p = Paths::temp();
+        // Raise: returns the id immediately (no blocking), pending shows it.
+        let id = ask_detached(&p, "triage", "merge or split?", "reports/cp.md", &[]).unwrap();
+        assert_eq!(id, "triage-1");
+        let pend = pending(&p);
+        assert_eq!(pend.len(), 1);
+        assert!(pend[0].detach, "the record carries the detach flag");
+        assert!(
+            answered_detached(&p).is_empty(),
+            "nothing to resume before the answer"
+        );
+        // resume_context before the answer is a loud error.
+        assert!(resume_context(&p, &id).is_err());
+        // …and so is an id that is not a safe path segment (traversal guard).
+        assert!(resume_context(&p, "../evil").is_err());
+
+        // Answer: the ask leaves pending and becomes resumable.
+        cmd_answer(&p, &ans(&id, "split it", false)).unwrap();
+        assert!(pending(&p).is_empty());
+        let resumable = answered_detached(&p);
+        assert_eq!(resumable.len(), 1);
+        assert_eq!(resumable[0].1, "split it");
+
+        // The resume preamble carries question, answer, and checkpoint.
+        let block = resume_context(&p, &id).unwrap();
+        assert!(block.contains("merge or split?"));
+        assert!(block.contains("split it"));
+        assert!(block.contains("reports/cp.md"));
+
+        // Consuming archives the pair: nothing left to resume, records kept.
+        archive_pair(&p, &id);
+        assert!(answered_detached(&p).is_empty());
+        assert!(p.asks_dir().join("archive/triage-1.json").is_file());
+        assert!(p.answers_dir().join("archive/triage-1.json").is_file());
+    }
+
+    #[test]
+    fn sys_asks_signal_tracks_the_ask_lifecycle() {
+        let p = Paths::temp();
+        let v = sys_asks(&p);
+        assert_eq!(v["signal"]["pending"], serde_json::json!([]));
+        assert_eq!(v["signal"]["resume"], serde_json::json!([]));
+
+        let id = ask_detached(&p, "w", "q?", "", &[]).unwrap();
+        let v = sys_asks(&p);
+        assert_eq!(v["signal"]["pending"], serde_json::json!([id.clone()]));
+
+        cmd_answer(&p, &ans(&id, "a", false)).unwrap();
+        let v = sys_asks(&p);
+        assert_eq!(v["signal"]["pending"], serde_json::json!([]));
+        assert_eq!(v["signal"]["resume"], serde_json::json!([id.clone()]));
+        assert_eq!(v["detail"][&id]["answered"], serde_json::json!(true));
+
+        archive_pair(&p, &id);
+        let v = sys_asks(&p);
+        assert_eq!(
+            v["signal"]["resume"],
+            serde_json::json!([]),
+            "archiving settles the wake signal"
+        );
+    }
+
+    #[test]
+    fn archived_ask_ids_are_reusable_without_clobbering_the_archive() {
+        let p = Paths::temp();
+        let id = ask_detached(&p, "w", "first?", "", &[]).unwrap();
+        cmd_answer(&p, &ans(&id, "one", false)).unwrap();
+        archive_pair(&p, &id);
+        // The id is free again (next_ask_id scans only live dirs)…
+        let id2 = ask_detached(&p, "w", "second?", "", &[]).unwrap();
+        assert_eq!(id2, id, "live id space is reusable after archive");
+        cmd_answer(&p, &ans(&id2, "two", false)).unwrap();
+        archive_pair(&p, &id2);
+        // …and the second archive did not clobber the first record.
+        assert!(p.asks_dir().join("archive/w-1.json").is_file());
+        assert!(p.asks_dir().join("archive/w-1-1.json").is_file());
     }
 
     #[test]

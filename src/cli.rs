@@ -260,6 +260,11 @@ pub enum WorkerOp {
         /// the loop as a FAILED worker instead of a clean corpse.
         #[arg(long)]
         verify: Option<String>,
+        /// Resume a DETACHED, ANSWERED ask: inject its question, the human's
+        /// answer, and the checkpoint reference into the worker's brief, then
+        /// archive the ask/answer pair. The value is the ask id.
+        #[arg(long)]
+        resume: Option<String>,
         #[command(flatten)]
         journal: JournalOpt,
     },
@@ -296,6 +301,12 @@ pub struct AskArgs {
     /// Comma-separated choices to offer.
     #[arg(long, value_delimiter = ',')]
     pub options: Vec<String>,
+    /// Don't block: write the ask and return immediately (prints the ask id).
+    /// For LONG waits — checkpoint your state to reports/ first, then exit;
+    /// when the human answers, looop re-dispatches a fresh worker with the
+    /// answer (`worker start --resume <ask_id>`).
+    #[arg(long)]
+    pub detach: bool,
 }
 
 #[derive(Args, Debug)]
