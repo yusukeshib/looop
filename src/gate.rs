@@ -98,6 +98,10 @@ pub(crate) fn claim(
     // acquisitions distinct even within the same second. Readers stay
     // backward-compatible: [`holder_of`] and the reaper look ONLY at
     // `.session`, so old-format `{session,name}` leases still parse.
+    // The nonce is deliberately NON-cryptographic: it only needs byte-
+    // uniqueness so a reclaimed-and-reissued lease never byte-equals a stale
+    // read (ABA armor for the compare-and-delete), not to authenticate the
+    // holder.
     let body = serde_json::json!({
         "session": session,
         "name": name,

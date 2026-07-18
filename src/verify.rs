@@ -166,9 +166,8 @@ pub fn reconcile(paths: &Paths) {
         // The event names WHAT ran, not just pass/fail: `verify` is AI-authored
         // shell executed automatically (constitution rule 2 constrains it to
         // read-only checks), so a human watching the pulse must be able to
-        // audit the actual command text. One-lined + clipped so a runaway
-        // command can't flood the event stream.
-        let cmd_shown: String = cmd.trim().replace('\n', " ").chars().take(256).collect();
+        // audit the actual command text.
+        let cmd_shown = clip_cmd_for_event(&cmd);
         crate::util::event(
             if outcome.ok {
                 crate::util::Level::Info
@@ -183,6 +182,25 @@ pub fn reconcile(paths: &Paths) {
             &[("cmd", serde_json::json!(cmd_shown))],
         );
     }
+}
+
+/// One-line a verify command for the `worker.verify` event: control chars
+/// (newlines, but also \r and ESC — the command is AI-authored and the event
+/// reaches the operator's terminal in human log mode, so ANSI sequences must
+/// not survive) become spaces, and a runaway command is clipped at 256 chars
+/// behind the same visible `…` marker prompt.rs's clip() appends — a
+/// truncation the auditor can't see is a command they can't audit.
+fn clip_cmd_for_event(cmd: &str) -> String {
+    let flat: String = cmd
+        .trim()
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if flat.chars().count() <= 256 {
+        return flat;
+    }
+    let cut: String = flat.chars().take(256).collect();
+    format!("{cut}…")
 }
 
 /// Run one due verification from its persisted `.cmd` file. Returns the
@@ -403,7 +421,11 @@ pub(crate) fn read_tail_file(path: &std::path::Path, max: usize) -> String {
         return String::new();
     }
     let mut tail = Vec::with_capacity(take);
-    if file.read_to_end(&mut tail).is_err() {
+    // take()-bounded, not a bare read_to_end: the file can GROW between the
+    // metadata() above and this read (live capture files are appended to),
+    // which would re-open the unbounded-read window the seek-based tail
+    // exists to close — at most `take` bytes are ever read.
+    if file.take(take as u64).read_to_end(&mut tail).is_err() {
         return String::new();
     }
     String::from_utf8_lossy(&tail).into_owned()
@@ -433,6 +455,26 @@ mod tests {
             ),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn clip_cmd_for_event_strips_control_chars_and_marks_the_clip() {
+        // Control chars must not reach the operator's terminal: \n one-lines
+        // as before, but \r and ESC (ANSI styling) are terminal control too —
+        // an AI-authored command must not be able to overwrite or style the
+        // human log line auditing it.
+        assert_eq!(
+            clip_cmd_for_event("echo a\nb\r\x1b[31mred"),
+            "echo a b  [31mred"
+        );
+        // Short commands pass through unmarked…
+        assert_eq!(clip_cmd_for_event(" ls -la "), "ls -la");
+        // …a clipped one carries the same visible … marker as prompt.rs's
+        // clip(): an invisible truncation is a command the auditor can't audit.
+        let long = "x".repeat(300);
+        let shown = clip_cmd_for_event(&long);
+        assert_eq!(shown.chars().count(), 257);
+        assert!(shown.ends_with('…'), "clip must be visible: {shown}");
     }
 
     #[test]

@@ -266,6 +266,14 @@ const PLAYBOOK_MAX: usize = 16 * 1024;
 const ASK_TEXT_MAX: usize = 2 * 1024;
 const JOURNAL_LINE_MAX: usize = 500;
 
+/// Max WHAT-CHANGED diff LINES. The diff renders in the volatile tail, below
+/// the aggregate-budget machinery, so it needs its own count bound: each line
+/// is value-clipped but one line is minted PER changed item, and the decider
+/// itself mints items every beat — thousands of goals appearing at once would
+/// re-blow the prompt the aggregate budget exists to bound. Generous by
+/// design: a well-formed beat changes a handful of items.
+const DIFF_LINES_MAX: usize = 200;
+
 /// Aggregate prompt budget (bytes). The per-item caps above bound each BODY,
 /// but nothing bounds the COUNTS: the decider itself mints goals (`write_goal`)
 /// and sensors (`write_sensor`) every beat and workers raise unlimited asks, so
@@ -335,6 +343,16 @@ fn what_changed(paths: &Paths, cur: &std::collections::BTreeMap<String, String>)
         if !cur.contains_key(k) {
             lines.push(format!("- {k} gone"));
         }
+    }
+    // Count-bound the diff with the same visible-marker style as the budgeted
+    // sections: the per-line clip bounds each BODY, this bounds the COUNT.
+    if lines.len() > DIFF_LINES_MAX {
+        let omitted = lines.len() - DIFF_LINES_MAX;
+        lines.truncate(DIFF_LINES_MAX);
+        lines.push(format!(
+            "(section truncated: {omitted} changed items omitted — too many world \
+             items changed in one beat; consolidate the world)"
+        ));
     }
     Some(if lines.is_empty() {
         "(nothing — this re-decide was forced: pulse start, cadence nudge, or a noop \
@@ -489,7 +507,8 @@ fn build_prompt_budgeted(
     // The aggregate size budget is spent in section order. Only the
     // count-unbounded item lists (goals, sensor readings, asks) check it — the
     // fixed sections and the per-item-capped singletons (playbook, journal
-    // tail, volatile tails) are individually bounded, so the final prompt
+    // tail, volatile tails; the WHAT CHANGED diff is additionally line-capped,
+    // see DIFF_LINES_MAX) are individually bounded, so the final prompt
     // stays within budget + a bounded constant.
     // (kind, omitted count) per truncated section — drives the oversize event.
     let mut oversize: Vec<(&str, usize)> = Vec::new();
@@ -526,7 +545,8 @@ fn build_prompt_budgeted(
     if goals.is_empty() {
         sec.push_str("(no goals yet)\n");
     } else {
-        for id in goals {
+        let total = goals.len();
+        for (i, id) in goals.into_iter().enumerate() {
             // The id is a filename, but exotic filesystems allow newlines in
             // filenames — escape it so an id's SECOND line can't forge a
             // section header (the separator's own leading `---` stays real).
@@ -537,17 +557,21 @@ fn build_prompt_budgeted(
                 GOAL_BODY_MAX,
             )));
             item.push('\n');
-            // Aggregate budget: once the assembled prompt would exceed it, the
-            // remaining items are counted and dropped behind the visible
-            // marker below (saturating: budget may be usize::MAX = no limit).
+            // Aggregate budget: the FIRST item that would exceed it stops the
+            // section — it and every remaining item are counted and dropped
+            // behind the visible marker below (saturating: budget may be
+            // usize::MAX = no limit). Stop, not skip: a skip-on-overflow
+            // `continue` would admit a later SMALLER item after an earlier one
+            // was dropped, making survival depend on body size instead of the
+            // list's deterministic order.
             if out
                 .len()
                 .saturating_add(sec.len())
                 .saturating_add(item.len())
                 > budget
             {
-                omitted += 1;
-                continue;
+                omitted = total - i;
+                break;
             }
             sec.push_str(&item);
         }
@@ -565,15 +589,19 @@ fn build_prompt_budgeted(
     // SENSOR READINGS.
     let mut sec = String::new();
     let mut omitted = 0usize;
-    for o in util::sorted_glob(snap_dir, "json") {
-        let fname = o
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        if !(fname.starts_with("sensor-") || fname.starts_with("sys-")) {
-            continue;
-        }
+    let snaps: Vec<(String, std::path::PathBuf)> = util::sorted_glob(snap_dir, "json")
+        .into_iter()
+        .filter_map(|o| {
+            let fname = o
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
+            (fname.starts_with("sensor-") || fname.starts_with("sys-")).then_some((fname, o))
+        })
+        .collect();
+    let total = snaps.len();
+    for (i, (fname, o)) in snaps.into_iter().enumerate() {
         let mut item = String::new();
         let _ = writeln!(item, "--- {fname}");
         // Sensor output is attacker/LLM-influenced — escape like every other
@@ -582,14 +610,15 @@ fn build_prompt_budgeted(
             &fs::read_to_string(&o).unwrap_or_default(),
         ));
         item.push('\n');
+        // Stop-at-first-overflow, like the GOALS loop above.
         if out
             .len()
             .saturating_add(sec.len())
             .saturating_add(item.len())
             > budget
         {
-            omitted += 1;
-            continue;
+            omitted = total - i;
+            break;
         }
         sec.push_str(&item);
     }
@@ -621,7 +650,8 @@ fn build_prompt_budgeted(
             .map(|s| s.id)
             .collect();
         let mut omitted = 0usize;
-        for a in asks {
+        let total = asks.len();
+        for (i, a) in asks.into_iter().enumerate() {
             let tag = if a.detach {
                 "DETACHED — worker checkpointed and exited by design; WAIT for the human"
             } else if alive.contains(&a.worker) {
@@ -650,14 +680,15 @@ fn build_prompt_budgeted(
                     escape_section_markers(&a.options.join(", "))
                 );
             }
+            // Stop-at-first-overflow, like the GOALS loop above.
             if out
                 .len()
                 .saturating_add(sec.len())
                 .saturating_add(item.len())
                 > budget
             {
-                omitted += 1;
-                continue;
+                omitted = total - i;
+                break;
             }
             sec.push_str(&item);
         }
@@ -682,7 +713,8 @@ fn build_prompt_budgeted(
     if !resumable.is_empty() {
         let mut sec = String::new();
         let mut omitted = 0usize;
-        for (a, answer) in &resumable {
+        let total = resumable.len();
+        for (i, (a, answer)) in resumable.iter().enumerate() {
             let mut item = String::new();
             let _ = writeln!(item, "--- {} (worker {})", a.id, a.worker);
             let _ = writeln!(
@@ -702,14 +734,15 @@ fn build_prompt_budgeted(
                     escape_section_markers(&clip(&a.reference, ASK_TEXT_MAX))
                 );
             }
+            // Stop-at-first-overflow, like the GOALS loop above.
             if out
                 .len()
                 .saturating_add(sec.len())
                 .saturating_add(item.len())
                 > budget
             {
-                omitted += 1;
-                continue;
+                omitted = total - i;
+                break;
             }
             sec.push_str(&item);
         }
@@ -1378,6 +1411,60 @@ mod tests {
         let out = build_prompt_budgeted(&p, &p.snapshots_dir(), &items, PROMPT_MAX_BYTES_DEFAULT);
         assert!(out.contains("BULK-SENTINEL"));
         assert!(!out.contains("section truncated"));
+    }
+
+    #[test]
+    fn budget_truncation_stops_at_first_overflow_instead_of_skipping() {
+        // Regression (skip-not-stop): on overflow the old loops `continue`d,
+        // so a LATER smaller item could be admitted after an EARLIER one was
+        // dropped — survival depended on body size, not order, contradicting
+        // the marker's "remaining items omitted" claim. The first item that
+        // would exceed the budget must stop the whole section.
+        let p = fixture();
+        fs::remove_file(p.goals_dir().join("triage.md")).unwrap();
+        let items = crate::worldhash::world_items(&p);
+        // Measure the goal-less prompt, then grant only enough headroom that
+        // the SMALL goal alone would fit but the BIG one (sorted first) never
+        // does — under skip semantics the small goal would slip in.
+        let base = build_prompt_budgeted(&p, &p.snapshots_dir(), &items, usize::MAX).len();
+        fs::write(p.goals_dir().join("a-big.md"), "X".repeat(4096)).unwrap();
+        fs::write(p.goals_dir().join("b-small.md"), "SMALL-SENTINEL\n").unwrap();
+        let items = crate::worldhash::world_items(&p);
+        let out = build_prompt_budgeted(&p, &p.snapshots_dir(), &items, base + 1024);
+        assert!(!out.contains("XXXX"), "the oversized goal is dropped");
+        assert!(
+            !out.contains("SMALL-SENTINEL"),
+            "a later smaller item must NOT be admitted after an earlier drop"
+        );
+        assert!(
+            out.contains("(section truncated: 2 goals omitted"),
+            "the stopped item AND everything after it count as omitted: {out}"
+        );
+    }
+
+    #[test]
+    fn what_changed_caps_diff_lines_with_a_visible_marker() {
+        // Regression (unbounded WHAT CHANGED): the diff renders in the
+        // volatile tail, exempt from the aggregate budget, but mints one line
+        // per changed item — thousands of minted goals used to re-blow the
+        // prompt the budget exists to bound. The line count is capped behind
+        // the same visible-marker style as the budgeted sections.
+        let p = fixture();
+        // Empty baseline: every current item reads as "appeared" — one line each.
+        fs::write(p.last_world(), "{}").unwrap();
+        let cur: std::collections::BTreeMap<String, String> = (0..DIFF_LINES_MAX + 25)
+            .map(|i| (format!("goal:g{i:05}"), "x".to_string()))
+            .collect();
+        let diff = what_changed(&p, &cur).unwrap();
+        assert_eq!(
+            diff.lines().count(),
+            DIFF_LINES_MAX + 1,
+            "capped lines + one marker line"
+        );
+        assert!(
+            diff.contains("(section truncated: 25 changed items omitted"),
+            "a visible marker names the omission: {diff}"
+        );
     }
 
     #[test]

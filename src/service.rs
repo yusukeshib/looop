@@ -166,10 +166,22 @@ pub fn cmd_down(paths: &Paths) -> Result<ExitCode> {
         );
         // Final audit: give the kills the same grace the pulse gets, then
         // warn (and fail) if anything outlived the sweep — mirroring the
-        // never-report-a-stop-that-didn't-happen rule above.
+        // never-report-a-stop-that-didn't-happen rule above. Same fail-closed
+        // stance as the enumerations above: the lenient `list_workers` reads
+        // an enumeration error as "no survivors", and the audit would then
+        // exit 0 claiming a clean stop over a possibly-live fleet.
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         loop {
-            let survivors = session::list_workers(paths).iter().any(|s| s.alive);
+            let survivors = match session::try_list(paths) {
+                Ok(fleet) => fleet.iter().any(|s| !s.is_pulse() && s.alive),
+                Err(e) => {
+                    eprintln!(
+                        "looop: cannot enumerate the fleet ({e}) — cannot confirm the \
+                         worker sweep; retry `looop down`"
+                    );
+                    return Ok(ExitCode::from(1));
+                }
+            };
             if !survivors {
                 break;
             }

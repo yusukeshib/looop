@@ -29,9 +29,13 @@ pub(crate) use ask::{ask, ask_detached};
 pub use signal::sys_asks;
 // `Tell` and `drain_tells` have no external consumer today, but they were part
 // of the module's public surface before the split — keep the paths working.
+// They sit on their OWN allowed `pub use` line so the suppression covers
+// exactly the genuinely-unnamed items — a blanket allow over the whole list
+// would hide a future dead-re-export warning for the used ones too.
 pub(crate) use tell::discard_tells;
 #[allow(unused_imports)]
-pub use tell::{Tell, cmd_tell, cmd_told, drain_tells, pending_tells};
+pub use tell::{Tell, drain_tells};
+pub use tell::{cmd_tell, cmd_told, pending_tells};
 
 #[cfg(test)]
 mod test_util {

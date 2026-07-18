@@ -605,8 +605,16 @@ impl StateStore for FileStore<'_> {
         }
         // util::write_atomic_mode directly (NOT self.write_atomic): that
         // method acquires the same DirLock and flock does not nest across
-        // fds within one process — calling it here would deadlock.
-        crate::util::write_atomic_mode(&path, contents.as_bytes(), None)?;
+        // fds within one process — calling it here would deadlock. Same mode
+        // selection as write_atomic, though: a sensor's content is a script
+        // the runtime execs, so a hardcoded None here would silently strip
+        // the exec bit if a compare-and-swap is ever used for Key::Sensor.
+        let mode = if matches!(key, Key::Sensor(_)) {
+            Some(0o755)
+        } else {
+            None
+        };
+        crate::util::write_atomic_mode(&path, contents.as_bytes(), mode)?;
         Ok(true)
     }
 
