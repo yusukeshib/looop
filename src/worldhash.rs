@@ -162,28 +162,35 @@ pub fn world_view(paths: &Paths) -> (String, std::collections::BTreeMap<String, 
         // Both hash branches end with a newline (consistent framing), and the
         // section marker is length-prefixed like the policy half (see
         // hash_policy_into) — injective even when a payload contains "@@ ".
-        let (mut payload, item) = match serde_json::from_slice::<serde_json::Value>(&raw) {
+        // We write straight into `buf` (length = payload.len()+1 for the
+        // trailing newline) and move the item value into the map separately,
+        // avoiding a clone of the payload bytes (or the serialized signal).
+        match serde_json::from_slice::<serde_json::Value>(&raw) {
             Ok(v) => {
                 let s = wake_signal(v).to_string();
-                (s.clone().into_bytes(), s)
+                let len = s.len() + 1; // +1 for the trailing newline
+                buf.extend_from_slice(format!("@@ {} {}\n", rel(paths, &f), len).as_bytes());
+                buf.extend_from_slice(s.as_bytes());
+                buf.push(b'\n');
+                items.insert(format!("snap:{stem}"), s);
             }
             // Item: content hash, not just the length — world_hash consumes
             // the raw bytes, so the item must track the CONTENT too or
             // same-length garbage would show "hash moved" with a useless
             // no-op diff.
-            Err(_) => (
-                raw.clone(), // non-JSON / error reading: raw bytes
-                format!(
+            Err(_) => {
+                let len = raw.len() + 1; // +1 for the trailing newline
+                buf.extend_from_slice(format!("@@ {} {}\n", rel(paths, &f), len).as_bytes());
+                buf.extend_from_slice(&raw);
+                buf.push(b'\n');
+                let item = format!(
                     "(non-JSON, {} bytes, fnv {})",
                     raw.len(),
                     util::content_hash(&raw)
-                ),
-            ),
+                );
+                items.insert(format!("snap:{stem}"), item);
+            }
         };
-        payload.push(b'\n');
-        buf.extend_from_slice(format!("@@ {} {}\n", rel(paths, &f), payload.len()).as_bytes());
-        buf.extend_from_slice(&payload);
-        items.insert(format!("snap:{stem}"), item);
     }
 
     (util::content_hash(&buf), items)

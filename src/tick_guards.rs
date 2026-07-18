@@ -64,8 +64,25 @@ enum BackoffRead {
 }
 
 fn read_backoff_raw(paths: &Paths) -> BackoffRead {
-    let Ok(raw) = fs::read_to_string(backoff_path(paths)) else {
-        return BackoffRead::Absent;
+    let raw = match fs::read_to_string(backoff_path(paths)) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BackoffRead::Absent,
+        // Present but unreadable (EACCES/EIO/…): the state file EXISTS, so
+        // restarting at 1 would fail OPEN just like a parse error. Treat it as
+        // CORRUPT so record_backoff resumes from BACKOFF_CORRUPT_FAILS.
+        Err(e) => {
+            util::event(
+                Level::Warn,
+                "tick.guard_degraded",
+                &format!(
+                    "backoff state file is unreadable ({e}) — treating as corrupt so the next \
+                     record_backoff resumes conservatively instead of resetting the exponential \
+                     backoff"
+                ),
+                &[],
+            );
+            return BackoffRead::Corrupt;
+        }
     };
     let parsed = serde_json::from_str::<serde_json::Value>(&raw)
         .ok()
@@ -355,8 +372,22 @@ pub(crate) fn read_decide_ledger(paths: &Paths) -> Vec<u64> {
         #[serde(default)]
         ts: Vec<serde_json::Value>,
     }
-    let Ok(raw) = fs::read_to_string(paths.decide_ledger()) else {
-        return Vec::new();
+    let raw = match fs::read_to_string(paths.decide_ledger()) {
+        Ok(raw) => raw,
+        // Absent file: a fresh ledger, not corruption — stay quiet.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        // Present but unreadable (EACCES/EIO/…): the ledger EXISTS, so silently
+        // returning empty would fail-open. WARN and restart empty (there is
+        // nothing to salvage), matching whole-file corruption discipline.
+        Err(e) => {
+            util::event(
+                Level::Warn,
+                "tick.guard_degraded",
+                &format!("the decide ledger is unreadable ({e}) — the hourly cap restarts empty"),
+                &[],
+            );
+            return Vec::new();
+        }
     };
     let ledger: Ledger = match serde_json::from_str(&raw) {
         Ok(l) => l,
