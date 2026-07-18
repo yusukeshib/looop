@@ -475,19 +475,12 @@ pub(crate) fn ask(
 
     // Block until answered. The human sees this ask (via a
     // client / `looop state`) and replies with `looop answer <id>`.
-    let poll = Duration::from_millis(
-        std::env::var("LOOOP_ASK_POLL_MS")
-            .ok()
-            .and_then(|v| v.trim().parse().ok())
-            .unwrap_or(1000),
-    );
+    let poll = Duration::from_millis(crate::util::env_knob("LOOOP_ASK_POLL_MS").unwrap_or(1000));
     // Optional wall-clock bound: `LOOOP_ASK_TIMEOUT_S` (default: none — an ask
     // legitimately waits on a human indefinitely).
     // checked_add: an absurd value (u64::MAX) would overflow Instant + Duration
     // and panic — treat overflow as "no deadline".
-    let deadline = std::env::var("LOOOP_ASK_TIMEOUT_S")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
+    let deadline = crate::util::env_knob::<u64>("LOOOP_ASK_TIMEOUT_S")
         .and_then(|s| std::time::Instant::now().checked_add(Duration::from_secs(s)));
     loop {
         if let Some(answer) = read_answer(&store, &id) {

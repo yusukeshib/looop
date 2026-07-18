@@ -21,6 +21,7 @@ mod gate;
 mod help;
 mod init;
 mod mailbox;
+mod observe;
 mod paths;
 mod prompt;
 mod run;
@@ -153,8 +154,8 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
         Cmd::Up(a) => service::cmd_up(paths, a.json),
         Cmd::Down => gated(&|| service::cmd_down(paths)),
         Cmd::Pulse => gated(&|| service::cmd_pulse(paths)),
-        Cmd::State(a) => gated(&|| tick::cmd_state(paths, a.json)),
-        Cmd::Wait(a) => gated(&|| tick::cmd_wait(paths, &a)),
+        Cmd::State(a) => gated(&|| observe::cmd_state(paths, a.json)),
+        Cmd::Wait(a) => gated(&|| observe::cmd_wait(paths, &a)),
         Cmd::Asks(a) => gated(&|| mailbox::cmd_asks(paths, a.json)),
         Cmd::Answer(a) => gated(&|| mailbox::cmd_answer(paths, &a)),
         Cmd::Goal(a) => gated(&|| match &a.op {

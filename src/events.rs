@@ -40,15 +40,8 @@ pub fn emit(paths: &Paths, event: &str, fields: serde_json::Value) {
     // would clobber the freshly rotated .1 generation. Today the only writer
     // is the single locked pulse process (one beat at a time), so the race
     // cannot fire; if emit() ever gains concurrent callers, add locking here.
-    let max_bytes: u64 = std::env::var("LOOOP_EVENTS_MAX_BYTES")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(5 * 1024 * 1024);
-    if max_bytes > 0
-        && std::fs::metadata(&path)
-            .map(|m| m.len() > max_bytes)
-            .unwrap_or(false)
-    {
+    let max_bytes: u64 = crate::util::env_knob("LOOOP_EVENTS_MAX_BYTES").unwrap_or(5 * 1024 * 1024);
+    if max_bytes > 0 && std::fs::metadata(&path).is_ok_and(|m| m.len() > max_bytes) {
         let _ = std::fs::rename(&path, paths.data_dir.join("events.jsonl.1"));
     }
     if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {

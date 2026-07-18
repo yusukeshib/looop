@@ -27,9 +27,7 @@ use std::time::Duration;
 /// its sandbox, never here, so this only bounds debug transcripts.
 pub(crate) fn session_ttl_secs(paths: &Paths) -> u64 {
     const DEFAULT: u64 = 3 * 24 * 60 * 60; // 3 days
-    if let Ok(v) = std::env::var("LOOOP_SESSION_TTL")
-        && let Ok(n) = v.trim().parse::<u64>()
-    {
+    if let Some(n) = util::env_knob::<u64>("LOOOP_SESSION_TTL") {
         return n;
     }
     Config::load(paths)
@@ -44,9 +42,7 @@ pub(crate) fn session_ttl_secs(paths: &Paths) -> u64 {
 
 /// Resolve a cadence knob: env var > config key > fallback.
 fn interval(env: &str, cfg: &Config, key: &str, fallback: u64) -> u64 {
-    if let Ok(v) = std::env::var(env)
-        && let Ok(n) = v.trim().parse::<u64>()
-    {
+    if let Some(n) = util::env_knob::<u64>(env) {
         return n;
     }
     cfg.root
@@ -63,7 +59,7 @@ fn read_next_wake(paths: &Paths) -> Option<u64> {
     serde_json::from_str::<serde_json::Value>(&raw)
         .ok()?
         .get("due")
-        .and_then(|v| v.as_u64())
+        .and_then(serde_json::Value::as_u64)
 }
 
 /// Persist a one-shot cadence nudge as a DEADLINE, not an in-memory flag: a
@@ -113,20 +109,9 @@ fn clamp_sleep_to_wake(want: u64, due: Option<u64>, now: u64) -> u64 {
 /// flock is the right primitive for single-instance: the kernel releases it when
 /// the holding process dies for ANY reason (normal exit, panic, `kill -9`, crash),
 /// so there is no stale lock to reclaim and no PID-liveness guessing that a reused
-/// PID can fool. (macOS DOES have flock(2), despite the old comment here.)
-#[cfg(unix)]
+/// PID can fool. Routes through the shared [`util::flock_file`] declaration.
 fn try_flock(f: &std::fs::File) -> bool {
-    use std::os::unix::io::AsRawFd;
-    const LOCK_EX: i32 = 2;
-    const LOCK_NB: i32 = 4;
-    unsafe extern "C" {
-        fn flock(fd: i32, op: i32) -> i32;
-    }
-    unsafe { flock(f.as_raw_fd(), LOCK_EX | LOCK_NB) == 0 }
-}
-#[cfg(not(unix))]
-fn try_flock(_f: &std::fs::File) -> bool {
-    true // best-effort: single-instance enforcement is unix-only
+    util::flock_file(f, false)
 }
 
 /// Whether a live pulse currently holds the single-instance flock. The

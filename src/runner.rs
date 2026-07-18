@@ -118,5 +118,5 @@ pub fn run_streamed(paths: &Paths, tick_cmd: &str, prompt_file: &Path, tee: &[Pa
     // would deadlock both sides on a full pipe buffer.
     drop(reader);
 
-    child.wait().map(|s| s.success()).unwrap_or(false)
+    child.wait().is_ok_and(|s| s.success())
 }

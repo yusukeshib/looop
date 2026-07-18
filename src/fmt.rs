@@ -25,7 +25,11 @@ pub(crate) fn format_line(line: &str) -> Option<String> {
             let name = e.get("toolName").and_then(|t| t.as_str()).unwrap_or("tool");
             Some(tool_line(name, e.get("args")))
         }
-        "tool_execution_end" if e.get("isError").and_then(|b| b.as_bool()).unwrap_or(false) => {
+        "tool_execution_end"
+            if e.get("isError")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false) =>
+        {
             let name = e.get("toolName").and_then(|t| t.as_str()).unwrap_or("tool");
             // No glyph — the failure signal rides on the text color (red),
             // mirroring the pulse's Error lines.
@@ -88,8 +92,8 @@ pub(crate) fn format_line(line: &str) -> Option<String> {
         }
         "result" => {
             // One tail summary line: duration/cost when claude reports them.
-            let dur = e.get("duration_ms").and_then(|v| v.as_u64());
-            let cost = e.get("total_cost_usd").and_then(|v| v.as_f64());
+            let dur = e.get("duration_ms").and_then(serde_json::Value::as_u64);
+            let cost = e.get("total_cost_usd").and_then(serde_json::Value::as_f64);
             let mut parts: Vec<String> = Vec::new();
             if let Some(ms) = dur {
                 parts.push(format!("{:.1}s", ms as f64 / 1000.0));
@@ -120,7 +124,7 @@ fn tool_line(name: &str, args: Option<&serde_json::Value>) -> String {
         .or_else(|| args.and_then(|a| a.get("path")))
         .or_else(|| args.and_then(|a| a.get("file_path")))
         .and_then(|v| v.as_str().map(str::to_owned))
-        .or_else(|| args.map(|a| a.to_string()))
+        .or_else(|| args.map(std::string::ToString::to_string))
         .unwrap_or_default();
     // LOG output — full command (whitespace collapsed, never truncated).
     let collapsed: String = collapse_ws(&raw);

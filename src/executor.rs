@@ -218,7 +218,7 @@ pub fn warn_if_interrupted(paths: &Paths) -> bool {
     // run's crash guard — leave it alone until it is unambiguously a corpse
     // (older than the shell deadline plus slack). An unparseable ts reads as
     // 0, i.e. ancient — consumed.
-    let ts = v.get("ts").and_then(|x| x.as_u64()).unwrap_or(0);
+    let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
     if crate::util::now_unix().saturating_sub(ts) < shell_timeout_secs() + 60 {
         return false;
     }
@@ -250,10 +250,7 @@ pub fn warn_if_interrupted(paths: &Paths) -> bool {
 /// inside the pulse beat, so it must be bounded like a verify command.
 /// `LOOOP_SHELL_TIMEOUT_SECS`, default 300.
 fn shell_timeout_secs() -> u64 {
-    std::env::var("LOOOP_SHELL_TIMEOUT_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(300)
+    crate::util::env_knob("LOOOP_SHELL_TIMEOUT_SECS").unwrap_or(300)
 }
 
 /// The last `max` chars of `s` (UTF-8 safe).
@@ -268,10 +265,7 @@ fn tail_chars(s: &str, max: usize) -> String {
 /// How many PLAYBOOK generations `playbook.d/` retains (`LOOOP_PLAYBOOK_KEEP`,
 /// default 20; 0 = keep all).
 fn playbook_keep() -> usize {
-    std::env::var("LOOOP_PLAYBOOK_KEEP")
-        .ok()
-        .and_then(|v| v.trim().parse().ok())
-        .unwrap_or(20)
+    crate::util::env_knob("LOOOP_PLAYBOOK_KEEP").unwrap_or(20)
 }
 
 /// Snapshot the CURRENT PLAYBOOK.md into `playbook.d/<ts>.md` before an
@@ -374,7 +368,18 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
                 "exit_code": code,
                 "output": tail,
             });
-            let _ = fs::write(paths.last_shell(), body.to_string());
+            if let Err(e) =
+                crate::util::write_atomic(&paths.last_shell(), body.to_string().as_bytes())
+            {
+                crate::util::event(
+                    crate::util::Level::Warn,
+                    "tick.guard_degraded",
+                    &format!(
+                        "failed to persist the run_shell output (next prompt won't see it): {e}"
+                    ),
+                    &[],
+                );
+            }
             let why = if reason.is_empty() { cmd } else { reason };
             if res.ok {
                 Ok(format!("run-shell · {why}"))
@@ -512,7 +517,7 @@ impl Decision {
             .and_then(|x| x.as_str())
             .unwrap_or_default()
             .to_string();
-        let next_interval_s = v.get("next_interval_s").and_then(|x| x.as_u64());
+        let next_interval_s = v.get("next_interval_s").and_then(serde_json::Value::as_u64);
         let action: Action =
             serde_json::from_value(v).context("decision has no/unknown \"action\"")?;
         Ok(Decision {
@@ -773,7 +778,9 @@ mod tests {
         let act: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(p.goal_activity()).unwrap()).unwrap();
         assert!(
-            act.get("triage").and_then(|v| v.as_u64()).is_some(),
+            act.get("triage")
+                .and_then(serde_json::Value::as_u64)
+                .is_some(),
             "acting on a goal stamps its activity time"
         );
     }

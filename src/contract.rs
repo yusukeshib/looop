@@ -32,7 +32,7 @@
 use crate::executor::{Action, run_action};
 use crate::mailbox::Ask;
 use crate::paths::Paths;
-use crate::{gate, mailbox, tick};
+use crate::{gate, mailbox, observe};
 use anyhow::Result;
 use serde_json::Value;
 
@@ -56,7 +56,7 @@ pub trait Contract {
     fn state(&self) -> Result<Value>;
     /// Block until the world changes (per `filter`), then return the fresh state
     /// with a `"changed"` array describing what moved.
-    fn wait(&self, filter: tick::WaitFilter) -> Result<Value>;
+    fn wait(&self, filter: observe::WaitFilter) -> Result<Value>;
     /// Just the pending (unanswered) asks.
     fn asks(&self) -> Result<Vec<Ask>>;
     /// Resolve a pending ask durably. `force` overwrites an existing answer.
@@ -128,13 +128,13 @@ impl<'a> LocalContract<'a> {
 impl Contract for LocalContract<'_> {
     fn state(&self) -> Result<Value> {
         let _ = crate::seed::ensure_dirs(self.paths);
-        Ok(tick::state(self.paths))
+        Ok(observe::state(self.paths))
     }
 
-    fn wait(&self, filter: tick::WaitFilter) -> Result<Value> {
+    fn wait(&self, filter: observe::WaitFilter) -> Result<Value> {
         let _ = crate::seed::ensure_dirs(self.paths);
-        let changed = tick::wait_for_change(self.paths, filter);
-        let mut s = tick::state(self.paths);
+        let changed = observe::wait_for_change(self.paths, filter);
+        let mut s = observe::state(self.paths);
         if let Some(obj) = s.as_object_mut() {
             obj.insert("changed".to_string(), serde_json::json!(changed));
         }
