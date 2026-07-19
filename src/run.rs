@@ -64,6 +64,21 @@ fn interval(env: &str, cfg: &Config, key: &str, fallback: u64) -> u64 {
     v.max(1)
 }
 
+/// Floor for a `next_interval_s` nudge: a re-decide sooner than this would burn
+/// the AI budget on near-back-to-back beats.
+const NUDGE_MIN_SECS: u64 = 5;
+/// Default ceiling for a `next_interval_s` nudge (overridable via
+/// `LOOOP_MAX_NEXT_INTERVAL` / config `max_next_interval`). Bounds how long the
+/// pulse stays blind (not sensing) during an AI-chosen nap.
+const DEFAULT_MAX_NUDGE_SECS: u64 = 300;
+
+/// Clamp the decider's one-shot cadence nudge into `[NUDGE_MIN_SECS, max_nudge]`.
+/// `max_nudge` is floored at `NUDGE_MIN_SECS` so a misconfigured tiny cap still
+/// yields a valid (non-inverted) range.
+fn clamp_nudge(req: u64, max_nudge: u64) -> u64 {
+    req.clamp(NUDGE_MIN_SECS, max_nudge.max(NUDGE_MIN_SECS))
+}
+
 // ---- durable cadence nudge (.next-wake.json) ---------------------------------
 
 /// The typed shape of `.next-wake.json`. Absent/unreadable/corrupt all read
@@ -410,6 +425,17 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
     seed::ensure_dirs(paths)?;
     let cfg = Config::load(paths)?;
     let beat = interval("LOOOP_INTERVAL", &cfg, "interval", 60);
+    // Upper bound on the decider's one-shot `next_interval_s` nudge. The pulse
+    // does not SENSE during an AI-chosen nap, so a world change (e.g. a PR
+    // going red just after a beat) stays invisible until the nap ends. Capping
+    // the nudge bounds that blindness window; 3600s (the old cap) meant up to
+    // an hour blind. Default 300s (5 min); env/config overridable.
+    let max_nudge = interval(
+        "LOOOP_MAX_NEXT_INTERVAL",
+        &cfg,
+        "max_next_interval",
+        DEFAULT_MAX_NUDGE_SECS,
+    );
 
     // Single-instance lock (flock-based; released by the kernel on exit/crash).
     let _guard = match acquire_lock(paths) {
@@ -506,7 +532,7 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
         // forced re-decide once it's due.
         let mut want = beat;
         if let Some(req) = outcome.next_interval_s {
-            let req = req.clamp(5, 3600);
+            let req = clamp_nudge(req, max_nudge);
             util::event(
                 Level::Info,
                 "cadence",
@@ -646,6 +672,25 @@ mod tests {
         consume_next_wake(&p, &observed);
         assert!(!next_wake_due(&p));
         assert!(!p.next_wake().is_file());
+    }
+
+    #[test]
+    fn clamp_nudge_bounds_the_ai_cadence_override() {
+        // A giant nap is capped to the ceiling — this is the whole point: the
+        // pulse must not go blind for an hour because the decider asked to.
+        assert_eq!(
+            clamp_nudge(3600, DEFAULT_MAX_NUDGE_SECS),
+            DEFAULT_MAX_NUDGE_SECS
+        );
+        assert_eq!(clamp_nudge(100_000, 300), 300);
+        // A too-eager tiny nudge is floored so back-to-back beats can't burn budget.
+        assert_eq!(clamp_nudge(0, 300), NUDGE_MIN_SECS);
+        assert_eq!(clamp_nudge(1, 300), NUDGE_MIN_SECS);
+        // In-range values pass through untouched.
+        assert_eq!(clamp_nudge(120, 300), 120);
+        // A misconfigured cap below the floor still yields a valid range
+        // (never an inverted clamp that would panic).
+        assert_eq!(clamp_nudge(10, 2), NUDGE_MIN_SECS);
     }
 
     #[test]

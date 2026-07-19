@@ -144,7 +144,7 @@ Pick exactly ONE `action` and fill its fields:
   {"action":"write_schedule","name":"<name>","in_s":<int>,"note":"why"}
   {"action":"write_schedule","name":"<name>","every_s":<int>,"note":"why"}
      A DURABLE time trigger (schedules/<name>.json — survives restarts; unlike
-     next_interval_s it has NO 3600s cap). `in_s` = one-shot, fires once that
+     next_interval_s it has NO short cap). `in_s` = one-shot, fires once that
      many seconds from now; `every_s` = recurring, fires every period. When a
      schedule fires, the sys-schedules signal changes, which WAKES the loop —
      use this for "re-check in 2 days", daily digests, deadline reminders. A
@@ -157,7 +157,9 @@ Pick exactly ONE `action` and fill its fields:
 Every action ALSO takes:
   "journal": "<one line: what you did and why>"  — looop appends it ALREADY
      timestamped, so do NOT restate the date or time inside it (no "02:31 AM,").
-  "next_interval_s": <int>  — OPTIONAL one-shot cadence nudge (clamped 5..3600):
+  "next_interval_s": <int>  — OPTIONAL one-shot cadence nudge (clamped 5..300 by
+     default; the pulse does NOT sense during the nap, so this is deliberately
+     capped short — use a schedule for genuinely long "re-check in N days" waits):
      tighten when a backlog is piling up, widen when it's been quiet a long while.
      It ALSO forces the next beat to re-decide even if nothing in the world
      changed — use it for a time-based follow-up ("re-check in N seconds"), since

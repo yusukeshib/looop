@@ -221,6 +221,11 @@ ENVIRONMENT KNOBS (all optional; unset = the default shown; an unparseable
   cadence & AI spend
     LOOOP_INTERVAL              seconds between beats          default: 60
                                                                (or config `interval`)
+    LOOOP_MAX_NEXT_INTERVAL     cap on the decider's one-shot  default: 300
+                                next_interval_s nudge (secs);  (or config
+                                the pulse is blind to world     `max_next_interval`)
+                                changes during an AI nap, so
+                                this bounds that window
     LOOOP_MAX_DECIDES_PER_HOUR  decide-attempt ceiling         default: 120 (0 = off)
     LOOOP_NOOP_TTL              re-decide an aged noop (secs)  default: 21600 (0 = off)
     LOOOP_FLAP_STREAK           beats before "flapping" flag   default: 5 (0 = off)
