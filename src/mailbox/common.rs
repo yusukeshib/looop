@@ -36,12 +36,31 @@ pub(super) fn stamp_v1(body: &str) -> Result<String> {
     Ok(serde_json::to_string_pretty(&val)?)
 }
 
+/// The session/worker id a CLI verb should act as: the explicit argument
+/// when non-empty, else the worker's exported `$LOOOP_SESSION_ID`. Empty when
+/// neither is set — callers decide whether that is an error. Shared by the
+/// claim verbs (gate.rs) and the worker self-callbacks (`ask`/`told`), which
+/// each used to carry their own copy of this fallback — three implementations
+/// of one rule invited them to drift apart.
+pub(crate) fn session_or_env(explicit: Option<&str>) -> String {
+    match explicit {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => std::env::var("LOOOP_SESSION_ID").unwrap_or_default(),
+    }
+}
+
 /// Print `msg` to stderr the FIRST time `key` is seen in this process, and
 /// report whether it printed. The mailbox read paths run every beat — and
 /// `ask()` polls every second — so an unconditional warning about the same
 /// broken record repeats hundreds of times (log spam that buries real
 /// signals). One line per condition per process is enough: the condition is
 /// durable (a corrupt file stays corrupt until a human acts).
+///
+/// The HashSet grows without an eviction path, but it is bounded in practice:
+/// keys derive from live record ids (one entry per broken record per kind),
+/// so its size tracks the mailbox dirs — which are themselves swept/archived.
+/// Unbounded growth would need a pathological writer minting endless distinct
+/// broken ids inside ONE process lifetime; not worth an LRU.
 pub(super) fn warn_once(key: String, msg: &str) -> bool {
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();

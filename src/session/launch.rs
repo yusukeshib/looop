@@ -200,6 +200,10 @@ impl Drop for StartRollback<'_> {
         // No stale verify for a no-show worker — it would fail the NEXT start
         // of this id for the wrong reason. Idempotent (clear of nothing is a
         // no-op), matching the old unconditional hand-rolled clears.
+        // The PROMPT FILE is deliberately NOT rolled back: prompts/<id>.md is
+        // rename-published and wholly overwritten by the next start of this
+        // id, so the residue is inert — and after a spawn failure it is the
+        // only record of the brief that never launched (post-mortem value).
         crate::verify::clear(self.paths, self.session);
     }
 }
@@ -215,7 +219,7 @@ pub fn cmd_start_session(
     verify: Option<&str>,
     resume: Option<&str>,
 ) -> Result<StartOutcome> {
-    start_session(
+    let out = start_session(
         paths,
         &BabysitFleet::new(paths),
         id,
@@ -223,7 +227,15 @@ pub fn cmd_start_session(
         command,
         verify,
         resume,
-    )
+    )?;
+    // The stderr line is a CLI-TRANSPORT concern, emitted HERE and not inside
+    // the core: start_session is the transport-agnostic policy, and a
+    // contract/TUI caller consumes StartOutcome.reason instead of scraping
+    // stderr — the same presenter/core split as cmd_answer / answer().
+    if let Some(reason) = &out.reason {
+        eprintln!("start-session: {reason}");
+    }
+    Ok(out)
 }
 
 /// Start one worker session. Structured as VALIDATE-THEN-COMMIT: every check
@@ -245,12 +257,11 @@ fn start_session(
 ) -> Result<StartOutcome> {
     seed::ensure_dirs(paths)?;
 
-    // One shape for every refusal: stderr for the human, the same text in the
-    // outcome for the executor (whose bail! feeds record_failure).
-    let refuse = |msg: String| {
-        eprintln!("start-session: {msg}");
-        Ok(StartOutcome::refused(msg))
-    };
+    // One shape for every refusal: the reason travels in the outcome, for the
+    // executor (whose bail! feeds record_failure) AND for the CLI binding
+    // (cmd_start_session prints it to stderr for the human). The core itself
+    // never prints — contract-layer policy stays transport-agnostic.
+    let refuse = |msg: String| Ok(StartOutcome::refused(msg));
 
     // ---- VALIDATION PHASE (no side effects) --------------------------------
 
@@ -363,27 +374,32 @@ fn start_session(
         fleet.reap(&session); // reuse the id held by a dead corpse (targeted)
     }
 
-    // GENERATION BOUNDARY for tells: a worker id is its goal id and gets
-    // reused, and a tell can only be queued for a LIVE worker (cmd_tell
-    // refuses corpses) — so any tell still pending here was addressed to the
-    // PREVIOUS, now-dead worker under this id. Discard before the spawn:
-    // delivering it to the new generation (via `told` or an ask-answer
-    // piggyback) would apply stale steering to a worker with a different
-    // brief. reap/prune/kill also discard (hygiene), but this pre-spawn point
-    // holds even when the corpse was removed by some other path — and it is
-    // race-safe: cmd_tell can't queue for this id until the worker is alive,
-    // i.e. after the spawn below.
-    crate::mailbox::discard_tells(paths, &session);
+    // GENERATION BOUNDARY: this id is about to be reused, so its previous
+    // generation's per-id state — undelivered tells AND any stale verify — is
+    // retired via the shared hygiene helper. Tells: one can only be queued for
+    // a LIVE worker (cmd_tell refuses corpses), so anything pending here was
+    // addressed to the PREVIOUS, now-dead worker; delivering it to the new
+    // generation (via `told` or an ask-answer piggyback) would apply stale
+    // steering to a worker with a different brief. reap/prune also run this
+    // hygiene, but this pre-spawn point holds even when the corpse was removed
+    // by some other path — and it is race-safe: cmd_tell can't queue for this
+    // id until the worker is alive, i.e. after the spawn below.
+    super::on_generation_end(paths, &session);
 
     // Persist the post-condition BEFORE the spawn: a verify declared for a
-    // worker that dies instantly must still be checked on the next beat. No
-    // verify ⇒ clear any stale one left by a prior corpse with this id.
+    // worker that dies instantly must still be checked on the next beat. (No
+    // verify ⇒ nothing to store; the stale one is already cleared above.)
     // Rolled back (cleared) below if a later commit step fails — a stale
     // verify record for a worker that never launched would fail the NEXT
     // start of this id for the wrong reason.
-    match verify {
-        Some(v) if !v.trim().is_empty() => crate::verify::store(paths, &session, v)?,
-        _ => crate::verify::clear(paths, &session),
+    if let Some(v) = verify.filter(|v| !v.trim().is_empty()) {
+        // Routed through refuse(), not a bare `?`: a store failure here must
+        // reach the decider's LAST FAILURE through the same unified refusal
+        // shape as every other check (a bare Err bypassed it). The hygiene
+        // above is idempotent, so refusing after it leaves no half-state.
+        if let Err(e) = crate::verify::store(paths, &session, v) {
+            return refuse(format!("cannot store the verify command: {e}"));
+        }
     }
 
     // From here on, every failure return rolls back the commit-phase side
@@ -419,10 +435,15 @@ fn start_session(
     // `cd` there inside the shell command instead of mutating looop's own cwd.
     // Export LOOOP_SESSION_ID so the worker knows its OWN session id (for its
     // lease claim, etc.) through a looop-branded var.
+    // `worker_command` always carries `{{prompt_file}}` (build_worker_cmd
+    // enforces it), so the launch reads the brief by PATH and is safe to wrap
+    // in the env-gated retry loop (no-op by default). Group with `{ …; }` so a
+    // multi-statement wrapper stays gated on the `cd` succeeding.
     let launch = format!(
-        "export LOOOP_SESSION_ID={}; cd {} && {cmd}",
+        "export LOOOP_SESSION_ID={}; cd {} && {{ {rcmd} ; }}",
         shell_quote(&session),
-        shell_quote(&paths.data_dir.to_string_lossy())
+        shell_quote(&paths.data_dir.to_string_lossy()),
+        rcmd = crate::runner::wrap_with_retry(&cmd),
     );
 
     // ARCHIVE-THEN-SPAWN: consume the answered resume pair BEFORE launching.
@@ -431,8 +452,19 @@ fn start_session(
     // a worker already running. Archiving first makes a crash lose at most one
     // dispatch (recoverable: the record stays under asks/archive/); if the
     // spawn FAILS we un-archive so the resume signal returns.
+    //
+    // The archive rename IS the resume's CLAIM (exactly one concurrent start
+    // wins — see archive_pair): resume_context above only VALIDATED the pair,
+    // and two starts racing past that validation would otherwise both spawn a
+    // worker carrying the same answer. The loser refuses instead — the guard
+    // rolls back the stored verify, and nothing was spawned.
     if let Some(ask_id) = resume {
-        crate::mailbox::archive_pair(paths, ask_id);
+        if !crate::mailbox::archive_pair(paths, ask_id) {
+            return refuse(format!(
+                "resume {ask_id}: already consumed by a concurrent start (or the pair could \
+                 not be archived)"
+            ));
+        }
         rollback.archived_resume = Some(ask_id); // now armed to un-archive too
     }
 
@@ -489,6 +521,52 @@ mod tests {
         let id = crate::mailbox::ask_detached(&p, "w", "q?", "", &[]).unwrap();
         let out = cmd_start_session(&p, "w", "brief", None, None, Some(&id)).unwrap();
         assert_eq!(out.code, ExitCode::from(1));
+    }
+
+    #[test]
+    fn concurrent_starts_never_double_dispatch_one_resume() {
+        // Regression: resume consumption was validate (resume_context) … then
+        // archive — non-atomic, so two concurrent starts could BOTH pass the
+        // validation and dispatch workers carrying the SAME answered ask. The
+        // archive rename is now the claim gating the spawn (see archive_pair):
+        // exactly one start wins, the loser refuses before spawning.
+        let p = crate::paths::Paths::temp();
+        let _ = crate::seed::ensure_dirs(&p);
+        let id = crate::mailbox::ask_detached(&p, "w", "go?", "", &[]).unwrap();
+        crate::mailbox::answer(&p, &id, "go", false).unwrap();
+        let run = |worker: &str| {
+            let fleet = FakeFleet::with(Vec::new());
+            let out = start_session(&p, &fleet, worker, "brief", None, None, Some(&id)).unwrap();
+            (out, fleet.spawned.borrow().len())
+        };
+        // Distinct worker ids so neither start trips the duplicate-id gate —
+        // the ONLY thing that may serialize them is the resume claim.
+        let ((out_a, spawned_a), (out_b, spawned_b)) = std::thread::scope(|s| {
+            let a = s.spawn(|| run("a"));
+            let b = s.spawn(|| run("b"));
+            (a.join().unwrap(), b.join().unwrap())
+        });
+        let successes = [&out_a, &out_b]
+            .iter()
+            .filter(|o| o.code == ExitCode::SUCCESS)
+            .count();
+        assert_eq!(
+            successes, 1,
+            "exactly one start may consume an answered resume"
+        );
+        assert_eq!(
+            spawned_a + spawned_b,
+            1,
+            "the losing start must never reach the spawn"
+        );
+        let reason = [&out_a, &out_b]
+            .into_iter()
+            .find_map(|o| o.reason.clone())
+            .expect("the loser's refusal names its cause");
+        assert!(
+            reason.contains(&id),
+            "the refusal names the contested ask: {reason}"
+        );
     }
 
     #[test]

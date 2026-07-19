@@ -156,11 +156,20 @@ pub fn cmd_tell(paths: &Paths, args: &crate::cli::TellArgs) -> Result<ExitCode> 
     if msg.is_empty() {
         bail!("tell: empty message");
     }
-    if !crate::session::is_alive(paths, &args.worker) {
-        bail!(
+    // try_is_alive, not the lenient is_alive: an enumeration failure used to
+    // collapse to "dead", and the refusal below would send the operator
+    // chasing a worker that may be perfectly alive. Distinguish the two — an
+    // unreadable fleet is a retryable condition, not evidence of death.
+    match crate::session::try_is_alive(paths, &args.worker) {
+        Ok(true) => {}
+        Ok(false) => bail!(
             "tell {}: not a live worker (a dead worker can never read it — steer via goals or a fresh worker)",
             args.worker
-        );
+        ),
+        Err(e) => bail!(
+            "tell {}: cannot enumerate the fleet ({e}) — cannot confirm the worker is alive; retry",
+            args.worker
+        ),
     }
     let store = FileStore::new(paths);
     // Same collision-safe allocation as asks: exclusive-create, re-scan on loss.
@@ -196,10 +205,7 @@ pub fn cmd_tell(paths: &Paths, args: &crate::cli::TellArgs) -> Result<ExitCode> 
 /// messages queued for it (one per line). Prints nothing when there are none.
 /// `<worker>` defaults to `$LOOOP_SESSION_ID`.
 pub fn cmd_told(paths: &Paths, args: &crate::cli::ToldArgs) -> Result<ExitCode> {
-    let worker = match &args.worker {
-        Some(w) if !w.is_empty() => w.clone(),
-        _ => std::env::var("LOOOP_SESSION_ID").unwrap_or_default(),
-    };
+    let worker = super::common::session_or_env(args.worker.as_deref());
     if worker.is_empty() {
         eprintln!("usage: looop told [worker]  (or run inside a worker with $LOOOP_SESSION_ID)");
         return Ok(ExitCode::from(1));

@@ -132,7 +132,18 @@ impl<'a> LocalContract<'a> {
 /// Warn to stderr and continue.
 fn seed_dirs_warn(paths: &Paths) {
     if let Err(e) = crate::seed::ensure_dirs(paths) {
+        // stderr (NOT util::event): these verbs back `state --json` / `asks
+        // --json`, whose stdout is machine-consumed — util::event writes to
+        // stdout and would corrupt the payload. The durable copy goes to
+        // events.jsonl so the degradation outlives the terminal (best-effort:
+        // the same broken layout may make the append fail too — emit never
+        // errors, and the stderr line still reaches the human).
         eprintln!("looop: warning — could not seed the data layout: {e}");
+        crate::events::emit(
+            paths,
+            "seed_degraded",
+            serde_json::json!({ "error": e.to_string() }),
+        );
     }
 }
 

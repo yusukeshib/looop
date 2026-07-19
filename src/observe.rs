@@ -47,9 +47,10 @@ fn journal_tail(paths: &Paths, n: usize) -> Vec<String> {
     let text = FileStore::new(paths)
         .read(&Key::Journal)
         .unwrap_or_default();
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(n);
-    lines[start..]
+    // Shared tail-slicing core with prompt.rs's tail_lines; VERBATIM here (no
+    // per-line clip) on purpose — `state` serves the journal for machine
+    // consumers, the prompt clips defensively for the decider.
+    crate::prompt::last_lines(&text, n)
         .iter()
         .map(std::string::ToString::to_string)
         .collect()
@@ -179,8 +180,12 @@ fn changed_categories(
 /// that changed. "Something" = a pending ask (return immediately) OR a category
 /// move that passes `filter`. Pure read — never senses, so it can't race the pulse.
 pub(crate) fn wait_for_change(paths: &Paths, filter: WaitFilter) -> Vec<String> {
-    let poll =
-        std::time::Duration::from_millis(util::env_knob("LOOOP_WAIT_POLL_MS").unwrap_or(1000));
+    // Clamped to ≥10ms: `LOOOP_WAIT_POLL_MS=0` would busy-spin a full core
+    // for the whole (potentially unbounded) wait — like every other knob, an
+    // absurd value gets a safe meaning instead of a pathological one.
+    let poll = std::time::Duration::from_millis(
+        util::env_knob("LOOOP_WAIT_POLL_MS").unwrap_or(1000).max(10),
+    );
     // An ask already waiting is actionable for every filter: don't block.
     if !mailbox::pending(paths).is_empty() {
         return vec!["asks".to_string()];

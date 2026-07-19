@@ -16,7 +16,7 @@ mod fsio;
 mod log;
 mod term;
 
-pub(crate) use fsio::flock_file;
+pub(crate) use fsio::{flock_file, sync_parent_dir};
 pub use fsio::{sorted_glob, temp_nonce, write_atomic, write_atomic_mode};
 // NB: `cyan`/`wht` exist in `log` too but are only consumed internally (by
 // `Level::color`) — re-exporting them would trip unused_imports until a
@@ -107,8 +107,10 @@ pub fn safe_segment(kind: &str, seg: &str) -> anyhow::Result<()> {
     if seg.is_empty()
         || seg.contains('/')
         || seg.contains('\\')
+        // Rejecting every dot-leading segment covers dotfiles AND the
+        // traversal names `.`/`..` in one clause — no separate `seg == ".."`
+        // arm is needed (it would be unreachable behind this check).
         || seg.starts_with('.')
-        || seg == ".."
         || seg.chars().any(char::is_whitespace)
         // Control chars (NUL, ESC, …) are not traversal risks but poison file
         // names, log lines, and prompt interpolation (a `\x1b` in a goal id

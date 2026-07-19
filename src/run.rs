@@ -66,20 +66,52 @@ fn interval(env: &str, cfg: &Config, key: &str, fallback: u64) -> u64 {
 
 // ---- durable cadence nudge (.next-wake.json) ---------------------------------
 
+/// The typed shape of `.next-wake.json`. Absent/unreadable/corrupt all read
+/// as "no pending deadline" (same as the old hand-parse): the nudge is a
+/// cadence optimization, never a correctness gate.
+#[derive(serde::Deserialize)]
+struct NextWake {
+    due: u64,
+}
+
+/// The pending next-wake deadline plus the EXACT raw bytes it was read from.
+/// The raw string is what [`consume_next_wake`] compares against — the
+/// compare-and-delete token — so a deadline REWRITTEN during the tick (even
+/// to a different value serialized the same length) is never mistaken for
+/// the one this beat observed.
+fn read_next_wake_entry(paths: &Paths) -> Option<(u64, String)> {
+    let raw = fs::read_to_string(paths.next_wake()).ok()?;
+    let due = serde_json::from_str::<NextWake>(&raw).ok()?.due;
+    Some((due, raw))
+}
+
 /// The pending next-wake deadline (unix secs), if any.
 fn read_next_wake(paths: &Paths) -> Option<u64> {
-    let raw = fs::read_to_string(paths.next_wake()).ok()?;
-    serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()?
-        .get("due")
-        .and_then(serde_json::Value::as_u64)
+    read_next_wake_entry(paths).map(|(due, _)| due)
 }
 
 /// Persist a one-shot cadence nudge as a DEADLINE, not an in-memory flag: a
 /// pulse crash during the sleep no longer loses the follow-up — the next pulse
 /// (or the next loop iteration) sees the file and re-decides once it's due.
+///
+/// Published under the data dir's per-directory writer lock (the same one
+/// FileStore's writer primitives take) so [`consume_next_wake`]'s
+/// compare-and-delete can never race this rename: without the lock, a fresh
+/// deadline could land between the consume's compare and its delete and be
+/// destroyed (exactly the hazard `StateStore::write_atomic` documents).
 fn write_next_wake(paths: &Paths, due: u64) {
     let body = serde_json::json!({ "v": 1, "due": due }).to_string();
+    // Lock failure degrades the CAS guarantee, not the nudge itself — still
+    // publish (losing the timed follow-up outright would be worse).
+    let lock = crate::store::DirLock::acquire(&paths.data_dir);
+    if let Err(e) = &lock {
+        util::event(
+            Level::Warn,
+            "pulse.guard_degraded",
+            &format!("cannot take the writer lock for the next-wake deadline: {e}"),
+            &[],
+        );
+    }
     if let Err(e) = util::write_atomic(&paths.next_wake(), body.as_bytes()) {
         util::event(
             Level::Warn,
@@ -95,14 +127,45 @@ fn write_next_wake(paths: &Paths, due: u64) {
 /// forever if the beat idles out (backoff / budget / config error) before
 /// deciding. The pulse loop consumes it ([`consume_next_wake`]) only AFTER a
 /// tick that actually attempted a decide.
+#[cfg(test)]
 fn next_wake_due(paths: &Paths) -> bool {
     matches!(read_next_wake(paths), Some(due) if crate::util::now_unix() >= due)
 }
 
 /// Consume the nudge — called once a due wake has been HONORED (a decide was
-/// actually attempted this beat, success or failure alike).
-fn consume_next_wake(paths: &Paths) {
-    let _ = fs::remove_file(paths.next_wake());
+/// actually attempted this beat, success or failure alike). COMPARE-AND-DELETE
+/// on the exact raw record the beat observed BEFORE the tick (`observed`,
+/// from [`read_next_wake_entry`]): a tick can run for up to the tick timeout
+/// (30 min default), and an unconditional `remove_file` here would destroy a
+/// FRESH deadline written during it (a schedule/verb nudging the loop
+/// mid-tick) — losing that timed follow-up entirely. Mirrors
+/// `StateStore::remove_if_eq` (there is no `Key` variant addressing
+/// `.next-wake.json`, so the read+compare+delete is done here under the same
+/// per-directory writer lock [`write_next_wake`] publishes with).
+fn consume_next_wake(paths: &Paths, observed: &str) {
+    let Ok(_lock) = crate::store::DirLock::acquire(&paths.data_dir) else {
+        // Cannot serialize the compare — leave the deadline in place. It
+        // re-fires next beat: a duplicate forced re-decide is far cheaper
+        // than deleting a deadline we can't prove is ours. Warn (like
+        // `write_next_wake` does on the same failure): if the lock keeps
+        // failing, every beat force-re-decides, and that must not be silent.
+        util::event(
+            Level::Warn,
+            "pulse.guard_degraded",
+            "cannot lock the data dir to consume the wake deadline — leaving it in place (forced re-decide next beat)",
+            &[],
+        );
+        return;
+    };
+    match fs::read_to_string(paths.next_wake()) {
+        Ok(cur) if cur == observed => {
+            let _ = fs::remove_file(paths.next_wake());
+        }
+        // A FRESH deadline landed mid-tick — not ours to consume.
+        Ok(_) => {}
+        // Already gone (or unreadable — leave it; the next beat retries).
+        Err(_) => {}
+    }
 }
 
 /// The seconds to sleep after a beat: `want` capped to a pending next-wake
@@ -130,6 +193,16 @@ fn clamp_sleep_to_wake(want: u64, due: Option<u64>, now: u64) -> u64 {
 /// would recreate the 1 Hz spin loop it exists to prevent). A fresh deadline
 /// that is ALREADY due clamps to `now` — i.e. wake immediately — which is
 /// exactly what a "wake the loop now" verb wants. `until` only ever shrinks.
+///
+/// KNOWN LIMIT (accepted): "changed" is judged by the deadline VALUE, so a
+/// mid-sleep rewrite carrying the SAME due second as the initial read is
+/// indistinguishable from the leftover and does not re-shorten the sleep.
+/// Reaching that state needs a writer to re-issue an identical deadline
+/// within the same second the sleep started with — and even then the
+/// deadline itself is still honored by [`clamp_sleep_to_wake`] on the next
+/// iteration, so the cost is at most one interval of latency, not a lost
+/// nudge. (The consume side is safe regardless: [`consume_next_wake`]
+/// compares raw bytes, not values.)
 fn recheck_wake_deadline(until: u64, initial_due: Option<u64>, due: Option<u64>, now: u64) -> u64 {
     match due {
         Some(d) if due != initial_due => until.min(d.max(now)),
@@ -261,10 +334,11 @@ fn try_flock(f: &std::fs::File) -> bool {
 /// KNOWN WINDOW: the probe actually TAKES the flock for the instant between
 /// the successful try and the fd drop at the end of this function. A `looop
 /// up` racing exactly into that window would see the lock held and report
-/// "already running" (a false negative for the starter — it just retries).
-/// The window is a few microseconds and the failure mode is benign, so a
-/// probe-without-acquire (which flock(2) simply doesn't offer) isn't worth
-/// the complexity.
+/// "already running" — a false negative for the starter: `up` exits 1 with
+/// the "already running" notice (there is NO automatic retry), and the
+/// operator simply re-runs it. The window is a few microseconds and the
+/// failure mode is benign, so a probe-without-acquire (which flock(2) simply
+/// doesn't offer) isn't worth the complexity.
 pub(crate) fn pulse_running(paths: &Paths) -> bool {
     let Ok(f) = std::fs::File::open(paths.lock().join("lock")) else {
         return false;
@@ -408,15 +482,22 @@ pub fn cmd_run(paths: &Paths) -> Result<ExitCode> {
         // beat to re-decide even over an unchanged world. It is only READ here
         // — consumed after the tick, and only when a decide actually ran, so a
         // beat that idles out (backoff / budget / config error) leaves the
-        // timed follow-up armed for the next beat instead of losing it.
-        let wake_due = next_wake_due(paths);
+        // timed follow-up armed for the next beat instead of losing it. The
+        // RAW record is captured too: the consume below is a compare-and-
+        // delete against exactly what this beat observed, so a fresh deadline
+        // written DURING the (up to 30 min) tick survives it.
+        let wake = read_next_wake_entry(paths);
+        let wake_due = matches!(&wake, Some((due, _)) if crate::util::now_unix() >= *due);
         if wake_due {
             force = true;
         }
         let outcome = tick::tick(paths, force);
         force = false;
-        if wake_due && outcome.decided_or_failed {
-            consume_next_wake(paths);
+        if wake_due
+            && outcome.decided_or_failed
+            && let Some((_, observed)) = &wake
+        {
+            consume_next_wake(paths, observed);
         }
 
         // One-shot AI cadence nudge (clamped 5..3600), persisted as a DEADLINE
@@ -498,10 +579,37 @@ mod tests {
         assert!(next_wake_due(&p), "due-ness is a pure read (not consumed)");
         assert!(p.next_wake().is_file());
 
-        // Explicit consume removes it exactly once.
-        consume_next_wake(&p);
+        // Explicit consume (with the observed record) removes it exactly once.
+        let (_, observed) = read_next_wake_entry(&p).unwrap();
+        consume_next_wake(&p, &observed);
         assert!(!p.next_wake().is_file(), "consumed");
         assert!(!next_wake_due(&p), "one-shot");
+    }
+
+    #[test]
+    fn consume_next_wake_is_a_compare_and_delete() {
+        // Regression: the consume used to be an unconditional remove_file — a
+        // FRESH deadline written DURING the tick (which can run up to 30 min)
+        // was deleted alongside the honored one, silently losing the timed
+        // follow-up.
+        let p = Paths::temp();
+        write_next_wake(&p, 100);
+        let (_, observed) = read_next_wake_entry(&p).unwrap();
+        // A fresh deadline lands "mid-tick" (after the beat's observation)…
+        write_next_wake(&p, 200);
+        consume_next_wake(&p, &observed);
+        assert_eq!(
+            read_next_wake(&p),
+            Some(200),
+            "a deadline written mid-tick survives the consume of the old one"
+        );
+        // …and only a consume carrying the CURRENT record removes it.
+        let (_, current) = read_next_wake_entry(&p).unwrap();
+        consume_next_wake(&p, &current);
+        assert!(!p.next_wake().is_file(), "the observed record is consumed");
+        // Consuming an already-gone deadline is a no-op (idempotent).
+        consume_next_wake(&p, &current);
+        assert!(!p.next_wake().is_file());
     }
 
     #[test]
@@ -532,7 +640,10 @@ mod tests {
         .unwrap();
         let attempted = crate::tick::tick(&p, true);
         assert!(attempted.decided_or_failed, "the runner was launched");
-        consume_next_wake(&p); // what the pulse loop does on decided_or_failed
+        // What the pulse loop does on decided_or_failed: compare-and-delete
+        // with the record it observed before the tick.
+        let (_, observed) = read_next_wake_entry(&p).unwrap();
+        consume_next_wake(&p, &observed);
         assert!(!next_wake_due(&p));
         assert!(!p.next_wake().is_file());
     }

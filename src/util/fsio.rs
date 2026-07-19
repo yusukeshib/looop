@@ -35,9 +35,18 @@ pub(crate) fn flock_file(f: &std::fs::File, block: bool) -> bool {
         }
     }
 }
+/// Non-unix: ALWAYS "acquired" — flock-based exclusion silently degrades to a
+/// no-op. Every mutual-exclusion guarantee built on it (the per-directory
+/// writer lock behind create_exclusive/remove_if_eq, the single-instance pulse
+/// lock, the log-rotation serialization) therefore does NOT hold on non-unix
+/// builds: concurrent writers can race and two pulses can run at once.
+/// Deliberate: looop's supported targets are macOS/Linux (both unix), and a
+/// `compile_error!` here would block even cross-compilation experiments. If a
+/// non-unix target ever becomes real, this stub must be replaced with a real
+/// lock (e.g. LockFileEx) BEFORE trusting any exclusivity claim.
 #[cfg(not(unix))]
 pub(crate) fn flock_file(_f: &std::fs::File, _block: bool) -> bool {
-    true // best-effort: flock-based exclusion is unix-only
+    true
 }
 
 /// A process-wide monotonic nonce for temp-file names. `now_unix()` alone is
@@ -54,16 +63,19 @@ pub fn temp_nonce() -> u64 {
 /// fsync the DIRECTORY containing `path`, so the rename that just landed in it
 /// is durable (a crash after rename can otherwise lose the directory entry).
 /// Unix-only (opening a directory read-only works there); a failure is ignored
-/// by callers that treat durability as best-effort.
+/// by callers that treat durability as best-effort. `pub(crate)`: store.rs's
+/// create_exclusive publishes via its own rename and needs the same dir-sync —
+/// it used to carry a local copy of these lines, and the ONE definition here
+/// keeps the fsync discipline from drifting between the two rename-publishers.
 #[cfg(unix)]
-fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::File::open(dir)?.sync_all()?;
     }
     Ok(())
 }
 #[cfg(not(unix))]
-fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
+pub(crate) fn sync_parent_dir(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 

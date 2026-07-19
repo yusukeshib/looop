@@ -155,8 +155,10 @@ pub fn clip_ansi(s: &str, max: usize) -> String {
 /// no-op unless color (ANSI) is enabled: JSON mode and `NO_COLOR` streams stay
 /// byte-clean, and a non-PTY consumer never sees stray carriage returns.
 ///
-/// STDOUT INTERLEAVING: the spinner repaints via raw `print!` with no lock
-/// against `util::event`'s `println!`. The callers uphold the invariant that
+/// STDOUT INTERLEAVING: the spinner repaints via `write!` on a per-write
+/// stdout lock (EPIPE-safe); the lock is per-write, not per-line-transaction,
+/// so it does NOT order the spinner against `util::event`'s output on its
+/// own. The callers uphold the invariant that
 /// NO events are printed while a spinner is live — it wraps exactly one
 /// silent wait and is dropped before the outcome event (see the matching note
 /// on [`super::event`]).
@@ -169,6 +171,7 @@ impl Spinner {
     /// Start the indicator (no-op when color is off). `label` is a short verb
     /// phrase, e.g. `"pi is deciding"`.
     pub fn start(label: &str) -> Self {
+        use std::io::Write;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         let stop = Arc::new(AtomicBool::new(false));
@@ -186,7 +189,17 @@ impl Spinner {
                 // line/sec). Poll `stop` in 100ms steps so drop() is responsive.
                 while !stop.load(Ordering::Relaxed) {
                     let secs = t0.elapsed().as_secs();
-                    print!("\r{}[{ts}] {label} {secs}s{}", dim(), rst());
+                    // `write!`, never `print!`: print! panics on a write
+                    // error, and this stdout is routinely a pipe whose reader
+                    // can vanish — an EPIPE inside the repaint thread must
+                    // not abort the long-lived pulse (observability must
+                    // never fail a beat; see util::event / events.rs).
+                    let _ = write!(
+                        std::io::stdout().lock(),
+                        "\r{}[{ts}] {label} {secs}s{}",
+                        dim(),
+                        rst()
+                    );
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                     for _ in 0..10 {
                         if stop.load(Ordering::Relaxed) {
@@ -205,12 +218,15 @@ impl Spinner {
 
 impl Drop for Spinner {
     fn drop(&mut self) {
+        use std::io::Write;
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
             // Erase the spinner line (CR + clear-to-end-of-line) so the next
-            // structured event prints on a clean line.
-            print!("\r\x1b[2K");
+            // structured event prints on a clean line. `write!`, not `print!`:
+            // an EPIPE on a dead pipe must not panic inside a Drop (which
+            // would abort the process outright if it fired during an unwind).
+            let _ = write!(std::io::stdout().lock(), "\r\x1b[2K");
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
     }

@@ -62,10 +62,14 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
     // same normalized {signal,detail} error blob — rename-published via
     // write_atomic, never a torn plain write — so the decider sees the failure
     // instead of an unexplained blank/partial world. The dead tmp is dropped.
-    let fail_blob = |rc: i32, msg: String| -> i32 {
+    // `stderr` is passed IN rather than read inside: only the caller knows
+    // whether the `.err` file was (re)created for THIS run — blindly tailing
+    // it here attributed a PREVIOUS beat's leftover stderr to the current
+    // failure when the capture files could not be created at all.
+    let fail_blob = |rc: i32, msg: String, stderr: String| -> i32 {
         let blob = serde_json::json!({
             "signal": { "error": true, "exit_code": rc },
-            "detail": { "message": msg, "stderr": read_tail(err, 1024) },
+            "detail": { "message": msg, "stderr": stderr },
         });
         let _ = util::write_atomic(out, format!("{blob}\n").as_bytes());
         let _ = fs::remove_file(&tmp);
@@ -76,8 +80,17 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
         (Ok(of), Ok(ef)) => (of, ef),
         // Best-effort: if the capture file itself is uncreatable the blob
         // write below likely fails too, but a failing .err file alone must
-        // not silently blank the snapshot.
-        _ => return fail_blob(1, "cannot create sensor capture files".to_string()),
+        // not silently blank the snapshot. stderr is EMPTY here, not a tail
+        // of the `.err` path: the file was not (re)created for this run, so
+        // any content there is a STALE leftover from a previous beat —
+        // surfacing it would misattribute an old error to this failure.
+        _ => {
+            return fail_blob(
+                1,
+                "cannot create sensor capture files".to_string(),
+                String::new(),
+            );
+        }
     };
 
     let mut cmd = Command::new(script);
@@ -95,6 +108,9 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
             return fail_blob(
                 1,
                 format!("spawn failed: {e} — check the script's exec bit and shebang"),
+                // The `.err` file WAS truncated-fresh above, so its tail is
+                // genuinely this run's stderr (empty on a spawn failure).
+                read_tail(err, 1024),
             );
         }
     };
@@ -173,7 +189,7 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
         } else {
             "sensor exited non-zero — fix the script or its environment".to_string()
         };
-        return fail_blob(rc, msg);
+        return fail_blob(rc, msg, read_tail(err, 1024));
     }
 
     // Context backpressure: a successful reading over the cap is replaced with a
@@ -207,6 +223,7 @@ fn exec_sensor(script: &Path, out: &Path, err: &Path) -> i32 {
         return fail_blob(
             1,
             "cannot publish the sensor snapshot (rename failed)".to_string(),
+            read_tail(err, 1024),
         );
     }
     rc

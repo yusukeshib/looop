@@ -51,6 +51,23 @@ pub fn cmd_up(paths: &Paths, json: bool) -> Result<ExitCode> {
     // (the same gate the plumbing verbs get via dispatch, run here after the init
     // check so the messages surface in the right order).
     crate::deps::require_deps(paths)?;
+    // Startup lease: serialize the whole check-then-spawn below. Two
+    // concurrent `looop up`s could BOTH read "no pulse" from the fleet
+    // snapshot and both spawn — one pulse then loses the inner flock race and
+    // lingers as a confusing half-started corpse (TOCTOU). The lease is the
+    // per-directory writer lock on the pulse's lock dir: a blocking flock, so
+    // the loser simply WAITS and then sees the winner's live pulse ("already
+    // running"). flock (not a `StateStore::create_exclusive` lease file,
+    // which has no Key for this) because it is kernel-managed — released on
+    // ANY exit, `kill -9` included, so there is never a stale lease to reap.
+    // Held until `_up_lease` drops at the end of this function.
+    let _up_lease = match crate::store::DirLock::acquire(&paths.lock()) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("looop: cannot take the startup lease ({e}) — refusing to start the pulse");
+            return Ok(ExitCode::from(1));
+        }
+    };
     // Enumerate the fleet ONCE, failing CLOSED: the lenient `is_alive` maps
     // an enumeration error to "no pulse", and spawning on that reading boots
     // a SECOND pulse whose inner loop then loses the flock race — a confusing
@@ -228,6 +245,36 @@ mod tests {
     use super::{
         PULSE_NOT_OBSERVED_WARNING, PULSE_SURVIVED_WARNING, WORKERS_SURVIVED_WARNING, down_summary,
     };
+
+    /// The `looop up` startup lease serializes concurrent starters: while one
+    /// holds it, a second acquire BLOCKS (flock LOCK_EX) until the first
+    /// releases — so the check-then-spawn can never interleave and double-
+    /// spawn the pulse. Timing-based, with a generous margin: the second
+    /// acquire must observably wait for the drop of the first.
+    #[test]
+    fn up_lease_blocks_a_concurrent_starter_until_released() {
+        let p = crate::paths::Paths::temp();
+        let lease = crate::store::DirLock::acquire(&p.lock()).expect("first lease");
+        let dir = p.lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            // flock conflicts across separate open fds even within one
+            // process, so this genuinely queues behind the holder.
+            let _second = crate::store::DirLock::acquire(&dir).expect("second lease");
+            tx.send(std::time::Instant::now()).unwrap();
+        });
+        let held_until = std::time::Instant::now() + std::time::Duration::from_millis(300);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(lease);
+        let acquired_at = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the second starter must eventually acquire the lease");
+        waiter.join().unwrap();
+        assert!(
+            acquired_at >= held_until,
+            "the second acquire must block until the first lease is released"
+        );
+    }
 
     /// `looop down` never claims a stop it didn't perform: with no live pulse
     /// the summary is the observed "not running", not a fabricated "stopped".

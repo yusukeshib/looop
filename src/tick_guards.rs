@@ -20,6 +20,7 @@
 
 use crate::events;
 use crate::paths::Paths;
+use crate::statefile::{StateRead, read_state};
 use crate::util::{self, Level};
 use std::fs;
 use std::path::PathBuf;
@@ -63,14 +64,28 @@ enum BackoffRead {
     Parsed(String, u32, u64),
 }
 
+/// The typed shape of `.tick-backoff`. `hash` is REQUIRED (a record without
+/// the policy hash carries nothing to gate a steering-edit retry on);
+/// `fails`/`ts` default to 0 like the old hand-parse. A record whose fields
+/// carry the WRONG TYPE now reads as Corrupt wholesale (the old per-field
+/// `unwrap_or(0)` silently zeroed it) — strictly MORE conservative, since
+/// Corrupt resumes from [`BACKOFF_CORRUPT_FAILS`] instead of fails=0.
+#[derive(serde::Deserialize)]
+struct BackoffState {
+    hash: String,
+    #[serde(default)]
+    fails: u32,
+    #[serde(default)]
+    ts: u64,
+}
+
 fn read_backoff_raw(paths: &Paths) -> BackoffRead {
-    let raw = match fs::read_to_string(backoff_path(paths)) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return BackoffRead::Absent,
+    match read_state::<BackoffState>(&backoff_path(paths)) {
+        StateRead::Absent => BackoffRead::Absent,
         // Present but unreadable (EACCES/EIO/…): the state file EXISTS, so
         // restarting at 1 would fail OPEN just like a parse error. Treat it as
         // CORRUPT so record_backoff resumes from BACKOFF_CORRUPT_FAILS.
-        Err(e) => {
+        StateRead::Unreadable(e) => {
             util::event(
                 Level::Warn,
                 "tick.guard_degraded",
@@ -81,36 +96,56 @@ fn read_backoff_raw(paths: &Paths) -> BackoffRead {
                 ),
                 &[],
             );
-            return BackoffRead::Corrupt;
+            BackoffRead::Corrupt
         }
-    };
-    let parsed = serde_json::from_str::<serde_json::Value>(&raw)
-        .ok()
-        .and_then(|v| {
-            let hash = v.get("hash")?.as_str()?.to_string();
-            let fails = v
-                .get("fails")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0) as u32;
-            let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
-            Some((hash, fails, ts))
-        });
-    match parsed {
-        Some((hash, fails, ts)) => BackoffRead::Parsed(hash, fails, ts),
-        None => BackoffRead::Corrupt,
+        StateRead::Corrupt(_) => BackoffRead::Corrupt,
+        StateRead::Parsed(s) => BackoffRead::Parsed(s.hash, s.fails, s.ts),
     }
 }
 
 /// Read backoff state as `(policy_hash, consecutive_fails, last_fail_unix)`.
 /// The stored hash is the POLICY hash (PLAYBOOK + goals) as of the last failed
 /// beat — a change there means the human steered and the wait may be cut short.
-/// `None` when absent/unparseable — a corrupt record carries no usable ts/hash
-/// to gate on, so no wait is enforced for it here; the NEXT failure's
-/// [`record_backoff`] repairs the count conservatively instead of resetting it.
+/// `None` only when ABSENT.
+///
+/// A CORRUPT record fails CLOSED: the old `None` skipped the exponential WAIT
+/// entirely (the counter was only repaired on the next failure, so state
+/// corruption bought a free full-rate retry). The record carries no usable
+/// ts/hash, so we assume `ts = now` and [`BACKOFF_CORRUPT_FAILS`] fails — and
+/// REPAIR the file with that well-formed record (stamped with the CURRENT
+/// policy hash, so a human steering edit still cuts the wait short). Without
+/// the persisted repair, every read would re-assume `ts = now` and the wait
+/// would never elapse.
 pub(crate) fn read_backoff(paths: &Paths) -> Option<(String, u32, u64)> {
     match read_backoff_raw(paths) {
         BackoffRead::Parsed(hash, fails, ts) => Some((hash, fails, ts)),
-        BackoffRead::Absent | BackoffRead::Corrupt => None,
+        BackoffRead::Absent => None,
+        BackoffRead::Corrupt => {
+            let policy = crate::worldhash::policy_hash(paths);
+            let ts = util::now_unix();
+            util::event(
+                Level::Warn,
+                "tick.guard_degraded",
+                &format!(
+                    "backoff state file is corrupt — imposing the conservative wait \
+                     ({BACKOFF_CORRUPT_FAILS} fails from now) instead of skipping the backoff"
+                ),
+                &[],
+            );
+            let body = serde_json::json!({
+                "v": 1, "hash": policy, "fails": BACKOFF_CORRUPT_FAILS, "ts": ts
+            })
+            .to_string();
+            if let Err(e) = util::write_atomic(&backoff_path(paths), body.as_bytes()) {
+                util::event(
+                    Level::Warn,
+                    "tick.guard_degraded",
+                    &format!("failed to repair the corrupt backoff record: {e}"),
+                    &[],
+                );
+            }
+            Some((policy, BACKOFF_CORRUPT_FAILS, ts))
+        }
     }
 }
 
@@ -171,8 +206,8 @@ pub(crate) fn noop_ttl_secs() -> u64 {
 
 /// Record that the latest decision was a noop at `hash` (or clear it for any
 /// other action — a real move resets the revisit clock).
-pub(crate) fn record_noop(paths: &Paths, kind: &str, hash: &str) {
-    if kind == "noop" {
+pub(crate) fn record_noop(paths: &Paths, kind: crate::executor::ActionKind, hash: &str) {
+    if kind == crate::executor::ActionKind::Noop {
         let body = serde_json::json!({ "v": 1, "ts": util::now_unix(), "hash": hash }).to_string();
         let _ = util::write_atomic(&paths.noop_at(), body.as_bytes());
     } else {
@@ -188,15 +223,23 @@ pub(crate) fn noop_revisit_due(paths: &Paths, hash: &str) -> bool {
     if ttl == 0 {
         return false;
     }
-    let Ok(raw) = fs::read_to_string(paths.noop_at()) else {
+    /// The typed shape of `.noop-at`. `ts` defaults to 0 (an aged, i.e.
+    /// revisit-due, record) and `hash` to None (never matches — no bypass),
+    /// matching the old hand-parse exactly.
+    #[derive(serde::Deserialize)]
+    struct NoopState {
+        #[serde(default)]
+        ts: u64,
+        #[serde(default)]
+        hash: Option<String>,
+    }
+    // Absent/unreadable/corrupt all mean "no usable noop record" here — the
+    // bypass simply doesn't fire (the safe direction: normal skip rules).
+    let StateRead::Parsed(v) = read_state::<NoopState>(&paths.noop_at()) else {
         return false;
     };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
-        return false;
-    };
-    let same = v.get("hash").and_then(|h| h.as_str()) == Some(hash);
-    let ts = v.get("ts").and_then(serde_json::Value::as_u64).unwrap_or(0);
-    same && util::now_unix().saturating_sub(ts) >= ttl
+    let same = v.hash.as_deref() == Some(hash);
+    same && util::now_unix().saturating_sub(v.ts) >= ttl
 }
 
 // ---- flapping-sensor detection --------------------------------------------------
@@ -220,6 +263,17 @@ fn flap_streak_threshold() -> u32 {
 /// beats is surfaced in the prompt (`FLAPPING SENSORS`) for the decider to fix
 /// (move the volatile fields to `.detail`) and warned once when crossing the
 /// threshold.
+///
+/// KNOWN DETECTION GAP (accepted): the ledger below is rebuilt from the
+/// snapshots present THIS beat, so an entry whose snapshot is ABSENT for one
+/// beat vanishes immediately — an appear/disappear-type flapper (a sensor
+/// whose snapshot alternates between existing and not existing) re-baselines
+/// at streak 0 on every reappearance and is never flagged, even though each
+/// flip moves the world hash and costs a decide. Detecting it would need
+/// tombstones for missing entries plus an expiry for genuinely-removed
+/// sensors; the hourly decide cap still bounds the spend, so the extra
+/// machinery isn't worth it. Documented so the gap is a decision, not a
+/// surprise.
 pub(crate) fn update_flap(
     paths: &Paths,
     items: &std::collections::BTreeMap<String, String>,
@@ -228,15 +282,21 @@ pub(crate) fn update_flap(
     if threshold == 0 {
         return Vec::new();
     }
-    let prev: serde_json::Value = fs::read_to_string(paths.flap_state())
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or(serde_json::Value::Null);
-    let prev_snaps = prev
-        .get("snaps")
-        .and_then(|v| v.as_object())
-        .cloned()
-        .unwrap_or_default();
+    /// The typed OUTER shape of the flap ledger. The per-snapshot entries stay
+    /// `serde_json::Value` deliberately: [`update_flap`] tolerates a corrupt
+    /// `last`/`streak` PER ENTRY (re-baseline that one sensor), and a typed
+    /// entry struct would escalate one bad entry into whole-ledger corruption.
+    #[derive(serde::Deserialize, Default)]
+    struct FlapLedger {
+        #[serde(default)]
+        snaps: serde_json::Map<String, serde_json::Value>,
+    }
+    // Absent/unreadable/corrupt ledger ⇒ empty baseline (silently, as before:
+    // the ledger is advisory and rebuilt every beat).
+    let prev_snaps = match read_state::<FlapLedger>(&paths.flap_state()) {
+        StateRead::Parsed(l) => l.snaps,
+        _ => Default::default(),
+    };
 
     let mut snaps = serde_json::Map::new();
     let mut flapping = Vec::new();
@@ -367,19 +427,20 @@ pub(crate) fn decide_cap_per_hour() -> u64 {
 /// the ledger (there is nothing to salvage) but WARNS instead of resetting
 /// the cap silently. An absent file is a fresh ledger, not corruption.
 pub(crate) fn read_decide_ledger(paths: &Paths) -> Vec<u64> {
+    // Entries stay `serde_json::Value` (not `u64`) so ONE corrupt entry costs
+    // only itself — see the doc above.
     #[derive(serde::Deserialize)]
     struct Ledger {
         #[serde(default)]
         ts: Vec<serde_json::Value>,
     }
-    let raw = match fs::read_to_string(paths.decide_ledger()) {
-        Ok(raw) => raw,
+    let ledger = match read_state::<Ledger>(&paths.decide_ledger()) {
         // Absent file: a fresh ledger, not corruption — stay quiet.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        StateRead::Absent => return Vec::new(),
         // Present but unreadable (EACCES/EIO/…): the ledger EXISTS, so silently
         // returning empty would fail-open. WARN and restart empty (there is
         // nothing to salvage), matching whole-file corruption discipline.
-        Err(e) => {
+        StateRead::Unreadable(e) => {
             util::event(
                 Level::Warn,
                 "tick.guard_degraded",
@@ -388,10 +449,7 @@ pub(crate) fn read_decide_ledger(paths: &Paths) -> Vec<u64> {
             );
             return Vec::new();
         }
-    };
-    let ledger: Ledger = match serde_json::from_str(&raw) {
-        Ok(l) => l,
-        Err(e) => {
+        StateRead::Corrupt(e) => {
             util::event(
                 Level::Warn,
                 "tick.guard_degraded",
@@ -400,6 +458,7 @@ pub(crate) fn read_decide_ledger(paths: &Paths) -> Vec<u64> {
             );
             return Vec::new();
         }
+        StateRead::Parsed(l) => l,
     };
     let ts: Vec<u64> = ledger
         .ts
@@ -610,17 +669,46 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_backoff_state_resumes_conservatively_instead_of_resetting() {
-        // Regression: a present-but-unparseable backoff file used to read as
-        // None, and record_backoff restarted the count at 1 — state
-        // corruption reset the exponential backoff (fail-open).
+    fn corrupt_backoff_state_imposes_the_conservative_wait_and_repairs_the_record() {
+        // Regression (two generations): a present-but-unparseable backoff file
+        // first reset the fail count to 1 (fail-open), then — after the count
+        // repair — still SKIPPED the exponential wait until the next failure
+        // rewrote the record. It must now fail fully CLOSED: the read itself
+        // imposes a conservative window (ts = now, BACKOFF_CORRUPT_FAILS
+        // fails) and persists the repaired record so the wait actually
+        // elapses instead of being re-assumed from "now" every beat.
         let p = Paths::temp();
         let _ = crate::seed::ensure_dirs(&p);
         fs::write(p.data_dir.join(".tick-backoff"), b"{not json").unwrap();
-        assert!(
-            read_backoff(&p).is_none(),
-            "a corrupt record carries no usable ts/hash to gate on"
+        let (hash, fails, ts) = read_backoff(&p).expect("corrupt reads as a conservative record");
+        assert_eq!(
+            fails, BACKOFF_CORRUPT_FAILS,
+            "the wait is imposed, not skipped"
         );
+        assert!(
+            util::now_unix().saturating_sub(ts) <= 2,
+            "ts is assumed 'now' so the window starts from the corruption sighting"
+        );
+        assert_eq!(
+            hash,
+            crate::worldhash::policy_hash(&p),
+            "the repair stamps the CURRENT policy hash so a steering edit still cuts the wait"
+        );
+        // The repair is PERSISTED (well-formed on disk now): a next failure
+        // increments normally instead of re-triggering the corrupt path.
+        let (h2, f2, _) = read_backoff(&p).expect("the repaired record round-trips");
+        assert_eq!((h2, f2), (hash, BACKOFF_CORRUPT_FAILS));
+        assert_eq!(record_backoff(&p, "h"), BACKOFF_CORRUPT_FAILS + 1);
+    }
+
+    #[test]
+    fn record_backoff_on_a_corrupt_record_resumes_conservatively() {
+        // record_backoff hits a still-corrupt file only when no read_backoff
+        // repaired it first (e.g. a failure recorded outside the beat's wait
+        // gate). It must resume from the conservative count, not restart at 1.
+        let p = Paths::temp();
+        let _ = crate::seed::ensure_dirs(&p);
+        fs::write(p.data_dir.join(".tick-backoff"), b"{not json").unwrap();
         assert_eq!(
             record_backoff(&p, "h"),
             BACKOFF_CORRUPT_FAILS,
@@ -665,7 +753,7 @@ mod tests {
         assert!(!noop_revisit_due(&p, "h1"));
 
         // Fresh noop at h1: not due yet.
-        record_noop(&p, "noop", "h1");
+        record_noop(&p, crate::executor::ActionKind::Noop, "h1");
         assert!(!noop_revisit_due(&p, "h1"));
 
         // Age the record past the TTL: due at the SAME hash only.
@@ -685,7 +773,7 @@ mod tests {
         );
 
         // A real (non-noop) decision clears the record.
-        record_noop(&p, "goal", "h1");
+        record_noop(&p, crate::executor::ActionKind::Goal, "h1");
         assert!(!p.noop_at().is_file());
         assert!(!noop_revisit_due(&p, "h1"));
     }

@@ -11,6 +11,12 @@ static JSON: OnceLock<bool> = OnceLock::new();
 /// structured object per line) instead of the human-pretty `[HH:MM:SS] …` form.
 /// Driven by `$LOOOP_LOG_FORMAT=json`. Exported so the detached pulse worker and
 /// any child inherit the decision (so a watcher of the pulse log sees a clean stream).
+///
+/// SAFETY CONTRACT: must be called BEFORE any thread is spawned. The exporting
+/// `set_var` below is `unsafe` precisely because a concurrent `getenv` from
+/// another thread is UB on some platforms — main() calls this first thing,
+/// while the process is still single-threaded, and that ordering is what makes
+/// the call sound.
 pub fn init_format() {
     let json = matches!(std::env::var("LOOOP_LOG_FORMAT").as_deref(), Ok("json"));
     let _ = JSON.set(json);
@@ -111,9 +117,20 @@ impl Level {
 /// mid-spinner would splice it into the repaint line; if that ever becomes a
 /// need, take a shared stdout lock in both paths instead.
 pub fn event(level: Level, event: &str, msg: &str, fields: &[(&str, serde_json::Value)]) {
+    use std::io::Write;
+    // Every stdout write in here is `let _ = writeln!(…)`, never `println!`:
+    // println! PANICS on a write error, and the pulse's stdout is routinely a
+    // pipe whose reader can go away (a detached `looop logs -f`, a crashed
+    // watcher) — an EPIPE would then abort the long-lived pulse from inside a
+    // LOG line. Same principle as events.rs: observability must never fail a
+    // beat. A lost log line on a dead pipe is the correct outcome.
     if is_json() {
         let ts = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
-        println!("{}", json_event_line(&ts, level, event, msg, fields));
+        let _ = writeln!(
+            std::io::stdout().lock(),
+            "{}",
+            json_event_line(&ts, level, event, msg, fields)
+        );
         return;
     }
     // Human mode is a *rendering* of the structured event, not a dump of it.
@@ -124,13 +141,29 @@ pub fn event(level: Level, event: &str, msg: &str, fields: &[(&str, serde_json::
     if matches!(level, Level::Info | Level::Step) {
         // Heartbeat & transient "starting" steps: the whole line is dim so it
         // sits quietly in the background and lets the OUTCOME stand out.
-        println!("{}[{}] {}{}", dim(), super::hms(), msg, rst());
+        let _ = writeln!(
+            std::io::stdout().lock(),
+            "{}[{}] {}{}",
+            dim(),
+            super::hms(),
+            msg,
+            rst()
+        );
         return;
     }
     // Outcomes (ok / warn / error): dim timestamp, then the message tinted by
     // the level color (no bold) so it carries the importance the glyph used to.
     let c = level.color();
-    println!("{}[{}]{} {}{}{}", dim(), super::hms(), rst(), c, msg, rst());
+    let _ = writeln!(
+        std::io::stdout().lock(),
+        "{}[{}]{} {}{}{}",
+        dim(),
+        super::hms(),
+        rst(),
+        c,
+        msg,
+        rst()
+    );
 }
 
 /// Build one NDJSON object line for a structured event. Always carries the
@@ -152,6 +185,14 @@ fn json_event_line(
     obj.insert("event".into(), serde_json::Value::String(event.into()));
     obj.insert("msg".into(), serde_json::Value::String(msg.into()));
     for (k, v) in fields {
+        // The reserved keys are the line's INTEGRITY: a caller field named
+        // `ts`/`level`/`event`/`msg` (typo or an attacker-influenced field
+        // name reaching a call site) must not be able to overwrite the
+        // timestamp or relabel the event a watcher filters on. Skip, keep the
+        // reserved value (same rule as events::emit).
+        if matches!(*k, "ts" | "level" | "event" | "msg") {
+            continue;
+        }
         obj.insert((*k).to_string(), v.clone());
     }
     serde_json::Value::Object(obj).to_string()
@@ -237,6 +278,32 @@ mod tests {
             warn_knob_once("LOOOP_TEST_KNOB_B"),
             "deduplication is per key, not global"
         );
+    }
+
+    #[test]
+    fn caller_fields_cannot_override_reserved_keys() {
+        // Regression: a caller field named like a reserved key used to
+        // overwrite it — a `ts` field could forge the timestamp, an `event`
+        // field could relabel the line a watcher filters on.
+        let line = json_event_line(
+            "2026-01-02T03:04:05Z",
+            Level::Ok,
+            "tick.decided",
+            "real message",
+            &[
+                ("ts", serde_json::json!("1999-01-01T00:00:00Z")),
+                ("event", serde_json::json!("forged")),
+                ("level", serde_json::json!("error")),
+                ("msg", serde_json::json!("forged msg")),
+                ("extra", serde_json::json!(1)),
+            ],
+        );
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["ts"], "2026-01-02T03:04:05Z");
+        assert_eq!(v["event"], "tick.decided");
+        assert_eq!(v["level"], "ok");
+        assert_eq!(v["msg"], "real message");
+        assert_eq!(v["extra"], 1, "non-reserved fields still merge");
     }
 
     #[test]

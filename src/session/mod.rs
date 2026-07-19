@@ -30,9 +30,15 @@ mod present;
 // exactly the genuinely-unnamed items — a blanket allow over the whole list
 // would hide a future dead-re-export warning for the used ones too.
 pub use fleet::{
-    PULSE_SESSION, await_alive, is_alive, kill_quiet, list, list_workers, output_idle_secs,
-    prune_aged, reap, run_detached_worker, spawn_detached, status_exists, try_is_alive, try_list,
+    PULSE_SESSION, await_alive, is_alive, kill_quiet, list_workers, output_idle_secs, prune_aged,
+    reap, run_detached_worker, spawn_detached, status_exists, try_is_alive, try_list,
 };
+// `list` (the lenient enumerate) lost its last non-test consumer outside this
+// module when gate.rs's claim verbs went fail-closed (try_list/try_is_alive);
+// the launch tests still name it to pin the lenient-vs-strict split, so the
+// re-export stays — on its own allowed line, same policy as Session/kill below.
+#[allow(unused_imports)]
+pub use fleet::list;
 #[allow(unused_imports)]
 pub use fleet::{Session, kill};
 #[allow(unused_imports)]
@@ -40,3 +46,21 @@ pub use launch::StartOutcome;
 pub use launch::cmd_start_session;
 pub(crate) use plumbing::suppress_stdout;
 pub use present::{cmd_kill, cmd_screenshot, cmd_worker_list};
+
+/// GENERATION-BOUNDARY hygiene, shared by every path that retires a worker
+/// id's per-generation state: worker ids ARE goal ids and get reused, so
+/// state addressed to a dead generation must never leak into its successor —
+/// a stale verify record would judge the new worker against the old
+/// post-condition (or fail its start for the wrong reason), and an
+/// undelivered tell would steer a worker with a different brief.
+///
+/// Callers: [`fleet::reap`] and [`fleet::prune_aged`] (the corpse's session
+/// record is removed, so a verify verdict would be unattributable anyway) and
+/// the pre-spawn point of `cmd_start_session` (the id is about to be reused).
+/// `cmd_kill` is deliberately NOT one of them: a killed worker's session
+/// record survives, so its verify obligation stays attributable and must
+/// still be judged by the next reconcile — kill discards only the tells.
+pub(crate) fn on_generation_end(paths: &crate::paths::Paths, id: &str) {
+    crate::verify::clear(paths, id);
+    crate::mailbox::discard_tells(paths, id);
+}

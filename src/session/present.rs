@@ -189,6 +189,9 @@ pub fn cmd_kill(paths: &Paths, id: &str) -> Result<ExitCode> {
     kill(paths, &session)?;
     // The worker is dead by fiat: any tell it never drained is now addressed
     // to a corpse and must not linger for a future worker reusing the id.
+    // Deliberately NOT session::on_generation_end — the killed worker's
+    // session record survives, so its verify obligation stays attributable
+    // and must still be judged by the next reconcile (see on_generation_end).
     crate::mailbox::discard_tells(paths, &session);
     Ok(ExitCode::SUCCESS)
 }

@@ -241,12 +241,20 @@ fn most_neglected_goal(paths: &Paths) -> Option<String> {
     })
 }
 
-fn tail_lines(text: &str, n: usize) -> String {
+/// The last `n` lines of `text`, unclipped. Shared tail-slicing core for this
+/// module's [`tail_lines`] (which adds a per-line clip for the prompt) and
+/// observe.rs's `journal_tail` (which serves lines verbatim for `state`) —
+/// the callers keep their deliberate clip/no-clip difference.
+pub(crate) fn last_lines(text: &str, n: usize) -> Vec<&str> {
     let lines: Vec<&str> = text.lines().collect();
     let start = lines.len().saturating_sub(n);
+    lines[start..].to_vec()
+}
+
+fn tail_lines(text: &str, n: usize) -> String {
     // Per-line clip: one pathological (LLM- or tool-written) journal line must
     // not dominate the prompt — the journal is a terse audit trail.
-    lines[start..]
+    last_lines(text, n)
         .iter()
         .map(|l| clip(l, JOURNAL_LINE_MAX))
         .collect::<Vec<_>>()
@@ -450,6 +458,54 @@ fn push_section(out: &mut String, title: &str, body: &str) {
     }
 }
 
+/// One count-unbounded item list under the aggregate prompt budget: append
+/// each rendered item to `sec` until the FIRST item that would push the
+/// prompt (`used` bytes assembled so far + `sec` + the item) past `budget`,
+/// then stop and write a visible truncation marker. STOP, not skip: a
+/// skip-on-overflow `continue` would admit a later SMALLER item after an
+/// earlier one was dropped, making survival depend on body size instead of
+/// the list's deterministic order. The iterator is consumed lazily, so
+/// bodies past the cut are never even read. Saturating adds: `budget` may be
+/// usize::MAX (= no limit).
+///
+/// `kind` labels the omission in the oversize warn event; `noun` is the
+/// human-facing word in the in-prompt marker; `hint` is the per-section
+/// remediation suffix. Extracted because the four budgeted sections (goals,
+/// sensor readings, pending asks, answered asks) each carried a copy of this
+/// loop — four copies of one policy invited them to drift apart.
+// The parameter count is the honest shape of the shared policy (prompt state,
+// budget, item stream, and three labelling knobs) — a builder/struct here
+// would be ceremony for one private helper with four call sites.
+#[allow(clippy::too_many_arguments)]
+fn budgeted_section(
+    used: usize,
+    sec: &mut String,
+    budget: usize,
+    total: usize,
+    items: impl Iterator<Item = String>,
+    kind: &'static str,
+    noun: &str,
+    hint: &str,
+    oversize: &mut Vec<(&'static str, usize)>,
+) {
+    let mut omitted = 0usize;
+    for (i, item) in items.enumerate() {
+        if used.saturating_add(sec.len()).saturating_add(item.len()) > budget {
+            omitted = total - i;
+            break;
+        }
+        sec.push_str(&item);
+    }
+    if omitted > 0 {
+        let _ = writeln!(
+            sec,
+            "(section truncated: {omitted} {noun} omitted — the prompt exceeded \
+             LOOOP_PROMPT_MAX_BYTES{hint})"
+        );
+        oversize.push((kind, omitted));
+    }
+}
+
 /// Minimal injection hardening for INTERPOLATED, untrusted bodies (goal text,
 /// ask prompts, the journal tail): a line starting with `===` could forge a
 /// section boundary, and a line starting with `---` could forge an ITEM
@@ -538,15 +594,15 @@ fn build_prompt_budgeted(
         )),
     );
 
-    // GOALS.
+    // GOALS. (Budgeted — see [`budgeted_section`] for the stop-not-skip
+    // truncation policy shared by every count-unbounded list below.)
     let goals = store.list(&Collection::Goals);
     let mut sec = String::new();
-    let mut omitted = 0usize;
     if goals.is_empty() {
         sec.push_str("(no goals yet)\n");
     } else {
         let total = goals.len();
-        for (i, id) in goals.into_iter().enumerate() {
+        let items = goals.into_iter().map(|id| {
             // The id is a filename, but exotic filesystems allow newlines in
             // filenames — escape it so an id's SECOND line can't forge a
             // section header (the separator's own leading `---` stays real).
@@ -557,38 +613,24 @@ fn build_prompt_budgeted(
                 GOAL_BODY_MAX,
             )));
             item.push('\n');
-            // Aggregate budget: the FIRST item that would exceed it stops the
-            // section — it and every remaining item are counted and dropped
-            // behind the visible marker below (saturating: budget may be
-            // usize::MAX = no limit). Stop, not skip: a skip-on-overflow
-            // `continue` would admit a later SMALLER item after an earlier one
-            // was dropped, making survival depend on body size instead of the
-            // list's deterministic order.
-            if out
-                .len()
-                .saturating_add(sec.len())
-                .saturating_add(item.len())
-                > budget
-            {
-                omitted = total - i;
-                break;
-            }
-            sec.push_str(&item);
-        }
-    }
-    if omitted > 0 {
-        let _ = writeln!(
-            sec,
-            "(section truncated: {omitted} goals omitted — the prompt exceeded \
-             LOOOP_PROMPT_MAX_BYTES; archive or consolidate goals)"
+            item
+        });
+        budgeted_section(
+            out.len(),
+            &mut sec,
+            budget,
+            total,
+            items,
+            "goals",
+            "goals",
+            "; archive or consolidate goals",
+            &mut oversize,
         );
-        oversize.push(("goals", omitted));
     }
     push_section(&mut out, "GOALS", &sec);
 
     // SENSOR READINGS.
     let mut sec = String::new();
-    let mut omitted = 0usize;
     let snaps: Vec<(String, std::path::PathBuf)> = util::sorted_glob(snap_dir, "json")
         .into_iter()
         .filter_map(|o| {
@@ -601,7 +643,7 @@ fn build_prompt_budgeted(
         })
         .collect();
     let total = snaps.len();
-    for (i, (fname, o)) in snaps.into_iter().enumerate() {
+    let items = snaps.into_iter().map(|(fname, o)| {
         let mut item = String::new();
         let _ = writeln!(item, "--- {fname}");
         // Sensor output is attacker/LLM-influenced — escape like every other
@@ -610,26 +652,19 @@ fn build_prompt_budgeted(
             &fs::read_to_string(&o).unwrap_or_default(),
         ));
         item.push('\n');
-        // Stop-at-first-overflow, like the GOALS loop above.
-        if out
-            .len()
-            .saturating_add(sec.len())
-            .saturating_add(item.len())
-            > budget
-        {
-            omitted = total - i;
-            break;
-        }
-        sec.push_str(&item);
-    }
-    if omitted > 0 {
-        let _ = writeln!(
-            sec,
-            "(section truncated: {omitted} sensor readings omitted — the prompt exceeded \
-             LOOOP_PROMPT_MAX_BYTES; consolidate sensors)"
-        );
-        oversize.push(("sensor readings", omitted));
-    }
+        item
+    });
+    budgeted_section(
+        out.len(),
+        &mut sec,
+        budget,
+        total,
+        items,
+        "sensor readings",
+        "sensor readings",
+        "; consolidate sensors",
+        &mut oversize,
+    );
     push_section(&mut out, "SENSOR READINGS", &sec);
 
     // PENDING ASKS — workers blocked waiting for a HUMAN answer. The decider sees
@@ -649,9 +684,8 @@ fn build_prompt_budgeted(
             .filter(|s| s.alive)
             .map(|s| s.id)
             .collect();
-        let mut omitted = 0usize;
         let total = asks.len();
-        for (i, a) in asks.into_iter().enumerate() {
+        let items = asks.into_iter().map(|a| {
             let tag = if a.detach {
                 "DETACHED — worker checkpointed and exited by design; WAIT for the human"
             } else if alive.contains(&a.worker) {
@@ -680,26 +714,19 @@ fn build_prompt_budgeted(
                     escape_section_markers(&a.options.join(", "))
                 );
             }
-            // Stop-at-first-overflow, like the GOALS loop above.
-            if out
-                .len()
-                .saturating_add(sec.len())
-                .saturating_add(item.len())
-                > budget
-            {
-                omitted = total - i;
-                break;
-            }
-            sec.push_str(&item);
-        }
-        if omitted > 0 {
-            let _ = writeln!(
-                sec,
-                "(section truncated: {omitted} asks omitted — the prompt exceeded \
-                 LOOOP_PROMPT_MAX_BYTES)"
-            );
-            oversize.push(("pending asks", omitted));
-        }
+            item
+        });
+        budgeted_section(
+            out.len(),
+            &mut sec,
+            budget,
+            total,
+            items,
+            "pending asks",
+            "asks",
+            "",
+            &mut oversize,
+        );
     }
     push_section(
         &mut out,
@@ -712,9 +739,8 @@ fn build_prompt_budgeted(
     let resumable = mailbox::answered_detached(paths);
     if !resumable.is_empty() {
         let mut sec = String::new();
-        let mut omitted = 0usize;
         let total = resumable.len();
-        for (i, (a, answer)) in resumable.iter().enumerate() {
+        let items = resumable.iter().map(|(a, answer)| {
             let mut item = String::new();
             let _ = writeln!(item, "--- {} (worker {})", a.id, a.worker);
             let _ = writeln!(
@@ -734,26 +760,19 @@ fn build_prompt_budgeted(
                     escape_section_markers(&clip(&a.reference, ASK_TEXT_MAX))
                 );
             }
-            // Stop-at-first-overflow, like the GOALS loop above.
-            if out
-                .len()
-                .saturating_add(sec.len())
-                .saturating_add(item.len())
-                > budget
-            {
-                omitted = total - i;
-                break;
-            }
-            sec.push_str(&item);
-        }
-        if omitted > 0 {
-            let _ = writeln!(
-                sec,
-                "(section truncated: {omitted} answered asks omitted — the prompt exceeded \
-                 LOOOP_PROMPT_MAX_BYTES)"
-            );
-            oversize.push(("answered asks", omitted));
-        }
+            item
+        });
+        budgeted_section(
+            out.len(),
+            &mut sec,
+            budget,
+            total,
+            items,
+            "answered asks",
+            "answered asks",
+            "",
+            &mut oversize,
+        );
         push_section(
             &mut out,
             "ANSWERED ASKS (resume these — start_worker with resume)",

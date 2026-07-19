@@ -81,8 +81,21 @@ fn hash_policy_into(
             }),
     );
     for (f, key) in files {
-        if !f.is_file() {
-            continue;
+        // fs::metadata, NOT `!f.is_file()`: is_file() maps EVERY stat error
+        // (EACCES, EIO, …) to false, which made a present-but-unstat-able
+        // policy file hash-invisible — identical to absent, so a goal
+        // flipping unreadable never moved the world. Only a definitive
+        // NotFound may skip (the PLAYBOOK legitimately may not exist yet);
+        // any other stat failure falls through to the read below, whose
+        // failure path emits the same `!unreadable` sentinel.
+        match fs::metadata(&f) {
+            // A directory squatting on a policy path is not policy — skip it
+            // (same verdict is_file() used to give), and fs::read on a dir
+            // would error into a misleading "unreadable" sentinel.
+            Ok(m) if !m.is_file() => continue,
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {} // fall through: the read error path carries the sentinel
         }
         let bytes = match fs::read(&f) {
             Ok(b) => b,
@@ -283,6 +296,35 @@ mod tests {
         assert!(items.contains_key("goal:a"));
         assert!(items.contains_key("snap:s"));
         assert!(items.contains_key("snap:raw"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unstatable_goal_reads_as_the_unreadable_sentinel_not_absence() {
+        // Regression: `!f.is_file()` squashed stat errors (EACCES, EIO) into
+        // "absent", silently dropping the file from hash AND items — a goal
+        // flipping unreadable never moved the world. A goals dir with read
+        // permission but NO search bit (0o444) makes the glob still list the
+        // file while every stat/read of it fails — exactly the squashed case.
+        use std::os::unix::fs::PermissionsExt;
+        let p = Paths::temp();
+        fs::create_dir_all(p.goals_dir()).unwrap();
+        let goal = p.goals_dir().join("locked.md");
+        fs::write(&goal, b"goal body\n").unwrap();
+        fs::set_permissions(p.goals_dir(), fs::Permissions::from_mode(0o444)).unwrap();
+        // Running as root (some CI containers) the kernel does not enforce
+        // the missing search bit — nothing to assert then.
+        let enforced = fs::metadata(&goal).is_err();
+        let view = if enforced { Some(world_view(&p)) } else { None };
+        // Restore BEFORE asserting so a failed assert can't strand an
+        // unsearchable temp dir (Paths::temp's Drop cleanup needs it).
+        fs::set_permissions(p.goals_dir(), fs::Permissions::from_mode(0o755)).unwrap();
+        let Some((_, items)) = view else { return };
+        assert_eq!(
+            items.get("goal:locked").map(String::as_str),
+            Some("!unreadable"),
+            "a stat failure must surface as the sentinel, never as absence"
+        );
     }
 
     #[test]

@@ -26,6 +26,9 @@ pub use ask::{
     unarchive_pair,
 };
 pub(crate) use ask::{ask, ask_detached};
+// Shared "--session/--worker arg → $LOOOP_SESSION_ID fallback" (one rule,
+// previously three copies: gate.rs and the ask/told self-callbacks).
+pub(crate) use common::session_or_env;
 pub use signal::sys_asks;
 // `Tell` and `drain_tells` have no external consumer today, but they were part
 // of the module's public surface before the split — keep the paths working.

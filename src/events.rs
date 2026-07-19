@@ -31,6 +31,15 @@ pub fn emit(paths: &Paths, event: &str, fields: serde_json::Value) {
     obj.insert("event".into(), serde_json::Value::String(event.to_string()));
     if let serde_json::Value::Object(extra) = fields {
         for (k, v) in extra {
+            // The reserved keys are the line's INTEGRITY for a tailing
+            // watcher: a caller field named `ts` or `event` (typo, or an
+            // attacker-influenced field name reaching an emit site) must not
+            // be able to forge the timestamp or relabel the event a consumer
+            // filters on. Skip, keep the reserved value (same rule as
+            // log.rs's json_event_line).
+            if k == "ts" || k == "event" {
+                continue;
+            }
             obj.insert(k, v);
         }
     }
@@ -100,6 +109,24 @@ mod tests {
             "ts must stay RFC3339-parseable, got {ts:?}"
         );
         assert!(ts.ends_with('Z') && ts.contains('.'), "got {ts:?}");
+    }
+
+    #[test]
+    fn caller_fields_cannot_override_reserved_keys() {
+        // Regression: a caller field named `ts`/`event` used to overwrite
+        // the reserved key — forging the timestamp or relabeling the event a
+        // tailing watcher filters on.
+        let _g = crate::util::test_env_lock();
+        let p = Paths::temp();
+        emit(
+            &p,
+            "tick.decided",
+            serde_json::json!({"ts": "1999-01-01T00:00:00Z", "event": "forged", "ok": 1}),
+        );
+        let lines = read_lines(&p);
+        assert_eq!(lines[0]["event"], "tick.decided", "event is reserved");
+        assert_ne!(lines[0]["ts"], "1999-01-01T00:00:00Z", "ts is reserved");
+        assert_eq!(lines[0]["ok"], 1, "non-reserved fields still merge");
     }
 
     #[test]
