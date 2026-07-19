@@ -568,9 +568,18 @@ mod tests {
     fn retry_wrapper_builds_a_bounded_loop_carrying_the_operator_pattern() {
         let w = build_retry_wrapper("RUNNER", 4, "auth failed for provider", 7);
         assert!(w.contains("while :; do"), "is a loop");
-        assert!(w.contains("{ RUNNER ; } 2>&1 | tee"), "streams + captures the runner");
-        assert!(w.contains("PIPESTATUS[0]"), "reads the runner's own exit, not tee's");
-        assert!(w.contains("-lt 4"), "bounds the attempts at the configured count");
+        assert!(
+            w.contains("{ RUNNER ; } 2>&1 | tee"),
+            "streams + captures the runner"
+        );
+        assert!(
+            w.contains("PIPESTATUS[0]"),
+            "reads the runner's own exit, not tee's"
+        );
+        assert!(
+            w.contains("-lt 4"),
+            "bounds the attempts at the configured count"
+        );
         // The operator pattern is single-quoted (shell_quote), never interpolated raw.
         assert!(
             w.contains("grep -qiE 'auth failed for provider'"),
@@ -599,7 +608,11 @@ mod tests {
             c = shell_quote(&cnt.to_string_lossy())
         );
         let w = build_retry_wrapper(&inner, 9, "auth failed for provider", 0);
-        let out = std::process::Command::new("bash").arg("-c").arg(&w).output().unwrap();
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&w)
+            .output()
+            .unwrap();
         assert!(out.status.success(), "the final clean attempt exits 0");
         assert!(
             String::from_utf8_lossy(&out.stdout).contains("READY"),
@@ -623,8 +636,16 @@ mod tests {
             c = shell_quote(&cnt.to_string_lossy())
         );
         let w = build_retry_wrapper(&inner, 2, "", 0);
-        let out = std::process::Command::new("bash").arg("-c").arg(&w).output().unwrap();
-        assert_eq!(out.status.code(), Some(5), "the last attempt's exit passes through");
+        let out = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&w)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(5),
+            "the last attempt's exit passes through"
+        );
         assert_eq!(
             std::fs::read_to_string(&cnt).unwrap().trim(),
             "3",
