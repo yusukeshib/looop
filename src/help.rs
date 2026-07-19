@@ -68,7 +68,7 @@ Usage:
                                 consume an ANSWERED (detached) ask — injects its
                                 question, the human's answer and the checkpoint
                                 into the brief, then archives the ask/answer pair
-  looop worker list [--json] [-a|--all] [-w|--watch [--interval N]]   fleet + health (busy/waiting-ask/stuck/dead), idle/uptime/ask age, verify verdict
+  looop worker list [--json] [-a|--all] [-w|--watch [--interval N]]   pulse (up/down) + fleet health (busy/waiting-ask/stuck/dead), idle/uptime/ask age, verify verdict
 
   Shorthands: `worker`=`w`, `worker ls` / `w ls` = `worker list`, `screenshot`=`ss`,
   and `write`=`w` (`goal w` / `sensor w` / `playbook w` / `schedule w`).

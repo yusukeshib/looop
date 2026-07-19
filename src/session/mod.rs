@@ -33,11 +33,10 @@ pub use fleet::{
     PULSE_SESSION, await_alive, is_alive, kill_quiet, list_workers, output_idle_secs, prune_aged,
     reap, run_detached_worker, spawn_detached, status_exists, try_is_alive, try_list,
 };
-// `list` (the lenient enumerate) lost its last non-test consumer outside this
-// module when gate.rs's claim verbs went fail-closed (try_list/try_is_alive);
-// the launch tests still name it to pin the lenient-vs-strict split, so the
-// re-export stays — on its own allowed line, same policy as Session/kill below.
-#[allow(unused_imports)]
+// `list` (the lenient enumerate): sensor.rs's pulse_health uses it (the only
+// enumerate that INCLUDES the pulse — needed to render the pulse row in
+// `looop worker list`); the launch tests also name it to pin the
+// lenient-vs-strict split against try_list.
 pub use fleet::list;
 #[allow(unused_imports)]
 pub use fleet::{Session, kill};
