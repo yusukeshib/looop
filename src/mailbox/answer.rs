@@ -147,6 +147,28 @@ pub(crate) fn answer(paths: &Paths, ask_id: &str, text: &str, force: bool) -> Re
     } else if !store.create_exclusive(&Key::Answer(ask_id.to_string()), &body)? {
         bail!("answer: {ask_id:?} is already answered (pass --force to overwrite)");
     }
+    // The exists check above and the create are NOT one atomic step: the ask
+    // can be archived/removed in between (a concurrent `worker start --resume`
+    // consuming the pair, a manual prune). The answer written for a vanished
+    // ask would be an ORPHAN — never read, never archived, and permanently
+    // reserving its id in next_seq_id's scan. Re-check and undo OUR OWN write:
+    // remove_if_eq keys on the exact body we wrote, so a concurrent --force
+    // re-answer landed meanwhile is never deleted.
+    match store.exists_checked(&Key::Ask(ask_id.to_string())) {
+        Ok(true) => {}
+        Ok(false) => {
+            let _ = store.remove_if_eq(&Key::Answer(ask_id.to_string()), &body);
+            bail!(
+                "answer: ask {ask_id:?} vanished while answering (consumed or removed) — \
+                 the answer was not recorded"
+            );
+        }
+        // A transient stat error is NOT evidence the ask vanished: the answer
+        // was durably written and the ask almost certainly still exists —
+        // deleting the answer (or reporting failure for a write that
+        // succeeded) would be the wrong side to fail on. Keep it.
+        Err(_) => {}
+    }
     Ok(())
 }
 

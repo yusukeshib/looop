@@ -303,25 +303,6 @@ impl<'a> FileStore<'a> {
     }
 }
 
-/// fsync the DIRECTORY containing `path`, so a rename that just landed in it
-/// survives a crash (the dir entry itself needs a sync, not just the data).
-/// Local replica of util's PRIVATE helper — kept identical, best-effort at
-/// call sites. Deliberately not deduplicated: util keeps its fsync helper
-/// private to its own write_atomic implementation, and widening it to
-/// pub(crate) to save these six lines would couple this module to util's
-/// internals for a trivial, drift-proof idiom (open parent, sync_all).
-#[cfg(unix)]
-fn sync_parent_dir(path: &std::path::Path) -> io::Result<()> {
-    if let Some(dir) = path.parent() {
-        fs::File::open(dir)?.sync_all()?;
-    }
-    Ok(())
-}
-#[cfg(not(unix))]
-fn sync_parent_dir(_path: &std::path::Path) -> io::Result<()> {
-    Ok(())
-}
-
 /// Best-effort ONE-GENERATION size rotation for an append-only log: when
 /// `path` is past `max_bytes` (0 = capping off), rename it to `<name>.1`
 /// (replacing any previous `.1`) so the live file stays bounded. Shared by
@@ -332,6 +313,15 @@ fn sync_parent_dir(_path: &std::path::Path) -> io::Result<()> {
 /// stale lock; contended ⇒ skip, the next append past the cap retries), and
 /// keep the append itself lock-free. All-ignore on purpose: rotation must
 /// never fail (or even slow) a write.
+///
+/// KNOWN RACE (accepted): an appender that opened the live file just before
+/// a concurrent rotation renames it keeps writing through its fd — that
+/// record lands in the freshly-renamed `.1` generation instead of the new
+/// live file. This is fine under the ONE-GENERATION policy: `.1` is retained
+/// (readers that care scan live + `.1`), so the record survives exactly as
+/// long as any other record of its generation; nothing is lost or torn.
+/// Serializing appends against rotation to close it would put a lock on the
+/// hot append path — the opposite of "rotation must never slow a write".
 pub(crate) fn rotate_at_cap(path: &std::path::Path, max_bytes: u64) {
     let Some(name) = path.file_name().map(|s| s.to_string_lossy().to_string()) else {
         return;
@@ -436,6 +426,17 @@ impl StateStore for FileStore<'_> {
             use io::Write;
             let mut f = fs::File::create(&tmp)?;
             f.write_all(contents.as_bytes())?;
+            // Same mode selection as write_atomic/replace_if_eq: a sensor's
+            // content is a script the runtime execs, so the exec bit goes on
+            // the TEMP file BEFORE the rename (a concurrent exec never sees a
+            // non-executable window) and BEFORE sync_all (the fsync covers
+            // the permission metadata too). Omitting it here silently shipped
+            // a non-executable sensor whenever the exclusive-create path won.
+            #[cfg(unix)]
+            if matches!(key, Key::Sensor(_)) {
+                use std::os::unix::fs::PermissionsExt;
+                f.set_permissions(fs::Permissions::from_mode(0o755))?;
+            }
             f.sync_all()
         })();
         if let Err(e) = write {
@@ -449,7 +450,7 @@ impl StateStore for FileStore<'_> {
                 // otherwise a claim/ask reported as created could vanish on
                 // power loss (double-lease risk). Best-effort: the contents
                 // are already synced, and durability here is defense in depth.
-                let _ = sync_parent_dir(&path);
+                let _ = crate::util::sync_parent_dir(&path);
                 Ok(true)
             }
             Err(e) => {
@@ -479,12 +480,24 @@ impl StateStore for FileStore<'_> {
             .create(true)
             .append(true)
             .open(&path)?;
+        // ONE line per record is the append-log's integrity invariant (the
+        // journal is parsed line-by-line; a record with an embedded newline
+        // would forge extra entries). executor::append_journal already
+        // collapses LLM-provided newlines, but this is the choke point every
+        // appender funnels through — defend here too so no future caller can
+        // reintroduce the hole. Flatten to spaces (never error): a journal
+        // write must not fail a move over cosmetic whitespace.
+        let line = if line.contains('\n') || line.contains('\r') {
+            std::borrow::Cow::Owned(line.replace(['\r', '\n'], " "))
+        } else {
+            std::borrow::Cow::Borrowed(line)
+        };
         // One write(2) for the whole line (mirrors events.rs): `writeln!` can
         // issue the line and the trailing newline as SEPARATE writes, letting
         // a concurrent appender (pulse + CLI journal writes race) interleave
         // mid-line. O_APPEND + a single write_all keeps each line intact.
         let mut buf = String::with_capacity(line.len() + 1);
-        buf.push_str(line);
+        buf.push_str(&line);
         buf.push('\n');
         f.write_all(buf.as_bytes())
     }
@@ -756,6 +769,52 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp left behind: {leftovers:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_exclusive_publishes_a_sensor_with_the_exec_bit() {
+        // Regression: create_exclusive skipped the Key::Sensor → 0o755 mode
+        // selection write_atomic/replace_if_eq apply — a sensor published
+        // through the exclusive-create path landed non-executable and every
+        // subsequent beat's exec of it failed with EACCES.
+        use std::os::unix::fs::PermissionsExt;
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        let k = Key::Sensor("probe".into());
+        assert!(s.create_exclusive(&k, "#!/bin/sh\necho '{}'\n").unwrap());
+        let mode = fs::metadata(p.sensors_dir().join("probe.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "sensor script must be executable");
+        // A non-sensor key stays at the default (no exec bit smeared on it).
+        let k2 = Key::Claim("lease".into());
+        assert!(s.create_exclusive(&k2, "{}").unwrap());
+        let mode2 = fs::metadata(p.claims_dir().join("lease.json"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode2 & 0o111, 0, "a claim must not become executable");
+    }
+
+    #[test]
+    fn append_line_flattens_embedded_newlines_to_one_record() {
+        // One line per record is the journal's integrity invariant — an
+        // embedded newline would forge extra entries for a line-by-line
+        // parser. The store is the choke point every appender funnels
+        // through, so it flattens instead of trusting each caller.
+        let p = Paths::temp();
+        let s = FileStore::new(&p);
+        s.append_line(&Key::Journal, "first\nsecond\r\nthird").unwrap();
+        s.append_line(&Key::Journal, "clean").unwrap();
+        let body = fs::read_to_string(p.journal()).unwrap();
+        let lines: Vec<&str> = body.lines().collect();
+        assert_eq!(
+            lines,
+            vec!["first second  third", "clean"],
+            "embedded newlines collapse to spaces — exactly one line per append"
+        );
     }
 
     #[test]

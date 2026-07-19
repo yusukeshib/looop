@@ -122,14 +122,16 @@ pub fn remove(paths: &Paths, name: &str) -> Result<String> {
 }
 
 /// Whether a parsed schedule is structurally INVALID: both or neither of
-/// `at`/`every_s`, or a recurring period of 0 (which would bump the world hash
-/// every second — a flapping signal). Invalid entries are surfaced (stable
-/// "invalid" signal, plus a warning from the human-facing `schedule list`),
-/// never silently dropped.
+/// `at`/`every_s`, or a recurring period below [`MIN_EVERY_S`]. The floor is
+/// the SAME one `write()` enforces — a hand-written `every_s` of 1–59 used to
+/// pass this read-side check and churn the world hash up to every beat, the
+/// exact flapping the write-side floor exists to prevent. Invalid entries are
+/// surfaced (stable "invalid" signal, plus a warning from the human-facing
+/// `schedule list`), never silently dropped.
 fn is_invalid(s: &Schedule) -> bool {
     match (s.at, s.every_s) {
         (Some(_), None) => false,
-        (None, Some(e)) => e == 0,
+        (None, Some(e)) => e < MIN_EVERY_S,
         _ => true,
     }
 }
@@ -172,7 +174,7 @@ fn warn_broken(all: &[(String, Option<Schedule>)]) {
         match s {
             None => eprintln!("schedules/{name}.json is unparseable — it will never fire"),
             Some(s) if is_invalid(s) => eprintln!(
-                "schedules/{name}.json is invalid (need exactly one of `at`/`every_s`, every_s > 0) — it will never fire"
+                "schedules/{name}.json is invalid (need exactly one of `at`/`every_s`, every_s >= {MIN_EVERY_S}) — it will never fire"
             ),
             Some(_) => {}
         }
@@ -208,9 +210,9 @@ fn reading(s: &Schedule, now: u64) -> (serde_json::Value, serde_json::Value) {
             // anchor=0 makes it due immediately and the period then advances
             // normally — the schedule self-heals instead of silently dying.
             let anchor = s.anchor.unwrap_or(0);
-            // `every > 0` is guaranteed here: every_s == 0 is structurally
-            // invalid and returned above ([`is_invalid`]) — no `.max(1)`
-            // divide-by-zero defense needed.
+            // `every >= MIN_EVERY_S > 0` is guaranteed here: anything below
+            // the floor is structurally invalid and returned above
+            // ([`is_invalid`]) — no `.max(1)` divide-by-zero defense needed.
             let elapsed = now.saturating_sub(anchor);
             let period = elapsed / every;
             let rem = elapsed % every;
@@ -376,13 +378,22 @@ mod tests {
 
     #[test]
     fn invalid_schedules_read_as_a_stable_invalid_signal() {
-        // every_s == 0 would flap the world hash every second; both-set and
-        // neither-set are contradictions. All read as a STABLE "invalid".
+        // every_s below MIN_EVERY_S (0 flaps every second; 1–59 churn up to
+        // every beat — the read side must enforce the same floor write()
+        // does, or a hand-written file bypasses it); both-set and neither-set
+        // are contradictions. All read as a STABLE "invalid".
         for s in [
             Schedule {
                 v: 1,
                 at: None,
                 every_s: Some(0),
+                anchor: Some(0),
+                note: String::new(),
+            },
+            Schedule {
+                v: 1,
+                at: None,
+                every_s: Some(MIN_EVERY_S - 1),
                 anchor: Some(0),
                 note: String::new(),
             },
@@ -453,6 +464,25 @@ mod tests {
         assert_eq!(v["signal"]["locked"], serde_json::json!("unparseable"));
         // Restore permissions so the temp dir can be cleaned up.
         std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    #[test]
+    fn hand_written_sub_minimum_every_s_reads_invalid_not_churning() {
+        // Regression: a hand-written every_s of 1–59 was accepted on read
+        // (only write() enforced the MIN_EVERY_S floor), so its period
+        // counter bumped the world hash up to every beat — the exact churn
+        // the floor exists to prevent. It must read as a STABLE "invalid".
+        let p = Paths::temp();
+        std::fs::create_dir_all(p.schedules_dir()).unwrap();
+        std::fs::write(
+            p.schedules_dir().join("tight.json"),
+            br#"{"every_s": 30, "anchor": 0}"#,
+        )
+        .unwrap();
+        let v = sys_schedules(&p);
+        assert_eq!(v["signal"]["tight"], serde_json::json!("invalid"));
+        let v2 = sys_schedules(&p);
+        assert_eq!(v["signal"]["tight"], v2["signal"]["tight"], "stable");
     }
 
     #[test]

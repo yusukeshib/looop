@@ -229,7 +229,24 @@ fn strip_fmt_seam(cmd: &str) -> String {
 /// up` gates on this and refuses to start the pulse when false, directing the
 /// user to `looop init`.
 pub fn is_initialized(paths: &Paths) -> bool {
-    paths.config.is_file()
+    // fs::metadata, NOT is_file(): is_file() maps EVERY stat error (EACCES,
+    // EIO, …) to false — the same squash Config::load was cured of — which
+    // sent the operator to `looop init` (whose overwrite could clobber a
+    // REAL config hidden behind a permission error). Only definitive
+    // NotFound means "not initialized"; any other error is warned and read
+    // as initialized, so the gate falls through to Config::load, which
+    // surfaces the real error with context instead of a misdiagnosis.
+    match fs::metadata(&paths.config) {
+        Ok(m) => m.is_file(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            eprintln!(
+                "looop: cannot check config {}: {e} — assuming initialized (load will report the real error)",
+                paths.config.display()
+            );
+            true
+        }
+    }
 }
 
 /// Write the runner wiring to $LOOOP_CONFIG (creating its parent dir). Used by
@@ -364,6 +381,42 @@ mod tests {
             cfg.runner_cmd("worker_command").unwrap(),
             "W {{prompt_file}}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_surfaces_a_permission_error_instead_of_defaulting() {
+        // Regression guard for the check-then-read squash Config::load was
+        // cured of: an EACCES on the config must ERROR (naming the file),
+        // never silently mask a REAL config with the inline default — the
+        // pulse would then run on wiring the operator never picked.
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+        let p = crate::paths::Paths::temp();
+        fs::write(&p.config, super::DEFAULT_CONFIG.as_bytes()).unwrap();
+        fs::set_permissions(&p.config, fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root (some CI containers), chmod 000 does not make the
+        // read fail — there is nothing to assert then.
+        if fs::read_to_string(&p.config).is_ok() {
+            return;
+        }
+        // (No expect_err: Config is deliberately not Debug — match instead.)
+        let err = match super::Config::load(&p) {
+            Ok(_) => panic!("EACCES must surface as an error, not default wiring"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:#}").contains("reading config"),
+            "the error must name the config read, got: {err:#}"
+        );
+        // And the init gate must NOT read the unreadable config as absent —
+        // that would send the operator to `looop init`, whose overwrite
+        // could clobber the real wiring hiding behind the permission error.
+        assert!(
+            super::is_initialized(&p),
+            "an unstat-able/unreadable config is not proof of un-initialization"
+        );
+        fs::set_permissions(&p.config, fs::Permissions::from_mode(0o644)).unwrap();
     }
 
     #[test]

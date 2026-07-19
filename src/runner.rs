@@ -226,7 +226,26 @@ pub fn run_streamed(
                     );
                 }
             }
-            Err(_) => break, // a real I/O error on the pipe, not bad UTF-8
+            Err(e) => {
+                // A real I/O error on the pipe, not bad UTF-8 (that is
+                // lossy-decoded above). Don't break in SILENCE: the rest of
+                // the runner's chatter is lost to the replay archive, and an
+                // operator replaying a confusing beat deserves to know the
+                // log is truncated rather than trust it as complete. The beat
+                // itself continues — the reap path below still bounds and
+                // reports the runner's exit.
+                util::event(
+                    Level::Warn,
+                    "tick.guard_degraded",
+                    &format!(
+                        "reading the tick runner's output failed mid-stream ({e}) — the rest \
+                         of this beat's replay archive is lost; the runner is still reaped \
+                         under the deadline"
+                    ),
+                    &[],
+                );
+                break;
+            }
         }
     }
     // Drop our end of the pipe BEFORE waiting: after a read error above the
@@ -267,6 +286,25 @@ pub fn run_streamed(
                         kill_pgid(pgid);
                         timed_out = true;
                     }
+                    // Non-Unix: the deadline DEGRADES to an indefinite wait
+                    // (this build cannot kill a process group), so a hung
+                    // runner can still stall the single-instance pulse. Warn
+                    // once at the moment the deadline lapses — this arm runs
+                    // once, right before the unbounded wait — so the operator
+                    // sees WHY the pulse is stuck instead of a silent hang.
+                    // (macOS/Linux are the primary targets; a real kill path
+                    // for other platforms isn't worth the complexity.)
+                    #[cfg(not(unix))]
+                    util::event(
+                        Level::Warn,
+                        "tick.guard_degraded",
+                        &format!(
+                            "LOOOP_TICK_TIMEOUT_SECS ({timeout}s) elapsed but this platform \
+                             cannot kill the runner's process group — waiting indefinitely \
+                             for it to exit"
+                        ),
+                        &[],
+                    );
                     break child.wait();
                 }
                 Ok(None) => std::thread::sleep(std::time::Duration::from_millis(50)),

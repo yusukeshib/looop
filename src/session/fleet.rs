@@ -244,10 +244,9 @@ pub fn prune_aged(paths: &Paths, max_age: std::time::Duration) {
                     .is_some_and(|age| age >= max_age);
             if old {
                 let _ = tokio::fs::remove_dir_all(&dir).await;
-                crate::verify::clear(paths, &id);
-                // Same generation hygiene as reap(): a pruned corpse must not
-                // leave tells behind for a future worker reusing its id.
-                crate::mailbox::discard_tells(paths, &id);
+                // Shared generation-boundary hygiene (verify + tells) — see
+                // session::on_generation_end for the full reasoning.
+                super::on_generation_end(paths, &id);
             }
         }
     });
@@ -268,11 +267,9 @@ pub fn reap(paths: &Paths, session: &str) {
         let alive = session::is_pid_alive(meta.babysit_pid);
         if corpse_dead(status.as_ref().map(|s| s.state), alive) {
             let _ = tokio::fs::remove_dir_all(bs.session_dir(session)).await;
-            crate::verify::clear(paths, session);
-            // A removed corpse's id is about to be REUSED — drop any tell
-            // still addressed to the dead generation (see cmd_start_session's
-            // generation-boundary discard for the full reasoning).
-            crate::mailbox::discard_tells(paths, session);
+            // A removed corpse's id is about to be REUSED — shared generation-
+            // boundary hygiene (verify + tells), see session::on_generation_end.
+            super::on_generation_end(paths, session);
         }
     });
 }

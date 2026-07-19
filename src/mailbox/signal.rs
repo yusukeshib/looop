@@ -66,7 +66,7 @@ mod tests {
         assert_eq!(v["signal"]["resume"], serde_json::json!([id.clone()]));
         assert_eq!(v["detail"][&id]["answered"], serde_json::json!(true));
 
-        archive_pair(&p, &id);
+        assert!(archive_pair(&p, &id), "the consumer claims the pair");
         let v = sys_asks(&p);
         assert_eq!(
             v["signal"]["resume"],

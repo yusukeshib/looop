@@ -31,14 +31,9 @@ fn holder_of(raw: &str) -> String {
         .unwrap_or_default()
 }
 
-/// The session that should own a claim: explicit `--session <id>`, else the
-/// worker's exported `$LOOOP_SESSION_ID`. Empty when neither is set.
-fn session_or_env(session: Option<&str>) -> String {
-    match session {
-        Some(s) if !s.is_empty() => s.to_string(),
-        _ => std::env::var("LOOOP_SESSION_ID").unwrap_or_default(),
-    }
-}
+// The explicit `--session <id>` → `$LOOOP_SESSION_ID` fallback is shared with
+// the mailbox self-callbacks (ask/told) — one rule, one implementation.
+use crate::mailbox::session_or_env;
 
 /// `looop claim <name> [--session <id>]` — atomically acquire the lease for
 /// `<name>`. Exit 0 if we now hold it (or already held it), exit 1 if a LIVE
@@ -158,7 +153,13 @@ pub(crate) fn claim(
             }
             continue; // the lease changed underneath us — re-inspect
         }
-        if !holder.is_empty() && session::is_alive(paths, &holder) {
+        // try_is_alive, and FAIL CLOSED (`unwrap_or(true)` = treat the holder
+        // as alive) when the fleet cannot be enumerated: the lenient is_alive
+        // collapses an I/O error to an empty fleet, i.e. "every holder is
+        // dead" — a transient hiccup would let this racer STEAL a live lease,
+        // silently voiding the mutual exclusion the claim exists for. A
+        // refused claim is retryable; a stolen lease is not.
+        if !holder.is_empty() && session::try_is_alive(paths, &holder).unwrap_or(true) {
             return Ok(ClaimOutcome::HeldByLive(holder));
         }
         // Stale (holder unparseable or dead): compare-and-delete, then retry
@@ -195,7 +196,15 @@ pub(crate) fn unclaim(paths: &Paths, name: &str, session: Option<&str>) -> Resul
         return Ok(true); // already released (idempotent)
     };
     let holder = holder_of(&raw);
-    if holder.is_empty() || holder == session || !session::is_alive(paths, &holder) {
+    // Fail CLOSED on an unreadable fleet (`unwrap_or(true)` = holder treated
+    // as alive): an enumeration error is not evidence of death, and refusing
+    // the release is retryable while removing a live holder's lease is not.
+    // Releasing our OWN lease stays allowed (the `holder == session` arm short-
+    // circuits before the liveness probe).
+    if holder.is_empty()
+        || holder == session
+        || !session::try_is_alive(paths, &holder).unwrap_or(true)
+    {
         // Compare-and-delete: only remove the lease we actually inspected — a
         // lease FRESHLY acquired by someone else after our read stays intact.
         return match store.remove_if_eq(&key, &raw)? {
@@ -215,11 +224,29 @@ pub(crate) fn unclaim(paths: &Paths, name: &str, session: Option<&str>) -> Resul
 /// SEMANTICS (what a claim means, who should hold it) live in the PLAYBOOK.
 pub fn reap_stale_claims(paths: &Paths) {
     let store = FileStore::new(paths);
-    let alive: Vec<String> = session::list(paths)
-        .into_iter()
-        .filter(|s| s.alive)
-        .map(|s| s.id)
-        .collect();
+    // FAIL CLOSED: the lenient list() collapses an enumeration error to an
+    // EMPTY fleet, which reads here as "every holder is dead" — one transient
+    // I/O hiccup would sweep every live lease at once. Skip the sweep instead:
+    // reaping is housekeeping that can wait a beat; a mass-stolen mutual
+    // exclusion cannot be undone.
+    let alive: Vec<String> = match session::try_list(paths) {
+        Ok(sessions) => sessions
+            .into_iter()
+            .filter(|s| s.alive)
+            .map(|s| s.id)
+            .collect(),
+        Err(e) => {
+            util::event(
+                util::Level::Warn,
+                "claim.reap_skipped",
+                &format!(
+                    "cannot enumerate the fleet ({e}) — skipping the stale-claim sweep this beat"
+                ),
+                &[],
+            );
+            return;
+        }
+    };
 
     for name in store.list(&Collection::Claims) {
         let key = Key::Claim(name.clone());
@@ -257,8 +284,9 @@ pub fn reap_stale_claims(paths: &Paths) {
             // dead and its LIVE lease reaped. Re-check this holder's liveness
             // individually, immediately before removal — the same per-claim
             // check claim() itself uses — so the snapshot is only a cheap
-            // first-pass filter, never the final verdict.
-            if !sess.is_empty() && session::is_alive(paths, &sess) {
+            // first-pass filter, never the final verdict. Fail CLOSED like
+            // claim(): an enumeration error mid-sweep keeps the lease.
+            if !sess.is_empty() && session::try_is_alive(paths, &sess).unwrap_or(true) {
                 continue;
             }
             // Compare-and-delete: never reap a lease that was freshly re-
@@ -337,6 +365,40 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(p.claims_dir().join("repo-y.json")).unwrap())
                 .unwrap();
         assert_eq!(v["session"], "w2", "a dead holder's lease is reclaimed");
+    }
+
+    #[test]
+    fn claim_verbs_fail_closed_when_the_fleet_cannot_be_enumerated() {
+        // Same sabotage as launch.rs's start_session_fails_closed… test: a
+        // regular FILE where babysit's sessions dir belongs makes every
+        // enumeration fail — the shape of any transient I/O error. The
+        // lenient is_alive read that as "empty fleet ⇒ holder dead", so one
+        // hiccup let a racer STEAL a live lease, let unclaim release someone
+        // else's, and let the reaper sweep EVERY lease in one pass. All three
+        // verbs must fail closed instead: holder treated as alive.
+        let p = Paths::temp();
+        fs::create_dir_all(p.claims_dir()).unwrap();
+        fs::write(
+            p.claims_dir().join("repo-io.json"),
+            br#"{"session":"holder","name":"repo-io"}"#,
+        )
+        .unwrap();
+        fs::write(p.data_dir.join("sessions"), "not a dir").unwrap();
+        assert!(crate::session::try_list(&p).is_err(), "sabotage holds");
+        // claim by a would-be thief: refused as held-by-live, never stolen.
+        assert!(matches!(
+            claim(&p, "repo-io", Some("thief")).unwrap(),
+            crate::contract::ClaimOutcome::HeldByLive(h) if h == "holder"
+        ));
+        // unclaim by a non-owner: refused (the owner path — holder == session
+        // — stays releasable, liveness is never consulted for it).
+        assert!(!unclaim(&p, "repo-io", Some("thief")).unwrap());
+        // reaper: the sweep is skipped outright — the lease survives intact.
+        reap_stale_claims(&p);
+        assert!(
+            p.claims_dir().join("repo-io.json").is_file(),
+            "a lease must never be reaped on an unreadable fleet"
+        );
     }
 
     #[test]

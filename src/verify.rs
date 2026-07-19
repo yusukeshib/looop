@@ -106,7 +106,28 @@ pub fn reconcile(paths: &Paths) {
     let Ok(entries) = fs::read_dir(&d) else {
         return;
     };
-    let workers = crate::session::list_workers(paths);
+    // FAIL CLOSED on an unreadable fleet: the lenient list_workers collapses
+    // an enumeration error to an EMPTY fleet, so every stored obligation
+    // below would hit the `None` (vanished-session) arm and be CLEARED — one
+    // transient I/O hiccup silently dropped every pending verify. Skip the
+    // whole reconcile instead: state is untouched, so the next beat retries;
+    // in particular "clear a vanished session's state" only ever runs against
+    // a fleet that was actually enumerated.
+    let workers: Vec<crate::session::Session> = match crate::session::try_list(paths) {
+        Ok(all) => all.into_iter().filter(|s| !s.is_pulse()).collect(),
+        Err(e) => {
+            crate::util::event(
+                crate::util::Level::Warn,
+                "worker.verify_skipped",
+                &format!(
+                    "cannot enumerate the fleet ({e}) — deferring every pending verify to the \
+                     next beat"
+                ),
+                &[],
+            );
+            return;
+        }
+    };
     let started = std::time::Instant::now();
     let budget = std::time::Duration::from_secs(beat_budget_secs());
     let mut budget_warned = false;
@@ -563,6 +584,36 @@ mod tests {
         assert!(
             result(&paths, "w-deferred").is_some(),
             "the deferred verify runs on the next beat"
+        );
+    }
+
+    #[test]
+    fn reconcile_fails_closed_when_the_fleet_cannot_be_enumerated() {
+        // Same sabotage as the gate/launch fail-closed tests: a regular FILE
+        // where babysit's sessions dir belongs makes enumeration fail — the
+        // shape of any transient I/O error. The lenient list_workers read
+        // that as an EMPTY fleet, so every stored verify obligation hit the
+        // vanished-session arm and was CLEARED without ever being judged.
+        // reconcile must skip the beat instead and retry once readable.
+        let paths = Paths::temp();
+        store(&paths, "w-io", "echo checked").unwrap();
+        fs::write(paths.data_dir.join("sessions"), "not a dir").unwrap();
+        reconcile(&paths);
+        assert!(
+            cmd_path(&paths, "w-io").exists(),
+            "a pending verify obligation must survive an unreadable fleet"
+        );
+        assert!(
+            result(&paths, "w-io").is_none(),
+            "no verdict is fabricated while the fleet is unreadable"
+        );
+        // Fleet readable again: the deferred obligation is judged next beat.
+        fs::remove_file(paths.data_dir.join("sessions")).unwrap();
+        fake_worker(&paths, "w-io", "exited");
+        reconcile(&paths);
+        assert!(
+            result(&paths, "w-io").is_some(),
+            "the deferred verify runs once the fleet is enumerable again"
         );
     }
 

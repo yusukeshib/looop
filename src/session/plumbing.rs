@@ -2,6 +2,13 @@
 //! stdout onto /dev/null for one action ([`suppress_stdout`]) without leaking
 //! the saved descriptor into detached children ([`dup_cloexec`]). Unix-only;
 //! the non-unix build is a pass-through.
+//!
+//! CAVEAT: fd 1 is PROCESS-GLOBAL, so while a suppression window is open,
+//! stdout is /dev/null for EVERY thread — not just the one that called
+//! [`suppress_stdout`]. A concurrent thread's println/event lands in the
+//! void for the duration. Acceptable today because the windows are brief and
+//! the callers (fleet verbs) don't overlap chatty threads; revisit before
+//! wrapping anything long-running in a suppression window.
 
 /// Run `f` with this process's stdout (fd 1) redirected to /dev/null, then
 /// restore it. Used to swallow babysit's parent-path banner while keeping

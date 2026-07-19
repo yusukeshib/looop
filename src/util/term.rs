@@ -169,6 +169,7 @@ impl Spinner {
     /// Start the indicator (no-op when color is off). `label` is a short verb
     /// phrase, e.g. `"pi is deciding"`.
     pub fn start(label: &str) -> Self {
+        use std::io::Write;
         use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
         let stop = Arc::new(AtomicBool::new(false));
@@ -186,7 +187,17 @@ impl Spinner {
                 // line/sec). Poll `stop` in 100ms steps so drop() is responsive.
                 while !stop.load(Ordering::Relaxed) {
                     let secs = t0.elapsed().as_secs();
-                    print!("\r{}[{ts}] {label} {secs}s{}", dim(), rst());
+                    // `write!`, never `print!`: print! panics on a write
+                    // error, and this stdout is routinely a pipe whose reader
+                    // can vanish — an EPIPE inside the repaint thread must
+                    // not abort the long-lived pulse (observability must
+                    // never fail a beat; see util::event / events.rs).
+                    let _ = write!(
+                        std::io::stdout().lock(),
+                        "\r{}[{ts}] {label} {secs}s{}",
+                        dim(),
+                        rst()
+                    );
                     let _ = std::io::Write::flush(&mut std::io::stdout());
                     for _ in 0..10 {
                         if stop.load(Ordering::Relaxed) {
@@ -205,12 +216,15 @@ impl Spinner {
 
 impl Drop for Spinner {
     fn drop(&mut self) {
+        use std::io::Write;
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
             // Erase the spinner line (CR + clear-to-end-of-line) so the next
-            // structured event prints on a clean line.
-            print!("\r\x1b[2K");
+            // structured event prints on a clean line. `write!`, not `print!`:
+            // an EPIPE on a dead pipe must not panic inside a Drop (which
+            // would abort the process outright if it fired during an unwind).
+            let _ = write!(std::io::stdout().lock(), "\r\x1b[2K");
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
     }

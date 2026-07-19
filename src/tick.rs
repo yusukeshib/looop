@@ -72,7 +72,7 @@ pub fn sense(paths: &Paths) -> Sensed {
         std::time::Duration::from_secs(crate::run::session_ttl_secs(paths)),
     );
     crate::gate::reap_stale_claims(paths);
-    crate::executor::warn_if_interrupted(paths);
+    crate::wal::warn_if_interrupted(paths);
 
     // Snapshots are NOT wiped wholesale: a snapshot still fresh under a
     // declared `# looop:interval=N` cadence survives the beat; run_all prunes
@@ -199,11 +199,30 @@ pub fn tick(paths: &Paths, force: bool) -> TickOutcome {
 /// Returns `Some(idle)` when the beat must idle out here without deciding;
 /// `None` when the decide should run.
 fn should_decide(paths: &Paths, hash: &str, force: bool) -> Option<TickOutcome> {
-    // 2. skip if the world is unchanged (no AI call).
-    let last = fs::read_to_string(last_tick_hash_path(paths))
-        .unwrap_or_default()
-        .trim()
-        .to_string();
+    // 2. skip if the world is unchanged (no AI call). Only PROVEN absence
+    // (NotFound — a fresh data dir) reads as "no committed hash": squashing an
+    // EACCES/EIO into an empty string (the old `unwrap_or_default()`) failed
+    // OPEN — a transient read failure looked like "the world changed", the
+    // beat re-decided, and the same non-idempotent run_shell could be
+    // re-issued. Fail CLOSED instead: warn and idle the beat out (spends no
+    // budget); the next beat simply retries the read.
+    let last = match fs::read_to_string(last_tick_hash_path(paths)) {
+        Ok(s) => s.trim().to_string(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => {
+            util::event(
+                Level::Warn,
+                "tick.guard_degraded",
+                &format!(
+                    "cannot read .last-tick-hash ({e}) — idling this beat out instead of \
+                     re-deciding blind (a re-decide here could re-issue the previous \
+                     non-idempotent move); retrying next beat"
+                ),
+                &[],
+            );
+            return Some(TickOutcome::idle());
+        }
+    };
     if can_skip(hash, &last, force) {
         // Noop TTL: an unchanged world normally skips, but if the decision that
         // committed this hash was a NOOP and it has aged past the TTL, re-decide
@@ -539,7 +558,7 @@ fn commit_outcome(
             // decider would never see what its own query returned. Arm a short
             // follow-up unless the decision already scheduled one.
             let next_interval_s = match d.next_interval_s {
-                None if d.kind == "shell" => Some(5),
+                None if d.kind == executor::ActionKind::Shell => Some(5),
                 other => other,
             };
             util::event(
@@ -547,7 +566,7 @@ fn commit_outcome(
                 "tick.decided",
                 &format!("{} · {} · {secs}s", d.kind, d.journal),
                 &[
-                    ("action", serde_json::json!(d.kind)),
+                    ("action", serde_json::json!(d.kind.as_str())),
                     ("summary", serde_json::json!(d.summary)),
                     ("journal", serde_json::json!(d.journal)),
                     ("secs", serde_json::json!(secs)),
@@ -557,11 +576,11 @@ fn commit_outcome(
             events::emit(
                 paths,
                 "decided",
-                serde_json::json!({ "run_id": run_id, "action": d.kind, "journal": d.journal }),
+                serde_json::json!({ "run_id": run_id, "action": d.kind.as_str(), "journal": d.journal }),
             );
             // noop is a real decision (the world is fine) — it does not count as
             // "acted" for cadence, but it DID commit the hash above.
-            (d.kind != "noop", next_interval_s)
+            (d.kind != executor::ActionKind::Noop, next_interval_s)
         }
         Err(failure) => {
             // The backoff record pairs the fail count with the CURRENT policy
@@ -802,6 +821,56 @@ mod tests {
         assert!(can_skip("a", "a", false));
         assert!(!can_skip("a", "b", false));
         assert!(!can_skip("a", "a", true));
+    }
+
+    #[test]
+    fn unreadable_last_tick_hash_idles_the_beat_out_instead_of_re_deciding() {
+        // Regression: `unwrap_or_default()` on the `.last-tick-hash` read
+        // squashed EACCES/EIO into an empty string — the beat then judged the
+        // world "changed" and re-decided, which could re-issue the previous
+        // beat's non-idempotent run_shell. A DIRECTORY at the hash path is the
+        // portable stand-in for such a non-NotFound read failure (EISDIR).
+        let p = Paths::temp();
+        fs::write(p.data_dir.join("PLAYBOOK.md"), "be good\n").unwrap();
+        fs::create_dir_all(p.data_dir.join(".last-tick-hash")).unwrap();
+        // Wire a runner that would record a FAILURE if it were ever launched:
+        // proving the beat idled out BEFORE any decide.
+        wire_failing_runner(&p);
+        let out = tick(&p, false);
+        assert!(
+            !out.decided_or_failed,
+            "an unreadable committed hash fails CLOSED: idle out, don't re-decide blind"
+        );
+        assert!(
+            !p.last_failure().is_file(),
+            "the runner was never launched (no failure recorded)"
+        );
+        assert!(
+            !p.data_dir.join(".tick-backoff").is_file(),
+            "an idled-out beat is not a FAILED beat — no backoff armed"
+        );
+    }
+
+    #[test]
+    fn corrupt_backoff_state_still_enforces_the_wait() {
+        // Regression companion to tick_guards' corrupt-backoff test: a
+        // present-but-unparseable `.tick-backoff` used to read as "no
+        // backoff", so the exponential WAIT was skipped entirely (the counter
+        // was repaired only on the NEXT failure). The beat must now honor a
+        // conservative window immediately — fail closed.
+        let p = Paths::temp();
+        fs::write(p.data_dir.join("PLAYBOOK.md"), "be good\n").unwrap();
+        wire_failing_runner(&p);
+        fs::write(p.data_dir.join(".tick-backoff"), b"{not json").unwrap();
+        let out = tick(&p, false);
+        assert!(
+            !out.decided_or_failed,
+            "corrupt backoff state imposes the conservative wait — the runner never launches"
+        );
+        assert!(
+            !p.last_failure().is_file(),
+            "idled out before the decide (no failure recorded)"
+        );
     }
 
     #[test]

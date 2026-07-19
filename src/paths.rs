@@ -60,7 +60,18 @@ fn xdg(var: &str, fallback: &str) -> PathBuf {
 
 impl Paths {
     pub fn resolve() -> Self {
-        let bin = env::current_exe().unwrap_or_else(|_| PathBuf::from("looop"));
+        // The bare-"looop" fallback keeps resolution alive but is PATH-
+        // dependent: workers exec `$LOOOP_BIN`, so if their PATH lacks looop
+        // (or finds a different build) every self-callback breaks in a way
+        // nothing else explains. One stderr line names the cause up front
+        // (eprintln, not util::event — resolve() runs before log init).
+        let bin = env::current_exe().unwrap_or_else(|e| {
+            eprintln!(
+                "looop: cannot resolve own executable path ({e}) — falling back to a bare \
+                 `looop` for $LOOOP_BIN (workers then depend on it being on their PATH)"
+            );
+            PathBuf::from("looop")
+        });
 
         let default_data = xdg("XDG_STATE_HOME", ".local/state").join("looop");
         let data_dir = match env::var_os("LOOOP_DATA_DIR") {
@@ -196,11 +207,13 @@ impl Paths {
             .map(|e| e.path())
             .filter(|p| {
                 p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
-                    // Per-actor records + the exact legacy name — NOT a bare
-                    // `.action-wal` prefix, which would also match unrelated
-                    // debris like `.action-walfoo.json`.
-                    (n.starts_with(".action-wal.") && n.ends_with(".json"))
-                        || n == ".action-wal.json"
+                    // Per-actor records — NOT a bare `.action-wal` prefix,
+                    // which would also match unrelated debris like
+                    // `.action-walfoo.json`. The legacy single-file name
+                    // `.action-wal.json` needs no extra arm: it starts with
+                    // `.action-wal.` and ends with `.json`, so this one
+                    // predicate already admits it.
+                    n.starts_with(".action-wal.") && n.ends_with(".json")
                 })
             })
             .collect();

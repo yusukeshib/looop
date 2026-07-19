@@ -31,12 +31,15 @@ mod seed;
 mod sensor;
 mod service;
 mod session;
+mod shell_guard;
 mod shellinit;
+mod statefile;
 mod store;
 mod tick;
 mod tick_guards;
 mod util;
 mod verify;
+mod wal;
 mod worldhash;
 
 use anyhow::Result;

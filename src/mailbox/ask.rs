@@ -154,20 +154,39 @@ pub fn resume_context(paths: &Paths, ask_id: &str) -> Result<String> {
 /// without an answer file archives just the ask). An id that is not a safe
 /// path segment archives nothing — the id becomes a filename, so it gets the
 /// same guard as every other mailbox verb.
-pub fn archive_pair(paths: &Paths, ask_id: &str) {
+///
+/// Returns whether THIS caller CONSUMED the pair. The ask half's rename into
+/// the archive is atomic, so it doubles as a CLAIM (the same claim-by-rename
+/// idiom as [`drain_tells`](super::drain_tells)): when two starts race to
+/// resume the same answered ask, exactly one rename succeeds — the loser sees
+/// NotFound and must NOT dispatch, or the same resume would be delivered to
+/// two workers. `false` also covers an unarchivable pair (unsafe id, I/O
+/// error): fail closed — an extra refusal is retryable, a double dispatch is
+/// not.
+#[must_use]
+pub fn archive_pair(paths: &Paths, ask_id: &str) -> bool {
     if util::safe_segment("ask id", ask_id).is_err() {
-        return;
+        return false;
     }
     let store = FileStore::new(paths);
-    // Failures are non-fatal but must be VISIBLE — a pair that fails to
-    // archive keeps the sys-asks resume signal hot (possible re-dispatch).
-    if let Err(e) = store.archive(&Key::Ask(ask_id.to_string())) {
-        util::event(
-            util::Level::Warn,
-            "ask.archive_failed",
-            &format!("could not archive asks/{ask_id}.json: {e}"),
-            &[("ask_id", serde_json::json!(ask_id))],
-        );
+    match store.archive(&Key::Ask(ask_id.to_string())) {
+        Ok(()) => {}
+        // NotFound = a concurrent consumer archived the ask first (or it never
+        // existed): the claim is LOST. Quiet on purpose — losing a race is a
+        // normal outcome, not a fault worth a warn event.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
+        // Any other failure is non-fatal but must be VISIBLE — a pair that
+        // fails to archive keeps the sys-asks resume signal hot (possible
+        // re-dispatch) — and the caller must not dispatch on an unclaimed pair.
+        Err(e) => {
+            util::event(
+                util::Level::Warn,
+                "ask.archive_failed",
+                &format!("could not archive asks/{ask_id}.json: {e}"),
+                &[("ask_id", serde_json::json!(ask_id))],
+            );
+            return false;
+        }
     }
     match store.archive(&Key::Answer(ask_id.to_string())) {
         Ok(()) => {}
@@ -181,6 +200,9 @@ pub fn archive_pair(paths: &Paths, ask_id: &str) {
             &[("ask_id", serde_json::json!(ask_id))],
         ),
     }
+    // The ask half — the resume signal itself — is claimed and archived; a
+    // straggling answer file is inert (pending() keys on asks/).
+    true
 }
 
 /// Best-effort inverse of [`archive_pair`]: move the MOST RECENTLY archived
@@ -287,10 +309,7 @@ fn restore_newest_archived(dir: &std::path::Path, ask_id: &str) -> bool {
 pub fn cmd_ask(paths: &Paths, args: &crate::cli::AskArgs) -> Result<ExitCode> {
     use crate::contract::Contract;
     // worker defaults to $LOOOP_SESSION_ID (a worker self-callback omits it).
-    let worker = match &args.worker {
-        Some(w) if !w.is_empty() => w.clone(),
-        _ => std::env::var("LOOOP_SESSION_ID").unwrap_or_default(),
-    };
+    let worker = super::common::session_or_env(args.worker.as_deref());
     if worker.is_empty() {
         eprintln!("usage: looop ask <worker> --prompt \"…\" [--ref PATH] [--options a,b]");
         return Ok(ExitCode::from(1));
@@ -405,7 +424,14 @@ pub(crate) fn ask(
 
     // Block until answered. The human sees this ask (via a
     // client / `looop state`) and replies with `looop answer <id>`.
-    let poll = Duration::from_millis(crate::util::env_knob("LOOOP_ASK_POLL_MS").unwrap_or(1000));
+    // Clamped to ≥10ms: `LOOOP_ASK_POLL_MS=0` would busy-spin a full core for
+    // the whole (potentially hours-long) human wait — like every other knob,
+    // an absurd value gets a safe meaning instead of a pathological one.
+    let poll = Duration::from_millis(
+        crate::util::env_knob("LOOOP_ASK_POLL_MS")
+            .unwrap_or(1000)
+            .max(10),
+    );
     // Optional wall-clock bound: `LOOOP_ASK_TIMEOUT_S` (default: none — an ask
     // legitimately waits on a human indefinitely).
     // checked_add: an absurd value (u64::MAX) would overflow Instant + Duration
@@ -617,10 +643,40 @@ mod tests {
         assert!(block.contains("reports/cp.md"));
 
         // Consuming archives the pair: nothing left to resume, records kept.
-        archive_pair(&p, &id);
+        assert!(archive_pair(&p, &id), "the first consumer claims the pair");
         assert!(answered_detached(&p).is_empty());
         assert!(p.asks_dir().join("archive/triage-1.json").is_file());
         assert!(p.answers_dir().join("archive/triage-1.json").is_file());
+        // A SECOND consume of the same pair loses the claim — the ask half's
+        // rename is the atomic test-and-set a concurrent start is gated on.
+        assert!(
+            !archive_pair(&p, &id),
+            "an already-consumed pair must not be claimable again"
+        );
+    }
+
+    #[test]
+    fn racing_archive_pair_claims_let_exactly_one_win() {
+        // Regression: resume consumption used to be fire-and-forget, so two
+        // concurrent `worker start --resume <id>` calls could BOTH dispatch
+        // the same answered-detached ask. The ask half's archive rename is
+        // the claim (same idiom as drain_tells): exactly one claimant wins.
+        let p = temp_seeded();
+        let id = ask_detached(&p, "w", "go?", "", &[]).unwrap();
+        answer(&p, &id, "go", false).unwrap();
+        let wins: usize = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8).map(|_| s.spawn(|| archive_pair(&p, &id))).collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .filter(|won| *won)
+                .count()
+        });
+        assert_eq!(wins, 1, "exactly one concurrent consumer claims the pair");
+        assert!(
+            p.asks_dir().join(format!("archive/{id}.json")).is_file(),
+            "the claimed pair is archived, not lost"
+        );
     }
 
     #[test]
@@ -628,12 +684,12 @@ mod tests {
         let p = Paths::temp();
         let id = ask_detached(&p, "w", "first?", "", &[]).unwrap();
         cmd_answer(&p, &ans(&id, "one", false)).unwrap();
-        archive_pair(&p, &id);
+        assert!(archive_pair(&p, &id));
         // The id is free again (next_ask_id scans only live dirs)…
         let id2 = ask_detached(&p, "w", "second?", "", &[]).unwrap();
         assert_eq!(id2, id, "live id space is reusable after archive");
         cmd_answer(&p, &ans(&id2, "two", false)).unwrap();
-        archive_pair(&p, &id2);
+        assert!(archive_pair(&p, &id2));
         // …and the second archive did not clobber the first record.
         assert!(p.asks_dir().join("archive/w-1.json").is_file());
         assert!(p.asks_dir().join("archive/w-1-1.json").is_file());
@@ -644,7 +700,7 @@ mod tests {
         let p = Paths::temp();
         let id = ask_detached(&p, "w", "first?", "", &[]).unwrap();
         cmd_answer(&p, &ans(&id, "one", false)).unwrap();
-        archive_pair(&p, &id);
+        assert!(archive_pair(&p, &id));
 
         // Plain restore: both halves come back, the pair is resumable again.
         unarchive_pair(&p, &id);
@@ -655,7 +711,7 @@ mod tests {
         // Archive again, then let a NEW live ask REUSE the id: unarchive must
         // restore NEITHER half — restoring only the answer would attach the
         // stale "one" to the brand-new question.
-        archive_pair(&p, &id);
+        assert!(archive_pair(&p, &id));
         let id2 = ask_detached(&p, "w", "second, unrelated?", "", &[]).unwrap();
         assert_eq!(id2, id, "the live id space reuses archived ids");
         unarchive_pair(&p, &id);
