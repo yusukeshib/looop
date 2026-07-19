@@ -441,6 +441,33 @@ pub(crate) struct WorkerHealth {
     pub verify_output: Option<String>,
 }
 
+/// The pulse's own health row — for `looop worker list` presentation ONLY.
+/// The pulse's decision paths (sys-sessions, world hash, cadence) deliberately
+/// exclude the pulse via [`fleet_health`]; this projection exists so a human
+/// glancing at the fleet table can always answer "is the loop running?".
+/// Always returns a row: a missing or dead pulse renders health "down".
+pub(crate) fn pulse_health(paths: &Paths) -> WorkerHealth {
+    let sess = session::list(paths).into_iter().find(|s| s.is_pulse());
+    let alive = sess.as_ref().is_some_and(|s| s.alive);
+    WorkerHealth {
+        health: if alive { "up" } else { "down" },
+        idle_s: sess
+            .as_ref()
+            .and_then(|_| session::output_idle_secs(paths, session::PULSE_SESSION)),
+        uptime_s: sess.as_ref().and_then(|s| s.uptime_secs()),
+        ask_age_s: None,
+        verify: None,
+        verify_output: None,
+        id: session::PULSE_SESSION.to_string(),
+        state: sess
+            .as_ref()
+            .map(|s| s.state.clone())
+            .unwrap_or_else(|| "down".to_string()),
+        alive,
+        exit_code: sess.and_then(|s| s.exit_code),
+    }
+}
+
 /// The whole fleet's health, sorted by id (order-stable for the wake hash).
 pub(crate) fn fleet_health(paths: &Paths) -> Vec<WorkerHealth> {
     let stuck_after: u64 = crate::util::env_knob("LOOOP_WORKER_STUCK_SECS").unwrap_or(900);
@@ -733,6 +760,21 @@ mod tests {
         assert_eq!(worker_health(true, false, Some(899), 900), "busy");
         // Unknown idle biases to busy (never stuck on missing evidence).
         assert_eq!(worker_health(true, false, None, 900), "busy");
+    }
+
+    #[test]
+    fn pulse_health_reports_down_when_no_pulse_session_exists() {
+        // The always-present pulse row in `looop worker list`: with no pulse
+        // session on disk the row must still exist and read down/down — the
+        // whole point is answering "is the loop up?" at a glance.
+        let p = Paths::temp();
+        let w = pulse_health(&p);
+        assert_eq!(w.id, session::PULSE_SESSION);
+        assert!(!w.alive);
+        assert_eq!(w.health, "down");
+        assert_eq!(w.state, "down");
+        assert_eq!(w.verify, None);
+        assert_eq!(w.ask_age_s, None);
     }
 
     #[test]

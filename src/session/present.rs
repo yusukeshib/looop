@@ -29,9 +29,12 @@ fn reject_pulse(session: &str, verb: &str) -> bool {
 /// `looop worker list [--json] [--all] [--watch [--interval N]]` — the fleet
 /// with its health reading (the same projection the `sys-sessions` snapshot
 /// feeds the decider): id, state, health, idle (since last PTY output), uptime,
-/// and how long a pending ask has been waiting. Live workers only by default;
-/// `--all` includes corpses. `--watch` re-renders every `--interval` seconds
-/// (default 2) until Ctrl-C — the humble replacement for a fleet TUI.
+/// and how long a pending ask has been waiting. The pulse is shown as the
+/// FIRST row (health up/down) — presentation only, so a glance answers "is
+/// the loop running?" without touching the decider's pulse-free fleet view.
+/// Live workers only by default; `--all` includes corpses. `--watch`
+/// re-renders every `--interval` seconds (default 2) until Ctrl-C — the
+/// humble replacement for a fleet TUI.
 pub fn cmd_worker_list(
     paths: &Paths,
     json: bool,
@@ -41,10 +44,14 @@ pub fn cmd_worker_list(
 ) -> Result<ExitCode> {
     let mut prev_lines = 0usize;
     loop {
-        let fleet: Vec<crate::sensor::WorkerHealth> = crate::sensor::fleet_health(paths)
-            .into_iter()
-            .filter(|w| all || w.alive)
-            .collect();
+        // The pulse row is ALWAYS shown (even dead — that's the point: "is
+        // the loop up?"), ahead of the workers, unaffected by --all.
+        let mut fleet: Vec<crate::sensor::WorkerHealth> = vec![crate::sensor::pulse_health(paths)];
+        fleet.extend(
+            crate::sensor::fleet_health(paths)
+                .into_iter()
+                .filter(|w| all || w.alive),
+        );
         if json {
             let rows: Vec<serde_json::Value> = fleet
                 .iter()
@@ -120,6 +127,8 @@ fn render_fleet(fleet: &[crate::sensor::WorkerHealth], clip: Option<usize>) -> u
         println!("no workers");
         return 1;
     }
+    // (fleet always contains at least the pulse row when called from
+    // cmd_worker_list; the empty guard covers direct/test callers.)
     let idw = fleet.iter().map(|w| w.id.len()).max().unwrap_or(2).max(2);
     print_clipped(
         &format!(
@@ -137,7 +146,7 @@ fn render_fleet(fleet: &[crate::sensor::WorkerHealth], clip: Option<usize>) -> u
     );
     for w in fleet {
         let (hl, hr) = match w.health {
-            "stuck" => (red(), rst()),
+            "stuck" | "down" => (red(), rst()),
             "waiting-ask" => (yel(), rst()),
             "dead" => (dim(), rst()),
             _ => ("", ""),
