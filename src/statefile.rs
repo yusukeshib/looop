@@ -1,4 +1,4 @@
-//! Three-valued reads of the small JSON state files the beat's guards keep
+//! Four-valued reads of the small JSON state files the beat's guards keep
 //! (`.tick-backoff`, `.noop-at`, the flap/decide ledgers, `.next-wake.json`).
 //!
 //! Every one of these files has the same failure taxonomy, and squashing the

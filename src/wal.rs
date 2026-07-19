@@ -93,10 +93,11 @@ pub(crate) fn begin_intent(paths: &Paths, action: &Action) -> Intent {
 /// nothing to recover. Only an actual crash between begin/clear leaves it.
 ///
 /// Compare-and-delete on the EXACT body this actor wrote ([`begin_intent`]'s
-/// return value): the WAL is a single global key, and a concurrent pulse beat +
-/// manual `looop run` would otherwise clear EACH OTHER's intent — the old
-/// fingerprint-read-then-remove was check-then-act and could still remove a
-/// record that changed between the compare and the remove.
+/// return value): each actor writes its own per-actor key
+/// (`Key::ActionWal(actor)`), so a concurrent pulse beat and manual `looop run`
+/// never share a file — but the old fingerprint-read-then-remove was
+/// check-then-act and could still remove a record that changed between the
+/// compare and the remove.
 pub(crate) fn clear_intent(paths: &Paths, intent: &Intent) {
     let _ = FileStore::new(paths).remove_if_eq(&Key::ActionWal(intent.actor.clone()), &intent.body);
 }
