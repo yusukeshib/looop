@@ -806,7 +806,8 @@ mod tests {
         // through, so it flattens instead of trusting each caller.
         let p = Paths::temp();
         let s = FileStore::new(&p);
-        s.append_line(&Key::Journal, "first\nsecond\r\nthird").unwrap();
+        s.append_line(&Key::Journal, "first\nsecond\r\nthird")
+            .unwrap();
         s.append_line(&Key::Journal, "clean").unwrap();
         let body = fs::read_to_string(p.journal()).unwrap();
         let lines: Vec<&str> = body.lines().collect();

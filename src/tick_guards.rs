@@ -681,7 +681,10 @@ mod tests {
         let _ = crate::seed::ensure_dirs(&p);
         fs::write(p.data_dir.join(".tick-backoff"), b"{not json").unwrap();
         let (hash, fails, ts) = read_backoff(&p).expect("corrupt reads as a conservative record");
-        assert_eq!(fails, BACKOFF_CORRUPT_FAILS, "the wait is imposed, not skipped");
+        assert_eq!(
+            fails, BACKOFF_CORRUPT_FAILS,
+            "the wait is imposed, not skipped"
+        );
         assert!(
             util::now_unix().saturating_sub(ts) <= 2,
             "ts is assumed 'now' so the window starts from the corruption sighting"

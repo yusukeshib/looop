@@ -360,8 +360,7 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
                 // MID-FLIGHT, so unlike a clean nonzero exit its side effects
                 // may have half-landed — the next prompt's LAST FAILURE must
                 // tell the decider to verify before re-issuing.
-                let partial = if res.exit_code.is_none() && res.output.contains("timed out after")
-                {
+                let partial = if res.exit_code.is_none() && res.output.contains("timed out after") {
                     " — the command may have partially executed; verify its side effects before retrying"
                 } else {
                     ""

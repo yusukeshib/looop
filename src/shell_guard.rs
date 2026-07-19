@@ -270,10 +270,10 @@ mod tests {
             "true&&sudo make install",
             "echo done;reboot",
             "false||sudo id",
-            "true&& sudo id",  // glued on one side only
+            "true&& sudo id", // glued on one side only
             "echo x &&sudo id",
-            "(sudo id)",       // subshell parens glued around the word
-            "true&&rm -rf /",  // the rm walk also sees the re-split tokens
+            "(sudo id)",      // subshell parens glued around the word
+            "true&&rm -rf /", // the rm walk also sees the re-split tokens
         ] {
             assert!(denied_shell_pattern(cmd).is_some(), "must be denied: {cmd}");
         }
