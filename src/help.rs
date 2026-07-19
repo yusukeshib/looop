@@ -50,7 +50,7 @@ Usage:
   looop schedule write <name> --in S | --every S [--note …]   durable time trigger:
                                 one-shot (--in) or recurring (--every, min 60s);
                                 when due it WAKES the loop (survives restarts —
-                                unlike next_interval_s there is no 3600s cap)
+                                unlike next_interval_s there is no short cap)
   looop schedule rm <name> | schedule list [--json]
   looop run [--reason "…"] <cmd…>   one ad-hoc, REVERSIBLE shell command (recorded);
                                 the command's own flags pass through verbatim — put
