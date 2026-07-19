@@ -435,10 +435,15 @@ fn start_session(
     // `cd` there inside the shell command instead of mutating looop's own cwd.
     // Export LOOOP_SESSION_ID so the worker knows its OWN session id (for its
     // lease claim, etc.) through a looop-branded var.
+    // `worker_command` always carries `{{prompt_file}}` (build_worker_cmd
+    // enforces it), so the launch reads the brief by PATH and is safe to wrap
+    // in the env-gated retry loop (no-op by default). Group with `{ …; }` so a
+    // multi-statement wrapper stays gated on the `cd` succeeding.
     let launch = format!(
-        "export LOOOP_SESSION_ID={}; cd {} && {cmd}",
+        "export LOOOP_SESSION_ID={}; cd {} && {{ {rcmd} ; }}",
         shell_quote(&session),
-        shell_quote(&paths.data_dir.to_string_lossy())
+        shell_quote(&paths.data_dir.to_string_lossy()),
+        rcmd = crate::runner::wrap_with_retry(&cmd),
     );
 
     // ARCHIVE-THEN-SPAWN: consume the answered resume pair BEFORE launching.

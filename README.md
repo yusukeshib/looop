@@ -247,6 +247,33 @@ Model ids above are examples. For claude, `sonnet`/`opus` are aliases that alway
 resolve to the latest of each; pin a specific version (e.g.
 `--model claude-opus-4-1`) if you need reproducibility.
 
+### Transient runner retry (optional)
+
+A runner can fail *transiently* — a provider auth blip, a rate-limit, a 5xx —
+and some runners report it in their structured stream while still **exiting 0**
+(e.g. pi prints `"stopReason":"error"` … `"willRetry":false` and exits 0), so an
+exit-code check alone misses it. looop can re-run one runner invocation, but it
+keeps **no runner vocabulary**: you supply the pattern that means "transient"
+for *your* runner. Disabled by default; opt in with env knobs:
+
+| Env knob | Meaning |
+| -------- | ------- |
+| `LOOOP_RUNNER_RETRIES` | Extra attempts after the first (default `0` = off). |
+| `LOOOP_RUNNER_RETRY_MATCH` | Extended-regex matched case-insensitively against the attempt's output; empty = retry on a nonzero **exit** only. |
+| `LOOOP_RUNNER_RETRY_SLEEP` | Base backoff seconds, multiplied by the attempt number (default `3`). |
+
+Applies to **both** the tick and workers. Each attempt streams live (teed to the
+replay archive) while its output is captured and matched; a retry fires on a
+nonzero exit **or** a pattern hit, and the last attempt's exit status passes
+through. The wrapped command must read its prompt by **path**
+(`{{prompt_file}}`) — a stdin-fed tick is left unwrapped (its prompt is consumed
+once), and `worker_command` always carries the placeholder. Example for pi:
+
+```sh
+export LOOOP_RUNNER_RETRIES=2
+export LOOOP_RUNNER_RETRY_MATCH='auth failed for provider|rate.?limit|HTTP 5[0-9][0-9]|"willRetry":false'
+```
+
 ## Threat model
 
 looop's `run_shell` action executes a **decider-written command** via `bash -c`
