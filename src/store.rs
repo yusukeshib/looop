@@ -317,9 +317,11 @@ impl<'a> FileStore<'a> {
 /// KNOWN RACE (accepted): an appender that opened the live file just before
 /// a concurrent rotation renames it keeps writing through its fd — that
 /// record lands in the freshly-renamed `.1` generation instead of the new
-/// live file. This is fine under the ONE-GENERATION policy: `.1` is retained
-/// (readers that care scan live + `.1`), so the record survives exactly as
-/// long as any other record of its generation; nothing is lost or torn.
+/// live file. This is fine under the ONE-GENERATION policy: the record
+/// survives on disk in `.1` for forensic reads. Live readers (journal tail,
+/// prompt) only scan the new generation, so the record drops out of their
+/// view early — acceptable, since a record that close to the size cap would
+/// age out of the short tails almost immediately anyway; nothing is torn.
 /// Serializing appends against rotation to close it would put a lock on the
 /// hot append path — the opposite of "rotation must never slow a write".
 pub(crate) fn rotate_at_cap(path: &std::path::Path, max_bytes: u64) {

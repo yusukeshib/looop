@@ -146,7 +146,15 @@ fn consume_next_wake(paths: &Paths, observed: &str) {
     let Ok(_lock) = crate::store::DirLock::acquire(&paths.data_dir) else {
         // Cannot serialize the compare — leave the deadline in place. It
         // re-fires next beat: a duplicate forced re-decide is far cheaper
-        // than deleting a deadline we can't prove is ours.
+        // than deleting a deadline we can't prove is ours. Warn (like
+        // `write_next_wake` does on the same failure): if the lock keeps
+        // failing, every beat force-re-decides, and that must not be silent.
+        util::event(
+            Level::Warn,
+            "pulse.guard_degraded",
+            "cannot lock the data dir to consume the wake deadline — leaving it in place (forced re-decide next beat)",
+            &[],
+        );
         return;
     };
     match fs::read_to_string(paths.next_wake()) {

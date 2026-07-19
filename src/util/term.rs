@@ -155,8 +155,10 @@ pub fn clip_ansi(s: &str, max: usize) -> String {
 /// no-op unless color (ANSI) is enabled: JSON mode and `NO_COLOR` streams stay
 /// byte-clean, and a non-PTY consumer never sees stray carriage returns.
 ///
-/// STDOUT INTERLEAVING: the spinner repaints via raw `print!` with no lock
-/// against `util::event`'s `println!`. The callers uphold the invariant that
+/// STDOUT INTERLEAVING: the spinner repaints via `write!` on a per-write
+/// stdout lock (EPIPE-safe); the lock is per-write, not per-line-transaction,
+/// so it does NOT order the spinner against `util::event`'s output on its
+/// own. The callers uphold the invariant that
 /// NO events are printed while a spinner is live — it wraps exactly one
 /// silent wait and is dropped before the outcome event (see the matching note
 /// on [`super::event`]).
