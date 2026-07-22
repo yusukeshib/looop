@@ -60,6 +60,8 @@ pub enum Cmd {
     Up(UpArgs),
     /// Tear the pulse (and workers) down.
     Down,
+    /// Read-only TUI for observing every pulse and worker buffer.
+    Watch(WatchArgs),
     /// looop's own detached reconcile-loop body (spawned by `up`).
     Pulse,
     /// Full world snapshot: goals, sensors, fleet, asks.
@@ -122,6 +124,18 @@ pub struct UpArgs {
     /// Emit pulse logs as JSON.
     #[arg(long)]
     pub json: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct WatchArgs {
+    /// Session id to focus initially.
+    pub id: Option<String>,
+    /// Show all retained sessions, not just active ones.
+    #[arg(long, short = 'a')]
+    pub all: bool,
+    /// Also show sessions newer than a duration (e.g. 1d, 12h, 30m).
+    #[arg(long, short = 's', conflicts_with = "all")]
+    pub since: Option<String>,
 }
 
 /// Shared by every action verb that funnels through `run_action`: a one-line
@@ -430,6 +444,19 @@ pub struct ClaimArgs {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    #[test]
+    fn watch_accepts_an_initial_session_and_exclusive_history_filters() {
+        let c = Cli::try_parse_from(["looop", "watch", "worker-1", "--since", "12h"])
+            .expect("watch id + recency parses");
+        let Some(Cmd::Watch(a)) = c.cmd else {
+            panic!("expected watch")
+        };
+        assert_eq!(a.id.as_deref(), Some("worker-1"));
+        assert_eq!(a.since.as_deref(), Some("12h"));
+        assert!(!a.all);
+        assert!(Cli::try_parse_from(["looop", "watch", "--all", "--since", "1d"]).is_err());
+    }
 
     #[test]
     fn screenshot_output_formats_are_mutually_exclusive() {

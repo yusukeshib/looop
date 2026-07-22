@@ -57,6 +57,19 @@ answers are a durable file mailbox reached through one backend-agnostic contract
 A client is an *interface*, never a decision-maker. looop decides; the client
 just carries the question to you and your answer back.
 
+To observe what the detached pulse and workers are doing, open the read-only
+buffer viewer:
+
+```sh
+looop watch              # live sessions; Enter opens the session picker
+looop watch <id>         # focus one buffer initially
+looop watch --all        # include retained finished sessions
+```
+
+The viewer replays each raw PTY transcript as a terminal, preserving colors,
+in-place redraws, scrollback, mouse scrolling, and the original polished session
+picker rather than dumping control sequences as text.
+
 Two properties make all this dependable:
 
 - **Level-triggered.** All state is plain files, so the loop re-senses every beat

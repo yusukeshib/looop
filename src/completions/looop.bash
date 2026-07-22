@@ -83,7 +83,7 @@ _looop() {
     local cur prev words cword
     _init_completion || return
 
-    local subcommands="init up down state wait asks answer goal sensor playbook schedule run worker w ask tell told screenshot ss kill claim unclaim config version help"
+    local subcommands="init up down watch state wait asks answer goal sensor playbook schedule run worker w ask tell told screenshot ss kill claim unclaim config version help"
 
     if [[ $cword -eq 1 ]]; then
         COMPREPLY=($(compgen -W "$subcommands" -- "$cur"))
@@ -94,6 +94,13 @@ _looop() {
     case "$sub" in
         up)
             [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--json" -- "$cur"))
+            ;;
+        watch)
+            if [[ "$cur" == -* ]]; then
+                COMPREPLY=($(compgen -W "-a --all -s --since" -- "$cur"))
+            elif [[ $cword -eq 2 ]]; then
+                COMPREPLY=($(compgen -W "$(__looop_workers_list)" -- "$cur"))
+            fi
             ;;
         state)
             [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--json" -- "$cur"))

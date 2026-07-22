@@ -1,6 +1,6 @@
 [package]
 name = "looop"
-version = "0.64.0"
+version = "0.65.0"
 edition = "2024"
 description = "A tiny, portable, Kubernetes-shaped control loop for your work"
 license = "MIT"
@@ -26,10 +26,12 @@ babysit = { version = "0.12", default-features = false }
 # supervisor (serve_worker), which babysit runs under a multi-thread runtime
 # (`#[tokio::main]`). Match that so the in-process worker behaves identically.
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "net", "time", "io-util", "signal"] }
-# `looop init` drives its interactive picker through `ratatui::crossterm`
-# (ratatui re-exports its crossterm backend, so we don't pin crossterm
-# separately).
+# `looop init` and the `looop watch` observer TUI use ratatui's crossterm
+# backend. Watch also parses raw PTY transcripts into styled terminal screens.
 ratatui = { version = "0.30" }
+ansi-to-tui = "8"
+# babysit already depends on vt100, but watch names the parser type directly.
+vt100 = "0.16"
 
 [profile.release]
 strip = true
