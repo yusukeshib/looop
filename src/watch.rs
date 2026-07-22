@@ -16,9 +16,8 @@
 //! an interactive agent redraws in place (cursor moves, line/screen
 //! clears, carriage returns), so the raw bytes are NOT a clean line log. We
 //! replay the WHOLE log through a `vt100` virtual terminal and render the
-//! resulting SCREEN plus its scrollback, instead of dumping every redraw frame
-//! as new lines — so scrolling up reaches the session's first line, not just a
-//! recent tail. Selecting a row in the bottom pane re-points the log pane.
+//! resulting SCREEN plus bounded scrollback, instead of dumping every redraw
+//! frame as new lines. Selecting a row in the picker re-points the log pane.
 //!
 //! Mouse capture stays on (wheel scrolls, the scrollbar scrubs); hold Shift
 //! while dragging to use the terminal's own text selection / copy.
@@ -80,12 +79,24 @@ impl Drop for MouseCaptureGuard {
 }
 
 pub fn cmd_watch(paths: &Paths, args: &crate::cli::WatchArgs) -> Result<ExitCode> {
-    let initial: Option<String> = args.id.clone();
-    if let Some(id) = initial.as_deref()
-        && !session::list(paths).iter().any(|s| s.id == id)
-    {
-        anyhow::bail!("looop watch: unknown session '{id}'");
-    }
+    // Resolve an explicit id before entering raw mode. Exact ids win; retain
+    // the same legacy `looop-foo` → `foo` compatibility as kill/screenshot.
+    let initial = if let Some(requested) = args.id.as_deref() {
+        let sessions = session::try_list(paths)?;
+        sessions
+            .iter()
+            .find(|s| s.id == requested)
+            .or_else(|| {
+                requested
+                    .strip_prefix("looop-")
+                    .and_then(|id| sessions.iter().find(|s| s.id == id))
+            })
+            .map(|s| s.id.clone())
+            .ok_or_else(|| anyhow::anyhow!("looop watch: unknown session '{requested}'"))?
+            .into()
+    } else {
+        None
+    };
     let filter = if let Some(dur) = &args.since {
         Filter::Recent(parse_duration(dur)?)
     } else if args.all {
@@ -94,12 +105,15 @@ pub fn cmd_watch(paths: &Paths, args: &crate::cli::WatchArgs) -> Result<ExitCode
         Filter::Active
     };
 
+    // Enumerate before entering raw mode so a fleet error is reported normally
+    // rather than repeatedly printing through the alternate-screen UI.
+    let mut app = App::new(paths, initial, filter)?;
     let mut terminal = ratatui::init();
     // Capture the mouse so wheel events reach us as `Event::Mouse`. The guard
     // also disables capture while unwinding from a panic; ratatui's own panic
     // hook handles raw mode and the alternate screen.
     let mouse = MouseCaptureGuard::enable();
-    let res = App::new(paths, initial, filter).run(&mut terminal, paths);
+    let res = app.run(&mut terminal, paths);
     drop(mouse);
     ratatui::restore();
     res?;
@@ -160,12 +174,12 @@ struct SelectorHit {
 }
 
 impl App {
-    fn new(paths: &Paths, initial: Option<String>, filter: Filter) -> Self {
+    fn new(paths: &Paths, initial: Option<String>, filter: Filter) -> Result<Self> {
         let recent_window = match filter {
             Filter::Recent(w) => w,
             _ => DEFAULT_WINDOW,
         };
-        let (sessions, hidden) = list_filtered(paths, filter, initial.as_deref());
+        let (sessions, hidden) = list_filtered(paths, filter, initial.as_deref())?;
         let mut list_state = ListState::default();
         let idx = initial
             .as_deref()
@@ -174,7 +188,7 @@ impl App {
         if !sessions.is_empty() {
             list_state.select(Some(idx));
         }
-        App {
+        Ok(App {
             sessions,
             list_state,
             filter,
@@ -184,7 +198,7 @@ impl App {
             picking: false,
             log: LogView::new(),
             selector: None,
-        }
+        })
     }
 
     /// Select the session under a mouse click on the bottom list. Returns
@@ -218,19 +232,20 @@ impl App {
 
     /// Re-list sessions, preserving the current selection by id (the list is
     /// re-sorted most-recently-active first, so the index drifts).
-    fn refresh(&mut self, paths: &Paths) {
+    fn refresh(&mut self, paths: &Paths) -> Result<()> {
         let keep = self.selected_id().map(str::to_string);
-        let (sessions, hidden) = list_filtered(paths, self.filter, self.requested_id.as_deref());
+        let (sessions, hidden) = list_filtered(paths, self.filter, self.requested_id.as_deref())?;
         self.sessions = sessions;
         self.hidden = hidden;
         if self.sessions.is_empty() {
             self.list_state.select(None);
-            return;
+            return Ok(());
         }
         let idx = keep
             .and_then(|id| self.sessions.iter().position(|s| s.id == id))
             .unwrap_or(0);
         self.list_state.select(Some(idx));
+        Ok(())
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -251,7 +266,7 @@ impl App {
             .unwrap_or_else(Instant::now);
         loop {
             if last_refresh.elapsed() >= TICK {
-                self.refresh(paths);
+                self.refresh(paths)?;
                 last_refresh = Instant::now();
             }
 
@@ -285,7 +300,7 @@ impl App {
                                         Filter::Recent(_) => Filter::All,
                                         Filter::All => Filter::Active,
                                     };
-                                    self.refresh(paths);
+                                    self.refresh(paths)?;
                                 }
                                 _ => {}
                             }
@@ -396,7 +411,7 @@ impl App {
             } else {
                 String::new()
             };
-            format!(" {name}{hidden}  ↑/↓ move · a filter · enter select · esc cancel · q quit ")
+            format!(" {name}{hidden}  ↑/↓ move · a filter · enter select · esc close · q quit ")
         } else {
             let id = self.selected_id().unwrap_or("—").to_string();
             format!(" {id}  ↑/↓ scroll · enter sessions · q quit ")
@@ -452,12 +467,12 @@ fn list_filtered(
     paths: &Paths,
     filter: Filter,
     requested_id: Option<&str>,
-) -> (Vec<Session>, usize) {
-    let all = session::list(paths);
+) -> Result<(Vec<Session>, usize)> {
+    let all = session::try_list(paths)?;
     let total = all.len();
     let explicitly_requested = |s: &Session| requested_id == Some(s.id.as_str());
     let kept: Vec<Session> = match filter {
-        Filter::All => return (all, 0),
+        Filter::All => return Ok((all, 0)),
         Filter::Active => all
             .into_iter()
             .filter(|s| s.alive || s.is_pulse() || explicitly_requested(s))
@@ -473,7 +488,7 @@ fn list_filtered(
             .collect(),
     };
     let hidden = total - kept.len();
-    (kept, hidden)
+    Ok((kept, hidden))
 }
 
 /// Render one session as a colored row: a state dot, the id (pulse flagged),

@@ -493,6 +493,7 @@ mod tests {
             vec!["init"],
             vec!["up"], // cmd_up runs the preflight itself, AFTER the init check
             vec!["down"],
+            vec!["watch"],
             vec!["state", "--json"],
             vec!["wait"],
             vec!["asks", "--json"],

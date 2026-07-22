@@ -3,8 +3,8 @@
 //! `looop watch` takes a PTY-backed session's raw `output.log` (an interactive
 //! agent redraws in place — cursor moves, line/screen clears, carriage returns
 //! — so the bytes are NOT a clean line log), replays the WHOLE stream through a
-//! `vt100` virtual terminal, and renders the resulting SCREEN plus its
-//! scrollback into a pane that reaches the session's first line.
+//! `vt100` virtual terminal, and renders the resulting SCREEN plus bounded
+//! scrollback into a pane.
 //!
 //! This module owns the replay machinery:
 //!
@@ -29,14 +29,13 @@ use babysit::render;
 use ratatui::prelude::*;
 use ratatui::widgets::{Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState};
 
-/// Cap on the INITIAL replay read. We feed the WHOLE `output.log` so scrollback
-/// reaches the session's first line (the worker streams its transcript with
-/// newlines — only the status block repaints in place — so the full history is
-/// recoverable). This cap only bounds latency on pathological logs: at/below it
-/// we read from byte 0 (first line reachable); above it we fall back to the last
-/// `MAX_REPLAY_BYTES` (live tail preserved, oldest lines dropped). 16 MiB covers
-/// every observed session and parses in well under ~1.5s; from there we only
-/// ever feed the freshly-appended tail.
+/// Cap on the initial replay read. Logs within the cap start at byte zero;
+/// larger logs keep their live tail. The virtual terminal separately bounds
+/// retained scrollback rows, so very long histories may drop their oldest rows.
+/// This also caps each incremental read, so one burst cannot force
+/// an unbounded allocation; remaining bytes are consumed on subsequent ticks.
+/// At/below the cap we read from byte 0; above it we fall back to the last
+/// `MAX_REPLAY_BYTES` (live tail preserved, oldest bytes dropped).
 const MAX_REPLAY_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Recorded PTY geometry of every detached worker. looop spawns with
@@ -53,9 +52,14 @@ const PTY_COLS: u16 = render::DEFAULT_SCREENSHOT_SIZE.1;
 /// How many rows of scrollback the virtual terminal retains. The agents don't
 /// use the alternate screen (they redraw in place on the primary screen), so
 /// content that scrolls off the top lands here and stays reachable. vt100 grows
-/// scrollback lazily, so this is just an upper bound; a long worker session can
-/// scroll well past 10k rows, so keep generous headroom.
-const SCROLLBACK_ROWS: usize = 100_000;
+/// scrollback lazily, so this is just an upper bound. Keep enough for long
+/// sessions while bounding the observer's worst-case memory (vt100 cells are
+/// substantially larger than the source bytes).
+const SCROLLBACK_ROWS: usize = 25_000;
+
+/// Bytes immediately before the consumed offset used to detect a truncate,
+/// replacement, or rewrite that regrew past that offset between UI ticks.
+const PREFIX_GUARD_BYTES: u64 = 4096;
 
 /// The dim gray style shared by hints and secondary text.
 fn dim() -> Style {
@@ -92,6 +96,9 @@ struct LogReplay {
     prev_scrollback: usize,
     /// Total bytes ever fed — 0 means the file exists but is empty.
     seen: u64,
+    /// Hash of the bytes immediately before `offset`. An append-only file keeps
+    /// this stable; a truncate/replace that regrows past `offset` does not.
+    prefix_guard: u64,
 }
 
 /// Cached result of the expensive vt100→ANSI→ratatui render. That path renders
@@ -217,8 +224,15 @@ impl LogView {
         let len = meta.len();
 
         let reset = match &self.log {
-            // New session, or the file was truncated/rotated under us.
-            Some(l) => l.id != id || len < l.offset,
+            // New session, truncation, replacement, or an in-place rewrite
+            // that regrew beyond our old offset between refreshes.
+            Some(l) => {
+                l.id != id
+                    || len < l.offset
+                    || prefix_guard(&path, l.offset)
+                        .map(|guard| guard != l.prefix_guard)
+                        .unwrap_or(true)
+            }
             None => true,
         };
 
@@ -245,7 +259,8 @@ impl LogView {
             return;
         }
         let start = l.offset;
-        let delta = match read_range(&path, start, len) {
+        let end = len.min(start.saturating_add(MAX_REPLAY_BYTES));
+        let delta = match read_range(&path, start, end) {
             Ok(b) => {
                 let consumed = b.len() as u64;
                 l.seen += consumed;
@@ -254,6 +269,9 @@ impl LogView {
                 // `len` here could replay bytes twice or skip them.
                 l.offset = start.saturating_add(consumed);
                 l.parser.process(&b);
+                if let Ok(guard) = prefix_guard(&path, l.offset) {
+                    l.prefix_guard = guard;
+                }
                 let sb = scrollback_len(&mut l.parser);
                 let d = sb.saturating_sub(l.prev_scrollback);
                 l.prev_scrollback = sb;
@@ -477,7 +495,7 @@ impl LogView {
             } else {
                 track
             };
-            let mut state = ScrollbarState::new(max_scroll)
+            let mut state = ScrollbarState::new(max_scroll.saturating_add(1))
                 .position(max_scroll - back)
                 .viewport_content_length(viewport);
             let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
@@ -611,12 +629,14 @@ fn build_replay(id: String, path: &Path) -> LogReplay {
         0
     };
     let prev_scrollback = scrollback_len(&mut parser);
+    let offset = start.saturating_add(consumed);
     LogReplay {
         id,
         parser,
-        offset: start.saturating_add(consumed),
+        offset,
         prev_scrollback,
         seen: consumed,
+        prefix_guard: prefix_guard(path, offset).unwrap_or(0),
     }
 }
 
@@ -641,8 +661,22 @@ fn spawn_replay_worker() -> (Sender<ParseRequest>, Receiver<ParseResult>) {
     (req_tx, res_rx)
 }
 
-/// Read `path` from byte `start` to EOF — the bytes appended since the last
-/// frame, fed incrementally into the persistent parser.
+/// Hash the consumed prefix's trailing window. This detects file replacement
+/// and truncate-then-regrow races even when the new length already exceeds the
+/// old offset. If the prefix is byte-identical, continuing from the old offset
+/// is correct regardless of how the file got there.
+fn prefix_guard(path: &Path, offset: u64) -> std::io::Result<u64> {
+    let start = offset.saturating_sub(PREFIX_GUARD_BYTES);
+    let bytes = read_range(path, start, offset)?;
+    // FNV-1a: stable, tiny, and sufficient as a corruption guard (not security).
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    Ok(hash)
+}
+
 /// Read exactly the snapshotted byte range `[start, end)`, or fewer bytes if
 /// the file was truncated concurrently. Appends after `end` wait for the next
 /// sync so no byte can be fed to the terminal twice.
@@ -691,6 +725,15 @@ mod tests {
     fn read_range_stops_at_the_snapshotted_end() {
         let p = tmp("bounded", b"0123456789");
         assert_eq!(read_range(&p, 2, 6).unwrap(), b"2345");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn prefix_guard_detects_a_rewritten_consumed_prefix() {
+        let p = tmp("guard", b"0123456789");
+        let before = prefix_guard(&p, 10).unwrap();
+        std::fs::write(&p, b"abcdefghij-extra").unwrap();
+        assert_ne!(prefix_guard(&p, 10).unwrap(), before);
         let _ = std::fs::remove_file(&p);
     }
 
