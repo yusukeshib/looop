@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEventKind,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::prelude::*;
@@ -274,6 +274,45 @@ impl App {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        // Release and an in-progress log-scrollbar drag are global: the pointer
+        // may cross into the docked worker pane before the button comes up.
+        // Routing by pane first would swallow those events and leave the log
+        // scrollbar stuck in dragging mode.
+        if mouse.kind == MouseEventKind::Up(MouseButton::Left) {
+            self.log.dragging_scrollbar = false;
+            return;
+        }
+        if self.log.dragging_scrollbar && mouse.kind == MouseEventKind::Drag(MouseButton::Left) {
+            self.log.scrollbar_scrub(mouse.row);
+            return;
+        }
+
+        if self.selector_contains(mouse.column, mouse.row) {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => self.move_selection(-1),
+                MouseEventKind::ScrollDown => self.move_selection(1),
+                MouseEventKind::Down(MouseButton::Left)
+                    if self.select_at(mouse.column, mouse.row) =>
+                {
+                    self.picking = true;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match mouse.kind {
+            MouseEventKind::ScrollUp => self.log.scroll(3),
+            MouseEventKind::ScrollDown => self.log.scroll(-3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.picking = false;
+                self.log.dragging_scrollbar = self.log.scrollbar_grab(mouse.column, mouse.row);
+            }
+            _ => {}
+        }
+    }
+
     fn run(&mut self, terminal: &mut ratatui::DefaultTerminal, paths: &Paths) -> Result<()> {
         let mut last_refresh = Instant::now()
             .checked_sub(TICK)
@@ -340,37 +379,7 @@ impl App {
                             }
                         }
                     }
-                    // Mouse input follows the pane under the cursor. Clicking a
-                    // worker focuses the table; the log keeps its own wheel and
-                    // draggable scrollbar everywhere else.
-                    Event::Mouse(m) if self.selector_contains(m.column, m.row) => match m.kind {
-                        MouseEventKind::ScrollUp => self.move_selection(-1),
-                        MouseEventKind::ScrollDown => self.move_selection(1),
-                        MouseEventKind::Down(MouseButton::Left)
-                            if self.select_at(m.column, m.row) =>
-                        {
-                            self.picking = true;
-                        }
-                        _ => {}
-                    },
-                    Event::Mouse(m) => match m.kind {
-                        MouseEventKind::ScrollUp => self.log.scroll(3),
-                        MouseEventKind::ScrollDown => self.log.scroll(-3),
-                        // Grab the scrollbar on press; once grabbed, keep
-                        // scrubbing on every drag (row only) until release, so
-                        // the cursor can leave the column without dropping it.
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            self.picking = false;
-                            self.log.dragging_scrollbar = self.log.scrollbar_grab(m.column, m.row);
-                        }
-                        MouseEventKind::Drag(MouseButton::Left) if self.log.dragging_scrollbar => {
-                            self.log.scrollbar_scrub(m.row);
-                        }
-                        MouseEventKind::Up(MouseButton::Left) => {
-                            self.log.dragging_scrollbar = false;
-                        }
-                        _ => {}
-                    },
+                    Event::Mouse(mouse) => self.handle_mouse(mouse),
                     _ => {}
                 }
             }
@@ -408,9 +417,7 @@ impl App {
             String::new()
         };
         let help = if self.picking {
-            format!(
-                " {name}{hidden}  ↑/↓ worker · tab living/all · enter select · esc log · q quit "
-            )
+            format!(" {name}{hidden}  ↑/↓ worker · tab living/all · enter log · esc log · q quit ")
         } else {
             let id = self.selected_id().unwrap_or("—");
             format!(" {id} · {name}{hidden}  ↑/↓ scroll · enter workers · tab living/all · q quit ")
@@ -474,7 +481,7 @@ impl App {
         if self.fleet.len() > MAX_WORKER_ROWS && data_area.height > 0 {
             let mut state = ScrollbarState::new(self.fleet.len())
                 .position(self.table_state.selected().unwrap_or(0))
-                .viewport_content_length(MAX_WORKER_ROWS);
+                .viewport_content_length(data_area.height as usize);
             let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
                 .begin_symbol(None)
                 .end_symbol(None)
@@ -645,6 +652,25 @@ mod tests {
         assert!(parse_duration("1w").is_err());
         assert!(parse_duration("d").is_err());
         assert!(parse_duration("18446744073709551615d").is_err());
+    }
+
+    #[test]
+    fn releasing_log_scrollbar_over_worker_pane_ends_drag() {
+        let mut app = app_with_fleet(vec![health("pulse")]);
+        app.selector = Some(SelectorHit {
+            area: Rect::new(0, 0, 20, 5),
+            offset: 0,
+        });
+        app.log.dragging_scrollbar = true;
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 3,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        assert!(!app.log.dragging_scrollbar);
     }
 
     #[test]
