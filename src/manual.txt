@@ -134,6 +134,7 @@ embedded DB, or anything else. A client does FOUR things:
      interface. Clients steer through the verbs.)
 
   Optional peek verbs for the fleet (read-only):
+       looop watch [<id>] [--all|--since D]  polished TUI over every session buffer
        looop worker list [--all] [--watch]   fleet + health, idle/uptime/ask age
        looop screenshot <id>                 capture what a worker shows right now
      health: busy (producing output) · waiting-ask (the human's turn) · stuck

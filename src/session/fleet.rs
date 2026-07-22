@@ -46,6 +46,9 @@ pub struct Session {
     /// Empty when babysit didn't report one. Feeds the sys-sessions health
     /// reading's `uptime_s` detail.
     pub started_at: String,
+    /// RFC3339 timestamp of the most recent session state change. This is the
+    /// authoritative recency marker for retained corpses in `looop watch`.
+    pub last_change: String,
 }
 
 impl Session {
@@ -62,6 +65,14 @@ impl Session {
             .ok()
             .map(|d| d.as_secs())
     }
+
+    /// Time since babysit last changed this session's state.
+    pub fn idle_for(&self) -> Option<std::time::Duration> {
+        let ts = chrono::DateTime::parse_from_rfc3339(self.last_change.trim()).ok()?;
+        (chrono::Utc::now() - ts.with_timezone(&chrono::Utc))
+            .to_std()
+            .ok()
+    }
 }
 
 fn project(info: ::babysit::SessionInfo) -> Session {
@@ -71,6 +82,7 @@ fn project(info: ::babysit::SessionInfo) -> Session {
         alive: info.alive,
         exit_code: info.exit_code.map(|c| c as i64),
         started_at: info.started_at,
+        last_change: info.last_change,
     }
 }
 

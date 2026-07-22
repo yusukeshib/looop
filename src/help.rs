@@ -31,6 +31,9 @@ Usage:
   looop up [--json]              start the pulse: the autonomous loop (sense +
                                 decide + run workers), detached. --json logs NDJSON.
   looop down                     stop the pulse and all workers
+  looop watch [<id>] [-a|--all] [-s|--since DURATION]
+                                read-only TUI: select and inspect every pulse /
+                                worker buffer; Enter opens the session picker
   looop config zsh|bash          shell integration (completions); eval "$(looop config zsh)"
   looop version | help           print version / show this help
 

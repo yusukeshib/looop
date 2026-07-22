@@ -93,6 +93,7 @@ __looop_subcommands() {
         'init:Interactive setup: choose the agent runner'
         'up:Bring the autonomous pulse up'
         'down:Tear the pulse (and workers) down'
+        'watch:Observe pulse and worker buffers in a read-only TUI'
         'state:Full world snapshot: goals, sensors, fleet, asks'
         'wait:Block until the world changes, then print state'
         'asks:Just the pending asks'
@@ -138,6 +139,12 @@ _looop() {
             case $words[1] in
                 up)
                     _arguments '--json[Emit pulse logs as JSON]'
+                    ;;
+                watch)
+                    _arguments \
+                        '(-a --all -s --since)'{-a,--all}'[Show all retained sessions]' \
+                        '(-a --all -s --since)'{-s,--since}'[Show sessions newer than duration]:duration:' \
+                        '1:session:__looop_workers'
                     ;;
                 state)
                     _arguments '--json[Emit JSON instead of the human summary]'

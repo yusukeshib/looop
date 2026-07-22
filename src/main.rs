@@ -20,6 +20,7 @@ mod fmt;
 mod gate;
 mod help;
 mod init;
+mod logview;
 mod mailbox;
 mod observe;
 mod paths;
@@ -40,6 +41,7 @@ mod tick_guards;
 mod util;
 mod verify;
 mod wal;
+mod watch;
 mod worldhash;
 
 use anyhow::Result;
@@ -151,6 +153,7 @@ fn needs_runner(cmd: &cli::Cmd) -> bool {
         | Cmd::Init
         | Cmd::Up(_)
         | Cmd::Down
+        | Cmd::Watch(_)
         | Cmd::State(_)
         | Cmd::Wait(_)
         | Cmd::Asks(_)
@@ -245,6 +248,9 @@ fn dispatch(paths: &Paths, cmd: Option<cli::Cmd>) -> Result<ExitCode> {
         // not even want), then runs the deps preflight itself.
         Cmd::Up(a) => service::cmd_up(paths, a.json),
         Cmd::Down => service::cmd_down(paths),
+        // Read-only observer: no runner preflight; it only lists sessions and
+        // replays their existing PTY logs.
+        Cmd::Watch(a) => watch::cmd_watch(paths, &a),
         Cmd::Pulse => service::cmd_pulse(paths),
         Cmd::State(a) => observe::cmd_state(paths, a.json),
         Cmd::Wait(a) => observe::cmd_wait(paths, &a),
@@ -487,6 +493,7 @@ mod tests {
             vec!["init"],
             vec!["up"], // cmd_up runs the preflight itself, AFTER the init check
             vec!["down"],
+            vec!["watch"],
             vec!["state", "--json"],
             vec!["wait"],
             vec!["asks", "--json"],
