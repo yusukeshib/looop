@@ -61,14 +61,16 @@ To observe what the detached pulse and workers are doing, open the read-only
 buffer viewer:
 
 ```sh
-looop watch              # live sessions; Enter opens the session picker
+looop watch              # live workers in a docked health table
 looop watch <id>         # focus one buffer initially
-looop watch --all        # include retained finished sessions
+looop watch --all        # include retained finished workers
 ```
 
 The viewer replays each raw PTY transcript as a terminal, preserving colors,
-in-place redraws, scrollback, mouse scrolling, and the original polished session
-picker rather than dumping control sequences as text.
+in-place redraws, scrollback, and mouse scrolling rather than dumping control
+sequences as text. A docked table below the log mirrors `looop worker list`
+(health, state, idle/uptime/ask age, and verification); it shows up to five rows
+with a scrollbar. Press Enter to focus it and Tab to toggle living/all workers.
 
 Two properties make all this dependable:
 
