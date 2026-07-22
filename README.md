@@ -70,7 +70,9 @@ The viewer replays each raw PTY transcript as a terminal, preserving colors,
 in-place redraws, scrollback, and mouse scrolling rather than dumping control
 sequences as text. A docked table below the log mirrors `looop worker list`
 (health, state, idle/uptime/ask age, and verification); it shows up to five rows
-with a scrollbar. Press Enter to focus it and Tab to toggle living/all workers.
+with a scrollbar. Keyboard shortcuts are global: arrows select workers,
+Ctrl-P/N scroll the log, Ctrl-U/D scroll half a page, and Tab toggles living/all
+workers.
 
 Two properties make all this dependable:
 

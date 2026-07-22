@@ -33,7 +33,7 @@ Usage:
   looop down                     stop the pulse and all workers
   looop watch [<id>] [-a|--all] [-s|--since DURATION]
                                 read-only TUI: worker-list table below the selected
-                                buffer; Enter focuses it, Tab toggles living/all
+                                buffer; arrows select workers, ^P/^N scroll the buffer
   looop config zsh|bash          shell integration (completions); eval "$(looop config zsh)"
   looop version | help           print version / show this help
 

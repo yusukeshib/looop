@@ -163,9 +163,6 @@ struct App {
     /// An explicitly requested session stays visible even when it is finished
     /// and the current filter is Active.
     requested_id: Option<String>,
-    /// `true` while keyboard focus is in the docked worker table (ENTER).
-    /// ENTER/ESC hands focus back to the log; the pane remains visible.
-    picking: bool,
     /// The scrollable vt100 replay of the selected session's `output.log` —
     /// scroll model, background parse, render + scrollbar all live here. `watch`
     /// shows it with an empty tail (pure log).
@@ -203,7 +200,6 @@ impl App {
             filter,
             hidden,
             requested_id: initial,
-            picking: false,
             log: LogView::new(),
             selector: None,
         })
@@ -292,10 +288,8 @@ impl App {
             match mouse.kind {
                 MouseEventKind::ScrollUp => self.move_selection(-1),
                 MouseEventKind::ScrollDown => self.move_selection(1),
-                MouseEventKind::Down(MouseButton::Left)
-                    if self.select_at(mouse.column, mouse.row) =>
-                {
-                    self.picking = true;
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.select_at(mouse.column, mouse.row);
                 }
                 _ => {}
             }
@@ -306,7 +300,6 @@ impl App {
             MouseEventKind::ScrollUp => self.log.scroll(3),
             MouseEventKind::ScrollDown => self.log.scroll(-3),
             MouseEventKind::Down(MouseButton::Left) => {
-                self.picking = false;
                 self.log.dragging_scrollbar = self.log.scrollbar_grab(mouse.column, mouse.row);
             }
             _ => {}
@@ -334,49 +327,44 @@ impl App {
             if event::poll(TICK)? {
                 match event::read()? {
                     Event::Key(key) if key.kind == KeyEventKind::Press => {
-                        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        let ctrl = key.modifiers == KeyModifiers::CONTROL;
+                        let plain = key.modifiers.is_empty();
+                        let shifted = key.modifiers == KeyModifiers::SHIFT;
                         if ctrl && matches!(key.code, KeyCode::Char('c')) {
                             break;
                         }
-                        if key.code == KeyCode::Tab {
+                        if plain && key.code == KeyCode::Tab {
                             // TAB is deliberately binary even when `--since`
                             // supplied the initial Recent view: first show all,
                             // then toggle living-only ↔ all.
                             self.filter = toggle_living_all(self.filter);
                             self.refresh(paths)?;
-                        } else if self.picking {
-                            // The docked table has keyboard focus. ENTER/ESC
-                            // returns focus to the log without hiding the pane.
-                            match key.code {
-                                KeyCode::Char('q') => break,
-                                KeyCode::Enter | KeyCode::Esc => self.picking = false,
-                                KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
-                                KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-                                _ => {}
-                            }
-                        } else {
-                            // Main buffer (log): scroll, or ENTER to focus the table.
-                            // Scrolling UP goes into history, DOWN toward the tail.
-                            let half = (self.log.rows() / 2).max(1) as isize;
-                            let page = self.log.rows().max(1) as isize;
-                            match key.code {
-                                KeyCode::Char('q') => break,
-                                KeyCode::Enter => self.picking = true,
-                                KeyCode::Down | KeyCode::Char('j') => self.log.scroll(-1),
-                                KeyCode::Up | KeyCode::Char('k') => self.log.scroll(1),
-                                // Half page: Ctrl-D down, Ctrl-U up (vim/less).
-                                KeyCode::Char('d') if ctrl => self.log.scroll(-half),
-                                KeyCode::Char('u') if ctrl => self.log.scroll(half),
-                                // Full page: Ctrl-F / PageDown down, Ctrl-B / PageUp up.
-                                KeyCode::Char('f') if ctrl => self.log.scroll(-page),
-                                KeyCode::Char('b') if ctrl => self.log.scroll(page),
-                                KeyCode::PageDown => self.log.scroll(-page),
-                                KeyCode::PageUp => self.log.scroll(page),
-                                // Jump to ends: g/Home oldest, G/End live tail.
-                                KeyCode::Char('g') | KeyCode::Home => self.log.jump_oldest(),
-                                KeyCode::Char('G') | KeyCode::End => self.log.follow_tail(),
-                                _ => {}
-                            }
+                            continue;
+                        }
+
+                        // Keyboard shortcuts are global: arrows always navigate
+                        // workers, while Ctrl-P/N and the paging keys scroll the log.
+                        let half = (self.log.rows() / 2).max(1) as isize;
+                        let page = self.log.rows().max(1) as isize;
+                        match key.code {
+                            KeyCode::Char('q') if plain => break,
+                            KeyCode::Down if plain => self.move_selection(1),
+                            KeyCode::Up if plain => self.move_selection(-1),
+                            KeyCode::Char('n') if ctrl => self.log.scroll(-1),
+                            KeyCode::Char('p') if ctrl => self.log.scroll(1),
+                            // Half page: Ctrl-D down, Ctrl-U up (vim/less).
+                            KeyCode::Char('d') if ctrl => self.log.scroll(-half),
+                            KeyCode::Char('u') if ctrl => self.log.scroll(half),
+                            // Full page: Ctrl-F / PageDown down, Ctrl-B / PageUp up.
+                            KeyCode::Char('f') if ctrl => self.log.scroll(-page),
+                            KeyCode::Char('b') if ctrl => self.log.scroll(page),
+                            KeyCode::PageDown if plain => self.log.scroll(-page),
+                            KeyCode::PageUp if plain => self.log.scroll(page),
+                            // Jump to ends: g/Home oldest, G/End live tail.
+                            KeyCode::Char('g') | KeyCode::Home if plain => self.log.jump_oldest(),
+                            KeyCode::Char('G') if plain || shifted => self.log.follow_tail(),
+                            KeyCode::End if plain => self.log.follow_tail(),
+                            _ => {}
                         }
                     }
                     Event::Mouse(mouse) => self.handle_mouse(mouse),
@@ -403,8 +391,7 @@ impl App {
         self.draw_footer(frame, chunks[2]);
     }
 
-    /// The dim help/legend line along the very bottom of the screen. Adapts to
-    /// focus while always exposing the living/all TAB toggle.
+    /// The dim help/legend line along the very bottom of the screen.
     fn draw_footer(&mut self, frame: &mut Frame, area: Rect) {
         let name = match self.filter {
             Filter::Active => "living",
@@ -416,12 +403,10 @@ impl App {
         } else {
             String::new()
         };
-        let help = if self.picking {
-            format!(" {name}{hidden}  ↑/↓ worker · tab living/all · enter log · esc log · q quit ")
-        } else {
-            let id = self.selected_id().unwrap_or("—");
-            format!(" {id} · {name}{hidden}  ↑/↓ scroll · enter workers · tab living/all · q quit ")
-        };
+        let id = self.selected_id().unwrap_or("—");
+        let help = format!(
+            " {id} · {name}{hidden}  ↑/↓ worker · ^P/^N scroll · ^U/^D half-page · tab living/all · q quit "
+        );
         let style = Style::default().bg(Color::Rgb(40, 40, 40)).fg(Color::White);
         frame.render_widget(Paragraph::new(Span::styled(help, style)).style(style), area);
     }
@@ -610,7 +595,6 @@ mod tests {
             filter: Filter::Active,
             hidden: 0,
             requested_id: None,
-            picking: false,
             log: LogView::new(),
             selector: None,
         }
