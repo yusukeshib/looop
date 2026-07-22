@@ -57,8 +57,9 @@ const PTY_COLS: u16 = render::DEFAULT_SCREENSHOT_SIZE.1;
 /// substantially larger than the source bytes).
 const SCROLLBACK_ROWS: usize = 25_000;
 
-/// Bytes immediately before the consumed offset used to detect a truncate,
-/// replacement, or rewrite that regrew past that offset between UI ticks.
+/// Bytes immediately before the consumed offset used to detect an in-place
+/// truncate/rewrite that regrew past that offset between UI ticks. File
+/// replacement/rotation is detected separately by identity.
 const PREFIX_GUARD_BYTES: u64 = 4096;
 
 /// The dim gray style shared by hints and secondary text.
@@ -89,6 +90,9 @@ struct LogReplay {
     /// Session id this replay belongs to (rebuilt when the selection changes).
     id: String,
     parser: vt100::Parser,
+    /// Identity of the open log generation. Atomic replacement/rotation changes
+    /// this even when the new file has already regrown beyond `offset`.
+    identity: FileIdentity,
     /// Bytes of `output.log` already fed to the parser.
     offset: u64,
     /// Scrollback depth after the last feed, to measure how far the tail moved
@@ -107,6 +111,33 @@ struct LogReplay {
 /// rebuild it when an input that affects the rendered lines changes: the
 /// session, the log content (`seen`), the scroll position, the pane size, or
 /// the appended `tail` (`tail_sig`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct FileIdentity {
+    #[cfg(unix)]
+    dev: u64,
+    #[cfg(unix)]
+    ino: u64,
+    #[cfg(not(unix))]
+    created: Option<std::time::SystemTime>,
+}
+
+fn file_identity(meta: &std::fs::Metadata) -> FileIdentity {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        FileIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        FileIdentity {
+            created: meta.created().ok(),
+        }
+    }
+}
+
 struct LogCache {
     id: String,
     seen: u64,
@@ -222,12 +253,14 @@ impl LogView {
             return;
         };
         let len = meta.len();
+        let identity = file_identity(&meta);
 
         let reset = match &self.log {
-            // New session, truncation, replacement, or an in-place rewrite
-            // that regrew beyond our old offset between refreshes.
+            // New session, replacement/rotation, truncation, or an in-place
+            // rewrite that changed the consumed suffix before regrowing.
             Some(l) => {
                 l.id != id
+                    || l.identity != identity
                     || len < l.offset
                     || prefix_guard(&path, l.offset)
                         .map(|guard| guard != l.prefix_guard)
@@ -613,13 +646,26 @@ fn scrollback_len(parser: &mut vt100::Parser) -> usize {
 /// expensive step (a multi-MB tail can take ~1s in debug builds), so it runs on
 /// the background worker rather than the UI thread.
 fn build_replay(id: String, path: &Path) -> LogReplay {
-    let len = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let mut parser = vt100::Parser::new(PTY_ROWS, PTY_COLS, SCROLLBACK_ROWS);
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return LogReplay {
+            id,
+            parser,
+            identity: FileIdentity::default(),
+            offset: 0,
+            prev_scrollback: 0,
+            seen: 0,
+            prefix_guard: 0,
+        };
+    };
+    let meta = file.metadata().ok();
+    let len = meta.as_ref().map_or(0, std::fs::Metadata::len);
+    let identity = meta.as_ref().map(file_identity).unwrap_or_default();
     // `0` for any log within the cap (first line reachable); only an over-cap
     // log starts mid-stream at the last MAX_REPLAY_BYTES.
     let start = len.saturating_sub(MAX_REPLAY_BYTES);
     let consumed = if len > 0 {
-        read_range(path, start, len)
+        read_range_from(&mut file, start, len)
             .map(|b| {
                 parser.process(&b);
                 b.len() as u64
@@ -633,6 +679,7 @@ fn build_replay(id: String, path: &Path) -> LogReplay {
     LogReplay {
         id,
         parser,
+        identity,
         offset,
         prev_scrollback,
         seen: consumed,
@@ -661,10 +708,11 @@ fn spawn_replay_worker() -> (Sender<ParseRequest>, Receiver<ParseResult>) {
     (req_tx, res_rx)
 }
 
-/// Hash the consumed prefix's trailing window. This detects file replacement
-/// and truncate-then-regrow races even when the new length already exceeds the
-/// old offset. If the prefix is byte-identical, continuing from the old offset
-/// is correct regardless of how the file got there.
+/// Hash the consumed prefix's trailing window. This catches the practical
+/// truncate-then-regrow case even when the new length already exceeds the old
+/// offset; replacement/rotation is handled by [`FileIdentity`]. output.log is
+/// append-only in normal operation, so a stable identity + stable consumed
+/// suffix is sufficient to continue incremental replay.
 fn prefix_guard(path: &Path, offset: u64) -> std::io::Result<u64> {
     let start = offset.saturating_sub(PREFIX_GUARD_BYTES);
     let bytes = read_range(path, start, offset)?;
@@ -681,10 +729,14 @@ fn prefix_guard(path: &Path, offset: u64) -> std::io::Result<u64> {
 /// the file was truncated concurrently. Appends after `end` wait for the next
 /// sync so no byte can be fed to the terminal twice.
 fn read_range(path: &Path, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
-    let mut f = std::fs::File::open(path)?;
-    f.seek(SeekFrom::Start(start))?;
+    let mut file = std::fs::File::open(path)?;
+    read_range_from(&mut file, start, end)
+}
+
+fn read_range_from(file: &mut std::fs::File, start: u64, end: u64) -> std::io::Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(start))?;
     let mut buf = Vec::new();
-    f.take(end.saturating_sub(start)).read_to_end(&mut buf)?;
+    file.take(end.saturating_sub(start)).read_to_end(&mut buf)?;
     Ok(buf)
 }
 
@@ -725,6 +777,18 @@ mod tests {
     fn read_range_stops_at_the_snapshotted_end() {
         let p = tmp("bounded", b"0123456789");
         assert_eq!(read_range(&p, 2, 6).unwrap(), b"2345");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn file_identity_detects_atomic_replacement() {
+        let p = tmp("identity", b"old");
+        let before = file_identity(&std::fs::metadata(&p).unwrap());
+        let replacement = tmp("identity-replacement", b"new");
+        std::fs::rename(&replacement, &p).unwrap();
+        let after = file_identity(&std::fs::metadata(&p).unwrap());
+        assert_ne!(after, before);
         let _ = std::fs::remove_file(&p);
     }
 
