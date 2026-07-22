@@ -155,3 +155,83 @@ jobs:
           prerelease: ${{ contains(needs.check-version.outputs.version, '-') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  update-homebrew-tap:
+    name: Update Homebrew tap
+    needs: [check-version, build, release]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Checkout Homebrew tap
+        uses: actions/checkout@v4
+        with:
+          repository: yusukeshib/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Update formula
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          checksum() {
+            awk '{print $1}' "artifacts/$1/$1.sha256"
+          }
+
+          ARM_DARWIN_SHA=$(checksum looop-aarch64-darwin)
+          INTEL_DARWIN_SHA=$(checksum looop-x86_64-darwin)
+          ARM_LINUX_SHA=$(checksum looop-aarch64-linux)
+          INTEL_LINUX_SHA=$(checksum looop-x86_64-linux)
+
+          cat > homebrew-tap/Formula/looop.rb <<EOF
+          class Looop < Formula
+            desc "Portable, Kubernetes-shaped control loop for work"
+            homepage "https://github.com/yusukeshib/looop"
+            version "$VERSION"
+            license "MIT"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/yusukeshib/looop/releases/download/v#{version}/looop-aarch64-darwin"
+                sha256 "$ARM_DARWIN_SHA"
+              end
+              on_intel do
+                url "https://github.com/yusukeshib/looop/releases/download/v#{version}/looop-x86_64-darwin"
+                sha256 "$INTEL_DARWIN_SHA"
+              end
+            end
+
+            on_linux do
+              on_arm do
+                url "https://github.com/yusukeshib/looop/releases/download/v#{version}/looop-aarch64-linux"
+                sha256 "$ARM_LINUX_SHA"
+              end
+              on_intel do
+                url "https://github.com/yusukeshib/looop/releases/download/v#{version}/looop-x86_64-linux"
+                sha256 "$INTEL_LINUX_SHA"
+              end
+            end
+
+            def install
+              bin.install Dir["looop-*-#{OS.mac? ? "darwin" : "linux"}"].first => "looop"
+            end
+
+            test do
+              assert_match "Usage:", shell_output("#{bin}/looop --help")
+            end
+          end
+          EOF
+
+      - name: Commit and push formula
+        working-directory: homebrew-tap
+        env:
+          VERSION: ${{ needs.check-version.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/looop.rb
+          git commit -m "looop: update to v$VERSION"
+          git push
