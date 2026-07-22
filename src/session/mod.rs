@@ -44,6 +44,7 @@ pub use fleet::{Session, kill};
 pub use launch::StartOutcome;
 pub use launch::cmd_start_session;
 pub(crate) use plumbing::suppress_stdout;
+pub(crate) use present::{WORKER_TABLE_HEADERS, worker_table_fleet, worker_table_row};
 pub use present::{cmd_kill, cmd_screenshot, cmd_worker_list};
 
 /// GENERATION-BOUNDARY hygiene, shared by every path that retires a worker

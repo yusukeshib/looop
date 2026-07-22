@@ -9,6 +9,60 @@ use std::process::ExitCode;
 
 use super::fleet::{PULSE_SESSION, full_session, kill, rt};
 
+/// Shared column labels for the plain `worker list` table and the table in
+/// `looop watch`. Keeping the projection here prevents the two views from
+/// drifting while allowing each frontend to apply its own styling.
+pub(crate) const WORKER_TABLE_HEADERS: [&str; 7] =
+    ["ID", "HEALTH", "STATE", "IDLE", "UP", "ASK", "VERIFY"];
+
+/// Display-ready values for one worker table row. ANSI and ratatui styling stay
+/// in their respective renderers; all textual projection is shared.
+pub(crate) struct WorkerTableRow {
+    pub id: String,
+    pub health: &'static str,
+    pub state: String,
+    pub idle: String,
+    pub up: String,
+    pub ask: String,
+    pub verify: &'static str,
+    pub verify_failed: bool,
+}
+
+/// Build the same fleet used by `looop worker list`: pulse first (always,
+/// including when down), then workers sorted by id. Corpses are opt-in.
+pub(crate) fn worker_table_fleet(paths: &Paths, all: bool) -> Vec<crate::sensor::WorkerHealth> {
+    let mut fleet = vec![crate::sensor::pulse_health(paths)];
+    fleet.extend(
+        crate::sensor::fleet_health(paths)
+            .into_iter()
+            .filter(|w| all || w.alive),
+    );
+    fleet
+}
+
+/// Project health data into the exact textual values shown in both tables.
+pub(crate) fn worker_table_row(w: &crate::sensor::WorkerHealth) -> WorkerTableRow {
+    let state = match (w.state.as_str(), w.exit_code) {
+        ("exited", Some(c)) => format!("exit {c}"),
+        (s, _) => s.to_string(),
+    };
+    let (verify, verify_failed) = match w.verify {
+        Some(true) => ("pass", false),
+        Some(false) => ("FAIL", true),
+        None => ("-", false),
+    };
+    WorkerTableRow {
+        id: w.id.clone(),
+        health: w.health,
+        state,
+        idle: fmt_dur(w.idle_s),
+        up: fmt_dur(w.uptime_s),
+        ask: fmt_dur(w.ask_age_s),
+        verify,
+        verify_failed,
+    }
+}
+
 /// The pulse is the control loop, NOT a worker: refuse worker-management verbs
 /// aimed at it so a stray `looop kill pulse` can't decapitate
 /// or hijack the loop. Observe it with `looop screenshot pulse`; control it
@@ -44,14 +98,7 @@ pub fn cmd_worker_list(
 ) -> Result<ExitCode> {
     let mut prev_lines = 0usize;
     loop {
-        // The pulse row is ALWAYS shown (even dead — that's the point: "is
-        // the loop up?"), ahead of the workers, unaffected by --all.
-        let mut fleet: Vec<crate::sensor::WorkerHealth> = vec![crate::sensor::pulse_health(paths)];
-        fleet.extend(
-            crate::sensor::fleet_health(paths)
-                .into_iter()
-                .filter(|w| all || w.alive),
-        );
+        let fleet = worker_table_fleet(paths, all);
         if json {
             let rows: Vec<serde_json::Value> = fleet
                 .iter()
@@ -129,46 +176,44 @@ fn render_fleet(fleet: &[crate::sensor::WorkerHealth], clip: Option<usize>) -> u
     }
     // (fleet always contains at least the pulse row when called from
     // cmd_worker_list; the empty guard covers direct/test callers.)
-    let idw = fleet.iter().map(|w| w.id.len()).max().unwrap_or(2).max(2);
+    let idw = fleet
+        .iter()
+        .map(|w| w.id.len())
+        .max()
+        .unwrap_or(WORKER_TABLE_HEADERS[0].len())
+        .max(WORKER_TABLE_HEADERS[0].len());
     print_clipped(
         &format!(
-            "{}{:idw$}  {:11}  {:8}  {:>6}  {:>6}  {:>7}  VERIFY{}",
+            "{}{:idw$}  {:11}  {:8}  {:>6}  {:>6}  {:>7}  {}{}",
             dim(),
-            "ID",
-            "HEALTH",
-            "STATE",
-            "IDLE",
-            "UP",
-            "ASK",
+            WORKER_TABLE_HEADERS[0],
+            WORKER_TABLE_HEADERS[1],
+            WORKER_TABLE_HEADERS[2],
+            WORKER_TABLE_HEADERS[3],
+            WORKER_TABLE_HEADERS[4],
+            WORKER_TABLE_HEADERS[5],
+            WORKER_TABLE_HEADERS[6],
             rst()
         ),
         clip,
     );
     for w in fleet {
-        let (hl, hr) = match w.health {
+        let row = worker_table_row(w);
+        let (hl, hr) = match row.health {
             "stuck" | "down" => (red(), rst()),
             "waiting-ask" => (yel(), rst()),
             "dead" => (dim(), rst()),
             _ => ("", ""),
         };
-        let state = match (w.state.as_str(), w.exit_code) {
-            ("exited", Some(c)) => format!("exit {c}"),
-            (s, _) => s.to_string(),
-        };
-        let verify = match w.verify {
-            Some(true) => "pass".to_string(),
-            Some(false) => format!("{}FAIL{}", red(), rst()),
-            None => "-".to_string(),
+        let verify = if row.verify_failed {
+            format!("{}{}{}", red(), row.verify, rst())
+        } else {
+            row.verify.to_string()
         };
         print_clipped(
             &format!(
                 "{:idw$}  {hl}{:11}{hr}  {:8}  {:>6}  {:>6}  {:>7}  {verify}",
-                w.id,
-                w.health,
-                state,
-                fmt_dur(w.idle_s),
-                fmt_dur(w.uptime_s),
-                fmt_dur(w.ask_age_s),
+                row.id, row.health, row.state, row.idle, row.up, row.ask,
             ),
             clip,
         );

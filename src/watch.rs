@@ -6,9 +6,9 @@
 //!   ┌─ log ──────────────────────────────────────────┐
 //!   │ live, COLORED tail of the selected session's    │
 //!   │ output.log (ANSI/SGR preserved via ansi-to-tui) │
-//!   ├─ sessions ─────────────────────────────────────┤
-//!   │ > ● pulse     running                           │
-//!   │   ● worker-1  running                           │
+//!   ├─ workers ──────────────────────────────────────┤
+//!   │ ID       HEALTH  STATE    IDLE  UP  ASK  VERIFY │
+//!   │ pulse    up      running  2s    1h  -    -      │
 //!   └─────────────────────────────────────────────────┘
 //!
 //! Read-only: it tails files and lists sessions, never sends input. The pulse
@@ -17,15 +17,18 @@
 //! clears, carriage returns), so the raw bytes are NOT a clean line log. We
 //! replay the WHOLE log through a `vt100` virtual terminal and render the
 //! resulting SCREEN plus bounded scrollback, instead of dumping every redraw
-//! frame as new lines. Selecting a row in the picker re-points the log pane.
+//! frame as new lines. Selecting a row in the docked worker table re-points
+//! the log pane.
 //!
 //! Mouse capture stays on (wheel scrolls, the scrollbar scrubs); hold Shift
 //! while dragging to use the terminal's own text selection / copy.
 
 use crate::logview::LogView;
 use crate::paths::Paths;
+use crate::sensor::WorkerHealth;
 use crate::session::{self, Session};
 use anyhow::Result;
+use std::collections::HashSet;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -35,17 +38,21 @@ use ratatui::crossterm::event::{
 };
 use ratatui::crossterm::execute;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Cell, Paragraph, Row, Scrollbar, ScrollbarOrientation, ScrollbarState, Table,
+    TableState,
+};
 
 /// How often we re-list sessions and re-read the tailed log.
 const TICK: Duration = Duration::from_millis(250);
 
-/// Recency window used by [`Filter::Recent`] when `--since` isn't given. Alive
-/// sessions and the pulse are always shown regardless of filter.
-const DEFAULT_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+/// The docked fleet pane shows at most five data rows. Its border and header
+/// are additional rows, so the log retains as much vertical room as possible.
+const MAX_WORKER_ROWS: usize = 5;
+const WORKER_PANE_CHROME_ROWS: u16 = 3; // top/bottom borders + table header
 
-/// Which sessions the selector shows. Cycled live in the TUI with `a`
-/// (Active → Recent → All → Active).
+/// Which sessions the worker table shows. TAB toggles living-only (`Active`)
+/// and `All`; `Recent` is retained as the initial view for `--since`.
 #[derive(Clone, Copy)]
 enum Filter {
     /// Only live sessions (plus the pulse). The default — dead corpses hidden.
@@ -54,6 +61,13 @@ enum Filter {
     Recent(Duration),
     /// Every session, no matter how stale.
     All,
+}
+
+fn toggle_living_all(filter: Filter) -> Filter {
+    match filter {
+        Filter::All => Filter::Active,
+        Filter::Active | Filter::Recent(_) => Filter::All,
+    }
 }
 
 /// `looop watch [<id>] [--since <dur>] [--all]` — open the observer TUI.
@@ -138,32 +152,31 @@ fn parse_duration(s: &str) -> Result<Duration> {
 }
 
 struct App {
-    sessions: Vec<Session>,
-    list_state: ListState,
-    /// Which sessions the selector shows. Cycled live with `a`.
+    /// The same pulse-first health projection used by `looop worker list`,
+    /// filtered for this view.
+    fleet: Vec<WorkerHealth>,
+    table_state: TableState,
+    /// Which sessions the worker table shows. TAB toggles living/all.
     filter: Filter,
-    /// The window used by [`Filter::Recent`] (from `--since` or
-    /// [`DEFAULT_WINDOW`]). Preserved across filter cycling.
-    recent_window: Duration,
     /// Sessions hidden by the current filter on the last refresh (footer hint).
     hidden: usize,
     /// An explicitly requested session stays visible even when it is finished
     /// and the current filter is Active.
     requested_id: Option<String>,
-    /// `true` while the floating session picker is open (ENTER). The log is the
-    /// main buffer; the list is hidden until summoned, and ENTER/ESC closes it.
+    /// `true` while keyboard focus is in the docked worker table (ENTER).
+    /// ENTER/ESC hands focus back to the log; the pane remains visible.
     picking: bool,
     /// The scrollable vt100 replay of the selected session's `output.log` —
     /// scroll model, background parse, render + scrollbar all live here. `watch`
     /// shows it with an empty tail (pure log).
     log: LogView,
-    /// Geometry of the session list from the last draw, so a mouse click can be
-    /// mapped back to a row → session index. `None` when the list is empty.
+    /// Geometry of the worker table from the last draw, so a mouse click can be
+    /// mapped back to a row → worker index. `None` when the table is empty.
     selector: Option<SelectorHit>,
 }
 
-/// The session list's on-screen geometry, captured during `draw_selector` so a
-/// mouse click can be mapped back to the session under the cursor.
+/// The worker table's on-screen geometry, captured during `draw_selector` so a
+/// mouse click can be mapped back to the worker under the cursor.
 #[derive(Clone, Copy)]
 struct SelectorHit {
     /// Inner area the session rows are drawn into (inside the border).
@@ -175,24 +188,19 @@ struct SelectorHit {
 
 impl App {
     fn new(paths: &Paths, initial: Option<String>, filter: Filter) -> Result<Self> {
-        let recent_window = match filter {
-            Filter::Recent(w) => w,
-            _ => DEFAULT_WINDOW,
-        };
-        let (sessions, hidden) = list_filtered(paths, filter, initial.as_deref())?;
-        let mut list_state = ListState::default();
+        let (fleet, hidden) = fleet_filtered(paths, filter, initial.as_deref())?;
+        let mut table_state = TableState::default();
         let idx = initial
             .as_deref()
-            .and_then(|id| sessions.iter().position(|s| s.id == id))
+            .and_then(|id| fleet.iter().position(|w| w.id == id))
             .unwrap_or(0);
-        if !sessions.is_empty() {
-            list_state.select(Some(idx));
+        if !fleet.is_empty() {
+            table_state.select(Some(idx));
         }
         Ok(App {
-            sessions,
-            list_state,
+            fleet,
+            table_state,
             filter,
-            recent_window,
             hidden,
             requested_id: initial,
             picking: false,
@@ -213,49 +221,55 @@ impl App {
             return false;
         }
         let idx = hit.offset + (row - a.top()) as usize;
-        if idx >= self.sessions.len() {
-            return false; // click landed on a blank row below the last session
+        if idx >= self.fleet.len() {
+            return false; // click landed on a blank row below the last worker
         }
-        if Some(idx) != self.list_state.selected() {
-            self.list_state.select(Some(idx));
+        if Some(idx) != self.table_state.selected() {
+            self.table_state.select(Some(idx));
             self.log.follow_tail();
         }
         true
     }
 
-    fn selected_id(&self) -> Option<&str> {
-        self.list_state
-            .selected()
-            .and_then(|i| self.sessions.get(i))
-            .map(|s| s.id.as_str())
+    fn selector_contains(&self, col: u16, row: u16) -> bool {
+        self.selector.is_some_and(|hit| {
+            let a = hit.area;
+            col >= a.left() && col < a.right() && row >= a.top() && row < a.bottom()
+        })
     }
 
-    /// Re-list sessions, preserving the current selection by id (the list is
-    /// re-sorted most-recently-active first, so the index drifts).
+    fn selected_id(&self) -> Option<&str> {
+        self.table_state
+            .selected()
+            .and_then(|i| self.fleet.get(i))
+            .map(|w| w.id.as_str())
+    }
+
+    /// Re-read the shared fleet projection, preserving selection by id.
     fn refresh(&mut self, paths: &Paths) -> Result<()> {
         let keep = self.selected_id().map(str::to_string);
-        let (sessions, hidden) = list_filtered(paths, self.filter, self.requested_id.as_deref())?;
-        self.sessions = sessions;
+        let (fleet, hidden) = fleet_filtered(paths, self.filter, self.requested_id.as_deref())?;
+        self.fleet = fleet;
         self.hidden = hidden;
-        if self.sessions.is_empty() {
-            self.list_state.select(None);
+        if self.fleet.is_empty() {
+            self.table_state.select(None);
             return Ok(());
         }
         let idx = keep
-            .and_then(|id| self.sessions.iter().position(|s| s.id == id))
+            .and_then(|id| self.fleet.iter().position(|w| w.id == id))
             .unwrap_or(0);
-        self.list_state.select(Some(idx));
+        self.table_state.select(Some(idx));
         Ok(())
     }
 
     fn move_selection(&mut self, delta: isize) {
-        if self.sessions.is_empty() {
+        if self.fleet.is_empty() {
             return;
         }
-        let cur = self.list_state.selected().unwrap_or(0) as isize;
-        let next = (cur + delta).clamp(0, self.sessions.len() as isize - 1) as usize;
-        if Some(next) != self.list_state.selected() {
-            self.list_state.select(Some(next));
+        let cur = self.table_state.selected().unwrap_or(0) as isize;
+        let next = (cur + delta).clamp(0, self.fleet.len() as isize - 1) as usize;
+        if Some(next) != self.table_state.selected() {
+            self.table_state.select(Some(next));
             self.log.follow_tail(); // switching sessions re-follows the tail
         }
     }
@@ -285,27 +299,24 @@ impl App {
                         if ctrl && matches!(key.code, KeyCode::Char('c')) {
                             break;
                         }
-                        if self.picking {
-                            // Floating picker: navigate sessions, ENTER/ESC closes
-                            // it and hands focus back to the log.
+                        if key.code == KeyCode::Tab {
+                            // TAB is deliberately binary even when `--since`
+                            // supplied the initial Recent view: first show all,
+                            // then toggle living-only ↔ all.
+                            self.filter = toggle_living_all(self.filter);
+                            self.refresh(paths)?;
+                        } else if self.picking {
+                            // The docked table has keyboard focus. ENTER/ESC
+                            // returns focus to the log without hiding the pane.
                             match key.code {
                                 KeyCode::Char('q') => break,
                                 KeyCode::Enter | KeyCode::Esc => self.picking = false,
                                 KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
                                 KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-                                KeyCode::Char('a') => {
-                                    // Cycle the filter: Active → Recent → All → Active.
-                                    self.filter = match self.filter {
-                                        Filter::Active => Filter::Recent(self.recent_window),
-                                        Filter::Recent(_) => Filter::All,
-                                        Filter::All => Filter::Active,
-                                    };
-                                    self.refresh(paths)?;
-                                }
                                 _ => {}
                             }
                         } else {
-                            // Main buffer (log): scroll, or ENTER to open the picker.
+                            // Main buffer (log): scroll, or ENTER to focus the table.
                             // Scrolling UP goes into history, DOWN toward the tail.
                             let half = (self.log.rows() / 2).max(1) as isize;
                             let page = self.log.rows().max(1) as isize;
@@ -329,16 +340,16 @@ impl App {
                             }
                         }
                     }
-                    // The floating picker, when open, is modal: it captures the
-                    // wheel (to move the selection) and clicks (to pick a row).
-                    // Otherwise the mouse drives the log: wheel scrolls and the
-                    // scrollbar can be clicked/dragged. Capturing the wheel
-                    // ourselves keeps the alternate screen from being corrupted.
-                    Event::Mouse(m) if self.picking => match m.kind {
+                    // Mouse input follows the pane under the cursor. Clicking a
+                    // worker focuses the table; the log keeps its own wheel and
+                    // draggable scrollbar everywhere else.
+                    Event::Mouse(m) if self.selector_contains(m.column, m.row) => match m.kind {
                         MouseEventKind::ScrollUp => self.move_selection(-1),
                         MouseEventKind::ScrollDown => self.move_selection(1),
-                        MouseEventKind::Down(MouseButton::Left) => {
-                            let _ = self.select_at(m.column, m.row);
+                        MouseEventKind::Down(MouseButton::Left)
+                            if self.select_at(m.column, m.row) =>
+                        {
+                            self.picking = true;
                         }
                         _ => {}
                     },
@@ -349,6 +360,7 @@ impl App {
                         // scrubbing on every drag (row only) until release, so
                         // the cursor can leave the column without dropping it.
                         MouseEventKind::Down(MouseButton::Left) => {
+                            self.picking = false;
                             self.log.dragging_scrollbar = self.log.scrollbar_grab(m.column, m.row);
                         }
                         MouseEventKind::Drag(MouseButton::Left) if self.log.dragging_scrollbar => {
@@ -367,97 +379,117 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
-        // The log is the main buffer and owns the whole screen, save a one-row
-        // footer for the dim help/legend line.
-        let chunks =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(frame.area());
-        let log_area = chunks[0];
-        // Pure log (empty tail); hide the scrollbar while the picker floats on top.
-        self.log.render(frame, log_area, &[], !self.picking);
-        self.draw_footer(frame, chunks[1]);
+        // The fleet is a real docked pane, never an overlay. Five DATA rows fit
+        // at most; the pane's border and header are accounted for separately.
+        let worker_height = worker_pane_height(self.fleet.len());
+        let chunks = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(worker_height),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
 
-        if self.picking {
-            // Floating session picker, overlaid on the bottom of the log. Capped
-            // so it never swallows the whole pane; `Clear` wipes the log rows
-            // underneath so the list reads cleanly on top.
-            let rows = self.sessions.len().clamp(1, 8) as u16;
-            let h = (rows + 2).min(log_area.height);
-            let float = Rect {
-                x: log_area.x,
-                y: log_area.bottom().saturating_sub(h),
-                width: log_area.width,
-                height: h,
-            };
-            frame.render_widget(Clear, float);
-            self.draw_selector(frame, float);
-        } else {
-            // No list on screen → nothing for a mouse click to hit-test.
-            self.selector = None;
-        }
+        self.log.render(frame, chunks[0], &[], true);
+        self.draw_selector(frame, chunks[1]);
+        self.draw_footer(frame, chunks[2]);
     }
 
     /// The dim help/legend line along the very bottom of the screen. Adapts to
-    /// the focus: scroll/quit hints for the log, navigate/filter hints (with
-    /// the active filter + hidden count) while the picker is open.
+    /// focus while always exposing the living/all TAB toggle.
     fn draw_footer(&mut self, frame: &mut Frame, area: Rect) {
-        let help = if self.picking {
-            let name = match self.filter {
-                Filter::Active => "active",
-                Filter::Recent(_) => "recent",
-                Filter::All => "all",
-            };
-            let hidden = if self.hidden > 0 {
-                format!(" ({} hidden)", self.hidden)
-            } else {
-                String::new()
-            };
-            format!(" {name}{hidden}  ↑/↓ move · a filter · enter select · esc close · q quit ")
+        let name = match self.filter {
+            Filter::Active => "living",
+            Filter::Recent(_) => "recent",
+            Filter::All => "all",
+        };
+        let hidden = if self.hidden > 0 {
+            format!(" ({} hidden)", self.hidden)
         } else {
-            let id = self.selected_id().unwrap_or("—").to_string();
-            format!(" {id}  ↑/↓ scroll · enter sessions · q quit ")
+            String::new()
+        };
+        let help = if self.picking {
+            format!(
+                " {name}{hidden}  ↑/↓ worker · tab living/all · enter select · esc log · q quit "
+            )
+        } else {
+            let id = self.selected_id().unwrap_or("—");
+            format!(" {id} · {name}{hidden}  ↑/↓ scroll · enter workers · tab living/all · q quit ")
         };
         let style = Style::default().bg(Color::Rgb(40, 40, 40)).fg(Color::White);
         frame.render_widget(Paragraph::new(Span::styled(help, style)).style(style), area);
     }
 
     fn draw_selector(&mut self, frame: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = if self.sessions.is_empty() {
-            vec![ListItem::new(Line::from(Span::styled(
-                "  no sessions — run `looop up` to start the pulse",
-                Style::default().fg(Color::DarkGray),
-            )))]
+        let id_width = self
+            .fleet
+            .iter()
+            .map(|w| w.id.len())
+            .max()
+            .unwrap_or("no workers".len())
+            .max(session::WORKER_TABLE_HEADERS[0].len()) as u16;
+        let rows: Vec<Row> = if self.fleet.is_empty() {
+            vec![Row::new([Cell::from("no workers")])]
         } else {
-            self.sessions.iter().map(session_row).collect()
+            self.fleet.iter().map(worker_table_row).collect()
         };
-
-        let list = List::new(items)
+        let header =
+            Row::new(session::WORKER_TABLE_HEADERS).style(Style::default().fg(Color::DarkGray));
+        let widths = [
+            Constraint::Length(id_width),
+            Constraint::Length(11),
+            Constraint::Length(8),
+            Constraint::Length(6),
+            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(6),
+        ];
+        let table = Table::new(rows, widths)
+            .header(header)
+            .column_spacing(2)
             .block(
                 Block::default()
                     .borders(Borders::ALL)
                     .border_style(Style::default().fg(Color::DarkGray)),
             )
-            // Subtle highlight on the selected row: just a dim bg. The dark
-            // background keeps the per-span colors (green dot, gray detail)
-            // legible, so — unlike a white highlight — we don't override fg.
-            .highlight_style(Style::default().bg(Color::Rgb(40, 40, 40)));
-        frame.render_stateful_widget(list, area, &mut self.list_state);
+            // Preserve per-cell health colors under the selection highlight.
+            .row_highlight_style(Style::default().bg(Color::Rgb(40, 40, 40)));
+        frame.render_stateful_widget(table, area, &mut self.table_state);
 
-        // Record the list geometry so a mouse click can hit-test a row. The
-        // rows render inside the border; read `offset()` AFTER the render so it
-        // reflects any scrolling the widget just applied.
-        self.selector = if self.sessions.is_empty() {
+        let data_area = Rect {
+            x: area.x.saturating_add(1),
+            y: area.y.saturating_add(2), // border + header
+            width: area.width.saturating_sub(2),
+            height: area.height.saturating_sub(WORKER_PANE_CHROME_ROWS),
+        };
+        self.selector = if self.fleet.is_empty() {
             None
         } else {
             Some(SelectorHit {
-                area: Rect {
-                    x: area.x.saturating_add(1),
-                    y: area.y.saturating_add(1),
-                    width: area.width.saturating_sub(2),
-                    height: area.height.saturating_sub(2),
-                },
-                offset: self.list_state.offset(),
+                area: data_area,
+                // Read offset AFTER render so Table has applied selection scroll.
+                offset: self.table_state.offset(),
             })
         };
+
+        if self.fleet.len() > MAX_WORKER_ROWS && data_area.height > 0 {
+            let mut state = ScrollbarState::new(self.fleet.len())
+                .position(self.table_state.selected().unwrap_or(0))
+                .viewport_content_length(MAX_WORKER_ROWS);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(None)
+                .end_symbol(None)
+                .thumb_symbol("┃")
+                .track_symbol(Some("│"))
+                .track_style(Style::default().fg(Color::DarkGray));
+            // Render on the pane's right border, alongside data rows only.
+            let scroll_area = Rect {
+                x: area.x,
+                y: data_area.y,
+                width: area.width,
+                height: data_area.height,
+            };
+            frame.render_stateful_widget(scrollbar, scroll_area, &mut state);
+        }
     }
 }
 
@@ -491,40 +523,110 @@ fn list_filtered(
     Ok((kept, hidden))
 }
 
-/// Render one session as a colored row: a state dot, the id (pulse flagged),
-/// and its state/exit detail.
-fn session_row(s: &Session) -> ListItem<'static> {
-    let (dot, color) = match (s.alive, s.state.as_str()) {
-        (true, _) => ("●", Color::Green),
-        (false, "exited") => ("✓", Color::DarkGray),
-        (false, "killed") => ("✗", Color::Red),
-        (false, _) => ("○", Color::DarkGray),
+/// Apply watch's session visibility policy to the same pulse-first health
+/// projection used by `looop worker list`.
+fn fleet_filtered(
+    paths: &Paths,
+    filter: Filter,
+    requested_id: Option<&str>,
+) -> Result<(Vec<WorkerHealth>, usize)> {
+    let (sessions, hidden) = list_filtered(paths, filter, requested_id)?;
+    let visible: HashSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+    let mut fleet = session::worker_table_fleet(paths, true);
+    // The pulse row is always present, even when down, exactly like worker list.
+    fleet.retain(|w| w.id == session::PULSE_SESSION || visible.contains(w.id.as_str()));
+    Ok((fleet, hidden))
+}
+
+fn worker_pane_height(workers: usize) -> u16 {
+    workers.clamp(1, MAX_WORKER_ROWS) as u16 + WORKER_PANE_CHROME_ROWS
+}
+
+fn right_cell(value: String) -> Cell<'static> {
+    Cell::from(Text::from(value).alignment(Alignment::Right))
+}
+
+/// Ratatui styling over the shared `worker list` textual row projection.
+fn worker_table_row(worker: &WorkerHealth) -> Row<'static> {
+    let row = session::worker_table_row(worker);
+    let health_style = match row.health {
+        "stuck" | "down" => Style::default().fg(Color::Red),
+        "waiting-ask" => Style::default().fg(Color::Yellow),
+        "dead" => Style::default().fg(Color::DarkGray),
+        _ => Style::default(),
     };
-    let label = if s.is_pulse() {
-        format!("{} (pulse)", s.id)
+    let verify_style = if row.verify_failed {
+        Style::default().fg(Color::Red)
     } else {
-        s.id.clone()
+        Style::default()
     };
-    // The status dot already conveys "running" for alive sessions, so only
-    // show a textual detail once the session has finished.
-    let detail = if s.alive {
-        String::new()
-    } else {
-        match s.exit_code {
-            Some(code) => format!("{} (exit {code})", s.state),
-            None => s.state.clone(),
-        }
-    };
-    ListItem::new(Line::from(vec![
-        Span::styled(format!("{dot} "), Style::default().fg(color)),
-        Span::raw(format!("{label:<20} ")),
-        Span::styled(detail, Style::default().fg(Color::DarkGray)),
-    ]))
+    Row::new([
+        Cell::from(row.id),
+        Cell::from(row.health).style(health_style),
+        Cell::from(row.state),
+        right_cell(row.idle),
+        right_cell(row.up),
+        right_cell(row.ask),
+        Cell::from(row.verify).style(verify_style),
+    ])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn health(id: impl Into<String>) -> WorkerHealth {
+        WorkerHealth {
+            id: id.into(),
+            state: "running".to_string(),
+            alive: true,
+            exit_code: None,
+            health: "busy",
+            idle_s: Some(65),
+            uptime_s: Some(3600),
+            ask_age_s: None,
+            verify: None,
+            verify_output: None,
+        }
+    }
+
+    fn app_with_fleet(fleet: Vec<WorkerHealth>) -> App {
+        let mut table_state = TableState::default();
+        if !fleet.is_empty() {
+            table_state.select(Some(0));
+        }
+        App {
+            fleet,
+            table_state,
+            filter: Filter::Active,
+            hidden: 0,
+            requested_id: None,
+            picking: false,
+            log: LogView::new(),
+            selector: None,
+        }
+    }
+
+    fn render_selector(app: &mut App) -> String {
+        let width = 100;
+        let height = worker_pane_height(app.fleet.len());
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| app.draw_selector(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer.cell((x, y)).unwrap().symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     #[test]
     fn parse_duration_units() {
@@ -543,5 +645,67 @@ mod tests {
         assert!(parse_duration("1w").is_err());
         assert!(parse_duration("d").is_err());
         assert!(parse_duration("18446744073709551615d").is_err());
+    }
+
+    #[test]
+    fn tab_filter_is_a_binary_living_all_toggle() {
+        assert!(matches!(toggle_living_all(Filter::Active), Filter::All));
+        assert!(matches!(toggle_living_all(Filter::All), Filter::Active));
+        assert!(matches!(
+            toggle_living_all(Filter::Recent(Duration::from_secs(60))),
+            Filter::All
+        ));
+    }
+
+    #[test]
+    fn worker_pane_caps_five_data_rows_beyond_header_and_border() {
+        assert_eq!(worker_pane_height(0), 4);
+        assert_eq!(worker_pane_height(1), 4);
+        assert_eq!(worker_pane_height(5), 8);
+        assert_eq!(worker_pane_height(6), 8);
+    }
+
+    #[test]
+    fn worker_table_uses_worker_list_columns_and_values() {
+        let mut worker = health("w1");
+        worker.state = "exited".to_string();
+        worker.alive = false;
+        worker.exit_code = Some(7);
+        worker.health = "dead";
+        worker.verify = Some(false);
+        let mut app = app_with_fleet(vec![worker]);
+
+        let rendered = render_selector(&mut app);
+        for heading in session::WORKER_TABLE_HEADERS {
+            assert!(rendered.contains(heading), "missing heading {heading}");
+        }
+        for value in ["w1", "dead", "exit 7", "1m", "1h", "FAIL"] {
+            assert!(rendered.contains(value), "missing table value {value}");
+        }
+        assert_eq!(app.selector.unwrap().area.height, 1);
+        assert!(!rendered.contains('┃'));
+    }
+
+    #[test]
+    fn worker_table_scrolls_after_five_rows_and_shows_scrollbar() {
+        let fleet = (0..6).map(|i| health(format!("w{i}"))).collect();
+        let mut app = app_with_fleet(fleet);
+        app.table_state.select(Some(5));
+
+        let rendered = render_selector(&mut app);
+        assert_eq!(app.selector.unwrap().area.height, 5);
+        assert_eq!(app.table_state.offset(), 1);
+        assert!(!rendered.contains("w0"));
+        assert!(rendered.contains("w5"));
+        assert!(rendered.contains('┃'));
+    }
+
+    #[test]
+    fn empty_worker_table_keeps_one_row_without_a_scrollbar() {
+        let mut app = app_with_fleet(Vec::new());
+        let rendered = render_selector(&mut app);
+        assert!(rendered.contains("no workers"));
+        assert!(app.selector.is_none());
+        assert!(!rendered.contains('┃'));
     }
 }
