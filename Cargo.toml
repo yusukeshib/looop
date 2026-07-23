@@ -1,6 +1,6 @@
 [package]
 name = "looop"
-version = "0.67.0"
+version = "0.67.1"
 edition = "2024"
 description = "A tiny, portable, Kubernetes-shaped control loop for your work"
 license = "MIT"
@@ -21,7 +21,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # out to the `babysit` binary + re-parsing JSON (step 3 of the port).
 # default-features = false drops the `upgrade` feature (self_update), keeping
 # the network stack out of looop.
-babysit = { version = "0.12", default-features = false }
+babysit = { version = "0.13.1", default-features = false }
 # looop drives babysit's async API in-process, including the detached worker
 # supervisor (serve_worker), which babysit runs under a multi-thread runtime
 # (`#[tokio::main]`). Match that so the in-process worker behaves identically.

@@ -319,6 +319,7 @@ pub fn spawn_detached(paths: &Paths, cmd: Vec<String>, session: &str) -> anyhow:
             None,  // timeout
             None,  // idle_timeout
             None,  // size
+            None,  // view_cmd (looop consumes raw worker output)
             true,  // json (one suppressed line; we print our own message)
         ))
     })
@@ -409,6 +410,7 @@ pub fn run_detached_worker(args: &[String]) -> anyhow::Result<i32> {
         parsed.timeout,
         parsed.idle_timeout,
         parsed.size,
+        None, // view_cmd (looop consumes raw worker output)
         false,
     ))
 }
