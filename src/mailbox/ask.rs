@@ -376,23 +376,14 @@ fn write_ask(
             stamp_v1(&serde_json::to_string(&ask)?)
         },
     )?;
-    util::event(
-        util::Level::Step,
-        "ask",
-        &format!(
-            "{worker} {}: {prompt}",
-            if detach {
-                "asked (detached — will resume on answer)"
-            } else {
-                "is waiting"
-            }
-        ),
-        &[
-            ("ask_id", serde_json::json!(id)),
-            ("worker", serde_json::json!(worker)),
-            ("detach", serde_json::json!(detach)),
-        ],
-    );
+    // `write_ask` is shared by the worker self-callback and the detached
+    // callback.  It MUST NOT log to stdout: the blocking callback is normally
+    // invoked through shell command substitution (`answer=$(looop ask …)`),
+    // where stdout is the worker's answer protocol.  Mixing the ask event into
+    // that stream leaves the runner with a log line instead of a clean answer
+    // and can prevent it from returning to the model after the human replies.
+    // The mailbox record itself is the durable event; presenters may report it
+    // on a separate channel.
     Ok(id)
 }
 
@@ -798,7 +789,7 @@ mod tests {
         } // perms restored — the store has "recovered"
         answer(&p, "w-1", "yes", false).unwrap();
         let got = handle.join().unwrap().expect("the answer still arrives");
-        assert!(got.contains("yes"), "got: {got}");
+        assert_eq!(got, "yes", "the worker callback returns only the answer");
     }
 
     #[test]
