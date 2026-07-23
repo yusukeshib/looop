@@ -29,7 +29,9 @@ use std::path::PathBuf;
 
 /// Exponential-backoff bounds for a repeatedly-failing world state (H1).
 const BACKOFF_BASE_SECS: u64 = 60;
-const BACKOFF_CAP_SECS: u64 = 3600;
+// Keep transient runner failures responsive: a long cap hides recovery for too
+// long once the model/provider becomes healthy again.
+const BACKOFF_CAP_SECS: u64 = 300;
 
 /// Backoff window after `fails` consecutive failed beats:
 /// base·2^(fails-1), capped. `fails == 0` => no wait.
@@ -743,6 +745,9 @@ mod tests {
         assert_eq!(backoff_delay(0), 0);
         assert_eq!(backoff_delay(1), BACKOFF_BASE_SECS);
         assert_eq!(backoff_delay(2), BACKOFF_BASE_SECS * 2);
+        assert_eq!(backoff_delay(3), BACKOFF_BASE_SECS * 4);
+        assert_eq!(backoff_delay(4), BACKOFF_CAP_SECS);
+        assert_eq!(backoff_delay(6), BACKOFF_CAP_SECS);
         assert_eq!(backoff_delay(99), BACKOFF_CAP_SECS);
     }
 
