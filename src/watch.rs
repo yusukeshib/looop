@@ -527,7 +527,26 @@ fn fleet_filtered(
     let mut fleet = session::worker_table_fleet(paths, true);
     // The pulse row is always present, even when down, exactly like worker list.
     fleet.retain(|w| w.id == session::PULSE_SESSION || visible.contains(w.id.as_str()));
+    sort_fleet_by_uptime(&mut fleet);
     Ok((fleet, hidden))
+}
+
+fn sort_fleet_by_uptime(fleet: &mut [WorkerHealth]) {
+    fleet.sort_by(|a, b| {
+        match (
+            a.id == session::PULSE_SESSION,
+            b.id == session::PULSE_SESSION,
+        ) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => a
+                .uptime_s
+                .is_none()
+                .cmp(&b.uptime_s.is_none())
+                .then_with(|| a.uptime_s.cmp(&b.uptime_s))
+                .then_with(|| a.id.cmp(&b.id)),
+        }
+    });
 }
 
 fn worker_pane_height(workers: usize) -> u16 {
@@ -673,6 +692,37 @@ mod tests {
         assert_eq!(worker_pane_height(1), 4);
         assert_eq!(worker_pane_height(5), 8);
         assert_eq!(worker_pane_height(6), 8);
+    }
+
+    #[test]
+    fn worker_table_orders_workers_by_uptime_after_pulse() {
+        let mut pulse = health(session::PULSE_SESSION);
+        pulse.uptime_s = Some(500);
+        let mut older = health("older");
+        older.uptime_s = Some(200);
+        let mut newer_b = health("newer-b");
+        newer_b.uptime_s = Some(10);
+        let mut newer_a = health("newer-a");
+        newer_a.uptime_s = Some(10);
+        let mut unknown = health("unknown");
+        unknown.uptime_s = None;
+        let mut fleet = vec![older, unknown, newer_b, pulse, newer_a];
+
+        sort_fleet_by_uptime(&mut fleet);
+
+        assert_eq!(
+            fleet
+                .iter()
+                .map(|worker| worker.id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                session::PULSE_SESSION,
+                "newer-a",
+                "newer-b",
+                "older",
+                "unknown",
+            ]
+        );
     }
 
     #[test]
