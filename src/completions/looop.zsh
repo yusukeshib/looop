@@ -172,8 +172,7 @@ _looop() {
                         _arguments \
                             '--prompt[What you need to know from the human]:prompt:' \
                             '--ref[A path/reference the human should look at]:reference:' \
-                            '--options[Comma-separated choices to offer]:options:' \
-                            '--detach[Write the ask and return immediately]'
+                            '--options[Comma-separated choices to offer]:options:'
                     fi
                     ;;
                 tell)
@@ -275,7 +274,6 @@ _looop() {
                         _arguments \
                             '--command[Full launch-command override (must contain {{prompt_file}})]:command:' \
                             '--verify[Post-condition shell command]:command:' \
-                            '--resume[Resume a detached, answered ask (ask id)]:ask:' \
                             '--journal[One line: what you did and why]:note:'
                     fi
                     ;;

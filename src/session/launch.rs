@@ -85,21 +85,13 @@ const CONTRACT: &str = r#"# ⚑ WORKER CONTRACT (auto-injected — must obey)
 - Never send notifications (no terminal-notifier or any OS notification). You are
   an agent; surface anything a human must see by ASKing (below) — the human sees
   it through whatever client they run.
-- When you need a human decision / info / approval, do NOT guess — ASK. Two modes:
-  • QUICK question (answer likely within the hour) — BLOCK on it:
-      answer=$("$LOOOP_BIN" ask __ID__ --prompt "<what you need to know>")
-    (optionally --ref reports/x.md and/or --options a,b). Use $answer, continue.
-    You do NOT need a terminal, stdin, or attach — just call it and read its
-    output. Ask once per question; it returns only when answered.
-  • LONG wait (the human may take hours or days) — CHECKPOINT and DETACH:
-      1) write your FULL state (done / remaining / how to continue) to
-         reports/__ID__-checkpoint.md
-      2) "$LOOOP_BIN" ask __ID__ --detach --prompt "…" --ref reports/__ID__-checkpoint.md
-      3) end your session: "$LOOOP_BIN" kill __ID__
-    Do NOT sit idle waiting: when the human answers, looop dispatches a FRESH
-    worker with the answer and your checkpoint. Your exit is by design, not a
-    failure. When unsure which mode, prefer detach — idling is the expensive
-    mistake.
+- When you need a human decision / info / approval, do NOT guess — ASK and
+  BLOCK until the human answers:
+    answer=$("$LOOOP_BIN" ask __ID__ --prompt "<what you need to know>")
+  (optionally --ref reports/x.md and/or --options a,b). Use $answer, continue.
+  You do NOT need a terminal, stdin, or attach — just call it and read its
+  output. Ask once per question; it returns only when answered. Do not end your
+  session while waiting: the same worker must consume the answer and continue.
 - STEERING: the human can queue mid-task course corrections for you. Between
   major steps (and BEFORE any big/irreversible-adjacent step), run:
     "$LOOOP_BIN" told
@@ -168,19 +160,13 @@ impl StartOutcome {
     }
 }
 
-/// Commit-phase rollback guard for [`cmd_start_session`]: undoes the side
-/// effects taken so far when a LATER commit step fails. The rollbacks used to
-/// be hand-scattered across every error return (verify clear ×2 +
-/// unarchive_pair), so adding a commit step meant remembering to extend each
-/// of them; as an RAII guard, ANY early return (or panic) rolls back
-/// automatically and only the one success path calls [`StartRollback::disarm`].
+/// Commit-phase rollback guard for [`cmd_start_session`]: clears a verify
+/// command stored for a worker when a later commit step fails. As an RAII
+/// guard, any early return (or panic) rolls back automatically and only the
+/// success path calls [`StartRollback::disarm`].
 struct StartRollback<'a> {
     paths: &'a Paths,
     session: &'a str,
-    /// Set once the resume pair has been archived — the step that then needs
-    /// undoing (un-archiving) if the spawn fails, so the resume signal
-    /// returns instead of being silently consumed by a worker that never ran.
-    archived_resume: Option<&'a str>,
     armed: bool,
 }
 impl StartRollback<'_> {
@@ -193,9 +179,6 @@ impl Drop for StartRollback<'_> {
     fn drop(&mut self) {
         if !self.armed {
             return;
-        }
-        if let Some(ask_id) = self.archived_resume {
-            crate::mailbox::unarchive_pair(self.paths, ask_id);
         }
         // No stale verify for a no-show worker — it would fail the NEXT start
         // of this id for the wrong reason. Idempotent (clear of nothing is a
@@ -217,7 +200,6 @@ pub fn cmd_start_session(
     prompt: &str,
     command: Option<&str>,
     verify: Option<&str>,
-    resume: Option<&str>,
 ) -> Result<StartOutcome> {
     let out = start_session(
         paths,
@@ -226,7 +208,6 @@ pub fn cmd_start_session(
         prompt,
         command,
         verify,
-        resume,
     )?;
     // The stderr line is a CLI-TRANSPORT concern, emitted HERE and not inside
     // the core: start_session is the transport-agnostic policy, and a
@@ -239,13 +220,12 @@ pub fn cmd_start_session(
 }
 
 /// Start one worker session. Structured as VALIDATE-THEN-COMMIT: every check
-/// (resume context, id, prompt, config, fleet cap, duplicate id, launch
-/// command) runs BEFORE the first side effect, so a refusal never leaves a
+/// (id, prompt, config, fleet cap, duplicate id, launch command) runs BEFORE
+/// the first side effect, so a refusal never leaves a
 /// half-started worker behind (in particular: no stale verify record from a
 /// start that failed a later step — the old shape stored the verify before
 /// resolving the launch command). All fleet access (enumerate / reap / spawn)
 /// goes through the [`Fleet`] seam.
-#[allow(clippy::too_many_arguments)]
 fn start_session(
     paths: &Paths,
     fleet: &dyn Fleet,
@@ -253,7 +233,6 @@ fn start_session(
     prompt: &str,
     command: Option<&str>,
     verify: Option<&str>,
-    resume: Option<&str>,
 ) -> Result<StartOutcome> {
     seed::ensure_dirs(paths)?;
 
@@ -264,19 +243,6 @@ fn start_session(
     let refuse = |msg: String| Ok(StartOutcome::refused(msg));
 
     // ---- VALIDATION PHASE (no side effects) --------------------------------
-
-    // Resolve the RESUME context FIRST: an unknown / not-yet-answered ask id
-    // is a decider mistake and must fail the move loudly (LAST FAILURE names
-    // it) before anything is spawned. The pair is ARCHIVED just before the
-    // spawn (archive-then-spawn, so a crash between the two can't re-dispatch
-    // the same resume) and UN-ARCHIVED if the spawn fails, below.
-    let resume_block = match resume {
-        Some(ask_id) => match crate::mailbox::resume_context(paths, ask_id) {
-            Ok(block) => Some(block),
-            Err(e) => return refuse(e.to_string()),
-        },
-        None => None,
-    };
 
     // The id becomes both a path segment (the prompt file) and the session id,
     // so reject traversal/dotfile/separator ids up front — the same guard the
@@ -408,7 +374,6 @@ fn start_session(
     let mut rollback = StartRollback {
         paths,
         session: &session,
-        archived_resume: None,
         armed: true,
     };
 
@@ -418,15 +383,13 @@ fn start_session(
     // binding above), so the old `__SESSION__`/`__ID__` pair always expanded
     // to the same value — two names for one thing invited them to drift apart.
     let contract = CONTRACT.replace("__ID__", id);
-    let resume_part = resume_block.as_deref().unwrap_or("");
     // Atomic write (temp + fsync + rename), not fs::write: the worker command
     // reads this file via `$(cat {{prompt_file}})`, and on an id REUSE a
     // truncate-then-write could expose a torn brief to a concurrent reader —
     // rename-publish means the path only ever holds a complete prompt.
-    if let Err(e) = crate::util::write_atomic(
-        &prompt_file,
-        format!("{contract}{resume_part}{prompt}\n").as_bytes(),
-    ) {
+    if let Err(e) =
+        crate::util::write_atomic(&prompt_file, format!("{contract}{prompt}\n").as_bytes())
+    {
         return Err(e.into()); // the guard clears the stored verify
     }
 
@@ -446,35 +409,13 @@ fn start_session(
         rcmd = crate::runner::wrap_with_retry(&cmd),
     );
 
-    // ARCHIVE-THEN-SPAWN: consume the answered resume pair BEFORE launching.
-    // The old order (spawn, then archive) re-dispatched the same resume when a
-    // crash landed between the two — the sys-asks resume signal stayed hot with
-    // a worker already running. Archiving first makes a crash lose at most one
-    // dispatch (recoverable: the record stays under asks/archive/); if the
-    // spawn FAILS we un-archive so the resume signal returns.
-    //
-    // The archive rename IS the resume's CLAIM (exactly one concurrent start
-    // wins — see archive_pair): resume_context above only VALIDATED the pair,
-    // and two starts racing past that validation would otherwise both spawn a
-    // worker carrying the same answer. The loser refuses instead — the guard
-    // rolls back the stored verify, and nothing was spawned.
-    if let Some(ask_id) = resume {
-        if !crate::mailbox::archive_pair(paths, ask_id) {
-            return refuse(format!(
-                "resume {ask_id}: already consumed by a concurrent start (or the pair could \
-                 not be archived)"
-            ));
-        }
-        rollback.archived_resume = Some(ask_id); // now armed to un-archive too
-    }
-
     // Launch the worker detached, IN-PROCESS via the babysit library (no
     // `babysit` binary). babysit re-execs looop as the headless supervisor.
     // `-c`, not `-lc`: a non-login shell sources no rc files, so the worker
     // launches against looop's inherited environment instead of re-running the
     // operator's login profile (hermetic + cheaper). The runner template itself
     // is still a shell string ($(cat ...), &&), so the shell stays.
-    // On Err the rollback guard un-archives the resume + clears the verify.
+    // On error the rollback guard clears the verify command.
     fleet.spawn(vec!["bash".to_string(), "-c".to_string(), launch], &session)?;
     rollback.disarm(); // launched — the side effects are legitimate state now
 
@@ -510,66 +451,6 @@ mod tests {
     use std::cell::RefCell;
 
     #[test]
-    fn start_session_refuses_a_resume_without_an_answer() {
-        // The resume check runs BEFORE any spawn: an unknown ask id — or one
-        // the human hasn't answered yet — must fail the move loudly.
-        let p = crate::paths::Paths::temp();
-        let out = cmd_start_session(&p, "w", "brief", None, None, Some("ghost-1")).unwrap();
-        assert_eq!(out.code, ExitCode::from(1));
-
-        // A pending (unanswered) detached ask is refused too.
-        let id = crate::mailbox::ask_detached(&p, "w", "q?", "", &[]).unwrap();
-        let out = cmd_start_session(&p, "w", "brief", None, None, Some(&id)).unwrap();
-        assert_eq!(out.code, ExitCode::from(1));
-    }
-
-    #[test]
-    fn concurrent_starts_never_double_dispatch_one_resume() {
-        // Regression: resume consumption was validate (resume_context) … then
-        // archive — non-atomic, so two concurrent starts could BOTH pass the
-        // validation and dispatch workers carrying the SAME answered ask. The
-        // archive rename is now the claim gating the spawn (see archive_pair):
-        // exactly one start wins, the loser refuses before spawning.
-        let p = crate::paths::Paths::temp();
-        let _ = crate::seed::ensure_dirs(&p);
-        let id = crate::mailbox::ask_detached(&p, "w", "go?", "", &[]).unwrap();
-        crate::mailbox::answer(&p, &id, "go", false).unwrap();
-        let run = |worker: &str| {
-            let fleet = FakeFleet::with(Vec::new());
-            let out = start_session(&p, &fleet, worker, "brief", None, None, Some(&id)).unwrap();
-            (out, fleet.spawned.borrow().len())
-        };
-        // Distinct worker ids so neither start trips the duplicate-id gate —
-        // the ONLY thing that may serialize them is the resume claim.
-        let ((out_a, spawned_a), (out_b, spawned_b)) = std::thread::scope(|s| {
-            let a = s.spawn(|| run("a"));
-            let b = s.spawn(|| run("b"));
-            (a.join().unwrap(), b.join().unwrap())
-        });
-        let successes = [&out_a, &out_b]
-            .iter()
-            .filter(|o| o.code == ExitCode::SUCCESS)
-            .count();
-        assert_eq!(
-            successes, 1,
-            "exactly one start may consume an answered resume"
-        );
-        assert_eq!(
-            spawned_a + spawned_b,
-            1,
-            "the losing start must never reach the spawn"
-        );
-        let reason = [&out_a, &out_b]
-            .into_iter()
-            .find_map(|o| o.reason.clone())
-            .expect("the loser's refusal names its cause");
-        assert!(
-            reason.contains(&id),
-            "the refusal names the contested ask: {reason}"
-        );
-    }
-
-    #[test]
     fn start_session_fails_closed_when_the_fleet_cannot_be_enumerated() {
         // The lenient list() used to collapse EVERY babysit error to an empty
         // fleet, so a transient I/O failure sailed past the cap AND the
@@ -580,7 +461,7 @@ mod tests {
         // Sabotage: a regular FILE where babysit's sessions dir belongs makes
         // its read_dir fail — the shape of any transient enumeration error.
         std::fs::write(p.data_dir.join("sessions"), "not a dir").unwrap();
-        let out = cmd_start_session(&p, "w", "brief", None, None, None)
+        let out = cmd_start_session(&p, "w", "brief", None, None)
             .expect("an enumeration failure is a refusal, not an Err");
         assert_eq!(out.code, ExitCode::from(1));
         let reason = out.reason.expect("the refusal names its cause");
@@ -608,7 +489,7 @@ mod tests {
         let p = crate::paths::Paths::temp();
         let _ = crate::seed::ensure_dirs(&p);
         std::fs::write(&p.config, "{ not json").unwrap();
-        let out = cmd_start_session(&p, "w", "brief", None, None, None)
+        let out = cmd_start_session(&p, "w", "brief", None, None)
             .expect("a config error is a refusal, not an Err");
         assert_eq!(out.code, ExitCode::from(1));
         let reason = out.reason.expect("the refusal names its cause");
@@ -690,7 +571,7 @@ mod tests {
         }
         let p = crate::paths::Paths::temp();
         let fleet = FakeFleet::with((0..cap).map(|i| live(&format!("w{i}"))).collect());
-        let out = start_session(&p, &fleet, "new", "brief", None, None, None).unwrap();
+        let out = start_session(&p, &fleet, "new", "brief", None, None).unwrap();
         assert_eq!(out.code, ExitCode::from(1));
         let reason = out.reason.expect("the refusal names its cause");
         assert!(
@@ -717,7 +598,7 @@ mod tests {
         sessions.push(live(PULSE_SESSION));
         sessions.push(corpse("old"));
         let fleet = FakeFleet::with(sessions);
-        let out = start_session(&p, &fleet, "new", "brief", None, None, None).unwrap();
+        let out = start_session(&p, &fleet, "new", "brief", None, None).unwrap();
         assert_eq!(out.code, ExitCode::SUCCESS, "under the cap — admitted");
         assert_eq!(fleet.spawned.borrow().as_slice(), ["new".to_string()]);
     }
@@ -730,7 +611,7 @@ mod tests {
         let p = crate::paths::Paths::temp();
         let mut fleet = FakeFleet::with(Vec::new());
         fleet.fail_list = true;
-        let out = start_session(&p, &fleet, "w", "brief", None, None, None).unwrap();
+        let out = start_session(&p, &fleet, "w", "brief", None, None).unwrap();
         assert_eq!(out.code, ExitCode::from(1));
         let reason = out.reason.expect("the refusal names its cause");
         assert!(
@@ -747,7 +628,7 @@ mod tests {
     fn start_session_refuses_a_duplicate_live_id() {
         let p = crate::paths::Paths::temp();
         let fleet = FakeFleet::with(vec![live("w")]);
-        let out = start_session(&p, &fleet, "w", "brief", None, None, None).unwrap();
+        let out = start_session(&p, &fleet, "w", "brief", None, None).unwrap();
         assert_eq!(out.code, ExitCode::from(1));
         let reason = out.reason.expect("the refusal names its cause");
         assert!(
@@ -766,7 +647,7 @@ mod tests {
         // (targeted) in the commit phase, then spawns under the freed id.
         let p = crate::paths::Paths::temp();
         let fleet = FakeFleet::with(vec![corpse("w")]);
-        let out = start_session(&p, &fleet, "w", "brief", None, None, None).unwrap();
+        let out = start_session(&p, &fleet, "w", "brief", None, None).unwrap();
         assert_eq!(out.code, ExitCode::SUCCESS);
         assert_eq!(fleet.reaped.borrow().as_slice(), ["w".to_string()]);
         assert_eq!(fleet.spawned.borrow().as_slice(), ["w".to_string()]);
@@ -782,6 +663,11 @@ mod tests {
             "the legacy __SESSION__ placeholder is gone"
         );
         assert!(CONTRACT.contains("__ID__"));
+        assert!(CONTRACT.contains("BLOCK until the human answers"));
+        assert!(
+            !CONTRACT.contains("--detach") && !CONTRACT.contains("CHECKPOINT and DETACH"),
+            "the worker contract exposes only blocking asks"
+        );
         let rendered = CONTRACT.replace("__ID__", "triage");
         assert!(
             !rendered.contains("__"),

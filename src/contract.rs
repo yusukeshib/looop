@@ -69,16 +69,6 @@ pub trait Contract {
         reference: &str,
         options: &[String],
     ) -> Result<String>;
-    /// Worker self-callback: raise a DETACHED ask (no blocking) and return the
-    /// ask id. The worker checkpoints and exits; the answer reaches a fresh
-    /// worker via `worker_start(…, resume: Some(ask_id))`.
-    fn ask_detached(
-        &self,
-        worker: &str,
-        prompt: &str,
-        reference: &str,
-        options: &[String],
-    ) -> Result<String>;
     /// Create or replace a goal; returns the executor's summary line.
     fn goal_write(&self, id: &str, body: &str, journal: Option<&str>) -> Result<String>;
     /// Archive a goal; returns the executor's summary line.
@@ -94,16 +84,13 @@ pub trait Contract {
     /// `worker_command` template wholesale (must carry `{{prompt_file}}`).
     /// `verify` is an optional post-condition shell command the pulse runs
     /// once after the worker dies (exit 0 = work verified done — see
-    /// `verify.rs`). `resume` names an answered DETACHED ask whose question,
-    /// answer, and checkpoint reference are injected into the brief (the pair
-    /// is archived once the worker launches).
+    /// `verify.rs`).
     fn worker_start(
         &self,
         id: &str,
         prompt: &str,
         command: Option<&str>,
         verify: Option<&str>,
-        resume: Option<&str>,
         journal: Option<&str>,
     ) -> Result<String>;
     /// Atomically acquire the named lease.
@@ -190,17 +177,6 @@ impl Contract for LocalContract<'_> {
         mailbox::ask(self.paths, worker, prompt, reference, options)
     }
 
-    fn ask_detached(
-        &self,
-        worker: &str,
-        prompt: &str,
-        reference: &str,
-        options: &[String],
-    ) -> Result<String> {
-        seed_dirs_warn(self.paths);
-        mailbox::ask_detached(self.paths, worker, prompt, reference, options)
-    }
-
     fn goal_write(&self, id: &str, body: &str, journal: Option<&str>) -> Result<String> {
         run_action(
             self.paths,
@@ -258,7 +234,6 @@ impl Contract for LocalContract<'_> {
         prompt: &str,
         command: Option<&str>,
         verify: Option<&str>,
-        resume: Option<&str>,
         journal: Option<&str>,
     ) -> Result<String> {
         run_action(
@@ -268,7 +243,6 @@ impl Contract for LocalContract<'_> {
                 prompt: prompt.to_string(),
                 command: command.map(str::to_owned),
                 verify: verify.map(str::to_owned),
-                resume: resume.map(str::to_owned),
             },
             journal,
         )

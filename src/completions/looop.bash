@@ -173,7 +173,7 @@ _looop() {
             ;;
         ask)
             if [[ "$cur" == -* ]]; then
-                COMPREPLY=($(compgen -W "--prompt --ref --options --detach" -- "$cur"))
+                COMPREPLY=($(compgen -W "--prompt --ref --options" -- "$cur"))
             elif [[ $cword -eq 2 ]]; then
                 COMPREPLY=($(compgen -W "$(__looop_workers_list)" -- "$cur"))
             fi
@@ -194,7 +194,7 @@ _looop() {
                     [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--json --all -a --watch -w --interval" -- "$cur"))
                     ;;
                 start)
-                    [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--command --verify --resume --journal" -- "$cur"))
+                    [[ "$cur" == -* ]] && COMPREPLY=($(compgen -W "--command --verify --journal" -- "$cur"))
                     ;;
             esac
             ;;

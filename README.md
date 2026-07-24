@@ -33,11 +33,9 @@ looop schedule write digest --every 86400 --note "daily digest"  # durable timer
 
 **Answer — sync, the loop initiates.** looop reaches back for *you* only when it
 genuinely must: a worker hits a decision only a human can make, or an
-irreversible action — merge, deploy, delete — needs an explicit yes. It blocks
-and waits for your call. (A worker facing a LONG wait doesn't idle: it
-checkpoints its state to `reports/`, raises the ask with `--detach`, and exits;
-your answer re-dispatches a fresh worker with the answer + checkpoint injected
-— no agent process burns tokens waiting out your weekend.)
+irreversible action — merge, deploy, delete — needs an explicit yes. The worker
+blocks and waits for your call, then the same worker consumes your answer and
+continues with its existing context.
 
 ```sh
 looop wait --only-asks          # block cheaply until the loop needs you

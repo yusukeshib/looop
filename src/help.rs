@@ -62,15 +62,12 @@ Usage:
                                 message up at its next `told` check or along with
                                 its next ask answer
   looop screenshot <id> [--ansi|--json|--plain] [--no-trim]   capture a session's screen
-  looop worker start <id> [prompt|-] [--command CMD] [--verify CMD] [--resume <ask-id>]
+  looop worker start <id> [prompt|-] [--command CMD] [--verify CMD]
                                 spawn a worker; --verify = post-condition shell
                                 command run ONCE after the worker dies (exit 0 =
                                 verified done; fail is surfaced in sys-sessions
                                 as verify:"fail" — exit status alone is never
-                                trusted as "work done"); --resume <ask-id> =
-                                consume an ANSWERED (detached) ask — injects its
-                                question, the human's answer and the checkpoint
-                                into the brief, then archives the ask/answer pair
+                                trusted as "work done")
   looop worker list [--json] [-a|--all] [-w|--watch [--interval N]]   pulse (up/down) + fleet health (busy/waiting-ask/stuck/dead), idle/uptime/ask age, verify verdict
 
   Shorthands: `worker`=`w`, `worker ls` / `w ls` = `worker list`, `screenshot`=`ss`,
@@ -79,10 +76,8 @@ Usage:
   `looop answer id-1 -- --yes`); only `tell` and `run` pass leading dashes through.
 
   WORKER self-callbacks (auto-injected CONTRACT — not for humans):
-  looop ask <id> --prompt "…" [--ref P] [--options a,b] [--detach]   ask + block
-                                for answer (--detach: write the ask, print its id
-                                and return immediately — checkpoint + exit; the
-                                answer arrives via `worker start --resume`)
+  looop ask <id> --prompt "…" [--ref P] [--options a,b]   ask + block
+                                until the human answers
   looop told [id]               print + consume pending steering messages
   looop kill <id> | claim <name> [--session ID] | unclaim <name> [--session ID]
 

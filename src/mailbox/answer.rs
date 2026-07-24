@@ -148,8 +148,8 @@ pub(crate) fn answer(paths: &Paths, ask_id: &str, text: &str, force: bool) -> Re
         bail!("answer: {ask_id:?} is already answered (pass --force to overwrite)");
     }
     // The exists check above and the create are NOT one atomic step: the ask
-    // can be archived/removed in between (a concurrent `worker start --resume`
-    // consuming the pair, a manual prune). The answer written for a vanished
+    // can be removed in between (for example by a manual prune). The answer
+    // written for a vanished
     // ask would be an ORPHAN — never read, never archived, and permanently
     // reserving its id in next_seq_id's scan. Re-check and undo OUR OWN write:
     // remove_if_eq keys on the exact body we wrote, so a concurrent --force
@@ -174,8 +174,8 @@ pub(crate) fn answer(paths: &Paths, ask_id: &str, text: &str, force: bool) -> Re
 
 #[cfg(test)]
 mod tests {
+    use super::super::pending;
     use super::super::test_util::ans;
-    use super::super::{answered_detached, pending, resume_context};
     use super::*;
     use std::fs;
 
@@ -248,17 +248,15 @@ mod tests {
     }
 
     #[test]
-    fn corrupt_answer_keeps_ask_pending_and_fails_resume_loudly() {
+    fn corrupt_answer_keeps_ask_pending_until_force_repaired() {
         // A truncated/corrupt answers/<id>.json is NOT "no answer": the ask
-        // stays visible (pending), and a resume against it fails loudly
-        // instead of injecting garbage — the fix (--force re-answer) works.
+        // stays visible until the human repairs it with --force.
         let p = Paths::temp();
         fs::create_dir_all(p.asks_dir()).unwrap();
         fs::create_dir_all(p.answers_dir()).unwrap();
         fs::write(
             p.asks_dir().join("w-1.json"),
-            serde_json::json!({"id":"w-1","worker":"w","prompt":"ok?","detach":true,"ts":1})
-                .to_string(),
+            serde_json::json!({"id":"w-1","worker":"w","prompt":"ok?","ts":1}).to_string(),
         )
         .unwrap();
         fs::write(p.answers_dir().join("w-1.json"), b"{truncat").unwrap();
@@ -267,15 +265,9 @@ mod tests {
             AnswerState::Corrupt
         ));
         assert_eq!(pending(&p).len(), 1, "corrupt answer keeps the ask listed");
-        assert!(
-            answered_detached(&p).is_empty(),
-            "a corrupt answer never counts as answered"
-        );
-        assert!(resume_context(&p, "w-1").is_err(), "resume fails loudly");
         // --force re-answer repairs the record and resolves the ask.
         answer(&p, "w-1", "repaired", true).unwrap();
         assert!(pending(&p).is_empty());
-        assert_eq!(answered_detached(&p).len(), 1);
     }
 
     #[test]

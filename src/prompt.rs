@@ -97,7 +97,6 @@ Pick exactly ONE `action` and fill its fields:
 
   {"action":"start_worker","id":"<goal-name>","prompt":"<detailed worker brief>",
    "verify":"<optional post-condition shell command>",
-   "resume":"<optional ask id — see ANSWERED ASKS>",
    "command":"<optional full launch-command override>"}
      Spawn an agent for hands-on, multi-step work. <id> matches the goal file.
      The worker starts in the data dir; if its task edits CODE, tell it to make
@@ -114,11 +113,6 @@ Pick exactly ONE `action` and fill its fields:
      once and sys-sessions reports verify:"pass"|"fail" (+ detail
      verify_output). Treat verify:"fail" as a FAILED worker — inspect, then
      respawn with sharper instructions or ask — never as sensor lag.
-     `resume` carries an ANSWERED ASK's id (see the ANSWERED ASKS section):
-     looop injects the original question, the human's answer, and the
-     checkpoint reference into the worker's brief and archives the pair. Use
-     it whenever you re-dispatch work a detached worker checkpointed — your
-     `prompt` then only needs the goal-level brief, not the answer itself.
      `command` replaces the configured worker launch command WHOLESALE for
      this one worker (it must contain {{prompt_file}}, the worker's brief).
      OMIT it unless the PLAYBOOK gives explicit guidance (exact commands valid
@@ -169,23 +163,13 @@ PENDING ASKS are asks raised via `looop ask` and not yet answered. They are
 NOT yours to answer — the human answers them out of band. Each ask is tagged:
   • LIVE — the asking worker is alive and BLOCKED on the human. Do NOT
     re-dispatch or duplicate work it is already blocked on; the human answers it
-    out of band and the worker resumes.
-  • DETACHED — the worker checkpointed its state (see its reference) and exited
-    BY DESIGN; its death is normal, not a failure. WAIT for the human — do NOT
-    re-dispatch while the ask is unanswered. Once answered it moves to the
-    ANSWERED ASKS section below, which is your cue to act.
-  • STRANDED — a BLOCKING ask whose worker is DEAD (crashed/killed, e.g. after
-    a reboot). Its answer can NEVER be delivered — no live process will consume
-    it, so a human answer is inert. A stranded ask is NOT a reason to noop: if
-    the underlying goal still needs the work, re-dispatch a FRESH worker for it
-    (it can read the prior `reports/*.md` for context and re-raise the ask).
-    Treat STRANDED asks as work to resume, not as blockers.
-
-ANSWERED ASKS (when the section is present) are detached asks the human has
-answered. Each is WORK TO RESUME THIS BEAT (unless something is clearly more
-urgent): emit start_worker with `resume:"<ask id>"` — looop injects the
-question, answer, and checkpoint into the fresh worker's brief and archives the
-pair. Do not leave one sitting: it keeps the world "changed" for no reason.
+    out of band and the same worker resumes.
+  • STRANDED — the asking worker is DEAD (crashed/killed, e.g. after a reboot).
+    Its answer can NEVER be delivered — no live process will consume it, so a
+    human answer is inert. A stranded ask is NOT a reason to noop: if the
+    underlying goal still needs the work, re-dispatch a FRESH worker for it (it
+    can read prior `reports/*.md` for context and re-raise the ask). Treat
+    STRANDED asks as work to resume, not as blockers.
 
 Some of the SENSOR READINGS are looop's OWN state (system sensors, not
 sensors/*.sh):
@@ -472,9 +456,9 @@ fn push_section(out: &mut String, title: &str, body: &str) {
 ///
 /// `kind` labels the omission in the oversize warn event; `noun` is the
 /// human-facing word in the in-prompt marker; `hint` is the per-section
-/// remediation suffix. Extracted because the four budgeted sections (goals,
-/// sensor readings, pending asks, answered asks) each carried a copy of this
-/// loop — four copies of one policy invited them to drift apart.
+/// remediation suffix. Extracted because the three budgeted sections (goals,
+/// sensor readings, pending asks) each carried a copy of this loop — three
+/// copies of one policy invited them to drift apart.
 // The parameter count is the honest shape of the shared policy (prompt state,
 // budget, item stream, and three labelling knobs) — a builder/struct here
 // would be ceremony for one private helper with four call sites.
@@ -677,9 +661,7 @@ fn build_prompt_budgeted(
         sec.push_str("(none)\n");
     } else {
         // A pending ask only blocks a LIVE worker; a dead worker's ask is
-        // STRANDED (its answer can never be delivered) — unless it was raised
-        // DETACHED, where the worker's exit is by design and the answer is
-        // delivered to a fresh worker via start_worker.resume. Collect the
+        // STRANDED because its answer can never be delivered. Collect the
         // alive worker ids once to tag each ask.
         let alive: std::collections::HashSet<String> = session::list_workers(paths)
             .into_iter()
@@ -688,8 +670,8 @@ fn build_prompt_budgeted(
             .collect();
         let total = asks.len();
         let items = asks.into_iter().map(|a| {
-            let tag = if a.detach {
-                "DETACHED — worker checkpointed and exited by design; WAIT for the human"
+            let tag = if !a.blocks_worker() {
+                "STRANDED — no worker is blocked; re-dispatch a fresh worker"
             } else if alive.contains(&a.worker) {
                 "LIVE — blocked on human"
             } else {
@@ -735,52 +717,6 @@ fn build_prompt_budgeted(
         "PENDING ASKS (waiting on the human — not yours to answer)",
         &sec,
     );
-
-    // ANSWERED ASKS — detached asks the human has answered: work to RESUME.
-    // Rendered only when present (an empty section would just burn prompt).
-    let resumable = mailbox::answered_detached(paths);
-    if !resumable.is_empty() {
-        let mut sec = String::new();
-        let total = resumable.len();
-        let items = resumable.iter().map(|(a, answer)| {
-            let mut item = String::new();
-            let _ = writeln!(item, "--- {} (worker {})", a.id, a.worker);
-            let _ = writeln!(
-                item,
-                "question: {}",
-                escape_section_markers(&clip(&a.prompt, ASK_TEXT_MAX))
-            );
-            let _ = writeln!(
-                item,
-                "answer: {}",
-                escape_section_markers(&clip(answer, ASK_TEXT_MAX))
-            );
-            if !a.reference.is_empty() {
-                let _ = writeln!(
-                    item,
-                    "checkpoint: {}",
-                    escape_section_markers(&clip(&a.reference, ASK_TEXT_MAX))
-                );
-            }
-            item
-        });
-        budgeted_section(
-            out.len(),
-            &mut sec,
-            budget,
-            total,
-            items,
-            "answered asks",
-            "answered asks",
-            "",
-            &mut oversize,
-        );
-        push_section(
-            &mut out,
-            "ANSWERED ASKS (resume these — start_worker with resume)",
-            &sec,
-        );
-    }
 
     // Loud, not silent: the in-prompt markers travel with the items they
     // replace, so a human watching the pulse also needs the event — it tells
@@ -1112,40 +1048,6 @@ mod tests {
     }
 
     #[test]
-    fn detached_ask_is_tagged_waiting_and_answered_one_renders_resume_section() {
-        let p = fixture();
-        fs::create_dir_all(p.asks_dir()).unwrap();
-        fs::create_dir_all(p.answers_dir()).unwrap();
-        fs::write(
-            p.asks_dir().join("tri-1.json"),
-            serde_json::json!({
-                "id":"tri-1","worker":"tri","prompt":"merge?",
-                "reference":"reports/tri-checkpoint.md","detach":true,"ts":1
-            })
-            .to_string(),
-        )
-        .unwrap();
-        let out = bp(&p);
-        assert!(
-            out.contains("DETACHED — worker checkpointed and exited by design"),
-            "a detached pending ask must not read as STRANDED"
-        );
-        assert!(!out.contains("=== ANSWERED ASKS"), "not answered yet");
-
-        // Answering moves it out of pending into the resume section.
-        fs::write(
-            p.answers_dir().join("tri-1.json"),
-            serde_json::json!({"answer":"merge it","ts":2}).to_string(),
-        )
-        .unwrap();
-        let out = bp(&p);
-        assert!(out.contains("=== ANSWERED ASKS"));
-        assert!(out.contains("answer: merge it"));
-        assert!(out.contains("checkpoint: reports/tri-checkpoint.md"));
-        assert!(!out.contains("DETACHED — worker checkpointed"));
-    }
-
-    #[test]
     fn volatile_time_rides_at_the_tail_for_prompt_cache_stability() {
         // Provider prompt caching hits the longest byte-identical PREFIX, so the
         // per-beat-changing time must sit BELOW every stable section, and the
@@ -1308,6 +1210,44 @@ mod tests {
             out.contains("re-dispatch a FRESH worker"),
             "instructions must tell the decider to re-dispatch stranded asks"
         );
+    }
+
+    #[test]
+    fn legacy_detached_ask_never_blocks_a_reused_worker_id() {
+        let p = fixture();
+        let id = "triage";
+        let session = p.data_dir.join("sessions").join(id);
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            session.join("meta.json"),
+            format!(
+                r#"{{"id":"{id}","cmd":["x"],"babysit_pid":{},"started_at":"2026-01-01T00:00:00Z"}}"#,
+                std::process::id()
+            ),
+        )
+        .unwrap();
+        fs::write(
+            session.join("status.json"),
+            r#"{"state":"running","child_pid":null,"exit_code":null,"last_change":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        fs::write(
+            p.asks_dir().join("triage-1.json"),
+            serde_json::json!({
+                "id":"triage-1","worker":id,"prompt":"old question",
+                "detach":true,"ts":1
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let out = bp(&p);
+        let ask_line = out
+            .lines()
+            .find(|line| line.contains("triage-1") && line.contains("worker triage"))
+            .expect("legacy ask line present");
+        assert!(ask_line.contains("STRANDED"), "legacy ask: {ask_line}");
+        assert!(!ask_line.contains("LIVE"), "legacy ask: {ask_line}");
     }
 
     #[test]

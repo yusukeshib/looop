@@ -1,43 +1,31 @@
 //! Signal assembly: the mailbox's view into the world hash.
 
-use super::ask::{Ask, answered_detached, pending};
+use super::ask::pending;
 use crate::paths::Paths;
 use crate::util;
 
-/// The `sys-asks` system-sensor probe: makes the mailbox a FIRST-CLASS part of
-/// the world hash. Signal: the pending ask ids plus the answered-detached ids
-/// awaiting a resume — an ask being raised, answered, or resumed each changes
-/// the signal exactly once (level-triggered, no clock in the signal). Volatile
-/// context (ages, prompts) rides in detail.
+/// The `sys-asks` system-sensor probe: makes the mailbox a first-class part of
+/// the world hash. The stable signal is the set of pending ask ids, so raising
+/// or answering an ask changes it exactly once (level-triggered, no clock in
+/// the signal). Volatile context rides in detail.
 pub fn sys_asks(paths: &Paths) -> serde_json::Value {
     let now = util::now_unix();
     let pending = pending(paths);
-    let resume: Vec<(Ask, String)> = answered_detached(paths);
-    let mut detail = serde_json::Map::new();
-    for a in &pending {
-        detail.insert(
-            a.id.clone(),
-            serde_json::json!({
-                "worker": a.worker,
-                "detach": a.detach,
-                "age_s": now.saturating_sub(a.ts),
-            }),
-        );
-    }
-    for (a, _) in &resume {
-        detail.insert(
-            a.id.clone(),
-            serde_json::json!({
-                "worker": a.worker,
-                "answered": true,
-                "age_s": now.saturating_sub(a.ts),
-            }),
-        );
-    }
+    let detail = pending
+        .iter()
+        .map(|a| {
+            (
+                a.id.clone(),
+                serde_json::json!({
+                    "worker": a.worker,
+                    "age_s": now.saturating_sub(a.ts),
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
     serde_json::json!({
         "signal": {
             "pending": pending.iter().map(|a| a.id.clone()).collect::<Vec<_>>(),
-            "resume": resume.iter().map(|(a, _)| a.id.clone()).collect::<Vec<_>>(),
         },
         "detail": detail,
     })
@@ -45,8 +33,8 @@ pub fn sys_asks(paths: &Paths) -> serde_json::Value {
 
 #[cfg(test)]
 mod tests {
+    use super::super::cmd_answer;
     use super::super::test_util::{ans, temp_seeded};
-    use super::super::{archive_pair, ask_detached, cmd_answer};
     use super::*;
 
     #[test]
@@ -54,24 +42,26 @@ mod tests {
         let p = temp_seeded();
         let v = sys_asks(&p);
         assert_eq!(v["signal"]["pending"], serde_json::json!([]));
-        assert_eq!(v["signal"]["resume"], serde_json::json!([]));
 
-        let id = ask_detached(&p, "w", "q?", "", &[]).unwrap();
+        let id = "w-1";
+        std::fs::create_dir_all(p.asks_dir()).unwrap();
+        std::fs::write(
+            p.asks_dir().join(format!("{id}.json")),
+            serde_json::json!({
+                "v": 1,
+                "id": id,
+                "worker": "w",
+                "prompt": "q?",
+                "ts": 1,
+            })
+            .to_string(),
+        )
+        .unwrap();
         let v = sys_asks(&p);
-        assert_eq!(v["signal"]["pending"], serde_json::json!([id.clone()]));
+        assert_eq!(v["signal"]["pending"], serde_json::json!([id]));
 
-        cmd_answer(&p, &ans(&id, "a", false)).unwrap();
+        cmd_answer(&p, &ans(id, "a", false)).unwrap();
         let v = sys_asks(&p);
         assert_eq!(v["signal"]["pending"], serde_json::json!([]));
-        assert_eq!(v["signal"]["resume"], serde_json::json!([id.clone()]));
-        assert_eq!(v["detail"][&id]["answered"], serde_json::json!(true));
-
-        assert!(archive_pair(&p, &id), "the consumer claims the pair");
-        let v = sys_asks(&p);
-        assert_eq!(
-            v["signal"]["resume"],
-            serde_json::json!([]),
-            "archiving settles the wake signal"
-        );
     }
 }
