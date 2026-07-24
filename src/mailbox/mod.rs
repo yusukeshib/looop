@@ -21,11 +21,8 @@ mod tell;
 
 pub(crate) use answer::answer;
 pub use answer::cmd_answer;
-pub use ask::{
-    Ask, answered_detached, archive_pair, cmd_ask, cmd_asks, pending, resume_context,
-    unarchive_pair,
-};
-pub(crate) use ask::{ask, ask_detached};
+pub(crate) use ask::ask;
+pub use ask::{Ask, cmd_ask, cmd_asks, pending};
 // Shared "--session/--worker arg → $LOOOP_SESSION_ID fallback" (one rule,
 // previously three copies: gate.rs and the ask/told self-callbacks).
 pub(crate) use common::session_or_env;
@@ -48,7 +45,7 @@ mod test_util {
     /// A temp profile with the FIRST-RUN SEED suppressed: contract verbs
     /// (`cmd_answer` → `LocalContract`) run `seed::ensure_dirs`, which on a
     /// PLAYBOOK-less data dir plants the `setup-1` starter ask — noise for
-    /// tests asserting exact pending/resume sets. A pre-existing PLAYBOOK
+    /// tests asserting exact pending sets. A pre-existing PLAYBOOK
     /// marks the profile as already seeded.
     pub(crate) fn temp_seeded() -> Paths {
         let p = Paths::temp();

@@ -257,9 +257,8 @@ const SYSTEM_SENSORS: &[(&str, Probe)] = &[
     ("claims", sys_claims),
     ("goals", sys_goals),
     ("schedules", crate::schedule::sys_schedules),
-    // The mailbox as a first-class world item: an ask raised / answered /
-    // resumed changes this signal. Without it, a DETACHED ask's answer would
-    // never wake the loop (no live worker transitions in sys-sessions).
+    // The mailbox as a first-class world item: raising or answering an ask
+    // changes this signal independently of the worker-fleet snapshot.
     ("asks", crate::mailbox::sys_asks),
 ];
 
@@ -477,7 +476,9 @@ pub(crate) fn fleet_health(paths: &Paths) -> Vec<WorkerHealth> {
     workers
         .into_iter()
         .map(|s| {
-            let ask = pending.iter().find(|a| a.worker == s.id);
+            let ask = pending
+                .iter()
+                .find(|a| a.worker == s.id && a.blocks_worker());
             let idle = session::output_idle_secs(paths, &s.id);
             let verdict = crate::verify::result(paths, &s.id);
             WorkerHealth {

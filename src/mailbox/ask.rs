@@ -1,6 +1,5 @@
-//! The ask half of the mailbox: raising questions (blocking and detached),
-//! listing pending asks, resuming answered detached asks, and the archive /
-//! unarchive lifecycle of a consumed ask/answer pair.
+//! The ask half of the mailbox: raising blocking questions and listing pending
+//! asks.
 
 use super::answer::{AnswerState, read_answer};
 use super::common::{stamp_v1, warn_future_v, warn_once, write_new_record};
@@ -8,7 +7,7 @@ use super::tell::drain_tells;
 use crate::paths::Paths;
 use crate::store::{Collection, FileStore, Key, StateStore};
 use crate::util;
-use anyhow::{Context, Result, bail};
+use anyhow::{Result, bail};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -29,15 +28,22 @@ pub struct Ask {
     /// Optional discrete choices the answer should pick from.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub options: Vec<String>,
-    /// DETACHED ask: the worker checkpointed its state and EXITED instead of
-    /// blocking on the answer. Its death is by design (not stranded); when the
-    /// human answers, the decider re-dispatches a fresh worker with
-    /// `start_worker.resume = <ask id>`, which injects the answer + checkpoint
-    /// and archives the pair.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub detach: bool,
+    /// Read-only migration marker for records written by the removed
+    /// `ask --detach` feature. No new record sets it, and it is never exposed
+    /// again when serializing state. It only prevents a later worker reusing
+    /// the same id from being mistaken for the process blocked on this ask.
+    #[serde(default, rename = "detach", skip_serializing)]
+    pub(crate) legacy_detached: bool,
     /// Unix seconds the ask was raised.
     pub ts: u64,
+}
+
+impl Ask {
+    /// Whether a live worker with `self.worker` can actually be blocked inside
+    /// this ask. Legacy detached records had no waiting process.
+    pub(crate) fn blocks_worker(&self) -> bool {
+        !self.legacy_detached
+    }
 }
 
 /// All asks that have NO matching answer yet. Read-only; used by `state` and
@@ -77,229 +83,6 @@ pub fn pending(paths: &Paths) -> Vec<Ask> {
     out
 }
 
-/// DETACHED asks that HAVE an answer and have not been resumed yet, oldest
-/// first, each paired with its answer text. These are the decider's cue to
-/// re-dispatch: `start_worker` with `resume = <ask id>` injects the answer +
-/// checkpoint into the fresh worker's brief and archives the pair (which
-/// settles the `sys-asks` wake signal).
-pub fn answered_detached(paths: &Paths) -> Vec<(Ask, String)> {
-    let store = FileStore::new(paths);
-    let mut out = Vec::new();
-    for id in store.list(&Collection::Asks) {
-        // Parse failures are surfaced by `pending()` (which scans the same
-        // records every beat); here they are just skipped.
-        if let Some(raw) = store.read(&Key::Ask(id.clone()))
-            && let Ok(ask) = serde_json::from_str::<Ask>(&raw)
-            && ask.detach
-            && let AnswerState::Ready(answer) = read_answer(&store, &ask.id)
-        {
-            out.push((ask, answer));
-        }
-    }
-    out.sort_by(|a, b| a.0.ts.cmp(&b.0.ts).then_with(|| a.0.id.cmp(&b.0.id)));
-    out
-}
-
-/// The RESUME preamble for a fresh worker taking over an answered detached
-/// ask: the original question, the human's answer, and the checkpoint
-/// reference. Errors when the ask is unknown or not answered yet — a resume
-/// against a pending ask is a decider mistake and must fail loudly.
-pub fn resume_context(paths: &Paths, ask_id: &str) -> Result<String> {
-    // The id becomes a path segment (asks/<id>.json) — same guard as answer().
-    util::safe_segment("ask id", ask_id)?;
-    let store = FileStore::new(paths);
-    let raw = store
-        .read(&Key::Ask(ask_id.to_string()))
-        .with_context(|| format!("resume: no ask {ask_id:?}"))?;
-    let ask: Ask = serde_json::from_str(&raw).with_context(|| format!("resume: ask {ask_id:?}"))?;
-    // A BLOCKING (non-detached) ask still has its original worker polling for
-    // the answer: resuming it would archive the pair out from under that
-    // worker (which then bails "vanished") while a SECOND worker consumes the
-    // answer. Only detached asks are resumable by design.
-    if !ask.detach {
-        bail!(
-            "ask {ask_id} is a blocking ask — its worker is already waiting; \
-             resume only detached asks"
-        );
-    }
-    let answer = match read_answer(&store, ask_id) {
-        AnswerState::Ready(a) => a,
-        AnswerState::Missing => bail!("resume: ask {ask_id:?} has no answer yet"),
-        // Resuming against a corrupt answer would inject garbage into a fresh
-        // worker's brief — fail loudly (the file was already named on stderr).
-        AnswerState::Corrupt => {
-            bail!("resume: answers/{ask_id}.json is unreadable — re-answer with --force first")
-        }
-    };
-    let reference = if ask.reference.is_empty() {
-        "(none — look for reports/ left by the previous worker)".to_string()
-    } else {
-        ask.reference.clone()
-    };
-    Ok(format!(
-        "# ⚡ RESUME (auto-injected)\n\
-         A previous worker checkpointed its state and asked the human, then exited.\n\
-         You are the fresh worker carrying that work forward.\n\
-         - Question asked: {}\n\
-         - Human's answer: {}\n\
-         - Checkpoint / reference: {}\n\
-         Read the checkpoint FIRST, obey the answer, and continue from where the\n\
-         previous worker left off — do not redo completed steps.\n\n---\n\n",
-        ask.prompt, answer, reference
-    ))
-}
-
-/// Archive a consumed ask/answer pair (asks/archive/, answers/archive/) so the
-/// `sys-asks` resume signal settles. Best-effort on the answer half (an ask
-/// without an answer file archives just the ask). An id that is not a safe
-/// path segment archives nothing — the id becomes a filename, so it gets the
-/// same guard as every other mailbox verb.
-///
-/// Returns whether THIS caller CONSUMED the pair. The ask half's rename into
-/// the archive is atomic, so it doubles as a CLAIM (the same claim-by-rename
-/// idiom as [`drain_tells`](super::drain_tells)): when two starts race to
-/// resume the same answered ask, exactly one rename succeeds — the loser sees
-/// NotFound and must NOT dispatch, or the same resume would be delivered to
-/// two workers. `false` also covers an unarchivable pair (unsafe id, I/O
-/// error): fail closed — an extra refusal is retryable, a double dispatch is
-/// not.
-#[must_use]
-pub fn archive_pair(paths: &Paths, ask_id: &str) -> bool {
-    if util::safe_segment("ask id", ask_id).is_err() {
-        return false;
-    }
-    let store = FileStore::new(paths);
-    match store.archive(&Key::Ask(ask_id.to_string())) {
-        Ok(()) => {}
-        // NotFound = a concurrent consumer archived the ask first (or it never
-        // existed): the claim is LOST. Quiet on purpose — losing a race is a
-        // normal outcome, not a fault worth a warn event.
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return false,
-        // Any other failure is non-fatal but must be VISIBLE — a pair that
-        // fails to archive keeps the sys-asks resume signal hot (possible
-        // re-dispatch) — and the caller must not dispatch on an unclaimed pair.
-        Err(e) => {
-            util::event(
-                util::Level::Warn,
-                "ask.archive_failed",
-                &format!("could not archive asks/{ask_id}.json: {e}"),
-                &[("ask_id", serde_json::json!(ask_id))],
-            );
-            return false;
-        }
-    }
-    match store.archive(&Key::Answer(ask_id.to_string())) {
-        Ok(()) => {}
-        // Best-effort on the answer half: an ask without an answer file
-        // archives just the ask (a detached ask killed before answering).
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => util::event(
-            util::Level::Warn,
-            "ask.archive_failed",
-            &format!("could not archive answers/{ask_id}.json: {e}"),
-            &[("ask_id", serde_json::json!(ask_id))],
-        ),
-    }
-    // The ask half — the resume signal itself — is claimed and archived; a
-    // straggling answer file is inert (pending() keys on asks/).
-    true
-}
-
-/// Best-effort inverse of [`archive_pair`]: move the MOST RECENTLY archived
-/// `<id>` records back into the live dirs. Used by the resume path when the
-/// worker spawn fails AFTER the pair was archived — restoring the pair restores
-/// the `sys-asks` resume signal, so the answer is not lost. The guard is
-/// PAIRWISE: if a NEW live ask reuses the id, NEITHER half is restored —
-/// restoring just the answer would attach a stale answer to a different
-/// question. The ANSWER half is restored FIRST; if that restore fails, the ask
-/// restore is skipped too (an answer without an ask is inert; an ask without
-/// its answer re-relays as pending — worse).
-pub fn unarchive_pair(paths: &Paths, ask_id: &str) {
-    if util::safe_segment("ask id", ask_id).is_err() {
-        return;
-    }
-    // Hold BOTH per-directory writer locks (fixed order: asks then answers —
-    // no other path takes both, so no deadlock) for the whole check+restore:
-    // exists()-then-rename without the lock was a TOCTOU — a concurrent
-    // create_exclusive of a REUSED id between the check and the rename would
-    // attach the old answer to a brand-new ask. create_exclusive takes the
-    // same locks, so under them the guard below is race-free. Best-effort
-    // (like the rest of this path): if a lock cannot be taken, restore nothing.
-    let Ok(_asks_lock) = crate::store::DirLock::acquire(&paths.asks_dir()) else {
-        return;
-    };
-    let Ok(_answers_lock) = crate::store::DirLock::acquire(&paths.answers_dir()) else {
-        return;
-    };
-    // Pairwise guard: a live ask with this id means the id was REUSED by a new
-    // ask — restore nothing (never attach the old answer to the new question).
-    if paths.asks_dir().join(format!("{ask_id}.json")).exists() {
-        return;
-    }
-    // Answer first: if it cannot be restored, skip the ask half as well.
-    if !restore_newest_archived(&paths.answers_dir(), ask_id) {
-        return;
-    }
-    restore_newest_archived(&paths.asks_dir(), ask_id);
-}
-
-/// Move the MOST RECENTLY archived `<ask_id>` record in `dir/archive/` back to
-/// `dir/<ask_id>.json`. Returns true when the live record exists afterwards
-/// (already present, or restored); false when there was nothing to restore or
-/// the rename failed. CALLER HOLDS `dir`'s writer lock ([`unarchive_pair`]):
-/// the exists-check doubles as the no-clobber guard — under the lock no
-/// create_exclusive/write_atomic can land a destination between the check and
-/// the rename, so an existing live record is never silently overwritten.
-fn restore_newest_archived(dir: &std::path::Path, ask_id: &str) -> bool {
-    let live = dir.join(format!("{ask_id}.json"));
-    if live.exists() {
-        return true;
-    }
-    let archive = dir.join("archive");
-    // The archive suffixes on collision (`<id>.json`, then `<id>-1.json`, …),
-    // so the HIGHEST suffix is the newest record. Scan the whole directory and
-    // take the max instead of probing suffixes upward from the bare name: a
-    // GAP in the sequence (a manually pruned generation) would stop an upward
-    // probe early and restore a STALE record — or nothing at all when the bare
-    // file itself is the gap.
-    let suffix_of = |name: &str| -> Option<u64> {
-        let stem = name.strip_suffix(".json")?;
-        if stem == ask_id {
-            return Some(0); // the bare, first-archived (oldest) record
-        }
-        stem.strip_prefix(&format!("{ask_id}-"))?.parse().ok()
-    };
-    let newest = std::fs::read_dir(&archive)
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().into_owned();
-            Some((suffix_of(&name)?, e.path()))
-        })
-        .max_by_key(|(n, _)| *n)
-        .map(|(_, p)| p);
-    let Some(from) = newest else {
-        return false;
-    };
-    match std::fs::rename(&from, &live) {
-        Ok(()) => true,
-        Err(e) => {
-            util::event(
-                util::Level::Warn,
-                "ask.unarchive_failed",
-                &format!(
-                    "could not restore {} → {}: {e}",
-                    from.display(),
-                    live.display()
-                ),
-                &[("ask_id", serde_json::json!(ask_id))],
-            );
-            false
-        }
-    }
-}
-
 /// `looop ask <worker> --prompt "…" [--ref PATH] [--options a,b,c]`
 ///
 /// Worker self-callback (CONTRACT). Writes the ask, then BLOCKS polling answers/
@@ -317,19 +100,6 @@ pub fn cmd_ask(paths: &Paths, args: &crate::cli::AskArgs) -> Result<ExitCode> {
     let reference = args.reference.clone().unwrap_or_default();
     // clap already split `--options a,b` on commas; trim each entry.
     let options: Vec<String> = args.options.iter().map(|s| s.trim().to_string()).collect();
-    if args.detach {
-        // Non-blocking: write the ask and hand back its id. The worker is
-        // expected to have checkpointed (--ref) and to END ITS SESSION now —
-        // the answer is delivered to a FRESH worker via `--resume <id>`.
-        let id = crate::contract::LocalContract::new(paths).ask_detached(
-            &worker,
-            &args.prompt,
-            &reference,
-            &options,
-        )?;
-        println!("{id}");
-        return Ok(ExitCode::SUCCESS);
-    }
     let answer = crate::contract::LocalContract::new(paths).ask(
         &worker,
         &args.prompt,
@@ -348,7 +118,6 @@ fn write_ask(
     prompt: &str,
     reference: &str,
     options: &[String],
-    detach: bool,
 ) -> Result<String> {
     util::safe_segment("worker id", worker)?;
     if prompt.trim().is_empty() {
@@ -370,14 +139,13 @@ fn write_ask(
                 prompt: prompt.to_string(),
                 reference: reference.to_string(),
                 options: options.to_vec(),
-                detach,
+                legacy_detached: false,
                 ts: util::now_unix(),
             };
             stamp_v1(&serde_json::to_string(&ask)?)
         },
     )?;
-    // `write_ask` is shared by the worker self-callback and the detached
-    // callback.  It MUST NOT log to stdout: the blocking callback is normally
+    // `write_ask` MUST NOT log to stdout: the blocking callback is normally
     // invoked through shell command substitution (`answer=$(looop ask …)`),
     // where stdout is the worker's answer protocol.  Mixing the ask event into
     // that stream leaves the runner with a log line instead of a clean answer
@@ -385,19 +153,6 @@ fn write_ask(
     // The mailbox record itself is the durable event; presenters may report it
     // on a separate channel.
     Ok(id)
-}
-
-/// CONTRACT core for `ask --detach`: write the durable ask and return its ID
-/// immediately — no blocking. The asking worker checkpoints and exits; the
-/// answer is delivered to a FRESH worker via `worker_start(…, resume)`.
-pub(crate) fn ask_detached(
-    paths: &Paths,
-    worker: &str,
-    prompt: &str,
-    reference: &str,
-    options: &[String],
-) -> Result<String> {
-    write_ask(paths, worker, prompt, reference, options, true)
 }
 
 /// CONTRACT core for `ask`: write the durable ask, then BLOCK polling answers/
@@ -410,7 +165,7 @@ pub(crate) fn ask(
     reference: &str,
     options: &[String],
 ) -> Result<String> {
-    let id = write_ask(paths, worker, prompt, reference, options, false)?;
+    let id = write_ask(paths, worker, prompt, reference, options)?;
     let store = FileStore::new(paths);
 
     // Block until answered. The human sees this ask (via a
@@ -547,7 +302,7 @@ mod tests {
             prompt: "merge?".into(),
             reference: String::new(),
             options: vec![],
-            detach: false,
+            legacy_detached: false,
             ts: 1,
         };
         fs::write(
@@ -573,6 +328,23 @@ mod tests {
     }
 
     #[test]
+    fn legacy_detach_field_is_migration_only() {
+        let ask: Ask =
+            serde_json::from_str(r#"{"id":"w-1","worker":"w","prompt":"q?","detach":true,"ts":1}"#)
+                .unwrap();
+        assert_eq!(ask.id, "w-1");
+        assert!(!ask.blocks_worker());
+        assert!(
+            !serde_json::to_value(&ask)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("detach"),
+            "the removed field is accepted only for migration and is never re-exposed"
+        );
+    }
+
+    #[test]
     fn ask_errors_when_the_ask_record_vanishes() {
         // set_var is process-global: serialize against other env-mutating
         // tests, and restore the knob even if an assert below panics.
@@ -594,156 +366,6 @@ mod tests {
         let res = handle.join().unwrap();
         let err = res.expect_err("a vanished ask must error, not block forever");
         assert!(err.to_string().contains("vanished"), "got: {err}");
-    }
-
-    #[test]
-    fn detached_ask_returns_id_and_resumes_through_the_pair_lifecycle() {
-        let p = temp_seeded();
-        // Raise: returns the id immediately (no blocking), pending shows it.
-        let id = ask_detached(&p, "triage", "merge or split?", "reports/cp.md", &[]).unwrap();
-        assert_eq!(id, "triage-1");
-        let pend = pending(&p);
-        assert_eq!(pend.len(), 1);
-        assert!(pend[0].detach, "the record carries the detach flag");
-        assert!(
-            answered_detached(&p).is_empty(),
-            "nothing to resume before the answer"
-        );
-        // resume_context before the answer is a loud error.
-        assert!(resume_context(&p, &id).is_err());
-        // …and so is resuming a BLOCKING (non-detached) ask: its worker is
-        // already polling for the answer.
-        let blocking = write_ask(&p, "other", "quick q?", "", &[], false).unwrap();
-        answer(&p, &blocking, "quick a", false).unwrap();
-        let err = resume_context(&p, &blocking).unwrap_err().to_string();
-        assert!(err.contains("blocking ask"), "got: {err}");
-        // …and so is an id that is not a safe path segment (traversal guard).
-        assert!(resume_context(&p, "../evil").is_err());
-
-        // Answer: the ask leaves pending and becomes resumable.
-        cmd_answer(&p, &ans(&id, "split it", false)).unwrap();
-        assert!(pending(&p).is_empty());
-        let resumable = answered_detached(&p);
-        assert_eq!(resumable.len(), 1);
-        assert_eq!(resumable[0].1, "split it");
-
-        // The resume preamble carries question, answer, and checkpoint.
-        let block = resume_context(&p, &id).unwrap();
-        assert!(block.contains("merge or split?"));
-        assert!(block.contains("split it"));
-        assert!(block.contains("reports/cp.md"));
-
-        // Consuming archives the pair: nothing left to resume, records kept.
-        assert!(archive_pair(&p, &id), "the first consumer claims the pair");
-        assert!(answered_detached(&p).is_empty());
-        assert!(p.asks_dir().join("archive/triage-1.json").is_file());
-        assert!(p.answers_dir().join("archive/triage-1.json").is_file());
-        // A SECOND consume of the same pair loses the claim — the ask half's
-        // rename is the atomic test-and-set a concurrent start is gated on.
-        assert!(
-            !archive_pair(&p, &id),
-            "an already-consumed pair must not be claimable again"
-        );
-    }
-
-    #[test]
-    fn racing_archive_pair_claims_let_exactly_one_win() {
-        // Regression: resume consumption used to be fire-and-forget, so two
-        // concurrent `worker start --resume <id>` calls could BOTH dispatch
-        // the same answered-detached ask. The ask half's archive rename is
-        // the claim (same idiom as drain_tells): exactly one claimant wins.
-        let p = temp_seeded();
-        let id = ask_detached(&p, "w", "go?", "", &[]).unwrap();
-        answer(&p, &id, "go", false).unwrap();
-        let wins: usize = std::thread::scope(|s| {
-            let handles: Vec<_> = (0..8).map(|_| s.spawn(|| archive_pair(&p, &id))).collect();
-            handles
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .filter(|won| *won)
-                .count()
-        });
-        assert_eq!(wins, 1, "exactly one concurrent consumer claims the pair");
-        assert!(
-            p.asks_dir().join(format!("archive/{id}.json")).is_file(),
-            "the claimed pair is archived, not lost"
-        );
-    }
-
-    #[test]
-    fn archived_ask_ids_are_reusable_without_clobbering_the_archive() {
-        let p = Paths::temp();
-        let id = ask_detached(&p, "w", "first?", "", &[]).unwrap();
-        cmd_answer(&p, &ans(&id, "one", false)).unwrap();
-        assert!(archive_pair(&p, &id));
-        // The id is free again (next_ask_id scans only live dirs)…
-        let id2 = ask_detached(&p, "w", "second?", "", &[]).unwrap();
-        assert_eq!(id2, id, "live id space is reusable after archive");
-        cmd_answer(&p, &ans(&id2, "two", false)).unwrap();
-        assert!(archive_pair(&p, &id2));
-        // …and the second archive did not clobber the first record.
-        assert!(p.asks_dir().join("archive/w-1.json").is_file());
-        assert!(p.asks_dir().join("archive/w-1-1.json").is_file());
-    }
-
-    #[test]
-    fn unarchive_restores_the_pair_and_never_pairs_a_stale_answer_with_a_new_ask() {
-        let p = Paths::temp();
-        let id = ask_detached(&p, "w", "first?", "", &[]).unwrap();
-        cmd_answer(&p, &ans(&id, "one", false)).unwrap();
-        assert!(archive_pair(&p, &id));
-
-        // Plain restore: both halves come back, the pair is resumable again.
-        unarchive_pair(&p, &id);
-        assert!(p.asks_dir().join(format!("{id}.json")).is_file());
-        assert!(p.answers_dir().join(format!("{id}.json")).is_file());
-        assert_eq!(answered_detached(&p).len(), 1);
-
-        // Archive again, then let a NEW live ask REUSE the id: unarchive must
-        // restore NEITHER half — restoring only the answer would attach the
-        // stale "one" to the brand-new question.
-        assert!(archive_pair(&p, &id));
-        let id2 = ask_detached(&p, "w", "second, unrelated?", "", &[]).unwrap();
-        assert_eq!(id2, id, "the live id space reuses archived ids");
-        unarchive_pair(&p, &id);
-        assert!(
-            !p.answers_dir().join(format!("{id}.json")).exists(),
-            "a stale answer must not be attached to the new ask"
-        );
-        assert!(
-            p.asks_dir()
-                .join("archive")
-                .join(format!("{id}.json"))
-                .is_file(),
-            "the archived ask half stays archived"
-        );
-        assert!(
-            pending(&p).iter().any(|a| a.prompt == "second, unrelated?"),
-            "the new live ask is untouched"
-        );
-    }
-
-    #[test]
-    fn unarchive_survives_a_gap_in_the_archive_suffix_sequence() {
-        // Regression: the restore scan used to probe suffixes upward from the
-        // bare name and stop at the first hole, so `<id>.json` + `<id>-2.json`
-        // (a pruned `-1` generation) restored the STALE bare record. The scan
-        // must pick the HIGHEST suffix present, gaps notwithstanding.
-        let p = Paths::temp();
-        let arch = p.asks_dir().join("archive");
-        fs::create_dir_all(&arch).unwrap();
-        fs::write(arch.join("w-1.json"), r#"{"gen":"oldest"}"#).unwrap();
-        fs::write(arch.join("w-1-2.json"), r#"{"gen":"newest"}"#).unwrap();
-        assert!(restore_newest_archived(&p.asks_dir(), "w-1"));
-        assert_eq!(
-            fs::read_to_string(p.asks_dir().join("w-1.json")).unwrap(),
-            r#"{"gen":"newest"}"#,
-            "the highest suffix (newest generation) wins, not the first probe hit"
-        );
-        assert!(
-            arch.join("w-1.json").is_file(),
-            "the older generation stays archived"
-        );
     }
 
     #[test]

@@ -63,12 +63,6 @@ pub enum Action {
         /// FAILED worker instead of a clean corpse. See `verify.rs`.
         #[serde(default)]
         verify: Option<String>,
-        /// Resume an ANSWERED, DETACHED ask: the ask's question, the human's
-        /// answer, and the checkpoint reference are injected into this
-        /// worker's brief, and the ask/answer pair is archived once the
-        /// worker launches (settling the sys-asks resume signal).
-        #[serde(default)]
-        resume: Option<String>,
     },
     /// Terminate a live worker session. The remedy for a STUCK worker (see the
     /// sys-sessions `health` reading): a worker has no input channel, so one
@@ -411,7 +405,6 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
             prompt,
             command,
             verify,
-            resume,
         } => {
             // Reuse the worker-launch path (contract injection, reserved-id
             // guard, corpse reuse, detached spawn).
@@ -421,7 +414,6 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
                 prompt,
                 command.as_deref(),
                 verify.as_deref(),
-                resume.as_deref(),
             )?;
             if outcome.code != std::process::ExitCode::SUCCESS {
                 // Carry the refusal REASON (fleet cap, duplicate id, bad
@@ -435,13 +427,10 @@ fn execute_inner(paths: &Paths, action: &Action) -> Result<String> {
                     .unwrap_or("refused for an unspecified reason");
                 bail!("start_worker {id:?} failed: {why}");
             }
-            // Flag a command override / resume in the journal (auditable).
+            // Flag a command override in the journal (auditable).
             let mut note = format!("start-worker {id}");
             if outcome.overridden {
                 note.push_str(" (command override)");
-            }
-            if let Some(r) = resume {
-                note.push_str(&format!(" (resume {r})"));
             }
             Ok(note)
         }
@@ -774,7 +763,6 @@ pub fn start_worker(
     prompt: &[String],
     command: Option<&str>,
     verify: Option<&str>,
-    resume: Option<&str>,
     journal: Option<&str>,
 ) -> Result<ExitCode> {
     use crate::contract::Contract;
@@ -784,7 +772,7 @@ pub fn start_worker(
         return Ok(ExitCode::from(1));
     }
     ok(crate::contract::LocalContract::new(paths)
-        .worker_start(id, &prompt, command, verify, resume, journal)?)
+        .worker_start(id, &prompt, command, verify, journal)?)
 }
 
 #[cfg(test)]
@@ -1055,8 +1043,7 @@ mod tests {
             id: "w".into(),
             prompt: "p".into(),
             command: None,
-            verify: None,
-            resume: None
+            verify: None
         }));
     }
 
@@ -1288,8 +1275,7 @@ mod tests {
                 id: "triage".into(),
                 prompt: "p".into(),
                 command: None,
-                verify: None,
-                resume: None
+                verify: None
             }),
             Some("triage".into())
         );

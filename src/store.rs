@@ -505,9 +505,8 @@ impl StateStore for FileStore<'_> {
     }
 
     fn archive(&self, key: &Key) -> io::Result<()> {
-        // Helper: move `from` into `<dir>/archive/`, suffixing on collision —
-        // ask ids can be REUSED after a pair is archived (`next_ask_id` scans
-        // only the live dirs), so an archived record must never be clobbered.
+        // Helper: move `from` into `<dir>/archive/`, suffixing on collision so
+        // recreating and re-archiving the same id never clobbers old history.
         fn into_archive(from: std::path::PathBuf, stem: &str, ext: &str) -> io::Result<()> {
             let live_dir = from
                 .parent()
@@ -517,10 +516,8 @@ impl StateStore for FileStore<'_> {
             // The free-suffix scan + rename must be ONE critical section:
             // unlocked, two concurrent archives of the same id could both pick
             // the same free suffix and the second rename would silently
-            // clobber the first record — and unarchive_pair's no-clobber guard
-            // already assumes archive-side movement is serialized under the
-            // LIVE dir's writer lock (the same DirLock create_exclusive
-            // takes), so that lock is the shared serialization point.
+            // clobber the first record. The live directory's writer lock is the
+            // shared serialization point.
             let _lock = DirLock::acquire(live_dir)?;
             let mut to = dir.join(format!("{stem}.{ext}"));
             let mut n = 1;
@@ -544,17 +541,12 @@ impl StateStore for FileStore<'_> {
             fs::rename(&from, to)
         }
         match key {
-            // A goal id can be recreated after archiving, so the archive must
-            // suffix on collision like the mailbox does — a plain rename to a
-            // fixed path would silently clobber the previous archived record.
+            // A goal id can be recreated after archiving, so a plain rename to
+            // a fixed path would silently clobber the previous archived record.
             Key::Goal(id) => into_archive(self.path(key), id, "md"),
-            // A consumed ask/answer pair (resumed detached ask) moves aside so
-            // the sys-asks wake signal settles while the record stays auditable.
-            Key::Ask(id) => into_archive(self.path(key), id, "json"),
-            Key::Answer(id) => into_archive(self.path(key), id, "json"),
             _ => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "archive: only goals and ask/answer records are archivable",
+                "archive: only goal records are archivable",
             )),
         }
     }
